@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -56,6 +57,8 @@ class TRTLLMMHAMetadata:
     cu_seqlens_k: torch.Tensor = None
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table for SWA layers (translated from full pool indices to SWA pool indices)
+    swa_page_table: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -120,8 +123,82 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
 
+        # Sliding Window Attention(SWA) hybrid model support.
+        # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
+        # with separate index spaces. We maintain a translated page_table for SWA
+        # layers so the trtllm kernel reads from the correct pool.
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.use_sliding_window_kv_pool = isinstance(
+            allocator, SWATokenToKVPoolAllocator
+        )
+        self._swa_kv_pool: Optional[SWAKVPool] = (
+            allocator.get_kvcache() if self.use_sliding_window_kv_pool else None
+        )
+
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+
+    def _maybe_translate_swa(
+        self, token_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Translate full-pool token indices to SWA-pool indices, or return None."""
+        if not self.use_sliding_window_kv_pool:
+            return None
+        shape = token_indices.shape
+        return self._swa_kv_pool.translate_loc_from_full_to_swa(
+            token_indices.reshape(-1)
+        ).reshape(shape)
+
+    def _alloc_swa_page_table(
+        self, max_bs: int, max_num_pages: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate a SWA page_table buffer, or return None for non-SWA models."""
+        if not self.use_sliding_window_kv_pool:
+            return None
+        return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
+
+    def _copy_swa_page_table(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        page_indices: torch.Tensor,
+        num_pages: int,
+    ):
+        """Translate and copy SWA page indices into metadata. No-op for non-SWA."""
+        if metadata.swa_page_table is None:
+            return
+        swa_indices = self._maybe_translate_swa(page_indices)
+        metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
+
+    def _get_layer_cache_loc(
+        self,
+        layer: RadixAttention,
+        cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return cache locations in the correct index space for the given layer."""
+        if self.use_sliding_window_kv_pool:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return self._swa_kv_pool.translate_loc_from_full_to_swa(cache_loc)
+        return cache_loc
+
+    def _bind_swa_page_table(
+        self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
+    ):
+        """Bind a pre-allocated SWA page_table slice to metadata for CUDA graph."""
+        buf = source.get(key)
+        if buf is not None:
+            metadata.swa_page_table = buf[:bs, :]
+
+    def _get_layer_page_table(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Return the correct page_table for the given layer (SWA or full)."""
+        swa_pt = self.forward_metadata.swa_page_table
+        if swa_pt is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return swa_pt
+        return self.forward_metadata.page_table
 
     def init_cuda_graph_state(
         self,
@@ -139,6 +216,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
             ),
@@ -160,6 +238,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
+                self._alloc_swa_page_table(max_bs, max_num_pages)
+            )
+
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -180,6 +262,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     dtype=torch.int32,
                     device=self.device,
                 ),
+                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -203,6 +286,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     dtype=torch.int32,
                     device=self.device,
                 ),
+                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -244,6 +328,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata[
                     "page_table_draft_decode"
                 ][:bs, :]
+                self._bind_swa_page_table(
+                    metadata,
+                    self.decode_cuda_graph_metadata,
+                    "swa_page_table_draft_decode",
+                    bs,
+                )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
@@ -264,6 +354,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                self._bind_swa_page_table(
+                    metadata,
+                    self.decode_cuda_graph_metadata,
+                    "swa_page_table",
+                    bs,
+                )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
             # Target Verify
@@ -293,6 +389,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+            self._bind_swa_page_table(
+                metadata,
+                self.target_verify_metadata,
+                "swa_page_table",
+                bs,
+            )
 
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend():
@@ -317,6 +419,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.max_seq_len_k = seq_lens.max().item()
 
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
+            self._bind_swa_page_table(
+                metadata,
+                self.draft_extend_metadata,
+                "swa_page_table",
+                bs,
+            )
 
             self.draft_extend_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -371,6 +479,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ],
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
@@ -392,8 +501,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 req_pool_indices[:, None],
                 self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
             ]
-            page_indices //= self.page_size
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
             metadata.max_seq_len_q = self.speculative_num_draft_tokens
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
@@ -422,6 +531,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -442,7 +552,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         """Fused FP8 quantization and KV cache write."""
-        cache_loc = forward_batch.out_cache_loc
+        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
 
         # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -553,7 +663,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        # Convert the page table to a strided format
+        # Compute SWA page table (None for non-SWA models)
+        metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+
+        # Convert the page tables to a strided format
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
@@ -561,6 +674,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
+            if metadata.swa_page_table is not None:
+                metadata.swa_page_table = (
+                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+                )
 
         self.forward_metadata = metadata
 
@@ -629,19 +746,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
+        page_table = self._get_layer_page_table(layer, forward_batch)
+
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
             workspace_buffer=self.workspace_buffer,
-            block_tables=self.forward_metadata.page_table,
+            block_tables=page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
             max_seq_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
             out_dtype=self.q_data_type,  # model_runner.dtype
         )
@@ -711,29 +829,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
+        page_table = self._get_layer_page_table(layer, forward_batch)
+
         if forward_batch.forward_mode.is_target_verify():
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
-                block_tables=self.forward_metadata.page_table,
+                block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_seq_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
-
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
-                block_tables=self.forward_metadata.page_table,
+                block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
@@ -743,7 +861,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )

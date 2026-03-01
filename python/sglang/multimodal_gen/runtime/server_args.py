@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -62,10 +63,15 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
     - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
     - Dataclasses are expanded to dicts and sanitized recursively.
     - Callables/functions are rendered as their qualified name.
+    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
     - Fallback to str(...) for unknown types.
     """
     # Handle simple types quickly
     if obj is None or isinstance(obj, (str, int, float, bool)):
+        # redact sensitive prompt fields
+        if key_hint in ("prompt", "negative_prompt"):
+            if isinstance(obj, str):
+                return f"<redacted, len={len(obj)}>"
         return obj
 
     # Enum -> value for readability
@@ -133,7 +139,7 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
 
     # Sequences/Sets -> list
     if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x) for x in obj]
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
 
     # Functions / Callables -> qualified name
     try:
@@ -149,59 +155,6 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return str(obj)
     except Exception:
         return "<unserializable>"
-
-
-class ExecutionMode(str, Enum):
-    """
-    Enumeration for different pipeline modes.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    INFERENCE = "inference"
-
-    @classmethod
-    def from_string(cls, value: str) -> "ExecutionMode":
-        """Convert string to ExecutionMode enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [mode.value for mode in cls]
-
-
-class WorkloadType(str, Enum):
-    """
-    Enumeration for different workload types.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    I2V = "i2v"  # Image to Video
-    T2V = "t2v"  # Text to Video
-    T2I = "t2i"  # Text to Image
-    I2I = "i2i"  # Image to Image
-
-    @classmethod
-    def from_string(cls, value: str) -> "WorkloadType":
-        """Convert string to WorkloadType enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [workload.value for workload in cls]
 
 
 class Backend(str, Enum):
@@ -286,8 +239,11 @@ class ServerArgs:
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
-    # VAE parameters
-    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
+    # Component path overrides (key = model_index.json component name, value = path)
+    component_paths: dict[str, str] = field(default_factory=dict)
+
+    # path to pre-quantized transformer weights (single .safetensors or directory).
+    transformer_weights_path: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -399,19 +355,34 @@ class ServerArgs:
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
         ncfg.validate()
-        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
-            # if nunchaku is not applied
+
+        # propagate the path to server_args
+        if ncfg.transformer_weights_path:
+            self.transformer_weights_path = ncfg.transformer_weights_path
+
+        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
             self.nunchaku_config = None
         else:
             self.nunchaku_config = NunchakuConfig(
                 precision=self.nunchaku_config.quantization_precision,
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                quantized_model_path=self.nunchaku_config.quantized_model_path,
+                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
             )
 
     def _adjust_offload(self):
-        if self.pipeline_config.task_type.is_image_gen():
+        # TODO: to be handled by each platform
+        if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
+            logger.info("Enabling all offloading for GPU with low device memory")
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
+        elif self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
             )
@@ -611,13 +582,6 @@ class ServerArgs:
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
-        parser.add_argument(
-            "--vae-path",
-            type=str,
-            default=ServerArgs.vae_path,
-            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
-        )
-
         # attention
         parser.add_argument(
             "--attention-backend",
@@ -635,13 +599,6 @@ class ServerArgs:
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
-        )
-        parser.add_argument(
-            "--diffusers-attention-backend",
-            type=str,
-            dest="attention_backend",
-            default=None,
-            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--cache-dit-config",
@@ -951,24 +908,66 @@ class ServerArgs:
             f"(started from port {original_port})"
         )
 
+    @staticmethod
+    def _extract_component_paths(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """
+        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        """
+        component_paths: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            if key_part.startswith("--") and key_part.endswith("-path"):
+                component = key_part[2:-5].replace("-", "_")
+                if "=" in arg:
+                    component_paths[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_paths[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+
+        # canonicalize and validate
+        for component, path in component_paths.items():
+            path = os.path.expanduser(path)
+            component_paths[component] = path
+        return component_paths, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
+
+        # extract dynamic --<component>-path from unknown args
+        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        if remaining:
+            raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
+
         provided_args = cls.get_provided_args(args, unknown_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
-            # Provided args override config file args
             provided_args = {**config_args, **provided_args}
 
-        # Handle special cases
-        # if "tp_size" in provided_args:
-        #     provided_args["tp"] = provided_args.pop("tp_size")
+        if dynamic_paths:
+            existing = dict(provided_args.get("component_paths") or {})
+            existing.update(dynamic_paths)
+            provided_args["component_paths"] = existing
 
         return cls.from_dict(provided_args)
 
@@ -977,6 +976,10 @@ class ServerArgs:
         """Create a ServerArgs object from a dictionary."""
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
+
+        component_paths = dict(kwargs.get("component_paths") or {})
+        if component_paths:
+            server_args_kwargs["component_paths"] = component_paths
 
         for attr in attrs:
             if attr == "pipeline_config":
@@ -1012,12 +1015,6 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        # Convert mode string to enum if necessary
-        if "mode" in kwargs and isinstance(kwargs["mode"], str):
-            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
@@ -1086,7 +1083,7 @@ class ServerArgs:
                 )
                 self.use_fsdp_inference = False
 
-            if self.dit_cpu_offload:
+            if self.dit_cpu_offload is None:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
@@ -1227,8 +1224,8 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
+    raw_args, unknown_args = parser.parse_known_args(argv)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
 
 

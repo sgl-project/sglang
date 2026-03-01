@@ -41,6 +41,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -612,6 +613,9 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
+        elif is_in_piecewise_cuda_graph():
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -622,6 +626,58 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        # Prefer communicator-native fused API when provided.
+        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                # Fall back to custom_fused_ar_rms path below.
+                pass
+
+        if not hasattr(ca_comm, "custom_fused_ar_rms"):
+            return None
+
+        # 1-stage policy for fused AR+RMSNorm:
+        # 1) Explicit env override wins.
+        # 2) Deterministic inference forces 1-stage for reproducibility.
+        # 3) Otherwise follow AITER's heuristic (small payloads only).
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
+
+        fused_outputs = ca_comm.custom_fused_ar_rms(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
+        return fused_outputs
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
@@ -629,7 +685,8 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm])
+        pynccl_comm = self.pynccl_comm
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -639,9 +696,14 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
-        else:
+        elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pynccl":
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                out = pynccl_comm.outplace_all_reduce(input_)
         assert out is not None
         return out
 
@@ -1514,6 +1576,20 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+_DEVICE_TO_DISTRIBUTED_BACKEND = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl",
+    "musa": "mccl",
+}
+
+
+def get_default_distributed_backend(device: str) -> str:
+    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
 def init_distributed_environment(

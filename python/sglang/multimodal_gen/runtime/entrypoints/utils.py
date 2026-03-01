@@ -12,7 +12,8 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Callable, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 import imageio
 import numpy as np
@@ -37,6 +38,79 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class SetLoraReq:
+    lora_nickname: Union[str, List[str]]
+    lora_path: Optional[Union[str, List[Optional[str]]]] = None
+    target: Union[str, List[str]] = "all"
+    strength: Union[float, List[float]] = 1.0
+
+
+@dataclass
+class MergeLoraWeightsReq:
+    target: str = "all"
+    strength: float = 1.0
+
+
+@dataclass
+class UnmergeLoraWeightsReq:
+    target: str = "all"
+
+
+@dataclass
+class ListLorasReq:
+    pass
+
+
+@dataclass
+class ShutdownReq:
+    pass
+
+
+def format_lora_message(
+    lora_nickname: Union[str, List[str]],
+    target: Union[str, List[str]],
+    strength: Union[float, List[float]],
+) -> tuple[str, str, str]:
+    """Format success message for single or multiple LoRAs."""
+    if isinstance(lora_nickname, list):
+        nickname_str = ", ".join(lora_nickname)
+        target_str = ", ".join(target) if isinstance(target, list) else target
+        strength_str = (
+            ", ".join(f"{s:.2f}" for s in strength)
+            if isinstance(strength, list)
+            else f"{strength:.2f}"
+        )
+    else:
+        nickname_str = lora_nickname
+        target_str = target if isinstance(target, str) else ", ".join(target)
+        strength_str = (
+            f"{strength:.2f}"
+            if isinstance(strength, (int, float))
+            else ", ".join(f"{s:.2f}" for s in strength)
+        )
+    return nickname_str, target_str, strength_str
+
+
+@dataclass
+class GenerationResult:
+    """Result of a single generation request from DiffGenerator."""
+
+    samples: Any = None
+    frames: Any = None
+    audio: Any = None
+    prompt: str | None = None
+    size: tuple | None = None  # (height, width, num_frames)
+    generation_time: float = 0.0
+    peak_memory_mb: float = 0.0
+    metrics: dict = field(default_factory=dict)
+    trajectory_latents: Any = None
+    trajectory_timesteps: Any = None
+    trajectory_decoded: Any = None
+    prompt_index: int = 0
+    output_file_path: str | None = None
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
@@ -267,6 +341,10 @@ def save_outputs(
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
     output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -275,6 +353,7 @@ def save_outputs(
         sample = output
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
+
         frames = post_process_sample(
             sample,
             data_type,
@@ -283,7 +362,12 @@ def save_outputs(
             save_file_path,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            enable_frame_interpolation=enable_frame_interpolation,
+            frame_interpolation_exp=frame_interpolation_exp,
+            frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
         )
+
         if samples_out is not None:
             samples_out.append(sample)
         if audios_out is not None:
@@ -310,14 +394,19 @@ def post_process_sample(
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
 ):
     """
-    Process sample output and save video if necessary
+    Process sample output, optionally interpolate video frames, and save.
     """
     audio = None
     if isinstance(sample, (tuple, list)) and len(sample) == 2:
         sample, audio = sample
 
+    # 1. Convert tensor / array to list of uint8 HWC frames
     frames = None
     if isinstance(sample, torch.Tensor):
         if sample.dim() == 3:
@@ -350,7 +439,21 @@ def post_process_sample(
                 arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
             frames = list(arr)
 
-    # 2. Save outputs if requested
+    # 2. Frame interpolation (video only)
+    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_frames,
+        )
+
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=frame_interpolation_exp,
+            scale=frame_interpolation_scale,
+            model_path=frame_interpolation_model_path,
+        )
+        fps = fps * multiplier
+
+    # 3. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
