@@ -66,8 +66,8 @@ def bench_fused_norm_scale_shift(
     B: int, S: int, D: int, norm_type, affine: bool, provider: str
 ) -> Tuple[float, float, float]:
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
-    scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
-    shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
     if norm_type == "layer":
         layer = LayerNormScaleShift(D, EPS, affine, dtype=DTYPE)
     else:
@@ -104,8 +104,8 @@ def bench_fused_scale_residual_norm_scale_shift(
 ) -> Tuple[float, float, float]:
     residual = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
-    scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
-    shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
     gate = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
     if norm_type == "layer":
         layer = ScaleResidualLayerNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)

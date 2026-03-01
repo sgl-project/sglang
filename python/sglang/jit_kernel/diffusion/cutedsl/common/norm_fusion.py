@@ -19,13 +19,14 @@ def apply_norm_cta(
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
     tBrB: Optional[cute.Tensor],
+    pred: cute.Tensor,
     D: Union[cutlass.Int32, cutlass.Constexpr],
     eps: Union[cutlass.Float32, cutlass.Constexpr],
 ) -> cute.Tensor:
     if cutlass.const_expr(norm_type == "rms"):
         return apply_rmsnorm_cta(num_warps, tidx, tXrX, tWrW, D, eps)
     else:
-        return apply_layernorm_cta(num_warps, tidx, tXrX, tWrW, tBrB, D, eps)
+        return apply_layernorm_cta(num_warps, tidx, tXrX, tWrW, tBrB, pred, D, eps)
 
 
 @cute.jit
@@ -64,6 +65,7 @@ def apply_layernorm_cta(
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
     tBrB: Optional[cute.Tensor],
+    pred: cute.Tensor,
     D: Union[cutlass.Int32, cutlass.Constexpr],
     eps: Union[cutlass.Float32, cutlass.Constexpr],
 ) -> cute.Tensor:
@@ -83,10 +85,12 @@ def apply_layernorm_cta(
     mean = val / D
     # Reduce variance
     val = cute.Float32(0.0)
-    for idx in range(cute.size(tXrX)):
-        # Accumulate in FP32 to improve numerical precision.
-        x_fp32 = tXrX[idx].to(cutlass.Float32)
-        val += (x_fp32 - mean) * (x_fp32 - mean)
+    for iter in range(cute.size(tXrX, mode=[1])):
+        if pred[iter]:
+            for idx in range(cute.size(tXrX[None, iter])):
+                # Accumulate in FP32 to improve numerical precision.
+                x_fp32 = tXrX[None, iter][idx].to(cutlass.Float32)
+                val += (x_fp32 - mean) * (x_fp32 - mean)
     val = warp_reduce_sum(val)
     val = cta_reduce_sum(val, num_warps, tidx)
     factor = cute.rsqrt(val / D + eps)

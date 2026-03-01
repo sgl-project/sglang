@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
@@ -53,24 +54,23 @@ def to_fake_cute_args(t: torch.Tensor):
         return fake_t
     return to_cute_arg(t)
 
+class KernelEnum(Enum):
+    NormScaleShift = 0 # NormScaleShift
+    ScaleResidualNormScaleShift = 1 # ScaleResidualNormScaleShift
+    DualNormScaleShift = 2 # DualNormScaleShift
+    DualScaleResidualNormScaleShift = 3 # DualScaleResidualNormScaleShift
 
-class ScaleResidualNormScaleShift:
+# CuTeDSL annotation
+# y, x, weight, bias, scale, shift
+NormScaleShiftParams = Tuple[*([cute.Tensor] * 6)]
+DualNormScaleShiftParams = Tuple[*([cute.Tensor] * 6 * 2)]
+# y, res_out, res, x, gate, weight, bias, scale, shift
+ScaleResidualNormScaleShiftParams = Tuple[*([cute.Tensor] * 9)]
+DualScaleResidualNormScaleShiftParams = Tuple[*([cute.Tensor] * 9 * 2)]
+
+class ScaleResidualNormScaleShift():
     @classmethod
     def make_hash_key(cls, *inputs):
-        """
-        Compile-time values:
-          - D: hidden dimension (size of the last dimension)
-          - norm_type: layer norm or RMS norm
-          - tensor dtype
-          - tensor rank (i.e., tensor.ndim)
-
-        Runtime values:
-          - all other inputs
-
-        This hash key defines the compile-time specialization boundary for
-        ScaleResidualNormScaleShift kernels.
-        """
-
         def _sig(val):
             if isinstance(val, torch.Tensor):
                 return (val.dtype, val.ndim, val.shape[-1])
@@ -78,55 +78,98 @@ class ScaleResidualNormScaleShift:
 
         return tuple(_sig(val) for val in inputs)
 
-    def __init__(self, D: int, norm_type: str):
+    def __init__(self, batch: int, D: int, norm_type: str):
+        self.batch = batch
         self.D = D
+        self.num_vectorized = 8  # maximum num of elem per copy
         self.norm_type = norm_type  # "layer" or "rms"
-        self.num_warps = self.D // 256  # num of warps per cta
-        self.num_threads = self.num_warps * WARP_SIZE  # num of threads per cta
+        self.num_threads = self.heuristic_threads()  # num of threads per cta
+        self.num_warps = self.num_threads // WARP_SIZE  # num of warps per cta
+
+    def heuristic_threads(self):
+        elems_per_warp = self.num_vectorized * WARP_SIZE
+        heu_warps = (self.D + elems_per_warp - 1) // elems_per_warp // 4
+        heu_warps = max(heu_warps, 1) # at least one warp
+        heu_warps = (heu_warps + 1) // 2 * 2 # be multiple of 2
+        heu_threads = heu_warps * 32
+        return heu_threads
 
     @cute.jit
-    def __call__(
-        self,
-        mY,
-        mResOut,
-        mRes,
-        mX,
-        mGate,
-        mWeight,
-        mBias,
-        mScale,
-        mShift,
-        eps: cutlass.Float32 = cutlass.Float32(1e-5),
-        stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
-    ):
-        # Tensor shapes
-        B, S, _ = mX.shape  # (batch, seq_len, hidden_dim)
-        # Vectorized copy configuration
-        num_vectorized = 8  # maximum num of elem per copy
+    def get_tiled_copy(self, dtype):
         atom_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            mX.element_type,
-            num_bits_per_copy=128,
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=128,
         )
-        # Thread/value layouts for tiled copy
-        t_layout = cute.make_layout(self.num_threads)  # thread layout within a CTA
-        v_layout = cute.make_layout(num_vectorized)  # per-thread vector layout
+        t_layout = cute.make_layout(self.num_threads)
+        v_layout = cute.make_layout(self.num_vectorized)
         tiled_copy = cute.make_tiled_copy_tv(atom_copy, t_layout, v_layout)
+        return tiled_copy
 
-        self.kernel(
-            mY,
-            mResOut,
-            mRes,
-            mX,
-            mGate,
-            mWeight,
-            mBias,
-            mScale,
-            mShift,
-            tiled_copy,
-            eps,
-        ).launch(
-            grid=[B * S, 1, 1],
+    @cute.jit
+    def norm_scale_shift(
+        self,
+        tensors: NormScaleShiftParams,
+        eps: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_enum = KernelEnum.NormScaleShift
+        mY = tensors[0]
+        _, S, _ = mY.shape
+        tiled_copy = self.get_tiled_copy(mY.element_type)
+        self.kernel(tensors, tiled_copy, eps).launch(
+            grid=[self.batch * S, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def dual_norm_scale_shift(
+        self,
+        tensors: DualNormScaleShiftParams,
+        eps: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_enum = KernelEnum.DualNormScaleShift
+        mY1, mY2 = tensors[0], tensors[6] # [batch, s1/s2, hidden]
+        S1, S2 = mY1.shape[1], mY2.shape[1]
+        num_cta_1 = self.batch * S1
+        tiled_copy = self.get_tiled_copy(mY1.element_type)
+        self.kernel(tensors + [num_cta_1], tiled_copy, eps).launch(
+            grid=[self.batch * (S1 + S2), 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def scale_residual_norm_scale_shift(
+        self,
+        tensors: ScaleResidualNormScaleShiftParams,
+        eps: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_enum = KernelEnum.ScaleResidualNormScaleShift
+        mY = tensors[0]
+        _, S, _ = mY.shape
+        tiled_copy = self.get_tiled_copy(mY.element_type)
+        self.kernel(tensors, tiled_copy, eps).launch(
+            grid=[self.batch * S, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def dual_scale_residual_norm_scale_shift(
+        self,
+        tensors: DualScaleResidualNormScaleShiftParams,
+        eps: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_enum = KernelEnum.DualScaleResidualNormScaleShift
+        mY1, mY2 = tensors[0], tensors[9] # [batch, s1/s2, hidden]
+        S1, S2 = mY1.shape[1], mY2.shape[1]
+        num_cta_1 = self.batch * S1
+        tiled_copy = self.get_tiled_copy(mY1.element_type)
+        self.kernel(tensors + [num_cta_1], tiled_copy, eps).launch(
+            grid=[self.batch * (S1 + S2), 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -134,23 +177,47 @@ class ScaleResidualNormScaleShift:
     @cute.kernel
     def kernel(
         self,
-        mY,
-        mResOut,
-        mRes,
-        mX,
-        mGate,
-        mWeight,
-        mBias,
-        mScale,
-        mShift,
+        tensors,
         tiled_copy: cute.TiledCopy,
         eps: cutlass.Float32,
     ):
-        _, S, _ = mX.shape
+        has_res = (
+            self.kernel_enum == KernelEnum.ScaleResidualNormScaleShift or
+            self.kernel_enum == KernelEnum.DualScaleResidualNormScaleShift
+        )
         tidx, _, _ = cute.arch.thread_idx()  # thread index
         bid, _, _ = cute.arch.block_idx()  # cta index
-        bidx = cutlass.Int32(bid // S)  # batch index
-        bidy = cutlass.Int32(bid % S)  # seq_len index
+        if cutlass.const_expr(
+            self.kernel_enum == KernelEnum.NormScaleShift
+        ):
+            mY, mX, mWeight, mBias, mScale, mShift = tensors
+        elif cutlass.const_expr(
+            self.kernel_enum == KernelEnum.ScaleResidualNormScaleShift
+        ):
+            mY, mResOut, mRes, mX, mGate, mWeight, mBias, mScale, mShift = tensors
+        elif cutlass.const_expr(
+            self.kernel_enum == KernelEnum.DualNormScaleShift
+        ):
+            mY, mX, mWeight, mBias, mScale, mShift = tensors[:6]
+            num_cta_1 = tensors[12]
+            if bid >= num_cta_1:
+                bid -= num_cta_1
+                mY, mX, mWeight, mBias, mScale, mShift = tensors[6:12]
+        elif cutlass.const_expr(
+            self.kernel_enum == KernelEnum.DualScaleResidualNormScaleShift
+        ):
+            num_cta_1 = tensors[18]
+            mY, mResOut, mRes, mX, mGate, mWeight, mBias, mScale, mShift = tensors[:9]
+            if bid >= num_cta_1:
+                bid -= num_cta_1
+                mY, mResOut, mRes, mX, mGate, mWeight, mBias, mScale, mShift = tensors[9:18]
+        _, S, _ = mX.shape
+        
+        if cutlass.const_expr(self.batch == 1):
+            bidx, bidy = 0, bid
+        else:
+            bidx = cutlass.Int32(bid // S)  # batch index
+            bidy = cutlass.Int32(bid % S)  # seq_len index
         thr_copy = tiled_copy.get_slice(tidx)
 
         @cute.jit
@@ -160,69 +227,60 @@ class ScaleResidualNormScaleShift:
             return mV, mV
 
         @cute.jit
-        def copy_if(src, dst):
+        def copy_if(src, dst, pred, fill_val=None):
             if cutlass.const_expr(
-                isinstance(src, cute.Tensor) and isinstance(src, cute.Tensor)
+                isinstance(src, cute.Tensor) and isinstance(dst, cute.Tensor)
             ):
-                cute.autovec_copy(src, dst)  # LDG.128
-
-        @cute.jit
-        def norm(x, weight, bias):
-            return apply_norm_cta(
-                self.norm_type, self.num_warps, tidx, x, weight, bias, self.D, eps
-            )
-
-        # Slice: retrieve the per-thread data slices for both global memory (gmem)
-        # and register memory (rmem). The layouts are:
-        # - ((4,2),(1)):((1,4),(0)) for fp32
-        # - ((8,1),(1)):((1,0),(0)) for fp16/bf16
-        tRgR, tRrR = slice_if(mRes)  # residual
+                for i in range(cute.size(src, mode=[1])):
+                    if pred[i]:
+                        cute.autovec_copy(src[None, i], dst[None, i])
+                    else:
+                        if cutlass.const_expr(fill_val is not None):
+                            dst.fill(fill_val)
+        
+        if cutlass.const_expr(has_res):
+            tRgR, tRrR = slice_if(mRes)  # residual
+            tGgG, tGrG = slice_if(mGate)  # gate
+            tROgRO, _ = slice_if(mResOut)  # residual_out
         tXgX, tXrX = slice_if(mX)  # x
-        tGgG, tGrG = slice_if(mGate)  # gate
-        tROgRO, tROrRO = slice_if(mResOut)  # residual_out
         tWgW, tWrW = slice_if(mWeight)  # weight
         tBgB, tBrB = slice_if(mBias)  # bias
         tSCgSC, tSCrSC = slice_if(mScale)  # scale
         tSHgSH, tSHrSH = slice_if(mShift)  # shift
         tYgY, tYrY = slice_if(mY)  # y
-        # Load: load tensor from global memory to registers
-        copy_if(tRgR, tRrR)  # gmem -> rmem
-        copy_if(tXgX, tXrX)  # gmem -> rmem
-        copy_if(tGgG, tGrG)  # gmem -> rmem
-        copy_if(tWgW, tWrW)  # gmem -> rmem
-        copy_if(tBgB, tBrB)  # gmem -> rmem
 
-        # For norm_scale_shift, output:
-        # - y = norm(x, weight, bias) * (1 + scale) + shift
-        # For scale_residual_norm_scale_shift, output:
-        # - residual_out = residual + gate * x
-        # - y = norm(residual_out, weight, bias) * (1 + scale) + shift
-        # Compute: value = <gate> * x
-        value = tXrX.load()
-        if cutlass.const_expr(isinstance(tGrG, cute.Tensor)):
-            value = tGrG.load() * value
-        # Compute: value = value + <residual>
-        if cutlass.const_expr(isinstance(tRrR, cute.Tensor)):
-            value = value + tRrR.load()
-        # Store: residual_out
-        if cutlass.const_expr(isinstance(tROrRO, cute.Tensor)):
-            tROrRO.store(value.to(tROrRO.element_type))
-            copy_if(tROrRO, tROgRO)  # rmem -> gmem
-        # Compute: value = norm(value) * <weight> + <bias>
-        tNrN = cute.make_rmem_tensor_like(tXrX, tXrX.element_type)
-        tNrN.store(value.to(tNrN.element_type))
-        tNrN = norm(tNrN, tWrW, tBrB)
-        # Compute: value = value * (1 + <scale>) + <shift>
+        pred = cute.make_rmem_tensor(cute.size(tYgY, mode=[1]), cutlass.Boolean)
+        for i in range(cute.size(pred)):
+            offset = (i * self.num_threads + tidx) * self.num_vectorized
+            pred[i] = offset < self.D
+        if cutlass.const_expr(has_res):
+            copy_if(tGgG, tGrG, pred, fill_val=0.0)
+            copy_if(tRgR, tRrR, pred, fill_val=0.0)
+        copy_if(tXgX, tXrX, pred, fill_val=0.0)
+        copy_if(tWgW, tWrW, pred)
+        copy_if(tBgB, tBrB, pred)
+
+        if cutlass.const_expr(has_res):
+            if cutlass.const_expr(isinstance(tGrG, cute.Tensor)):
+                value = tGrG.load().to(cutlass.Float32) * tXrX.load()
+                tXrX.store(value.to(tXrX.element_type))
+            if cutlass.const_expr(isinstance(tRrR, cute.Tensor)):
+                value = tXrX.load().to(cutlass.Float32) + tRrR.load()
+                tXrX.store(value.to(tXrX.element_type))
+            if cutlass.const_expr(isinstance(tROgRO, cute.Tensor)):
+                copy_if(tXrX, tROgRO, pred)
+        tNrN = apply_norm_cta(
+            self.norm_type, self.num_warps, tidx, tXrX, tWrW, tBrB, pred, self.D, eps
+        )
+        copy_if(tSCgSC, tSCrSC, pred)
+        copy_if(tSHgSH, tSHrSH, pred)
         value = tNrN.load()
-        copy_if(tSCgSC, tSCrSC)  # gmem -> rmem
-        copy_if(tSHgSH, tSHrSH)  # gmem -> rmem
         if cutlass.const_expr(isinstance(tSCrSC, cute.Tensor)):
             value = value * (1 + tSCrSC.load())
         if cutlass.const_expr(isinstance(tSHrSH, cute.Tensor)):
             value = value + tSHrSH.load()
-        # Store: y
         tYrY.store(value.to(tYrY.element_type))
-        copy_if(tYrY, tYgY)  # rmem -> gmem
+        copy_if(tYrY, tYgY, pred)
 
 
 def validate_x(t: torch.Tensor, B: int, S: int, D: int):
@@ -308,8 +366,8 @@ def fused_norm_scale_shift(
     validate_scale_shift(shift, *BSD)
 
     if norm_type == "layer" or norm_type == "rms":
-        D = x.shape[-1]
-        if D % 256 != 0 or D > 8192:
+        batch, _, D = x.shape
+        if D % 8 != 0 or D > 16384:
             raise ValueError(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
@@ -321,20 +379,25 @@ def fused_norm_scale_shift(
         # in code generation and have no impact on runtime performance.
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
-        ResOut, Residual, Gate = 0, 0, 1
-        torch_tensors = [y, ResOut, Residual, x, Gate, weight, bias, scale, shift]
+        torch_tensors = [y, x, weight, bias, scale, shift]
         # Compile cache
-        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, batch, *torch_tensors
+        )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            kernel = ScaleResidualNormScaleShift(batch, D, norm_type)
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
-                kernel, *fake_sig_args, options="--enable-tvm-ffi"
+                kernel.norm_scale_shift,
+                fake_sig_args,
+                eps,  # eps: runtime value
+                stream,
+                options="--enable-tvm-ffi",
             )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*torch_tensors, eps, stream)
+        compiled_fn(torch_tensors, eps, stream)
         return y
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
@@ -342,8 +405,98 @@ def fused_norm_scale_shift(
 
 @fused_norm_scale_shift.register_fake
 def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps):
-    y = x.new_empty(x.shape)
+    y = torch.empty_like(x)
     return y
+
+
+@torch.library.custom_op("sglang::fused_dual_norm_scale_shift", mutates_args=())
+def fused_dual_norm_scale_shift(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    x_2: torch.Tensor,
+    weight_2: Optional[torch.Tensor],
+    bias_2: Optional[torch.Tensor],
+    scale_2: torch.Tensor,
+    shift_2: torch.Tensor,
+    norm_type: str,
+    eps: float = 1e-5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fuse: norm(x) * (1 + scale) + shift
+      where norm is either layernorm or rmsnorm.
+
+    Expects:
+      - x: [B, S, D]
+      - weight/bias: None, [D]
+      - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - norm_type: str, "layer" or "rms"
+      - eps: Optional[float], default: 1e-5
+
+    D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
+    thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
+    """
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    # Tensor Validation
+    BSD = x.shape
+    validate_x(x, *BSD)
+    validate_weight_bias(weight, *BSD)
+    validate_weight_bias(bias, *BSD)
+    validate_scale_shift(scale, *BSD)
+    validate_scale_shift(shift, *BSD)
+
+    if norm_type == "layer" or norm_type == "rms":
+        batch, _, D = x.shape
+        if D % 8 != 0 or D > 16384:
+            raise ValueError(
+                f"D={D} not supported, must be multiple of 8 and <= 16384"
+            )
+        y = torch.empty_like(x)  # create output tensor
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
+        weight = 1 if weight is None else weight
+        bias = 0 if bias is None else bias
+        torch_tensors = [y, x, weight, bias, scale, shift]
+        y_2 = torch.empty_like(x_2)  # create output tensor
+        scale_2 = broadcast_tensor_for_bsfd(scale_2, *x_2.shape)  # handle various shapes
+        shift_2 = broadcast_tensor_for_bsfd(shift_2, *x_2.shape)  # handle various shapes
+        weight_2 = 1 if weight_2 is None else weight_2
+        bias_2 = 0 if bias_2 is None else bias_2
+        torch_tensors += [y_2, x_2, weight_2, bias_2, scale_2, shift_2]
+        # Compile cache
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, batch, *torch_tensors
+        )
+        compiled_fn = _COMPILE_CACHE.get(hash_key)
+        if compiled_fn is None:
+            kernel = ScaleResidualNormScaleShift(batch, D, norm_type)
+            fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
+            compiled_fn = cute.compile(
+                kernel.dual_norm_scale_shift,
+                fake_sig_args,
+                eps,  # eps: runtime value
+                stream,
+                options="--enable-tvm-ffi",
+            )
+            _COMPILE_CACHE[hash_key] = compiled_fn
+        # Execute
+        compiled_fn(torch_tensors, eps, stream)
+        return y, y_2
+    else:
+        raise ValueError(f'norm_type must be one of "layer" and "rms"')
+
+
+@fused_dual_norm_scale_shift.register_fake
+def _fused_dual_norm_scale_shift_fake(
+    x, weight, bias, scale, shift,
+    x_2, weight_2, bias_2, scale_2, shift_2,
+    norm_type, eps
+):
+    y_1 = torch.empty_like(x)
+    y_2 = torch.empty_like(x_2)
+    return y_1, y_2
 
 
 @torch.library.custom_op(
@@ -388,8 +541,8 @@ def fused_scale_residual_norm_scale_shift(
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # if norm_type == "layer" or norm_type == "rms":
-        D = x.shape[-1]
-        if D % 256 != 0 or D > 8192:
+        batch, _, D = x.shape
+        if D % 8 != 0 or D > 16384:
             raise ValueError(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
@@ -406,17 +559,22 @@ def fused_scale_residual_norm_scale_shift(
         bias = 0 if bias is None else bias
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
         # Compile cache
-        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, batch, *torch_tensors)
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            kernel = ScaleResidualNormScaleShift(batch, D, norm_type)
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
-                kernel, *fake_sig_args, options="--enable-tvm-ffi"
+                kernel.scale_residual_norm_scale_shift,
+                fake_sig_args,
+                eps,  # eps: runtime value
+                stream,
+                options="--enable-tvm-ffi"
             )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*torch_tensors, eps, stream)
+        compiled_fn(torch_tensors, eps, stream)
         return y, resi_out
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
@@ -426,6 +584,116 @@ def fused_scale_residual_norm_scale_shift(
 def _fused_scale_residual_norm_scale_shift_fake(
     residual, x, gate, weight, bias, scale, shift, norm_type, eps
 ):
-    y = x.new_empty(x.shape)
-    residual_out = x.new_empty(x.shape)
+    y = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
     return y, residual_out
+
+
+@torch.library.custom_op(
+    "sglang::fused_dual_scale_residual_norm_scale_shift", mutates_args=()
+)
+def fused_dual_scale_residual_norm_scale_shift(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: Optional[torch.Tensor],  # Union[Optional[torch.Tensor], int] indeed
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    residual_2: torch.Tensor,
+    x_2: torch.Tensor,
+    gate_2: Optional[torch.Tensor],  # Union[Optional[torch.Tensor], int] indeed
+    weight_2: Optional[torch.Tensor],
+    bias_2: Optional[torch.Tensor],
+    scale_2: torch.Tensor,
+    shift_2: torch.Tensor,
+    norm_type: str,
+    eps: float = 1e-5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fuse: norm(residual + gate * x) * (1 + scale) + shift
+      where norm is either layernorm or rmsnorm.
+
+    Expects:
+      - residual, x: [B, S, D]
+      - gate: None, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - weight/bias: None, [D]
+      - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - norm_type: str, "layer" or "rms"
+      - eps: Optional[float], default: 1e-5
+
+    D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
+    thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
+    """
+    # Tensor Validation
+    BSD = x.shape
+    validate_x(x, *BSD)
+    validate_x(residual, *BSD)
+    validate_gate(gate, *BSD)
+    validate_weight_bias(weight, *BSD)
+    validate_weight_bias(bias, *BSD)
+    validate_scale_shift(scale, *BSD)
+    validate_scale_shift(shift, *BSD)
+    if norm_type == "layer" or norm_type == "rms":
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        # if norm_type == "layer" or norm_type == "rms":
+        batch, _, D = x.shape
+        if D % 8 != 0 or D > 16384:
+            raise ValueError(
+                f"D={D} not supported, must be multiple of 256 and <= 8192"
+            )
+        y = torch.empty_like(x)  # create output tensor
+        resi_out = torch.empty_like(x)  # create output tensor
+        gate = broadcast_tensor_for_bsfd(gate, *x.shape)  # handle various shapes
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
+        gate = 1 if gate is None else gate
+        weight = 1 if weight is None else weight
+        bias = 0 if bias is None else bias
+        y_2 = torch.empty_like(x_2)  # create output tensor
+        resi_out_2 = torch.empty_like(x_2)  # create output tensor
+        gate_2 = broadcast_tensor_for_bsfd(gate_2, *x_2.shape)  # handle various shapes
+        scale_2 = broadcast_tensor_for_bsfd(scale_2, *x_2.shape)  # handle various shapes
+        shift_2 = broadcast_tensor_for_bsfd(shift_2, *x_2.shape)  # handle various shapes
+        gate_2 = 1 if gate_2 is None else gate_2
+        weight_2 = 1 if weight_2 is None else weight_2
+        bias_2 = 0 if bias_2 is None else bias_2
+        torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
+        torch_tensors += [
+            y_2, resi_out_2, residual_2, x_2, gate_2, weight_2, bias_2, scale_2, shift_2
+        ]
+        # Compile cache
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, batch, *torch_tensors)
+        compiled_fn = _COMPILE_CACHE.get(hash_key)
+        if compiled_fn is None:
+            kernel = ScaleResidualNormScaleShift(batch, D, norm_type)
+            fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
+            compiled_fn = cute.compile(
+                kernel.dual_scale_residual_norm_scale_shift,
+                fake_sig_args,
+                eps,  # eps: runtime value
+                stream,
+                options="--enable-tvm-ffi"
+            )
+            _COMPILE_CACHE[hash_key] = compiled_fn
+        # Execute
+        compiled_fn(torch_tensors, eps, stream)
+        return y, resi_out, y_2, resi_out_2
+    else:
+        raise ValueError(f'norm_type must be one of "layer" and "rms"')
+
+
+@fused_dual_scale_residual_norm_scale_shift.register_fake
+def _fused_dual_scale_residual_norm_scale_shift_fake(
+    residual, x, gate, weight, bias, scale, shift,
+    residual_2, x_2, gate_2, weight_2, bias_2, scale_2, shift_2,
+    norm_type, eps
+):
+    y = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    y_2 = torch.empty_like(x_2)
+    residual_out_2 = torch.empty_like(x_2)
+    return y, residual_out, y_2, residual_out_2
+
