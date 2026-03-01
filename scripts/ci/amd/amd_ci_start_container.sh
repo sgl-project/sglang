@@ -190,13 +190,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   fi
 
   DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
-
-  # Use rocm720.Dockerfile for ROCm 7.2 builds, otherwise use rocm.Dockerfile
-  if [[ "${GPU_ARCH_BUILD}" == *"rocm720"* ]]; then
-    DOCKERFILE="${DOCKERFILE_DIR}/rocm720.Dockerfile"
-  else
-    DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
-  fi
+  DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
 
   if [[ ! -f "${DOCKERFILE}" ]]; then
     echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2

@@ -26,7 +26,7 @@ python -m sglang.test.run_eval \
 
 ```bash
 python -m sglang.test.few_shot_gsm8k \
-  --host http://127.0.0.1 \
+  --host 127.0.0.1 \
   --port 30000 \
   --num-questions 200 \
   --num-shots 5
@@ -36,7 +36,7 @@ python -m sglang.test.few_shot_gsm8k \
 
 ```bash
 python benchmark/hellaswag/bench_sglang.py \
-  --host http://127.0.0.1 \
+  --host 127.0.0.1 \
   --port 30000 \
   --num-questions 200 \
   --num-shots 20

@@ -349,5 +349,158 @@ class TestKimiVLImageUnderstandsImage(
 #         return dict(processor_output, format="processor_output")
 
 
+class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "OpenGVLab/InternVL2-2B"
+    chat_template = "internvl-2-5"
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model_path is not None, "Set model_path in subclass"
+        assert cls.chat_template is not None, "Set chat_template in subclass"
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.main_image = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.main_image.append(Image.open(BytesIO(response.content)))
+
+        # InternVL models (2, 3, 3.5) do not ship a standard HuggingFace
+        # Processor; AutoProcessor.from_pretrained returns a bare tokenizer.
+        # Use AutoTokenizer explicitly so the intent is clear.
+        from transformers import AutoTokenizer
+
+        cls.processor = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls._init_visual()
+
+    @classmethod
+    def _init_visual(cls):
+        model = AutoModel.from_pretrained(
+            cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+        )
+        cls.vision_model = model.vision_model.eval().to(cls.device)
+        cls.mlp1 = model.mlp1.eval().to(cls.device)
+
+        config = model.config
+        cls.internvl_config = config
+        image_size = getattr(config, "force_image_size", None) or (
+            config.vision_config.image_size
+        )
+        patch_size = config.vision_config.patch_size
+        cls.num_image_token = int(
+            (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
+        )
+        cls.internvl_image_size = image_size
+        cls.internvl_downsample_ratio = config.downsample_ratio
+        cls.internvl_ps_version = config.ps_version
+        cls.internvl_select_layer = config.select_layer
+
+        del model
+
+        def pixel_shuffle(x, scale_factor):
+            n, w, h, c = x.size()
+            x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+            x = x.permute(0, 2, 1, 3).contiguous()
+            x = x.view(
+                n,
+                int(h * scale_factor),
+                int(w * scale_factor),
+                int(c / (scale_factor * scale_factor)),
+            )
+            if cls.internvl_ps_version != "v1":
+                x = x.permute(0, 2, 1, 3).contiguous()
+            return x
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"].to(
+                cls.device, dtype=torch.bfloat16
+            )
+            if cls.internvl_select_layer == -1:
+                vit_embeds = cls.vision_model(
+                    pixel_values=pixel_values,
+                    output_hidden_states=False,
+                    return_dict=True,
+                ).last_hidden_state
+            else:
+                vit_embeds = cls.vision_model(
+                    pixel_values=pixel_values,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ).hidden_states[cls.internvl_select_layer]
+            vit_embeds = vit_embeds[:, 1:, :]
+
+            h = w = int(vit_embeds.shape[1] ** 0.5)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            vit_embeds = pixel_shuffle(
+                vit_embeds, scale_factor=cls.internvl_downsample_ratio
+            )
+            vit_embeds = vit_embeds.reshape(
+                vit_embeds.shape[0], -1, vit_embeds.shape[-1]
+            )
+            vit_embeds = cls.mlp1(vit_embeds)
+            return vit_embeds
+
+        cls.visual = visual_func
+
+    def get_processor_output(self, req=None):
+        """Override to handle InternVL's custom preprocessing.
+
+        Uses shared ``image_to_pixel_values`` from ``internvl_utils`` for
+        image preprocessing (dynamic tiling + normalize) and expands
+        ``<IMG_CONTEXT>`` placeholders into ``<img>`` + context tokens +
+        ``</img>`` — mirroring the logic in
+        ``InternVLProcessor.process_internlm2_mm_data_async``.
+        """
+        from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
+        from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        # Preprocess images using the shared utility (dynamic tiling +
+        # bicubic resize + ImageNet normalize), same pipeline as the engine.
+        all_pixel_values = []
+        num_patches_list = []
+        for img in self.main_image:
+            pv = image_to_pixel_values(
+                img,
+                input_size=self.internvl_image_size,
+                max_num_tiles=InternVLProcessor.IMAGE_MAX_NUM,
+                use_thumbnail=True,
+            )
+            all_pixel_values.append(pv)
+            num_patches_list.append(pv.shape[0])
+
+        pixel_values = torch.cat(all_pixel_values, dim=0).to(self.device)
+
+        # Expand each <IMG_CONTEXT> placeholder into <img> + <IMG_CONTEXT>*N + </img>.
+        # This mirrors InternVLProcessor.process_internlm2_mm_data_async.
+        ph = "<<<__IMG_PH__>>>"
+        expanded_text = text.replace(InternVLProcessor.IMG_CONTEXT, ph)
+        for num_patches in num_patches_list:
+            image_tokens = (
+                InternVLProcessor.IMG_START
+                + InternVLProcessor.IMG_CONTEXT * (self.num_image_token * num_patches)
+                + InternVLProcessor.IMG_END
+            )
+            expanded_text = expanded_text.replace(ph, image_tokens, 1)
+        # Remove any remaining placeholders (more placeholders than images)
+        expanded_text = expanded_text.replace(ph, "")
+
+        # Tokenize the expanded text
+        input_ids = self.processor(expanded_text, return_tensors="pt")["input_ids"]
+
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+        }, text
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
 if __name__ == "__main__":
     unittest.main()

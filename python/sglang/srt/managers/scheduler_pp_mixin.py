@@ -13,7 +13,7 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
+from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -980,10 +980,7 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.process_batch_result_disagg_prefill(batch, output_result)
-        else:
-            self.process_batch_result(batch, output_result)
+        self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
@@ -1085,8 +1082,9 @@ class SchedulerPPMixin:
         """
         Used by PP, get the required rids with the given poll statuses.
         """
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
         rids: List = []

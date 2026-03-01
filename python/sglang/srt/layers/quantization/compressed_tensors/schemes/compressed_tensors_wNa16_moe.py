@@ -503,7 +503,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         self.num_experts = num_experts
         if (
             extra_weight_attrs.get(
-                "intermediate_size_full", intermediate_size_per_partition
+                "moe_intermediate_size", intermediate_size_per_partition
             )
             // intermediate_size_per_partition
             > 1

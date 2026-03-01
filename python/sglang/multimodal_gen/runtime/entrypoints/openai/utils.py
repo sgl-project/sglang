@@ -259,6 +259,10 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
             )
 
     total_time = time.perf_counter() - total_start_time
@@ -304,8 +308,8 @@ def add_common_data_to_response(
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         response["peak_memory_mb"] = result.peak_memory_mb
 
-    if result.timings and result.timings.total_duration_s > 0:
-        response["inference_time_s"] = result.timings.total_duration_s
+    if result.metrics and result.metrics.total_duration_s > 0:
+        response["inference_time_s"] = result.metrics.total_duration_s
 
     response["id"] = request_id
 
