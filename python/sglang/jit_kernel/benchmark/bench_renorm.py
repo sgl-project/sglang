@@ -1,16 +1,11 @@
 import itertools
-import os
 
 import sgl_kernel
 import torch
 import triton
 import triton.testing
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+from sglang.jit_kernel.benchmark.utils import is_in_ci
 
 
 def torch_top_k_renorm_probs(probs, top_k):
@@ -155,7 +150,7 @@ def calculate_diff_top_k_mask(batch_size, vocab_size, k):
 
 
 # Parameter space - simplified for CI
-if IS_CI:
+if is_in_ci():
     batch_size_range = [16]
     vocab_size_range = [111]
     k_range = [10]
@@ -273,7 +268,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Correctness checks - simplified for CI
-    if IS_CI:
+    if is_in_ci():
         test_configs_k = [configs_k[0]] if configs_k else [(16, 111, 10)]
         test_configs_p = [configs_p[0]] if configs_p else [(16, 111, 0.5)]
     else:
