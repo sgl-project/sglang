@@ -190,6 +190,9 @@ class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
 
+    # explicit model ID override (e.g. "Qwen-Image")
+    model_id: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -581,6 +584,17 @@ class ServerArgs:
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--model-id",
+            type=str,
+            default=ServerArgs.model_id,
+            help=(
+                "Override the model ID used for config resolution. "
+                "Useful when --model-path is a local directory whose name does not match "
+                "any registered HF repo name. Should be the repo name portion of the HF ID "
+                "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
         )
         # attention
         parser.add_argument(

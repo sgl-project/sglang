@@ -11,6 +11,7 @@ import dataclasses
 import importlib
 import os
 import pkgutil
+import warnings
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -219,9 +220,9 @@ def register_configs(
     """
     Registers configuration classes for a new model family.
     """
-    model_id = str(len(_CONFIG_REGISTRY))
+    registry_id = str(len(_CONFIG_REGISTRY))
 
-    _CONFIG_REGISTRY[model_id] = ConfigInfo(
+    _CONFIG_REGISTRY[registry_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
     )
@@ -229,13 +230,20 @@ def register_configs(
         for path in hf_model_paths:
             if path in _MODEL_HF_PATH_TO_NAME:
                 logger.warning(
-                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
+                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{registry_id}'."
                 )
-            _MODEL_HF_PATH_TO_NAME[path] = model_id
+            _MODEL_HF_PATH_TO_NAME[path] = registry_id
 
     if model_detectors:
+        warnings.warn(
+            "model_detectors is deprecated and will be removed in a future release. "
+            "Register models via hf_model_paths instead; users loading from a custom local "
+            "path can pass --model-id to identify the model explicitly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         for detector in model_detectors:
-            _MODEL_NAME_DETECTORS.append((model_id, detector))
+            _MODEL_NAME_DETECTORS.append((registry_id, detector))
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -245,10 +253,28 @@ def get_model_short_name(model_id: str) -> str:
         return model_id
 
 
-def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
+def _get_config_info(
+    model_path: str, model_id: Optional[str] = None
+) -> Optional[ConfigInfo]:
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+
+    # 0. Explicit model_id override: match by short name
+    if model_id is not None:
+        model_id_lower = model_id.lower()
+        for registered_hf_id in all_model_hf_paths:
+            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
+                logger.debug(
+                    f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
+                )
+                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+        logger.warning(
+            f"--model-id '{model_id}' did not match any registered model; "
+            "falling back to automatic detection."
+        )
+
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
@@ -256,12 +282,11 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         return _CONFIG_REGISTRY.get(model_id)
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_name = get_model_short_name(model_path.lower())
-    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+    model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
-        if registered_model_name == model_name:
+        if registered_model_name == model_short_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
@@ -337,6 +362,7 @@ def _get_diffusers_model_info(model_path: str) -> ModelInfo:
 def get_model_info(
     model_path: str,
     backend: Optional[Union[str, "Backend"]] = None,
+    model_id: Optional[str] = None,
 ) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
@@ -419,7 +445,7 @@ def get_model_info(
             return None
 
     # 3. Get configuration classes (sampling, pipeline config)
-    config_info = _get_config_info(model_path)
+    config_info = _get_config_info(model_path, model_id=model_id)
     if not config_info:
         if backend == Backend.AUTO:
             logger.warning(
