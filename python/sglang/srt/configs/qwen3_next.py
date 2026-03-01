@@ -282,9 +282,6 @@ class Qwen3NextConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
-        from sglang.srt.server_args import get_global_server_args
-
-        k_last = bool(get_global_server_args().mamba_ssm_k_last)
 
         if _is_cpu:
             world_size = get_attention_tp_size()
@@ -298,7 +295,6 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
-            k_last=k_last,
         )
 
         return Mamba2CacheParams(
