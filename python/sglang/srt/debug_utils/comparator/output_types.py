@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import sys
 from abc import abstractmethod
-from pathlib import Path
-from typing import IO, TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 
 import polars as pl
 from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
+from rich.console import RenderableType
+from rich.markup import escape
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
@@ -16,12 +16,15 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
 )
-from sglang.srt.debug_utils.comparator.utils import _StrictBase
+from sglang.srt.debug_utils.comparator.utils import Pair, _StrictBase
 
 if TYPE_CHECKING:
-    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
-        AlignerPlan,
+    from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+        TracedAlignerPlan,
+        TracedSubPlan,
     )
+    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
+    from sglang.srt.debug_utils.comparator.report_sink import Verbosity
 
 
 class BaseLog(_StrictBase):
@@ -59,12 +62,38 @@ class ReplicatedCheckResult(_StrictBase):
     diff: Optional[DiffInfo] = None
 
 
+class BundleFileInfo(_StrictBase):
+    """Per-file info within a bundle (one rank's raw tensor)."""
+
+    shape: list[int]
+    dtype: str
+    rank: Optional[int] = None
+    parallel_info: Optional[dict[str, str]] = None  # e.g. {"tp": "0/4", "ep": "1/2"}
+
+
+class BundleSideInfo(_StrictBase):
+    num_files: int
+    files: list[BundleFileInfo]
+    dims: Optional[str] = None  # e.g. "b s h(tp) d"
+
+
+class ShapeSnapshot(_StrictBase):
+    input_shapes: list[list[int]]
+    output_shapes: list[list[int]]
+
+
 class _OutputRecord(_StrictBase):
     errors: list[ErrorLog] = Field(default_factory=list)
     infos: list[InfoLog] = Field(default_factory=list)
 
     @abstractmethod
     def _format_body(self) -> str: ...
+
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return self._format_body()
+
+    def to_rich(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return self._format_body()
 
     def to_text(self) -> str:
         body = self._format_body()
@@ -85,6 +114,11 @@ class _BaseComparisonRecord(_OutputRecord):
     def _format_location_prefix(self) -> str:
         if self.location.step is not None:
             return f"[step={self.location.step}] "
+        return ""
+
+    def _format_location_prefix_rich(self) -> str:
+        if self.location.step is not None:
+            return escape(f"[step={self.location.step}]") + " "
         return ""
 
     def _format_location_suffix(self) -> str:
@@ -149,8 +183,9 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
     model_config = ConfigDict(extra="forbid", defer_build=True)
 
     type: Literal["comparison"] = "comparison"
-    aligner_plan: Optional[AlignerPlan] = None
+    traced_plan: Optional[TracedAlignerPlan] = None
     replicated_checks: list[ReplicatedCheckResult] = Field(default_factory=list)
+    raw_bundle_info: Optional[Pair[BundleSideInfo]] = None
 
     @property
     def category(self) -> str:
@@ -164,8 +199,8 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
         body: str = self._format_location_prefix() + format_comparison(self)
         if self.replicated_checks:
             body += "\n" + format_replicated_checks(self.replicated_checks)
-        if self.aligner_plan is not None:
-            body += "\n" + _format_aligner_plan(self.aligner_plan)
+        if self.traced_plan is not None:
+            body += "\n" + _format_aligner_plan(self.traced_plan)
         return body
 
 
@@ -225,25 +260,47 @@ class LogRecord(_OutputRecord):
         return ""
 
 
-def _format_aligner_plan(plan: AlignerPlan) -> str:
+def _format_aligner_plan(traced_plan: TracedAlignerPlan) -> str:
     lines: list[str] = ["Aligner Plan:"]
 
-    for side_label, side_plans in [
-        ("baseline", plan.per_step_plans.x),
-        ("target", plan.per_step_plans.y),
+    for side_label, traced_side in [
+        ("baseline", traced_plan.per_side.x),
+        ("target", traced_plan.per_side.y),
     ]:
-        if not side_plans:
+        if not traced_side.step_plans:
             lines.append(f"  {side_label}: (no steps)")
             continue
 
         step_summaries: list[str] = []
-        for step_plan in side_plans:
-            sub_strs: list[str] = []
-            for sub in step_plan.sub_plans:
-                sub_strs.append(f"{sub.type}")
+        for traced_step in traced_side.step_plans:
+            sub_strs: list[str] = [
+                _format_sub_plan_text(traced_sub)
+                for traced_sub in traced_step.sub_plans
+            ]
             summary: str = ", ".join(sub_strs) if sub_strs else "passthrough"
-            step_summaries.append(f"step={step_plan.step}: {summary}")
+            step_summaries.append(f"step={traced_step.step}: {summary}")
         lines.append(f"  {side_label}: [{'; '.join(step_summaries)}]")
+
+    lines.extend(_format_cross_side_plan_text(traced_plan.plan))
+    return "\n".join(lines)
+
+
+def _format_sub_plan_text(traced_sub: TracedSubPlan) -> str:
+    sub_desc: str = f"{traced_sub.plan.type}"
+
+    if traced_sub.snapshot is not None:
+        snap = traced_sub.snapshot
+        in_count: int = len(snap.input_shapes)
+        out_count: int = len(snap.output_shapes)
+        in_shape: str = str(snap.input_shapes[0]) if snap.input_shapes else "?"
+        out_shape: str = str(snap.output_shapes[0]) if snap.output_shapes else "?"
+        sub_desc += f" {in_count}x{in_shape} -> {out_count}x{out_shape}"
+
+    return sub_desc
+
+
+def _format_cross_side_plan_text(plan: AlignerPlan) -> list[str]:
+    lines: list[str] = []
 
     if plan.token_aligner_plan is not None:
         num_tokens: int = len(plan.token_aligner_plan.locators.x.steps)
@@ -257,7 +314,7 @@ def _format_aligner_plan(plan: AlignerPlan) -> str:
             parts.append(f"y: {plan.axis_aligner_plan.pattern.y}")
         lines.append(f"  axis_aligner: {', '.join(parts)}")
 
-    return "\n".join(lines)
+    return lines
 
 
 AnyRecord = Annotated[
@@ -281,64 +338,3 @@ def _get_any_record_adapter() -> TypeAdapter:
 
 def parse_record_json(json_str: str | bytes) -> AnyRecord:
     return _get_any_record_adapter().validate_json(json_str)
-
-
-def _print_to_stdout(record: _OutputRecord, *, output_format: str) -> None:
-    if output_format == "json":
-        print(record.model_dump_json())
-    else:
-        print(record.to_text())
-
-
-class ReportSink:
-    """Unified entry point for all record output."""
-
-    def __init__(self) -> None:
-        self._output_format: str = "text"
-        self._report_file: Optional[IO[str]] = None
-        self._report_path: Optional[Path] = None
-
-    def configure(
-        self,
-        *,
-        output_format: str = "text",
-        report_path: Optional[Path] = None,
-    ) -> None:
-        self._output_format = output_format
-
-        if report_path is not None:
-            try:
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                self._report_file = open(report_path, "w", encoding="utf-8")
-                self._report_path = report_path
-            except OSError as exc:
-                print(
-                    f"Warning: cannot open report file {report_path}: {exc}",
-                    file=sys.stderr,
-                )
-
-    def add(self, record: _OutputRecord) -> None:
-        _print_to_stdout(record, output_format=self._output_format)
-
-        if self._report_file is not None:
-            self._report_file.write(record.model_dump_json())
-            self._report_file.write("\n")
-            self._report_file.flush()
-
-    def close(self) -> None:
-        if self._report_file is not None:
-            self._report_file.close()
-            self._report_file = None
-
-    @property
-    def report_path(self) -> Optional[Path]:
-        return self._report_path
-
-    def _reset(self) -> None:
-        """Reset state for test isolation."""
-        self.close()
-        self._output_format = "text"
-        self._report_path = None
-
-
-report_sink = ReportSink()

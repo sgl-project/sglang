@@ -27,8 +27,8 @@ class LogSink:
             from sglang.srt.debug_utils.comparator.output_types import (
                 LogRecord,
                 _split_logs,
-                report_sink,
             )
+            from sglang.srt.debug_utils.comparator.report_sink import report_sink
 
             errors, infos = _split_logs([log])
             report_sink.add(LogRecord(errors=errors, infos=infos))

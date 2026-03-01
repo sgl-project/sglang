@@ -1458,7 +1458,7 @@ class TestEntrypointConcatMode:
         assert len(comparisons) == 3
 
     def test_concat_aligner_plan_fields(self, tmp_path, capsys):
-        """TensorComparisonRecord.aligner_plan reports mode='concat' with plan=None."""
+        """TensorComparisonRecord.traced_plan reports mode='concat' with plan=None."""
         torch.manual_seed(42)
 
         records = self._run_concat(
@@ -1470,8 +1470,9 @@ class TestEntrypointConcatMode:
         )
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 1
-        plan = comparisons[0].aligner_plan
-        assert plan is not None
+        traced_plan = comparisons[0].traced_plan
+        assert traced_plan is not None
+        plan = traced_plan.plan
         assert plan.token_aligner_mode == "concat_steps"
         assert plan.token_aligner_plan is None
 
@@ -4250,7 +4251,7 @@ class TestReportOutput:
 
     def test_streaming_flush(self, tmp_path, capsys):
         """Report file is flushed after each record (readable before close)."""
-        from sglang.srt.debug_utils.comparator.output_types import report_sink
+        from sglang.srt.debug_utils.comparator.report_sink import report_sink
 
         report_file: Path = tmp_path / "stream_report.jsonl"
         report_sink.configure(
@@ -4360,6 +4361,103 @@ class TestEntrypointAutoDescend:
         argv: list[str] = _make_argv(baseline_exp, empty_dir, preset="raw")
         with pytest.raises(ValueError, match="no .pt files found"):
             run(parse_args(argv))
+
+
+class TestEntrypointDpAttentionMissingAlias:
+    """Regression: dp-attention without ``# dp:=attn_dp`` → shape mismatch failure.
+
+    In dp-attention mode (tp_size=2, attn_dp_size=2), layer_input is dumped
+    after prepare_attn which DP-distributes tokens.  One rank gets 0 tokens
+    (shape [0, H]), the other gets all tokens (shape [T, H]).
+
+    Without ``# dp:=attn_dp`` in dims, the comparator has no dp_rank/dp_size
+    to filter on, so it picks one rank via TP pick — potentially the empty
+    one — causing a shape mismatch with the baseline.
+    """
+
+    @staticmethod
+    def _sglang_dp_attn_parallel_info(*, tp_rank: int) -> dict:
+        return {
+            "tp_rank": tp_rank,
+            "tp_size": 2,
+            "pp_rank": 0,
+            "pp_size": 1,
+            "moe_ep_rank": 0,
+            "moe_ep_size": 1,
+            "moe_tp_rank": tp_rank,
+            "moe_tp_size": 2,
+            "moe_dp_rank": 0,
+            "moe_dp_size": 1,
+            "enable_dp_attention": True,
+            "attn_tp_rank": 0,
+            "attn_tp_size": 1,
+            "attn_dp_rank": tp_rank,
+            "attn_dp_size": 2,
+            "local_attn_dp_rank": tp_rank,
+            "local_attn_dp_size": 2,
+            "attn_cp_rank": 0,
+            "attn_cp_size": 1,
+        }
+
+    def test_missing_dp_alias_causes_shape_mismatch(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """dims='t h' (no dp:=attn_dp) → comparator picks empty rank → shape_mismatch failure."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(5, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(5, 8) * 0.001
+
+        for side_name, data in [("baseline", tensor_data), ("target", target_data)]:
+            side_dir: Path = tmp_path / side_name
+            side_dir.mkdir()
+
+            # Baseline: single rank, no DP attention
+            if side_name == "baseline":
+                _create_rank_dump(
+                    side_dir,
+                    rank=0,
+                    name="layer_input",
+                    tensor=data,
+                    dims="t h",
+                    parallel_info={"tp_rank": 0, "tp_size": 1},
+                    framework="sglang",
+                )
+            else:
+                # Target: dp-attention, tp_rank=0 gets 0 tokens, tp_rank=1 gets all
+                _create_rank_dump(
+                    side_dir,
+                    rank=0,
+                    name="layer_input",
+                    tensor=torch.empty(0, 8),
+                    dims="t h",
+                    parallel_info=self._sglang_dp_attn_parallel_info(tp_rank=0),
+                    framework="sglang",
+                )
+                _create_rank_dump(
+                    side_dir,
+                    rank=1,
+                    name="layer_input",
+                    tensor=data,
+                    dims="t h",
+                    parallel_info=self._sglang_dp_attn_parallel_info(tp_rank=1),
+                    framework="sglang",
+                )
+
+        argv: list[str] = _make_argv(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 1
+
+        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
+        assert len(comparisons) == 1
+        comparison: TensorComparisonRecord = comparisons[0]
+        assert comparison.shape_mismatch is True
+        assert comparison.diff is None
+        assert comparison.category == "failed"
 
 
 if __name__ == "__main__":

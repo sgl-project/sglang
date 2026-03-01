@@ -31,8 +31,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SkipComparisonRecord,
     SummaryRecord,
     TensorComparisonRecord,
-    report_sink,
 )
+from sglang.srt.debug_utils.comparator.report_sink import report_sink
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
@@ -53,7 +53,11 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    report_sink.configure(output_format=args.output_format, report_path=None)
+    report_sink.configure(
+        output_format=args.output_format,
+        report_path=None,
+        verbosity=args.verbosity,
+    )
 
     dir_pair: Pair[Path] = Pair(
         x=auto_descend_dir(Path(args.baseline_path), label="baseline_path"),
@@ -73,7 +77,11 @@ def run(args: argparse.Namespace) -> int:
         target_path=dir_pair.y,
         report_path_arg=args.report_path,
     )
-    report_sink.configure(output_format=args.output_format, report_path=report_path)
+    report_sink.configure(
+        output_format=args.output_format,
+        report_path=report_path,
+        verbosity=args.verbosity,
+    )
 
     try:
         report_sink.add(ConfigRecord(config=vars(args)))
@@ -293,6 +301,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["text", "json"],
         default="text",
         help="Output format: text (default) or json (JSONL, one JSON object per line)",
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=str,
+        choices=["minimal", "normal", "verbose"],
+        default="normal",
+        help="Output verbosity: minimal (1 line per tensor), normal (compact lifecycle), "
+        "verbose (full detail). Default: normal",
     )
     parser.add_argument(
         "--preset",
