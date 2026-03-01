@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import logging
 from collections.abc import Iterable
 
 import torch
@@ -111,9 +110,6 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states, residual
-
-
-logger = logging.getLogger(__name__)
 
 
 class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
