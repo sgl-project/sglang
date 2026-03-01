@@ -39,11 +39,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import (
-    FlexibleArgumentParser,
-    StoreBoolean,
-    expand_path_fields,
-)
+from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 
@@ -336,7 +332,7 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def _adjust_path(self):
-        expand_path_fields(self)
+        self.model_path = os.path.expanduser(self.model_path)
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""

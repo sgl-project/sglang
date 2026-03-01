@@ -14,15 +14,12 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
+from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def _json_safe(obj: Any):
@@ -357,8 +354,6 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
-        expand_path_fields(self)
-
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
@@ -509,18 +504,15 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         backend = kwargs.pop("backend", None)
-        model_id = kwargs.pop("model_id", None)
-        model_info = get_model_info(model_path, backend=backend, model_id=model_id)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
-    def from_user_sampling_params_args(
-        model_path: str, server_args: "ServerArgs", *args, **kwargs
-    ):
+    def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
             sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend, model_id=server_args.model_id
+                model_path, backend=server_args.backend
             )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available

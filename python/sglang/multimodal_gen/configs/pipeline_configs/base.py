@@ -539,7 +539,7 @@ class PipelineConfig:
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
         """
-        Load PipelineConfig from kwargs Dictionary, as part of the ServerArg initialization process
+        Load PipelineConfig from kwargs Dictionary.
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
@@ -583,11 +583,7 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(
-                    model_path,
-                    backend=kwargs.get("backend"),
-                    model_id=kwargs.get("model_id"),
-                )
+                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -603,11 +599,7 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(
-                model_path,
-                backend=kwargs.get("backend"),
-                model_id=kwargs.get("model_id"),
-            )
+            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
@@ -640,7 +632,6 @@ class PipelineConfig:
 
         # 2. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
-            pipeline_config_or_path = os.path.expanduser(pipeline_config_or_path)
             pipeline_config.load_from_json(pipeline_config_or_path)
             kwargs[prefix_with_dot + "pipeline_config_path"] = pipeline_config_or_path
         elif isinstance(pipeline_config_or_path, PipelineConfig):
