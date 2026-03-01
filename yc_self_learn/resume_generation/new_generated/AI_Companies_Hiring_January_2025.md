@@ -335,3 +335,271 @@
 ---
 
 **最后更新**: 2025年1月
+
+
+
+## A) 全球大公司/科技/金融/咨询（1–60）
+
+> 说明：这一部分主要用于**跟踪大公司投递状态**，不再像前面50家新兴AI公司那样写详细介绍。每个公司保留一个条目和`投递状态`字段，方便你后面标记“已投递 / 待投递 / 不考虑”。
+
+### A1. Amazon
+- **投递状态**: 待填写（例如：已投递 SDE / Applied Scientist 等）
+
+### A2. Google
+- **投递状态**: 待填写（例如：已投递 SWE / Research Engineer 等）
+
+### A3. Microsoft
+- **投递状态**: 待填写
+
+### A4. Meta
+- **投递状态**: 待填写
+
+### A5. Apple
+- **投递状态**: 待填写
+
+### A6. NVIDIA
+- **投递状态**: 待填写
+
+### A7. Tesla
+- **投递状态**: 待填写
+
+### A8. Oracle
+- **投递状态**: 待填写
+
+### A9. Salesforce
+- **投递状态**: 待填写
+
+### A10. Adobe
+- **投递状态**: 待填写
+
+### A11. IBM
+- **投递状态**: 待填写
+
+### A12. Intel
+- **投递状态**: 待填写
+
+### A13. Cisco
+- **投递状态**: 待填写
+
+### A14. Qualcomm
+- **投递状态**: 待填写
+
+### A15. Broadcom
+- **投递状态**: 待填写
+
+### A16. AMD
+- **投递状态**: 待填写
+
+### A17. Dell Technologies
+- **投递状态**: 待填写
+
+### A18. HP Inc.
+- **投递状态**: 待填写
+
+### A19. ServiceNow
+- **投递状态**: 待填写
+
+### A20. Snowflake
+- **投递状态**: 待填写
+
+### A21. Palantir
+- **投递状态**: 待填写
+
+### A22. Databricks
+- **投递状态**: 待填写
+
+### A23. Uber
+- **投递状态**: 待填写
+
+### A24. Lyft
+- **投递状态**: 待填写
+
+### A25. Airbnb
+- **投递状态**: 待填写
+
+### A26. Stripe
+- **投递状态**: 待填写
+
+### A27. PayPal
+- **投递状态**: 待填写
+
+### A28. Block (Square)
+- **投递状态**: 待填写
+
+### A29. Visa
+- **投递状态**: 待填写
+
+### A30. Mastercard
+- **投递状态**: 待填写
+
+### A31. American Express
+- **投递状态**: 待填写
+
+### A32. Bloomberg
+- **投递状态**: 待填写
+
+### A33. JPMorgan Chase
+- **投递状态**: 待填写
+
+### A34. Goldman Sachs
+- **投递状态**: 待填写
+
+### A35. Morgan Stanley
+- **投递状态**: 待填写
+
+### A36. Bank of America
+- **投递状态**: 待填写
+
+### A37. Citigroup
+- **投递状态**: 待填写
+
+### A38. Wells Fargo
+- **投递状态**: 待填写
+
+### A39. Capital One
+- **投递状态**: 待填写
+
+### A40. Accenture
+- **投递状态**: 待填写
+
+### A41. Deloitte
+- **投递状态**: 待填写
+
+### A42. PwC
+- **投递状态**: 待填写
+
+### A43. EY (Ernst & Young)
+- **投递状态**: 待填写
+
+### A44. KPMG
+- **投递状态**: 待填写
+
+### A45. Capgemini
+- **投递状态**: 待填写
+
+### A46. Cognizant
+- **投递状态**: 待填写
+
+### A47. Infosys
+- **投递状态**: 待填写
+
+### A48. Tata Consultancy Services (TCS)
+- **投递状态**: 待填写
+
+### A49. Wipro
+- **投递状态**: 待填写
+
+### A50. HCLTech
+- **投递状态**: 待填写
+
+### A51. Walmart Global Tech
+- **投递状态**: 待填写
+
+### A52. Target
+- **投递状态**: 待填写
+
+### A53. Costco
+- **投递状态**: 待填写
+
+### A54. The Home Depot
+- **投递状态**: 待填写
+
+### A55. General Motors (GM)
+- **投递状态**: 待填写
+
+### A56. Ford
+- **投递状态**: 待填写
+
+### A57. General Electric (GE)
+- **投递状态**: 待填写
+
+### A58. Honeywell
+- **投递状态**: 待填写
+
+### A59. Siemens (US)
+- **投递状态**: 待填写
+
+### A60. Samsung Semiconductor (US)
+- **投递状态**: 待填写
+
+B) 医疗/生物医药/器械/医疗IT/医院体系（61–100）
+
+Johnson & Johnson
+
+Pfizer
+
+Merck
+
+Bristol Myers Squibb
+
+Eli Lilly
+
+AbbVie
+
+Amgen
+
+Gilead Sciences
+
+Regeneron
+
+Biogen
+
+Genentech (Roche)
+
+Roche (US)
+
+Novartis (US)
+
+Sanofi (US)
+
+AstraZeneca (US)
+
+Moderna
+
+Illumina
+
+Thermo Fisher Scientific
+
+Danaher
+
+BD (Becton, Dickinson and Company)
+
+Medtronic
+
+Boston Scientific
+
+Stryker
+
+Abbott
+
+Dexcom
+
+Intuitive Surgical（近期政策波动可能影响新 H-1B，投递要看 JD 是否写暂停）
+
+Edwards Lifesciences
+
+GE HealthCare
+
+Philips (US)
+
+Siemens Healthineers (US)
+
+Epic Systems
+
+Oracle Health (Cerner)
+
+UnitedHealth Group / Optum
+
+CVS Health / Aetna
+
+Kaiser Permanente
+
+Mayo Clinic
+
+Cleveland Clinic
+
+Mass General Brigham
+
+Labcorp
+
+Quest Diagnostics
