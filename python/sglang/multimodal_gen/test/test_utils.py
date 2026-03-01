@@ -28,7 +28,7 @@ logger = init_logger(__name__)
 # Common model IDs for diffusion tests
 #
 # Centralised here so every test file references the same constants instead
-# of scattering hard-coded strings.  When adding a new model that will be
+# of scattering hard-coded strings. When adding a new model that will be
 # reused across tests, define it here.
 # ---------------------------------------------------------------------------
 
