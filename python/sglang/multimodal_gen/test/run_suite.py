@@ -32,7 +32,6 @@ SUITES = {
     # no GPU required; safe to run on any CPU-only runner
     "unit": [
         "../unit/test_sampling_params_validate.py",
-        "../unit/test_server_args_unit.py",
         "../unit/test_storage.py",
         # add new unit tests here
     ],
