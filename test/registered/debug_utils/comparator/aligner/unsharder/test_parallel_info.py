@@ -54,6 +54,22 @@ class TestNormalizeParallelInfo:
         with pytest.raises(ValueError, match="multiple parallel_info"):
             normalize_parallel_info(meta)
 
+    def test_megatron_with_sp(self) -> None:
+        """Megatron SP reuses TP group: sp_rank==tp_rank, sp_size==tp_size."""
+        meta = {
+            "megatron_parallel_info": {
+                "tp_rank": 1,
+                "tp_size": 4,
+                "sp_rank": 1,
+                "sp_size": 4,
+            }
+        }
+        result = normalize_parallel_info(meta)
+        assert result == {
+            ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4),
+            ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=4),
+        }
+
     def test_size_1_filtered(self) -> None:
         meta = {
             "sglang_parallel_info": {
@@ -64,6 +80,19 @@ class TestNormalizeParallelInfo:
             }
         }
         assert normalize_parallel_info(meta) == {}
+
+    def test_recompute_pseudo_from_top_level_meta(self) -> None:
+        """recompute_pseudo_rank/size at top-level meta is extracted alongside TP."""
+        meta = {
+            "recompute_pseudo_rank": 1,
+            "recompute_pseudo_size": 2,
+            "sglang_parallel_info": {"tp_rank": 0, "tp_size": 2},
+        }
+        result = normalize_parallel_info(meta)
+        assert result == {
+            ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2),
+            ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+        }
 
 
 if __name__ == "__main__":

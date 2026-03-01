@@ -1,14 +1,21 @@
 from collections import defaultdict
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
+    CpThdConcatParams,
     PickParams,
+    ReduceSumParams,
     UnsharderParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
+from sglang.srt.debug_utils.comparator.dims import (
+    TOKEN_DIM_NAME,
+    DimSpec,
+    ParallelAxis,
+    ParallelModifier,
+)
 
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`
@@ -24,18 +31,27 @@ class _GroupResult(NamedTuple):
 def compute_unsharder_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    *,
+    thd_global_seq_lens: Optional[list[int]] = None,
 ) -> list[UnsharderPlan]:
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axis_infos: dict[ParallelAxis, tuple[int, DimSpec]] = {
-        spec.parallel: (dim_idx, spec)
-        for dim_idx, spec in enumerate(dim_specs)
-        if spec.parallel is not None
-    }
-    sharded_axes: set[ParallelAxis] = set(sharded_axis_infos)
+    # Within each dim spec, reverse modifier order: innermost shard (rightmost) unshards first.
+    reversed_sharded_modifiers: list[tuple[str, ParallelModifier]] = [
+        (spec.name, m) for spec in dim_specs for m in reversed(spec.parallel_modifiers)
+    ]
 
+    sharded_axes_raw: set[ParallelAxis] = {
+        m.axis for _, m in reversed_sharded_modifiers
+    }
     all_axes: set[ParallelAxis] = {axis for info in parallel_infos for axis in info}
+
+    # axis annotated in dims but absent from all parallel_infos -> axis_size=1, skip
+    sharded_axes: set[ParallelAxis] = sharded_axes_raw & all_axes
+    reversed_sharded_modifiers = [
+        (name, m) for name, m in reversed_sharded_modifiers if m.axis in sharded_axes
+    ]
     replicated_axes: set[ParallelAxis] = all_axes - sharded_axes
 
     if not sharded_axes and not replicated_axes:
@@ -54,8 +70,16 @@ def compute_unsharder_plan(
     axis_and_params: list[tuple[ParallelAxis, UnsharderParams]] = [
         (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
-        (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
-        for axis, (dim_index, spec) in sharded_axis_infos.items()
+        (
+            modifier.axis,
+            _resolve_unshard_params(
+                modifier=modifier,
+                dim_name=dim_name,
+                parallel_infos=parallel_infos,
+                thd_global_seq_lens=thd_global_seq_lens,
+            ),
+        )
+        for dim_name, modifier in reversed_sharded_modifiers
     ]
 
     plans: list[UnsharderPlan] = []
@@ -130,9 +154,29 @@ def _group_and_project(
     return _GroupResult(groups=groups, projected_coords=projected)
 
 
-def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnsharderParams:
-    if spec.reduction is not None:
-        raise NotImplementedError(
-            f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
-        )
-    return ConcatParams(dim=dim_index)
+def _resolve_unshard_params(
+    *,
+    modifier: ParallelModifier,
+    dim_name: str,
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    thd_global_seq_lens: Optional[list[int]] = None,
+) -> UnsharderParams:
+    if modifier.reduction is not None:
+        return ReduceSumParams()
+
+    if (
+        dim_name == TOKEN_DIM_NAME
+        and modifier.axis == ParallelAxis.CP
+        and thd_global_seq_lens is not None
+    ):
+        axis_size: int = parallel_infos[0][modifier.axis].axis_size
+        for s in thd_global_seq_lens:
+            if s % axis_size != 0:
+                raise ValueError(
+                    f"THD seq_len {s} is not divisible by cp_size {axis_size}. "
+                    f"Sequences must be padded to a multiple of cp_size for CP zigzag."
+                )
+        seq_lens_per_rank: list[int] = [s // axis_size for s in thd_global_seq_lens]
+        return CpThdConcatParams(dim_name=dim_name, seq_lens_per_rank=seq_lens_per_rank)
+
+    return ConcatParams(dim_name=dim_name)
