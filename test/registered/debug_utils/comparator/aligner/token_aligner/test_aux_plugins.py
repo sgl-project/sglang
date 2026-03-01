@@ -3,12 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_plugins import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
     _infer_positions,
     _MegatronPlugin,
     _SGLangPlugin,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     SGLangSeqId,
     TokenAlignerStepAux,

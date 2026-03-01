@@ -544,7 +544,7 @@ class TestEntrypointGroupingLogical:
         assert summary.skipped == 0
 
     def test_multi_step_tp(self, tmp_path, capsys):
-        """Two steps with TP=2 shards produce two per-step comparisons (no aux → no alignment)."""
+        """Two steps with TP=2 shards: concat mode merges into one comparison."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
 
@@ -574,14 +574,14 @@ class TestEntrypointGroupingLogical:
 
         records = _run_and_parse(args, capsys)
         comparisons = _get_comparisons(records)
-        assert len(comparisons) == 2
-        assert comparisons[0].baseline.shape == [4, 8]
-        assert comparisons[1].baseline.shape == [4, 8]
+        assert len(comparisons) == 1
+        # concat along dim 0 (fallback, no token dim) → 2 steps × [4, 8] = [8, 8]
+        assert comparisons[0].baseline.shape == [8, 8]
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
-        assert summary.total == 2
-        assert summary.passed == 2
+        assert summary.total == 1
+        assert summary.passed == 1
 
     def test_cp_axis_unshard(self, tmp_path, capsys):
         """CP-sharded tensors are correctly concatenated along the sequence dim."""
@@ -1046,6 +1046,447 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
 
+class TestEntrypointConcatMode:
+    """Test concat token-aligner mode through the full entrypoint pipeline."""
+
+    @staticmethod
+    def _make_dirs(tmp_path: Path) -> tuple[Path, Path]:
+        baseline_dir: Path = tmp_path / "baseline"
+        target_dir: Path = tmp_path / "target"
+        baseline_dir.mkdir()
+        target_dir.mkdir()
+        return baseline_dir, target_dir
+
+    @staticmethod
+    def _create_both_sides(
+        tmp_path: Path,
+        *,
+        baseline_steps: list[torch.Tensor],
+        target_steps: list[torch.Tensor],
+        name: str = "hidden",
+        dims: str | None = None,
+    ) -> tuple[Path, Path]:
+        """Create multi-step rank-0 dumps for both sides and return exp paths."""
+        baseline_dir, target_dir = TestEntrypointConcatMode._make_dirs(tmp_path)
+
+        for side_dir, steps in [
+            (baseline_dir, baseline_steps),
+            (target_dir, target_steps),
+        ]:
+            _create_multi_step_rank_dump(
+                side_dir,
+                rank=0,
+                name=name,
+                tensors_per_step=steps,
+                dims=dims,
+            )
+
+        return baseline_dir / _FIXED_EXP_NAME, target_dir / _FIXED_EXP_NAME
+
+    @staticmethod
+    def _run_concat(
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+        *,
+        baseline_steps: list[torch.Tensor],
+        target_steps: list[torch.Tensor],
+        name: str = "hidden",
+        dims: str | None = None,
+        diff_threshold: float = 0.01,
+    ) -> list[AnyRecord]:
+        """Create both-side dumps, run comparator, return parsed records."""
+        baseline_path, target_path = TestEntrypointConcatMode._create_both_sides(
+            tmp_path,
+            baseline_steps=baseline_steps,
+            target_steps=target_steps,
+            name=name,
+            dims=dims,
+        )
+        args: Namespace = _make_args(
+            baseline_path, target_path, diff_threshold=diff_threshold
+        )
+        return _run_and_parse(args, capsys)
+
+    def test_concat_multi_step_different_data(self, tmp_path, capsys):
+        """Multi-step concat with different data per step + truncation."""
+        torch.manual_seed(42)
+
+        # baseline: 2 steps [5,4] + [3,4] → concat → [8,4]
+        baseline_step0 = torch.randn(5, 4)
+        baseline_step1 = torch.randn(3, 4)
+        baseline_concat = torch.cat([baseline_step0, baseline_step1], dim=0)
+
+        # target: 1 step [6,4] — will be truncated to min(8,6)=6
+        target_step0 = baseline_concat[:6] + torch.randn(6, 4) * 0.0001
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[baseline_step0, baseline_step1],
+            target_steps=[target_step0],
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        # truncated to min(8,6) = 6 along concat dim
+        assert comparisons[0].baseline.shape == [6, 4]
+        assert comparisons[0].target.shape == [6, 4]
+
+    def test_concat_multi_step_tp_unshard(self, tmp_path, capsys):
+        """Multi-step different data + TP=2 unshard + concat."""
+        torch.manual_seed(42)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        # 2 steps: [4,8] each → concat → [8,8]
+        full_step0 = torch.randn(4, 8)
+        full_step1 = torch.randn(4, 8)
+
+        _create_multi_step_tp_sharded_dumps(
+            baseline_dir,
+            full_tensors_per_step=[full_step0, full_step1],
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+        _create_multi_step_tp_sharded_dumps(
+            target_dir,
+            full_tensors_per_step=[
+                full_step0 + torch.randn(4, 8) * 0.0001,
+                full_step1 + torch.randn(4, 8) * 0.0001,
+            ],
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        # 2 steps × [4, 8] concat along dim 0 (fallback) → [8, 8]
+        assert comparisons[0].baseline.shape == [8, 8]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_unequal_step_counts(self, tmp_path, capsys):
+        """Baseline 3 steps vs target 2 steps with truncation."""
+        torch.manual_seed(42)
+
+        # baseline: 3 steps [3]+[4]+[2] = 9 tokens along dim 0
+        b_step0 = torch.randn(3, 4)
+        b_step1 = torch.randn(4, 4)
+        b_step2 = torch.randn(2, 4)
+        b_concat = torch.cat([b_step0, b_step1, b_step2], dim=0)
+
+        # target: 2 steps [5]+[3] = 8 tokens along dim 0
+        t_step0 = b_concat[:5] + torch.randn(5, 4) * 0.0001
+        t_step1 = b_concat[5:8] + torch.randn(3, 4) * 0.0001
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1, b_step2],
+            target_steps=[t_step0, t_step1],
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        # truncated to min(9,8) = 8
+        assert comparisons[0].baseline.shape == [8, 4]
+        assert comparisons[0].target.shape == [8, 4]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_token_dim_nonzero(self, tmp_path, capsys):
+        """Token dim at dim=1 (dims='b t h') — concat along dim 1."""
+        torch.manual_seed(42)
+
+        # 2 steps: [2,5,4] + [2,3,4] → concat along dim 1 → [2,8,4]
+        b_step0 = torch.randn(2, 5, 4)
+        b_step1 = torch.randn(2, 3, 4)
+        b_concat = torch.cat([b_step0, b_step1], dim=1)
+
+        t_step0 = b_concat[:, :5, :] + torch.randn(2, 5, 4) * 0.0001
+        t_step1 = b_concat[:, 5:, :] + torch.randn(2, 3, 4) * 0.0001
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1],
+            target_steps=[t_step0, t_step1],
+            dims="b t h",
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].baseline.shape == [2, 8, 4]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_seq_dim_fallback(self, tmp_path, capsys):
+        """No 't' dim but 's' dim present (dims='b s h') → concat along s."""
+        torch.manual_seed(42)
+
+        # 2 steps: [2,5,4] + [2,3,4] → concat along dim 1 (s) → [2,8,4]
+        b_step0 = torch.randn(2, 5, 4)
+        b_step1 = torch.randn(2, 3, 4)
+        b_concat = torch.cat([b_step0, b_step1], dim=1)
+
+        t_step0 = b_concat[:, :5, :] + torch.randn(2, 5, 4) * 0.0001
+        t_step1 = b_concat[:, 5:, :] + torch.randn(2, 3, 4) * 0.0001
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1],
+            target_steps=[t_step0, t_step1],
+            dims="b s h",
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].baseline.shape == [2, 8, 4]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_no_dims_fallback(self, tmp_path, capsys):
+        """No dims annotation → fallback to concat along dim 0."""
+        torch.manual_seed(42)
+
+        # 2 steps: [5,4] + [3,4] → concat along dim 0 → [8,4]
+        b_step0 = torch.randn(5, 4)
+        b_step1 = torch.randn(3, 4)
+        b_concat = torch.cat([b_step0, b_step1], dim=0)
+
+        t_step0 = b_concat[:5] + torch.randn(5, 4) * 0.0001
+        t_step1 = b_concat[5:] + torch.randn(3, 4) * 0.0001
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1],
+            target_steps=[t_step0, t_step1],
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].baseline.shape == [8, 4]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_preserves_step_order(self, tmp_path, capsys):
+        """Verify step0 data precedes step1 data in the concatenated result."""
+        # deterministic integer data: step0=[1,2,3], step1=[4,5]
+        b_step0 = torch.tensor([[1.0], [2.0], [3.0]])
+        b_step1 = torch.tensor([[4.0], [5.0]])
+
+        # target: same data, single step [1,2,3,4,5]
+        t_full = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1],
+            target_steps=[t_full],
+        )
+        comp = _assert_single_comparison_passed(records)
+        # if order were wrong, diff would not pass with exact integer data
+        assert comp.baseline.shape == [5, 1]
+        assert comp.diff is not None
+        assert comp.diff.max_abs_diff == 0.0
+
+    def test_concat_aux_tensors_not_filtered(self, tmp_path, capsys):
+        """Concat mode does not filter aux tensors — all participate in comparison."""
+        torch.manual_seed(42)
+
+        baseline_dir, target_dir = self._make_dirs(tmp_path)
+
+        hidden = torch.randn(4, 8)
+        input_ids = torch.randint(0, 100, (4,))
+        positions = torch.arange(4)
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden_states",
+            tensor=hidden,
+            extra_dumps=[("input_ids", input_ids), ("positions", positions)],
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden_states",
+            tensor=hidden + torch.randn(4, 8) * 0.0001,
+            extra_dumps=[("input_ids", input_ids), ("positions", positions)],
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        # all 3 tensors should be compared (not filtered out)
+        names = {c.name for c in comparisons}
+        assert "hidden_states" in names
+        assert "input_ids" in names
+        assert "positions" in names
+        assert len(comparisons) == 3
+
+    def test_concat_aligner_plan_fields(self, tmp_path, capsys):
+        """ComparisonRecord.aligner_plan reports mode='concat' with plan=None."""
+        torch.manual_seed(42)
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[torch.randn(3, 4), torch.randn(2, 4)],
+            target_steps=[torch.randn(3, 4), torch.randn(2, 4)],
+            diff_threshold=100.0,
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        plan = comparisons[0].aligner_plan
+        assert plan is not None
+        assert plan.token_aligner_mode == "concat_steps"
+        assert plan.token_aligner_plan is None
+
+    def test_concat_comparison_fails(self, tmp_path, capsys):
+        """Completely different data → comparison fails."""
+        torch.manual_seed(42)
+        b_step0 = torch.randn(4, 4)
+        b_step1 = torch.randn(3, 4)
+
+        # target: completely different random data
+        torch.manual_seed(99)
+        t_step0 = torch.randn(4, 4) * 100
+        t_step1 = torch.randn(3, 4) * 100
+
+        records = self._run_concat(
+            tmp_path,
+            capsys,
+            baseline_steps=[b_step0, b_step1],
+            target_steps=[t_step0, t_step1],
+            diff_threshold=1e-6,
+        )
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].diff is not None
+        assert not comparisons[0].diff.passed
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+        assert summary.passed == 0
+
+    def test_concat_multi_step_cp_unshard(self, tmp_path, capsys):
+        """Multi-step different data + CP=2 unshard along seq dim + concat."""
+        torch.manual_seed(42)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        # 2 steps: [4,8,6] each → concat along seq dim (dim 1) → [4,16,6]
+        full_step0 = torch.randn(4, 8, 6)
+        full_step1 = torch.randn(4, 8, 6)
+
+        for side_dir, steps in [
+            (baseline_dir, [full_step0, full_step1]),
+            (
+                target_dir,
+                [
+                    full_step0 + torch.randn(4, 8, 6) * 0.0001,
+                    full_step1 + torch.randn(4, 8, 6) * 0.0001,
+                ],
+            ),
+        ]:
+            for cp_rank in range(2):
+                per_step_shards: list[torch.Tensor] = [
+                    t.chunk(2, dim=1)[cp_rank] for t in steps
+                ]
+                _create_multi_step_rank_dump(
+                    side_dir,
+                    rank=cp_rank,
+                    name="attn_out",
+                    tensors_per_step=per_step_shards,
+                    dims="b s(cp) h",
+                    parallel_info={"cp_rank": cp_rank, "cp_size": 2},
+                )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        # CP unshard: [4,4,6] × 2 ranks → [4,8,6] per step
+        # concat along seq dim (dim 1): 2 steps × [4,8,6] → [4,16,6]
+        assert comparisons[0].baseline.shape == [4, 16, 6]
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+    def test_concat_thd_cp_zigzag(self, tmp_path: Path, capsys) -> None:
+        """Concat mode with THD CP=2 zigzag (Megatron format) — unshard + reorder works."""
+        torch.manual_seed(42)
+        cp_size: int = 2
+        seq_lens: list[int] = [100, 64]
+        total_tokens: int = sum(seq_lens)
+        total_per_rank: int = 128
+        num_steps: int = 2
+
+        full_tensor: torch.Tensor = torch.randn(total_tokens + 92)
+
+        baseline_dir: Path = tmp_path / "baseline"
+        target_dir: Path = tmp_path / "target"
+        baseline_dir.mkdir()
+        target_dir.mkdir()
+
+        baseline_path: Path = _create_thd_cp_zigzag_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden_states",
+            seq_lens=seq_lens,
+            cp_size=cp_size,
+            total_per_rank=total_per_rank,
+            num_steps=num_steps,
+        )
+
+        target_tensor: torch.Tensor = full_tensor + torch.randn_like(full_tensor) * 1e-5
+        target_path: Path = _create_thd_cp_zigzag_dumps(
+            target_dir,
+            full_tensor=target_tensor,
+            name="hidden_states",
+            seq_lens=seq_lens,
+            cp_size=cp_size,
+            total_per_rank=total_per_rank,
+            num_steps=num_steps,
+        )
+
+        args: Namespace = _make_args(
+            baseline_path,
+            target_path,
+            token_aligner="concat_steps",
+            diff_threshold=1e-3,
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        comparisons: list[ComparisonRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonRecord] = [
+            c for c in comparisons if c.name == "hidden_states"
+        ]
+        assert len(hidden_comparisons) >= 1
+        assert all(c.diff is not None and c.diff.passed for c in hidden_comparisons)
+
+
 class TestEntrypointAxisAligner:
     """Test cross-framework dim reordering through the full entrypoint pipeline."""
 
@@ -1406,7 +1847,9 @@ class TestEntrypointAlignment:
 
             exp_paths.append(d / _FIXED_EXP_NAME)
 
-        args = _make_args(exp_paths[0], exp_paths[1], grouping="logical")
+        args = _make_args(
+            exp_paths[0], exp_paths[1], grouping="logical", token_aligner="smart"
+        )
         records = _run_and_parse(args, capsys)
 
         comparisons = _get_comparisons(records)
@@ -1518,6 +1961,7 @@ class TestEntrypointAlignment:
             sglang_dir / _FIXED_EXP_NAME,
             megatron_dir / _FIXED_EXP_NAME,
             grouping="logical",
+            token_aligner="smart",
         )
 
         records = _run_and_parse(args, capsys)
@@ -1549,7 +1993,11 @@ class TestEntrypointAlignment:
         """Without aux tensors, logical grouping skips alignment and compares per-step."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"], num_steps=2)
         args = _make_args(
-            baseline_path, target_path, grouping="logical", diff_threshold=0.1
+            baseline_path,
+            target_path,
+            grouping="logical",
+            token_aligner="smart",
+            diff_threshold=0.1,
         )
 
         capsys.readouterr()
@@ -1885,6 +2333,7 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         filter=None,
         output_format="json",
         grouping="logical",
+        token_aligner="concat_steps",
         viz_bundle_details=False,
         viz_output_dir="/tmp/comparator_viz/",
         visualize_per_token=None,
@@ -1943,6 +2392,44 @@ def _create_rank_dump(
             dumper.dump(name, tensor, dims=dims)
             for extra_name, extra_value in extra_dumps or []:
                 dumper.dump(extra_name, extra_value)
+            dumper.step()
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_multi_step_rank_dump(
+    directory: Path,
+    *,
+    rank: int,
+    name: str,
+    tensors_per_step: list[torch.Tensor],
+    dims: str | None = None,
+    parallel_info: dict | None = None,
+    framework: str = "sglang",
+) -> Path:
+    """Create a dump file with *different* tensors per step.
+
+    Unlike ``_create_rank_dump`` (which repeats the same tensor),
+    this helper accepts a list of tensors — one per step.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
+
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+            )
+        )
+
+        static_meta: dict = {"world_rank": rank, "world_size": 1}
+        if parallel_info is not None:
+            static_meta[f"{framework}_parallel_info"] = parallel_info
+        dumper.__dict__["_static_meta"] = static_meta
+
+        for tensor in tensors_per_step:
+            dumper.dump(name, tensor, dims=dims)
             dumper.step()
 
     return directory / _FIXED_EXP_NAME
@@ -2149,6 +2636,38 @@ def _create_tp_sharded_dumps(
             dims=dims_str,
             parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
             num_steps=num_steps,
+        )
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_multi_step_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensors_per_step: list[torch.Tensor],
+    name: str,
+    tp_size: int,
+    shard_dim: int,
+    dims_str: str,
+) -> Path:
+    """Create TP-sharded dump files with *different* tensors per step.
+
+    Each step's full tensor is chunked across TP ranks, then
+    ``_create_multi_step_rank_dump`` writes one file per rank.
+    """
+    shards_per_rank: list[list[torch.Tensor]] = [[] for _ in range(tp_size)]
+    for full_tensor in full_tensors_per_step:
+        shards = list(full_tensor.chunk(tp_size, dim=shard_dim))
+        for tp_rank in range(tp_size):
+            shards_per_rank[tp_rank].append(shards[tp_rank])
+
+    for tp_rank in range(tp_size):
+        _create_multi_step_rank_dump(
+            directory,
+            rank=tp_rank,
+            name=name,
+            tensors_per_step=shards_per_rank[tp_rank],
+            dims=dims_str,
+            parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
         )
     return directory / _FIXED_EXP_NAME
 
@@ -2470,6 +2989,7 @@ class TestEntrypointThdCpZigzag:
             sglang_dir / _FIXED_EXP_NAME,
             megatron_dir / _FIXED_EXP_NAME,
             grouping="logical",
+            token_aligner="smart",
             diff_threshold=1e-3,
         )
         records: list[AnyRecord] = _run_and_parse(args, capsys)
@@ -2517,7 +3037,11 @@ class TestEntrypointThdCpZigzag:
         )
 
         args: Namespace = _make_args(
-            baseline_path, target_path, grouping="logical", diff_threshold=1e-3
+            baseline_path,
+            target_path,
+            grouping="logical",
+            token_aligner="smart",
+            diff_threshold=1e-3,
         )
         records: list[AnyRecord] = _run_and_parse(args, capsys)
 

@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     SeqId,
     SGLangSeqId,

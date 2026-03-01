@@ -14,7 +14,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
@@ -234,6 +234,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 
@@ -285,6 +286,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 

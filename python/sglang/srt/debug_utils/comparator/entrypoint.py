@@ -6,14 +6,14 @@ from typing import Any, Iterator, Optional, Union
 
 import polars as pl
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_loader import (
-    AUX_NAMES,
-)
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.entrypoint import (
     TokenAlignerResult,
     compute_maybe_token_aligner_result,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader import (
+    AUX_NAMES,
+)
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.bundle_comparator import compare_bundle_pair
@@ -69,12 +69,13 @@ def run(args: argparse.Namespace) -> None:
 
     ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
 
-    dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
+    if ta_result.mode == "smart":
+        dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
 
     bundle_info_pairs: list[Pair[TensorBundleInfo]] = match_bundles(
         dfs=dfs,
         skip_keys=_compute_skip_keys(
-            args, has_token_aligner_plan=ta_result.plan is not None
+            args, has_token_aligner=ta_result.mode is not None
         ),
     )
 
@@ -97,6 +98,7 @@ def run(args: argparse.Namespace) -> None:
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
         target_path=Path(args.target_path),
+        token_aligner_mode=ta_result.mode,
         token_aligner_plan=ta_result.plan,
         diff_threshold=args.diff_threshold,
         thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
@@ -145,11 +147,11 @@ def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
     return Pair(x=df_baseline, y=df_target)
 
 
-def _compute_skip_keys(args, *, has_token_aligner_plan: bool):
+def _compute_skip_keys(args, *, has_token_aligner: bool) -> set[str]:
     skip_keys: set[str] = {"dump_index", "filename"}
     if args.grouping == "logical":
         skip_keys |= {"rank", "recompute_status"}
-        if has_token_aligner_plan:
+        if has_token_aligner:
             skip_keys |= {"step"}
     return skip_keys
 
@@ -159,6 +161,7 @@ def _compare_bundle_pairs(
     bundle_info_pairs: list[Pair[TensorBundleInfo]],
     baseline_path: Path,
     target_path: Path,
+    token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
@@ -179,6 +182,7 @@ def _compare_bundle_pairs(
             filenames_pair=filenames_pair,
             baseline_path=baseline_path,
             target_path=target_path,
+            token_aligner_mode=token_aligner_mode,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
@@ -238,6 +242,13 @@ def _parse_args() -> argparse.Namespace:
         choices=["logical", "raw"],
         default="logical",
         help="Grouping mode: logical (cross-rank unshard) or raw (rank-by-rank)",
+    )
+    parser.add_argument(
+        "--token-aligner",
+        type=str,
+        choices=["smart", "concat_steps"],
+        default="concat_steps",
+        help="Token aligner mode: concat_steps (BS=1, no aux needed) or smart (BS>1, sequence matching)",
     )
     parser.add_argument(
         "--tokenizer",
