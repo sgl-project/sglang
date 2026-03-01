@@ -76,7 +76,7 @@ def _skip_if_no_matplotlib() -> None:
     pytest.importorskip("matplotlib")
 
 
-class TestManuallyVerify:
+class TestBundleDetailsManualVerify:
     def test_normal_small_diff(self, tmp_path: Path, publish_dir: Path) -> None:
         """Two nearly-identical tensors (randn + 0.01 noise).
 
@@ -197,6 +197,94 @@ class TestManuallyVerify:
             tmp_path=tmp_path,
             publish_dir=publish_dir,
         )
+
+
+class TestPerTokenHeatmapManualVerify:
+    def test_increasing_diff(self, tmp_path: Path, publish_dir: Path) -> None:
+        """Per-token heatmap with linearly increasing diff across token positions.
+
+        Expected: Heatmap shows a clear left-to-right gradient — dark/cold on
+        the left (small diff), bright/hot on the right (large diff). Multiple
+        rows for different tensor names. Colorbar shows log10 scale.
+        """
+        from sglang.srt.debug_utils.comparator.output_types import ComparisonRecord
+        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+            generate_per_token_heatmap,
+        )
+        from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+            compare_tensor_pair,
+        )
+
+        torch.manual_seed(42)
+        seq_len: int = 64
+        hidden_dim: int = 128
+        num_tensors: int = 5
+
+        records: list[ComparisonRecord] = []
+        for i in range(num_tensors):
+            baseline: torch.Tensor = torch.randn(seq_len, hidden_dim)
+            noise_scale: torch.Tensor = torch.linspace(
+                1e-6, 0.5, steps=seq_len
+            ).unsqueeze(1)
+            target: torch.Tensor = baseline + torch.randn_like(baseline) * noise_scale
+
+            info = compare_tensor_pair(
+                x_baseline=baseline,
+                x_target=target,
+                name=f"layer_{i}_hidden_states",
+                diff_threshold=1e-3,
+                seq_dim=0,
+            )
+            records.append(ComparisonRecord(**info.model_dump()))
+
+        output_path: Path = tmp_path / "per_token_increasing_diff.png"
+        result = generate_per_token_heatmap(records=records, output_path=output_path)
+
+        assert result is not None
+        _assert_valid_png(output_path)
+        shutil.copy2(src=output_path, dst=publish_dir / output_path.name)
+
+    def test_single_spike(self, tmp_path: Path, publish_dir: Path) -> None:
+        """Per-token heatmap where only one token position has large diff.
+
+        Expected: Heatmap shows one bright vertical stripe at the spike position,
+        rest is dark/cold.
+        """
+        from sglang.srt.debug_utils.comparator.output_types import ComparisonRecord
+        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+            generate_per_token_heatmap,
+        )
+        from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+            compare_tensor_pair,
+        )
+
+        torch.manual_seed(42)
+        seq_len: int = 64
+        hidden_dim: int = 128
+        spike_pos: int = 32
+        num_tensors: int = 4
+
+        records: list[ComparisonRecord] = []
+        for i in range(num_tensors):
+            baseline: torch.Tensor = torch.randn(seq_len, hidden_dim)
+            target: torch.Tensor = baseline.clone()
+            target[spike_pos, :] += torch.randn(hidden_dim) * 5.0
+
+            info = compare_tensor_pair(
+                x_baseline=baseline,
+                x_target=target,
+                name=f"layer_{i}_attn_output",
+                diff_threshold=1e-3,
+                seq_dim=0,
+            )
+            records.append(ComparisonRecord(**info.model_dump()))
+
+        output_path: Path = tmp_path / "per_token_single_spike.png"
+        result = generate_per_token_heatmap(records=records, output_path=output_path)
+
+        assert result is not None
+        _assert_valid_png(output_path)
+        shutil.copy2(src=output_path, dst=publish_dir / output_path.name)
 
 
 if __name__ == "__main__":

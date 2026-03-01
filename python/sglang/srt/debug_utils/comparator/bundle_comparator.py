@@ -19,6 +19,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.dims import (
+    SEQ_DIM_NAME,
+    TOKEN_DIM_NAME,
     apply_dim_names,
     resolve_dim_names,
 )
@@ -50,6 +52,7 @@ def compare_bundle_pair(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     with warning_sink.context() as collected_warnings:
         result = _compare_bundle_pair_inner(
@@ -61,6 +64,7 @@ def compare_bundle_pair(
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
+            compute_per_token=compute_per_token,
         )
 
     return result.model_copy(update={"warnings": collected_warnings})
@@ -78,6 +82,7 @@ def _compare_bundle_pair_inner(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     # 1. Load all successfully loaded values
     all_pair: Pair[list[ValueWithMeta]] = Pair(
@@ -104,6 +109,7 @@ def _compare_bundle_pair_inner(
         diff_threshold=diff_threshold,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
+        compute_per_token=compute_per_token,
     )
 
 
@@ -117,6 +123,7 @@ def _compare_bundle_pair_tensor_type(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
 ) -> Union[ComparisonRecord, SkipRecord]:
     if not valid_pair.x or not valid_pair.y:
         reason = "baseline_load_failed" if not valid_pair.x else "target_load_failed"
@@ -153,6 +160,11 @@ def _compare_bundle_pair_tensor_type(
         reason: str = f"{side_name}_load_failed"
         return SkipRecord(name=name, reason=reason)
 
+    # Resolve seq_dim for per-token computation
+    seq_dim: Optional[int] = (
+        _resolve_seq_dim(aligner_result.tensors.y) if compute_per_token else None
+    )
+
     # Compare
     aligned_baseline: torch.Tensor = aligner_result.tensors.x.rename(None)
     aligned_target: torch.Tensor = aligner_result.tensors.y.rename(None)
@@ -162,6 +174,7 @@ def _compare_bundle_pair_tensor_type(
         x_target=aligned_target,
         name=name,
         diff_threshold=diff_threshold,
+        seq_dim=seq_dim,
     )
     record = ComparisonRecord(**info.model_dump(), aligner_plan=plan)
 
@@ -207,6 +220,19 @@ def _try_generate_viz(
                 message=f"Visualization failed for {name}: {exc}",
             )
         )
+
+
+def _resolve_seq_dim(tensor: torch.Tensor) -> Optional[int]:
+    """Find the token/seq dimension index from the tensor's named dims."""
+    if tensor.names[0] is None:
+        return None
+
+    names: tuple[Optional[str], ...] = tensor.names
+    for target_name in (TOKEN_DIM_NAME, SEQ_DIM_NAME):
+        if target_name in names:
+            return list(names).index(target_name)
+
+    return None
 
 
 def _compare_bundle_pair_non_tensor_type(

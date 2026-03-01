@@ -1785,6 +1785,7 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         grouping="logical",
         viz_bundle_details=False,
         viz_output_dir="/tmp/comparator_viz/",
+        visualize_per_token=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -2178,6 +2179,73 @@ def _create_thd_cp_zigzag_dumps(
         )
 
     return directory / _FIXED_EXP_NAME
+
+
+class TestEntrypointPerTokenVisualization:
+    """Test --visualize-per-token CLI flag integration."""
+
+    def test_visualize_per_token_creates_png(self, tmp_path: Path, capsys) -> None:
+        """--visualize-per-token with dims metadata produces per-token data in records."""
+        pytest.importorskip("matplotlib")
+
+        torch.manual_seed(42)
+        baseline_dir: Path = tmp_path / "baseline"
+        target_dir: Path = tmp_path / "target"
+        baseline_dir.mkdir()
+        target_dir.mkdir()
+
+        baseline_tensor: torch.Tensor = torch.randn(10, 10)
+        target_tensor: torch.Tensor = baseline_tensor + torch.randn(10, 10) * 0.01
+
+        for name in ["tensor_a", "tensor_b"]:
+            _create_rank_dump(
+                baseline_dir,
+                rank=0,
+                name=name,
+                tensor=baseline_tensor,
+                dims="t h",
+            )
+            _create_rank_dump(
+                target_dir,
+                rank=0,
+                name=name,
+                tensor=target_tensor,
+                dims="t h",
+            )
+
+        baseline_path: Path = baseline_dir / _FIXED_EXP_NAME
+        target_path: Path = target_dir / _FIXED_EXP_NAME
+
+        output_png: Path = tmp_path / "per_token.png"
+        args = _make_args(
+            baseline_path,
+            target_path,
+            grouping="raw",
+            visualize_per_token=str(output_png),
+        )
+        records = _run_and_parse(args, capsys)
+
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+
+        # per_token_rel_diff should be populated
+        for comp in comparisons:
+            assert comp.diff is not None
+            assert comp.diff.per_token_rel_diff is not None
+            assert isinstance(comp.diff.per_token_rel_diff, list)
+            assert len(comp.diff.per_token_rel_diff) == 10
+
+    def test_no_visualize_no_per_token(self, tmp_path: Path, capsys) -> None:
+        """Without --visualize-per-token, per_token_rel_diff is None."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.per_token_rel_diff is None
 
 
 class TestEntrypointThdCpZigzag:

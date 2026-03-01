@@ -31,6 +31,7 @@ class DiffInfo(_StrictBase):
     target_at_max: float
     diff_threshold: float
     passed: bool
+    per_token_rel_diff: Optional[list[float]] = None
 
 
 class TensorComparisonInfo(_StrictBase):

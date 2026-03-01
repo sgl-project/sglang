@@ -10,6 +10,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     _compute_tensor_stats,
     compare_tensor_pair,
 )
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="default", nightly=True)
@@ -95,6 +96,47 @@ class TestComputeDiff:
 
         assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
         assert diff.passed is False
+
+    def test_per_token_with_seq_dim(self) -> None:
+        """seq_dim provided → per_token_rel_diff is list[float]."""
+        torch.manual_seed(42)
+        x: torch.Tensor = torch.randn(8, 16)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = _compute_diff(
+            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
+        )
+
+        assert diff.per_token_rel_diff is not None
+        assert isinstance(diff.per_token_rel_diff, list)
+        assert len(diff.per_token_rel_diff) == 8
+        assert all(isinstance(v, float) for v in diff.per_token_rel_diff)
+
+    def test_per_token_without_seq_dim(self) -> None:
+        """No seq_dim → per_token_rel_diff is None."""
+        x: torch.Tensor = torch.randn(8, 16)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = _compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
+
+        assert diff.per_token_rel_diff is None
+
+    def test_per_token_json_roundtrip(self) -> None:
+        """DiffInfo with per_token_rel_diff survives JSON serialization."""
+        torch.manual_seed(42)
+        x: torch.Tensor = torch.randn(4, 8)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = _compute_diff(
+            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
+        )
+
+        json_str: str = diff.model_dump_json()
+        assert "per_token_rel_diff" in json_str
+
+        roundtripped: DiffInfo = DiffInfo.model_validate_json(json_str)
+        assert roundtripped.per_token_rel_diff is not None
+        assert len(roundtripped.per_token_rel_diff) == 4
 
 
 class TestCompareTensors:

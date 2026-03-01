@@ -30,6 +30,9 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
+from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+    generate_per_token_heatmap,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
@@ -78,6 +81,10 @@ def run(args: argparse.Namespace) -> None:
         Path(args.viz_output_dir) if args.viz_bundle_details else None
     )
 
+    visualize_per_token: Optional[Path] = (
+        Path(args.visualize_per_token) if args.visualize_per_token else None
+    )
+
     comparison_records = _compare_bundle_pairs(
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
@@ -86,9 +93,12 @@ def run(args: argparse.Namespace) -> None:
         diff_threshold=args.diff_threshold,
         thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
+        compute_per_token=visualize_per_token is not None,
     )
     _consume_comparison_records(
-        comparison_records=comparison_records, output_format=args.output_format
+        comparison_records=comparison_records,
+        output_format=args.output_format,
+        visualize_per_token=visualize_per_token,
     )
 
 
@@ -144,6 +154,7 @@ def _compare_bundle_pairs(
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
 ) -> Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
@@ -162,6 +173,7 @@ def _compare_bundle_pairs(
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
+            compute_per_token=compute_per_token,
         )
 
 
@@ -169,17 +181,27 @@ def _consume_comparison_records(
     *,
     comparison_records: Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]],
     output_format: str,
+    visualize_per_token: Optional[Path] = None,
 ) -> None:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
+    collected_comparisons: list[ComparisonRecord] = []
 
     for record in comparison_records:
         counts[record.category] += 1
         print_record(record, output_format=output_format)
+        if visualize_per_token is not None and isinstance(record, ComparisonRecord):
+            collected_comparisons.append(record)
 
     print_record(
         SummaryRecord(total=sum(counts.values()), **counts),
         output_format=output_format,
     )
+
+    if visualize_per_token is not None and collected_comparisons:
+        generate_per_token_heatmap(
+            records=collected_comparisons,
+            output_path=visualize_per_token,
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -223,5 +245,11 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="/tmp/comparator_viz/",
         help="Output directory for visualization PNGs (default: /tmp/comparator_viz/)",
+    )
+    parser.add_argument(
+        "--visualize-per-token",
+        type=str,
+        default=None,
+        help="Output path for per-token relative difference heatmap PNG",
     )
     return parser.parse_args()
