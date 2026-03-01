@@ -11,7 +11,6 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import warnings
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -220,9 +219,9 @@ def register_configs(
     """
     Registers configuration classes for a new model family.
     """
-    registry_id = str(len(_CONFIG_REGISTRY))
+    model_id = str(len(_CONFIG_REGISTRY))
 
-    _CONFIG_REGISTRY[registry_id] = ConfigInfo(
+    _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
     )
@@ -230,20 +229,13 @@ def register_configs(
         for path in hf_model_paths:
             if path in _MODEL_HF_PATH_TO_NAME:
                 logger.warning(
-                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{registry_id}'."
+                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
                 )
-            _MODEL_HF_PATH_TO_NAME[path] = registry_id
+            _MODEL_HF_PATH_TO_NAME[path] = model_id
 
     if model_detectors:
-        warnings.warn(
-            "model_detectors is deprecated and will be removed in a future release. "
-            "Register models via hf_model_paths instead; users loading from a custom local "
-            "path can pass --model-id to identify the model explicitly.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         for detector in model_detectors:
-            _MODEL_NAME_DETECTORS.append((registry_id, detector))
+            _MODEL_NAME_DETECTORS.append((model_id, detector))
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -253,6 +245,7 @@ def get_model_short_name(model_id: str) -> str:
         return model_id
 
 
+@lru_cache(maxsize=1)
 def _get_config_info(
     model_path: str, model_id: Optional[str] = None
 ) -> Optional[ConfigInfo]:
@@ -335,7 +328,7 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
-def _get_diffusers_model_info(model_path: str) -> ModelInfo:
+def _get_diffusers_model_info() -> ModelInfo:
     """
     Get model info for diffusers backend.
 
@@ -391,7 +384,7 @@ def get_model_info(
         logger.info(
             "Using diffusers backend for model '%s' (explicitly requested)", model_path
         )
-        return _get_diffusers_model_info(model_path)
+        return _get_diffusers_model_info()
 
     # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
@@ -415,7 +408,7 @@ def get_model_info(
             logger.error(f"Could not read model config for '{model_path}': {e}")
             if backend == Backend.AUTO:
                 logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info(model_path)
+                return _get_diffusers_model_info()
             return None
 
         pipeline_class_name = config.get("_class_name")
@@ -425,7 +418,7 @@ def get_model_info(
             )
             if backend == Backend.AUTO:
                 logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info(model_path)
+                return _get_diffusers_model_info()
             return None
 
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
@@ -435,7 +428,7 @@ def get_model_info(
                 f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
                 f"Falling back to diffusers backend."
             )
-            return _get_diffusers_model_info(model_path)
+            return _get_diffusers_model_info()
         else:
             logger.error(
                 f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
@@ -452,7 +445,7 @@ def get_model_info(
                 f"Could not resolve native configuration for model '{model_path}'. "
                 f"Falling back to diffusers backend."
             )
-            return _get_diffusers_model_info(model_path)
+            return _get_diffusers_model_info()
         else:
             logger.error(
                 f"Could not resolve configuration for model '{model_path}'. "
