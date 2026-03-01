@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -316,7 +319,7 @@ class DiffusersExecutionStage(PipelineStage):
                     return next(component.parameters()).device
                 except StopIteration:
                     pass
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return current_platform.device_type
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
@@ -565,7 +568,11 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
         Determine the dtype to use for model loading.
         """
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        dtype = (
+            torch.bfloat16
+            if torch.get_device_module().is_bf16_supported()
+            else torch.float16
+        )
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
             dit_precision = server_args.pipeline_config.dit_precision

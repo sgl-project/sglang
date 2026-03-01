@@ -1210,7 +1210,7 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 300.00,
+                "InputValidationStage": 300.0,
                 "TextEncodingStage": 843.86,
                 "TimestepPreparationStage": 58.66,
                 "LatentPreparationStage": 28.55,
@@ -1303,7 +1303,7 @@
                 "39": 1599.78
             },
             "expected_e2e_ms": 123182.9887,
-            "expected_avg_denoise_ms": 2831.00,
+            "expected_avg_denoise_ms": 2831.0,
             "expected_median_denoise_ms": 1600.09
         },
         "turbo_wan2_2_i2v_a14b_2gpu": {
@@ -1320,7 +1320,7 @@
             "denoise_step_ms": {
                 "0": 3042.56,
                 "1": 485.88,
-                "2": 721.20,
+                "2": 721.2,
                 "3": 475.58
             },
             "expected_e2e_ms": 11605.97,
@@ -1919,6 +1919,72 @@
             "expected_e2e_ms": 2103.05,
             "expected_avg_denoise_ms": 173.83,
             "expected_median_denoise_ms": 178.08
+        },
+        "wan2_1_t2v_1.3b_frame_interp_2x": {
+            "stages_ms": {
+                "InputValidationStage": 0.03,
+                "TextEncodingStage": 1155.78,
+                "LatentPreparationStage": 0.12,
+                "TimestepPreparationStage": 2.17,
+                "DenoisingStage": 4977.09,
+                "DecodingStage": 98.46,
+                "per_frame_generation": 1271.97
+            },
+            "denoise_step_ms": {
+                "0": 85.33,
+                "1": 76.41,
+                "2": 100.5,
+                "3": 99.28,
+                "4": 100.14,
+                "5": 100.33,
+                "6": 100.17,
+                "7": 100.35,
+                "8": 100.14,
+                "9": 100.32,
+                "10": 100.18,
+                "11": 100.37,
+                "12": 100.17,
+                "13": 100.34,
+                "14": 100.21,
+                "15": 100.35,
+                "16": 100.15,
+                "17": 100.32,
+                "18": 100.23,
+                "19": 100.35,
+                "20": 100.19,
+                "21": 100.57,
+                "22": 100.27,
+                "23": 100.24,
+                "24": 100.27,
+                "25": 100.27,
+                "26": 100.27,
+                "27": 100.29,
+                "28": 100.25,
+                "29": 100.25,
+                "30": 100.3,
+                "31": 100.3,
+                "32": 100.23,
+                "33": 100.25,
+                "34": 100.26,
+                "35": 100.27,
+                "36": 100.24,
+                "37": 100.26,
+                "38": 100.26,
+                "39": 100.29,
+                "40": 100.31,
+                "41": 100.31,
+                "42": 100.31,
+                "43": 100.26,
+                "44": 100.26,
+                "45": 100.27,
+                "46": 100.3,
+                "47": 100.27,
+                "48": 100.23,
+                "49": 99.65
+            },
+            "expected_e2e_ms": 6359.87,
+            "expected_avg_denoise_ms": 99.47,
+            "expected_median_denoise_ms": 100.27
         }
     }
 }

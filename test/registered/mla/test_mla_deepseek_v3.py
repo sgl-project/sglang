@@ -110,7 +110,9 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
             "fp8_e4m3",
         ]
         if is_cuda():
-            other_args.extend(["--attention-backend", "fa3"])
+            other_args.extend(
+                ["--attention-backend", "fa3", "--cuda-graph-max-bs", "2"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

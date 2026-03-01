@@ -546,7 +546,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
+        # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
         original_dtype = x.dtype
@@ -554,10 +556,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
-        top_k = layer.top_k
-
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
+        top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
             torch.ops.npu.npu_moe_init_routing_v2(
