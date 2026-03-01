@@ -29,7 +29,13 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    RMSNorm,
+    ScaleResidualLayerNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -495,6 +501,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 pre_only=True,
                 quant_config=quant_config,
             )
+        self.mlp_residual = MulAdd()
 
     def forward(
         self,
@@ -529,10 +536,9 @@ class FluxSingleTransformerBlock(nn.Module):
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
 
-            hidden_states = attn_output + mlp_hidden_states
-            gate = gate.unsqueeze(1)
-            hidden_states = gate * hidden_states
-            hidden_states = residual + hidden_states
+            hidden_states = self.mlp_residual(
+                attn_output + mlp_hidden_states, gate.unsqueeze(1), residual
+            )
         else:
             proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
             mlp_hidden_states = self.act_mlp(proj_hidden_states)
@@ -546,8 +552,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
             gate = gate.unsqueeze(1)
             proj_out, _ = self.proj_out(hidden_states)
-            hidden_states = gate * proj_out
-            hidden_states = residual + hidden_states
+            hidden_states = self.mlp_residual(proj_out, gate, residual)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -588,8 +593,12 @@ class FluxTransformerBlock(nn.Module):
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
-        self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        self.ff_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=1e-6, elementwise_affine=False
+        )
+        self.ff_context_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=1e-6, elementwise_affine=False
+        )
 
         nunchaku_enabled = (
             quant_config is not None
@@ -648,17 +657,25 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
-        norm_hidden_states = self.norm2(hidden_states)
+        # hidden_states = hidden_states + gate_msa * attn_output
+        # norm_hidden_states = norm(hidden_states) * (1 + scale_mlp) + shift_mlp
         if self.use_nunchaku_structure:
-            norm_hidden_states = (
-                norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
-            )
+            # Nunchaku expects x * scale + shift
+            # ScaleResidualLayerNormScaleShift does x * (1 + scale) + shift
+            # So we pass (scale - 1)
+            scale_mlp_adj = scale_mlp - 1.0
+            c_scale_mlp_adj = c_scale_mlp - 1.0
         else:
-            norm_hidden_states = (
-                norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-            )
+            scale_mlp_adj = scale_mlp
+            c_scale_mlp_adj = c_scale_mlp
+
+        norm_hidden_states, hidden_states = self.ff_residual_norm(
+            hidden_states,
+            attn_output,
+            gate_msa.unsqueeze(1),
+            shift_mlp,
+            scale_mlp_adj,
+        )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -668,19 +685,17 @@ class FluxTransformerBlock(nn.Module):
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        if self.use_nunchaku_structure:
-            norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
+        # encoder_hidden_states = encoder_hidden_states + c_gate_msa * context_attn_output
+        # norm_encoder_hidden_states = norm(encoder_hidden_states) * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states, encoder_hidden_states = (
+            self.ff_context_residual_norm(
+                encoder_hidden_states,
+                context_attn_output,
+                c_gate_msa.unsqueeze(1),
+                c_shift_mlp,
+                c_scale_mlp_adj,
             )
-        else:
-            norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-                + c_shift_mlp[:, None]
-            )
+        )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = (

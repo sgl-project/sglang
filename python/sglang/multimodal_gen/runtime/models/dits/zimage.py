@@ -8,7 +8,11 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    RMSNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -328,8 +332,10 @@ class ZImageTransformerBlock(nn.Module):
         else:
             self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm_fused = RMSNormScaleShift(
+            dim, eps=norm_eps, scale_constant=0.0
+        )
+        self.ffn_norm_fused = RMSNormScaleShift(dim, eps=norm_eps, scale_constant=0.0)
 
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -338,6 +344,10 @@ class ZImageTransformerBlock(nn.Module):
             self.adaLN_modulation = nn.Sequential(
                 ReplicatedLinear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True)
             )
+
+        self.register_buffer(
+            "zero_shift", torch.zeros(1, 1, dim), recurse=False
+        )
 
     def forward(
         self,
@@ -356,7 +366,7 @@ class ZImageTransformerBlock(nn.Module):
 
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                self.attention_norm_fused(x, shift=self.zero_shift, scale=scale_msa),
                 freqs_cis=freqs_cis,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
@@ -364,13 +374,13 @@ class ZImageTransformerBlock(nn.Module):
             # FFN block
             x = x + gate_mlp * self.ffn_norm2(
                 self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
+                    self.ffn_norm_fused(x, shift=self.zero_shift, scale=scale_mlp),
                 )
             )
         else:
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x),
+                self.attention_norm_fused(x, shift=self.zero_shift, scale=1.0),
                 freqs_cis=freqs_cis,
             )
             x = x + self.attention_norm2(attn_out)
@@ -378,7 +388,7 @@ class ZImageTransformerBlock(nn.Module):
             # FFN block
             x = x + self.ffn_norm2(
                 self.feed_forward(
-                    self.ffn_norm1(x),
+                    self.ffn_norm_fused(x, shift=self.zero_shift, scale=1.0),
                 )
             )
 

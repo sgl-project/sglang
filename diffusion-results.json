@@ -1,0 +1,49 @@
+[
+  {
+    "test_name": "flux_2_klein_image_t2i",
+    "modality": "image",
+    "e2e_ms": 473.8021790981293,
+    "avg_denoise_ms": 38.324509747326374,
+    "median_denoise_ms": 37.793779745697975,
+    "stage_metrics": {
+      "InputValidationStage": 0.03478303551673889,
+      "TextEncodingStage": 105.68369552493095,
+      "ImageVAEEncodingStage": 0.0032354146242141724,
+      "LatentPreparationStage": 0.8956361562013626,
+      "TimestepPreparationStage": 23.934578523039818,
+      "DenoisingStage": 245.39769440889359,
+      "DecodingStage": 12.822229415178299
+    },
+    "sampled_steps": {
+      "0": 24.827972054481506,
+      "1": 17.495283856987953,
+      "2": 50.759587436914444,
+      "3": 60.21519564092159
+    },
+    "class_name": "TestDiffusionServerOneGpu"
+  },
+  {
+    "test_name": "zimage_image_t2i_multi_lora",
+    "modality": "image",
+    "e2e_ms": 1364.9610001593828,
+    "avg_denoise_ms": 86.12553920182917,
+    "median_denoise_ms": 95.41030414402485,
+    "stage_metrics": {
+      "InputValidationStage": 0.04710070788860321,
+      "TextEncodingStage": 422.59518057107925,
+      "LatentPreparationStage": 0.12205727398395538,
+      "TimestepPreparationStage": 44.845275580883026,
+      "DenoisingStage": 780.9831947088242,
+      "DecodingStage": 13.377239927649498
+    },
+    "sampled_steps": {
+      "0": 40.20826332271099,
+      "2": 95.41030414402485,
+      "3": 95.43094411492348,
+      "5": 95.68417258560658,
+      "6": 95.20649164915085,
+      "8": 95.72989866137505
+    },
+    "class_name": "TestDiffusionServerOneGpu"
+  }
+]
