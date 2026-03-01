@@ -15,9 +15,10 @@ python3 -m sglang.test.send_1 --profile --profile-steps 5
 import argparse
 import asyncio
 import dataclasses
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import orjson
@@ -26,8 +27,8 @@ from rich.table import Table
 
 from sglang.profiler import run_profile
 
-EST = timezone(timedelta(hours=-5), "EST")
-PST = timezone(timedelta(hours=-8), "PST")
+TZ_EASTERN = ZoneInfo("America/New_York")
+TZ_PACIFIC = ZoneInfo("America/Los_Angeles")
 TIME_FMT = "%Y-%m-%d %H:%M:%S %Z"
 
 IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
@@ -37,8 +38,8 @@ def get_timestamps() -> dict:
     now = datetime.now(timezone.utc)
     return {
         "utc": now.strftime(TIME_FMT),
-        "est": now.astimezone(EST).strftime(TIME_FMT),
-        "pst": now.astimezone(PST).strftime(TIME_FMT),
+        "eastern": now.astimezone(TZ_EASTERN).strftime(TIME_FMT),
+        "pacific": now.astimezone(TZ_PACIFIC).strftime(TIME_FMT),
     }
 
 
@@ -53,7 +54,7 @@ class BenchArgs:
     max_new_tokens: int = 512
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
-    json: bool = False
+    json_mode: bool = False
     return_logprob: bool = False
     prompt: str = "Give me a fully functional FastAPI server. Show the python code."
     image: bool = False
@@ -87,7 +88,7 @@ class BenchArgs:
         parser.add_argument(
             "--presence-penalty", type=float, default=BenchArgs.presence_penalty
         )
-        parser.add_argument("--json", action="store_true")
+        parser.add_argument("--json-mode", action="store_true")
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument("--prompt", type=str, default=BenchArgs.prompt)
         parser.add_argument("--image", action="store_true")
@@ -153,7 +154,7 @@ def apply_chat_template(tokenizer, prompt: str, image_data=None) -> str:
     )
 
 
-def print_meta_info(meta: dict, timestamps: dict):
+def print_meta_info(meta: dict, timestamps: dict, model_name: str):
     console = Console()
 
     latency = meta["e2e_latency"]
@@ -166,7 +167,7 @@ def print_meta_info(meta: dict, timestamps: dict):
     # Timestamp
     console.print()
     console.print(
-        f"[bold yellow]{timestamps['est']}[/]  /  [bold yellow]{timestamps['pst']}[/]"
+        f"[bold yellow]{timestamps['eastern']}[/]  /  [bold yellow]{timestamps['pacific']}[/]"
     )
 
     # Performance
@@ -208,6 +209,7 @@ def print_meta_info(meta: dict, timestamps: dict):
     info = Table(title="Request Info", show_header=True, header_style="bold green")
     info.add_column("Metric", style="bold")
     info.add_column("Value", justify="right")
+    info.add_row("Model", model_name)
     info.add_row("Request ID", meta["id"])
     info.add_row("Weight Version", str(meta["weight_version"]))
     if meta.get("dp_rank") is not None:
@@ -238,7 +240,7 @@ async def send_one_prompt(args: BenchArgs):
             sampling_params.update(model_params)
             console.print(f"[bold green]Using model sampling params:[/] {model_params}")
 
-        if args.json:
+        if args.json_mode:
             sampling_params["json_schema"] = "$$ANY$$"
 
         # Build prompt
@@ -252,7 +254,7 @@ async def send_one_prompt(args: BenchArgs):
                 "Describe their relationship in a very short sentence."
             )
             image_data = [IMAGE_URL] * 4
-        elif args.json:
+        elif args.json_mode:
             args.prompt = (
                 "What is the capital of France and how is that city like. "
                 "Give me 3 trivial information about that city. "
@@ -293,13 +295,21 @@ async def send_one_prompt(args: BenchArgs):
             if args.stream:
                 last_len = 0
                 ret = None
-                async for line in response.content:
-                    line = line.decode("utf-8").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    if line == "data: [DONE]":
+                while True:
+                    raw = await response.content.readline()
+                    if not raw:
                         break
-                    ret = orjson.loads(line[5:])
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    ret = orjson.loads(payload)
                     print(ret["text"][last_len:], end="", flush=True)
                     last_len = len(ret["text"])
                 print()
@@ -312,7 +322,8 @@ async def send_one_prompt(args: BenchArgs):
 
     # Display results
     timestamps = get_timestamps()
-    print_meta_info(ret["meta_info"], timestamps)
+    model_name = model_info.get("model_path", "unknown")
+    print_meta_info(ret["meta_info"], timestamps, model_name)
 
     # Append full response to JSONL
     record = ret.copy()
@@ -321,14 +332,6 @@ async def send_one_prompt(args: BenchArgs):
     with open(output_path, "ab") as f:
         f.write(orjson.dumps(record) + b"\n")
     console.print(f"\n[dim]Results appended to {output_path}[/]")
-
-    meta = ret["meta_info"]
-    spec_verify_ct = meta.get("spec_verify_ct", 0)
-    acc_length = (
-        meta["completion_tokens"] / spec_verify_ct if spec_verify_ct > 0 else 1.0
-    )
-    speed = meta["completion_tokens"] / meta["e2e_latency"]
-    return acc_length, speed
 
 
 if __name__ == "__main__":
