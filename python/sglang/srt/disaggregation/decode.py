@@ -287,10 +287,8 @@ class DecodePreallocQueue:
         attn_tp_size = get_attention_tp_size()
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
-        kv_args.decode_tp_size = attn_tp_size
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
