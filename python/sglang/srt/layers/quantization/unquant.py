@@ -388,7 +388,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 activation_type=(
                     ActivationType.Relu2
                     if moe_runner_config.activation == "relu2"
-                    else ActivationType.Silu
+                    else ActivationType.Swiglu
                 ),
             )[0]
             return StandardCombineInput(hidden_states=output)
