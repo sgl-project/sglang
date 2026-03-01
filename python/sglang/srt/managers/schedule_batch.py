@@ -87,7 +87,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -104,7 +103,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
-OPT_PREBUILT_BATCH = get_int_env_var("SGLANG_ENABLE_OPT_PREBUILT_BATCH", False)
+OPT_PREBUILT_BATCH = envs.SGLANG_ENABLE_OPT_PREBUILT_BATCH.get()
 
 logger = logging.getLogger(__name__)
 
