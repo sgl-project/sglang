@@ -25,20 +25,31 @@ class AxisInfo(_FrozenBase):
 
 class ConcatParams(_FrozenBase):
     op: Literal["concat"] = "concat"
-    dim: int
+    dim_name: str
+
+
+class CpThdConcatParams(_FrozenBase):
+    op: Literal["cp_thd_concat"] = "cp_thd_concat"
+    dim_name: str
+    seq_lens_per_rank: list[int]  # per-seq token count on each rank, e.g. [50, 32, 46]
 
 
 class PickParams(_FrozenBase):
     op: Literal["pick"] = "pick"
 
 
+class ReduceSumParams(_FrozenBase):
+    op: Literal["reduce_sum"] = "reduce_sum"
+
+
 UnsharderParams = Annotated[
-    Union[ConcatParams, PickParams],
+    Union[ConcatParams, CpThdConcatParams, PickParams, ReduceSumParams],
     Field(discriminator="op"),
 ]
 
 
 class UnsharderPlan(_FrozenBase):
+    type: Literal["unsharder"] = "unsharder"
     axis: ParallelAxis
     params: UnsharderParams
     # groups[i] = indices in the input tensor list, which will be operated (e.g. concat) into i-th output tensor.

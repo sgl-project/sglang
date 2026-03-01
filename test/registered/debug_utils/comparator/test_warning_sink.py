@@ -3,23 +3,23 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.output_types import ReplicatedMismatchWarning
+from sglang.srt.debug_utils.comparator.output_types import (
+    GeneralWarning,
+    report_sink,
+)
 from sglang.srt.debug_utils.comparator.warning_sink import WarningSink
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
 
 
-def _make_warning(**overrides) -> ReplicatedMismatchWarning:
+def _make_warning(**overrides) -> GeneralWarning:
     defaults: dict = dict(
-        axis="tp",
-        group_index=0,
-        differing_index=1,
-        baseline_index=0,
-        max_abs_diff=0.1,
+        category="test",
+        message="test warning",
     )
     defaults.update(overrides)
-    return ReplicatedMismatchWarning(**defaults)
+    return GeneralWarning(**defaults)
 
 
 class TestWarningSink:
@@ -35,8 +35,8 @@ class TestWarningSink:
 
     def test_nested_contexts(self) -> None:
         sink = WarningSink()
-        outer_warning = _make_warning(group_index=0)
-        inner_warning = _make_warning(group_index=1)
+        outer_warning = _make_warning(message="outer")
+        inner_warning = _make_warning(message="inner")
 
         with sink.context() as outer:
             sink.add(outer_warning)
@@ -56,16 +56,16 @@ class TestWarningSink:
 
     def test_add_outside_context_prints(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         sink.add(_make_warning())
 
         captured = capsys.readouterr()
-        assert "Replicated along tp" in captured.out
+        assert "test warning" in captured.out
 
     def test_context_captures_instead_of_printing(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         with sink.context() as collected:
             sink.add(_make_warning())
@@ -76,7 +76,7 @@ class TestWarningSink:
 
     def test_json_output_outside_context(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("json")
+        report_sink.configure(output_format="json")
 
         sink.add(_make_warning())
 
@@ -87,7 +87,7 @@ class TestWarningSink:
 
     def test_exception_in_context_cleans_stack(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         with pytest.raises(RuntimeError):
             with sink.context() as collected:
@@ -96,9 +96,9 @@ class TestWarningSink:
 
         assert len(collected) == 1
 
-        sink.add(_make_warning(group_index=99))
+        sink.add(_make_warning(message="after exception"))
         captured = capsys.readouterr()
-        assert "Replicated along tp" in captured.out
+        assert "after exception" in captured.out
 
 
 if __name__ == "__main__":

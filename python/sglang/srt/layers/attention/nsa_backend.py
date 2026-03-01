@@ -52,6 +52,8 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 if _is_hip:
+    from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
+
     try:
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
@@ -331,6 +333,12 @@ class NativeSparseAttnBackend(
 
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
+
+            self.kv_indices = torch.zeros(
+                max_bs * self.nsa_index_topk,
+                dtype=torch.int32,
+                device=self.device,
             )
 
         # Speculative decoding
@@ -1476,8 +1484,19 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif nsa_impl == "aiter":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_aiter_extend(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
+            )
         else:
-            raise ValueError(f"Unsupported {nsa_impl = }")
+            raise ValueError(
+                f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
+            )
 
     def forward_decode(
         self,
@@ -1859,7 +1878,8 @@ class NativeSparseAttnBackend(
         non_minus1_counts = non_minus1_mask.sum(dim=1)
         kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
-        kv_indices = page_table_1[page_table_1 != -1]
+        kv_indices = self.kv_indices
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1870,10 +1890,59 @@ class NativeSparseAttnBackend(
             kv_indices,
             metadata.cu_seqlens_q,
             metadata.max_seq_len_q,
-            layer.scaling,
-            layer.logit_cap,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+        return o
+
+    def _forward_aiter_extend(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        num_tokens = q_all.shape[0]
+        q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+
+        if layer.head_dim != layer.v_head_dim:
+            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        non_minus1_mask = page_table_1 != -1
+        non_minus1_counts = non_minus1_mask.sum(dim=1)
+
+        kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
+        kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+
+        # Allocate kv_indices with upper-bound size (num_tokens * topk)
+        topk = page_table_1.shape[1]
+        kv_indices = torch.zeros(
+            num_tokens * topk, dtype=torch.int32, device=self.device
+        )
+
+        # Use get_valid_kv_indices kernel to extract valid indices
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
+
+        # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
+        cu_seqlens_q = torch.arange(
+            0, num_tokens + 1, dtype=torch.int32, device=self.device
+        )
+        # TODO support more forward_mode
+        mla_decode_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_cache.view(-1, 1, 1, layer.head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            cu_seqlens_q,
+            kv_indptr,
+            kv_indices,
+            cu_seqlens_q,
+            1,  # max_seq_len_q = 1 for per-token attention
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+        )
         return o
 
     def _forward_trtllm(
