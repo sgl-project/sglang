@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import re
+import sys
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
@@ -29,88 +31,124 @@ from sglang.srt.debug_utils.comparator.output_types import (
     NonTensorRecord,
     SkipRecord,
     SummaryRecord,
-    print_record,
+    report_sink,
+)
+from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+    generate_per_token_heatmap,
 )
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 
 def main() -> None:
     args = _parse_args()
-    run(args)
+    sys.exit(run(args))
 
 
-def run(args: argparse.Namespace) -> None:
-    print_record(
-        ConfigRecord.from_args(args),
+def run(args: argparse.Namespace) -> int:
+    report_path: Optional[Path] = _resolve_report_path(args)
+    report_sink.configure(
         output_format=args.output_format,
+        report_path=report_path,
     )
 
-    warning_sink.set_output_format(args.output_format)
+    try:
+        report_sink.add(ConfigRecord.from_args(args))
 
-    dfs: Pair[pl.DataFrame] = _read_df(args)
+        dfs: Pair[pl.DataFrame] = _read_df(args)
 
-    tokenizer: Any = _maybe_load_tokenizer(args)
-    for label, df, dump_dir in [
-        ("baseline", dfs.x, Path(args.baseline_path)),
-        ("target", dfs.y, Path(args.target_path)),
-    ]:
-        emit_display_records(
-            df=df,
-            dump_dir=dump_dir,
-            label=label,
-            tokenizer=tokenizer,
-            output_format=args.output_format,
+        tokenizer: Any = _maybe_load_tokenizer(args)
+        for label, df, dump_dir in [
+            ("baseline", dfs.x, Path(args.baseline_path)),
+            ("target", dfs.y, Path(args.target_path)),
+        ]:
+            emit_display_records(
+                df=df,
+                dump_dir=dump_dir,
+                label=label,
+                tokenizer=tokenizer,
+            )
+
+        ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
+
+        if ta_result.mode == "smart":
+            dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
+
+        bundle_info_pairs: list[Pair[TensorBundleInfo]] = match_bundles(
+            dfs=dfs,
+            skip_keys=_compute_skip_keys(
+                args, has_token_aligner=ta_result.mode is not None
+            ),
         )
 
-    ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
+        viz_output_dir: Optional[Path] = (
+            Path(args.viz_output_dir) if args.viz_bundle_details else None
+        )
 
-    if ta_result.mode == "smart":
-        dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
+        visualize_per_token: Optional[Path] = (
+            Path(args.visualize_per_token) if args.visualize_per_token else None
+        )
 
-    bundle_info_pairs: list[Pair[TensorBundleInfo]] = match_bundles(
-        dfs=dfs,
-        skip_keys=_compute_skip_keys(
-            args, has_token_aligner=ta_result.mode is not None
-        ),
-    )
+        meta_overrider: MetaOverrider = MetaOverrider.from_args_and_config(
+            override_dims=args.override_dims,
+            override_baseline_dims=args.override_baseline_dims,
+            override_target_dims=args.override_target_dims,
+            override_config=(
+                Path(args.override_config) if args.override_config else None
+            ),
+        )
 
-    viz_output_dir: Optional[Path] = (
-        Path(args.viz_output_dir) if args.viz_bundle_details else None
-    )
+        comparison_records = _compare_bundle_pairs(
+            bundle_info_pairs=bundle_info_pairs,
+            baseline_path=Path(args.baseline_path),
+            target_path=Path(args.target_path),
+            token_aligner_mode=ta_result.mode,
+            token_aligner_plan=ta_result.plan,
+            diff_threshold=args.diff_threshold,
+            thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
+            viz_output_dir=viz_output_dir,
+            compute_per_token=visualize_per_token is not None,
+            meta_overrider=meta_overrider,
+        )
+        summary, skipped_names = _consume_comparison_records(
+            comparison_records=comparison_records,
+            visualize_per_token=visualize_per_token,
+        )
+        return _compute_exit_code(
+            summary,
+            allow_skip_pattern=args.allow_skip_pattern,
+            skipped_names=skipped_names,
+        )
+    finally:
+        report_sink.close()
+        if report_path is not None:
+            print(f"Report: {report_path}", file=sys.stderr)
 
-    visualize_per_token: Optional[Path] = (
-        Path(args.visualize_per_token) if args.visualize_per_token else None
-    )
 
-    meta_overrider: MetaOverrider = MetaOverrider.from_args_and_config(
-        override_dims=args.override_dims,
-        override_baseline_dims=args.override_baseline_dims,
-        override_target_dims=args.override_target_dims,
-        override_config=Path(args.override_config) if args.override_config else None,
-    )
+def _compute_exit_code(
+    summary: SummaryRecord,
+    *,
+    allow_skip_pattern: str,
+    skipped_names: list[str],
+) -> int:
+    if summary.failed > 0:
+        return 1
 
-    comparison_records = _compare_bundle_pairs(
-        bundle_info_pairs=bundle_info_pairs,
-        baseline_path=Path(args.baseline_path),
-        target_path=Path(args.target_path),
-        token_aligner_mode=ta_result.mode,
-        token_aligner_plan=ta_result.plan,
-        diff_threshold=args.diff_threshold,
-        thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
-        viz_output_dir=viz_output_dir,
-        compute_per_token=visualize_per_token is not None,
-        meta_overrider=meta_overrider,
-    )
-    _consume_comparison_records(
-        comparison_records=comparison_records,
-        output_format=args.output_format,
-        visualize_per_token=visualize_per_token,
-    )
+    pattern: re.Pattern[str] = re.compile(allow_skip_pattern)
+    forbidden: list[str] = [n for n in skipped_names if not pattern.fullmatch(n)]
+    if forbidden:
+        return 1
+
+    return 0
+
+
+def _resolve_report_path(args: argparse.Namespace) -> Optional[Path]:
+    if args.report_path is not None:
+        return Path(args.report_path) if args.report_path else None
+    return Path(args.target_path) / "comparator_report.jsonl"
 
 
 def _maybe_load_tokenizer(args: argparse.Namespace) -> Any:
@@ -195,22 +233,30 @@ def _compare_bundle_pairs(
 def _consume_comparison_records(
     *,
     comparison_records: Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]],
-    output_format: str,
     visualize_per_token: Optional[Path] = None,
-) -> None:
+) -> tuple[SummaryRecord, list[str]]:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
     collected_comparisons: list[ComparisonRecord] = []
+    skipped_names: list[str] = []
 
     for record in comparison_records:
         counts[record.category] += 1
-        print_record(record, output_format=output_format)
+        report_sink.add(record)
+        if isinstance(record, SkipRecord) and record.category == "skipped":
+            skipped_names.append(record.name)
         if visualize_per_token is not None and isinstance(record, ComparisonRecord):
             collected_comparisons.append(record)
 
-    print_record(
-        SummaryRecord(total=sum(counts.values()), **counts),
-        output_format=output_format,
-    )
+    summary: SummaryRecord = SummaryRecord(total=sum(counts.values()), **counts)
+    report_sink.add(summary)
+
+    if visualize_per_token is not None and collected_comparisons:
+        generate_per_token_heatmap(
+            records=collected_comparisons,
+            output_path=visualize_per_token,
+        )
+
+    return summary, skipped_names
 
     if visualize_per_token is not None and collected_comparisons:
         generate_per_token_heatmap(
@@ -299,6 +345,22 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to YAML override config file (dims overrides, etc.)",
+    )
+    parser.add_argument(
+        "--allow-skip-pattern",
+        type=str,
+        default=".*",
+        help="Regex pattern for tensor names allowed to be skipped. "
+        "Default '.*' allows all skips. Use '^$' to forbid all skips.",
+    )
+
+    # Report output
+    parser.add_argument(
+        "--report-path",
+        type=str,
+        default=None,
+        help="Path for JSONL report (default: <target-path>/comparator_report.jsonl). "
+        "Pass empty string '' to disable.",
     )
 
     return parser.parse_args()

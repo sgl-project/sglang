@@ -315,8 +315,16 @@ def _apply_dim_names_from_meta(
 
 
 def _load_all_values(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:
-    return [
-        item
-        for f in filenames
-        if (item := ValueWithMeta.load(base_path / f)).value is not LOAD_FAILED
-    ]
+    result: list[ValueWithMeta] = []
+    for f in filenames:
+        item: ValueWithMeta = ValueWithMeta.load(base_path / f)
+        if item.value is LOAD_FAILED:
+            warning_sink.add(
+                GeneralWarning(
+                    category="load_failed",
+                    message=f"Failed to load tensor file: {f}",
+                )
+            )
+            continue
+        result.append(item)
+    return result

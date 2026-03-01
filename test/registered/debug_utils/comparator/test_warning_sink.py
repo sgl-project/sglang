@@ -3,7 +3,10 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
+from sglang.srt.debug_utils.comparator.output_types import (
+    GeneralWarning,
+    report_sink,
+)
 from sglang.srt.debug_utils.comparator.warning_sink import WarningSink
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -53,7 +56,7 @@ class TestWarningSink:
 
     def test_add_outside_context_prints(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         sink.add(_make_warning())
 
@@ -62,7 +65,7 @@ class TestWarningSink:
 
     def test_context_captures_instead_of_printing(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         with sink.context() as collected:
             sink.add(_make_warning())
@@ -73,7 +76,7 @@ class TestWarningSink:
 
     def test_json_output_outside_context(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("json")
+        report_sink.configure(output_format="json")
 
         sink.add(_make_warning())
 
@@ -84,7 +87,7 @@ class TestWarningSink:
 
     def test_exception_in_context_cleans_stack(self, capsys) -> None:
         sink = WarningSink()
-        sink.set_output_format("text")
+        report_sink.configure(output_format="text")
 
         with pytest.raises(RuntimeError):
             with sink.context() as collected:

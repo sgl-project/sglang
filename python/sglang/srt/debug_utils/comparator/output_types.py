@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 
 import polars as pl
 from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
@@ -253,8 +255,62 @@ def parse_record_json(json_str: str | bytes) -> AnyRecord:
     return _get_any_record_adapter().validate_json(json_str)
 
 
-def print_record(record: _OutputRecord, output_format: str) -> None:
+def _print_to_stdout(record: _OutputRecord, *, output_format: str) -> None:
     if output_format == "json":
         print(record.model_dump_json())
     else:
         print(record.to_text())
+
+
+class ReportSink:
+    """Unified entry point for all record output."""
+
+    def __init__(self) -> None:
+        self._output_format: str = "text"
+        self._report_file: Optional[IO[str]] = None
+        self._report_path: Optional[Path] = None
+
+    def configure(
+        self,
+        *,
+        output_format: str = "text",
+        report_path: Optional[Path] = None,
+    ) -> None:
+        self._output_format = output_format
+
+        if report_path is not None:
+            try:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                self._report_file = open(report_path, "w", encoding="utf-8")
+                self._report_path = report_path
+            except OSError as exc:
+                print(
+                    f"Warning: cannot open report file {report_path}: {exc}",
+                    file=sys.stderr,
+                )
+
+    def add(self, record: _OutputRecord) -> None:
+        _print_to_stdout(record, output_format=self._output_format)
+
+        if self._report_file is not None:
+            self._report_file.write(record.model_dump_json())
+            self._report_file.write("\n")
+            self._report_file.flush()
+
+    def close(self) -> None:
+        if self._report_file is not None:
+            self._report_file.close()
+            self._report_file = None
+
+    @property
+    def report_path(self) -> Optional[Path]:
+        return self._report_path
+
+    def _reset(self) -> None:
+        """Reset state for test isolation."""
+        self.close()
+        self._output_format = "text"
+        self._report_path = None
+
+
+report_sink = ReportSink()
