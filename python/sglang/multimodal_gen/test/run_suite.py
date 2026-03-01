@@ -33,12 +33,12 @@ SUITES = {
     "unit": [
         "../unit/test_sampling_params_validate.py",
         "../unit/test_storage.py",
+        "../unit/test_lora_format_adapter.py",
         # add new unit tests here
     ],
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
-        "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
