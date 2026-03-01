@@ -19,7 +19,10 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -28,39 +31,6 @@
 #include <cuda_runtime.h>
 
 namespace {
-
-// ---------------------------------------------------------------------------
-// Self-contained utilities (no external heavy deps)
-// ---------------------------------------------------------------------------
-
-#define SGL_QKNORM_ROPE_FINAL_MASK 0xffffffff
-
-// Packed uint types for vectorized bf16 loads/stores
-template <typename T, int num>
-struct packed_as_uint;
-
-template <>
-struct packed_as_uint<unsigned int, 1> {
-  using type = unsigned int;
-};
-
-template <>
-struct packed_as_uint<unsigned int, 2> {
-  using type = uint2;
-};
-
-template <>
-struct packed_as_uint<unsigned int, 4> {
-  using type = uint4;
-};
-
-template <typename T>
-__inline__ __device__ T warp_reduce_sum(T val) {
-#pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    val += __shfl_xor_sync(SGL_QKNORM_ROPE_FINAL_MASK, val, mask, 32);
-  return val;
-}
 
 template <typename T>
 inline __device__ __host__ T div_up(T m, T n) {
@@ -143,10 +113,7 @@ __global__ void fusedQKNormRopeKernel(
   static_assert(head_dim % (32 * 2) == 0, "head_dim must be divisible by 64 (each warp handles one head)");
   constexpr int numElemsPerThread = head_dim / 32;
   float elements[numElemsPerThread];
-  constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
-  static_assert(elemSizeBytes % 4 == 0, "elemSizeBytes must be a multiple of 4");
-  constexpr int vecSize = elemSizeBytes / 4;
-  using vec_T = typename packed_as_uint<unsigned int, vecSize>::type;
+  using vec_T = device::AlignedVector<bf16_t, numElemsPerThread>;
 
   // Compute flat offset of this warp's head in qkv
   int offsetWarp;
@@ -162,17 +129,16 @@ __global__ void fusedQKNormRopeKernel(
   // -------------------------------------------------------------------
   float sumOfSquares = 0.0f;
   {
-    vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
-    for (int i = 0; i < vecSize; i++) {
-      float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<unsigned int*>(&vec) + i));
-      sumOfSquares += vals.x * vals.x;
-      sumOfSquares += vals.y * vals.y;
-      elements[2 * i] = vals.x;
-      elements[2 * i + 1] = vals.y;
+    vec_T vec;
+    vec.load(qkv + offsetThread);
+    for (int i = 0; i < numElemsPerThread; i++) {
+      float val = device::cast<float>(vec[i]);
+      sumOfSquares += val * val;
+      elements[i] = val;
     }
   }
 
-  sumOfSquares = warp_reduce_sum(sumOfSquares);
+  sumOfSquares = device::warp::reduce_sum(sumOfSquares);
 
   // -------------------------------------------------------------------
   // Apply RMSNorm
@@ -180,7 +146,7 @@ __global__ void fusedQKNormRopeKernel(
   float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
   for (int i = 0; i < numElemsPerThread; i++) {
     int dim = laneId * numElemsPerThread + i;
-    float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
+    float weight = isQ ? device::cast<float>(q_weight[dim]) : device::cast<float>(k_weight[dim]);
     elements[i] *= rms_rcp * weight;
   }
 
@@ -239,12 +205,10 @@ __global__ void fusedQKNormRopeKernel(
   // -------------------------------------------------------------------
   {
     vec_T vec;
-    for (int i = 0; i < vecSize; i++) {
-      __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-      reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<unsigned int*>(&vec) + i)) = vals;
+    for (int i = 0; i < numElemsPerThread; i++) {
+      vec[i] = device::cast<bf16_t>(elements[i]);
     }
-    vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
-    *outputPtr = vec;
+    vec.store(qkv + offsetThread);
   }
 }
 
@@ -309,8 +273,6 @@ void fused_qk_norm_rope(
     RuntimeCheck(is_pow2, "half_rotary_lanes must be a power of 2 for NeoX style RoPE");
   }
 
-  RuntimeCheck(head_dim == 64 || head_dim == 128 || head_dim == 256, "head_dim must be 64, 128, or 256");
-
   cudaStream_t stream = LaunchKernel::resolve_device(qkv.device());
 
   constexpr int blockSize = 256;
@@ -344,28 +306,12 @@ void fused_qk_norm_rope(
       attention_factor,                                              \
       rotary_dim)
 
-  switch (head_dim) {
-    case 64:
-      if (interleave)
-        LAUNCH_KERNEL(64, true);
-      else
-        LAUNCH_KERNEL(64, false);
-      break;
-    case 128:
-      if (interleave)
-        LAUNCH_KERNEL(128, true);
-      else
-        LAUNCH_KERNEL(128, false);
-      break;
-    case 256:
-      if (interleave)
-        LAUNCH_KERNEL(256, true);
-      else
-        LAUNCH_KERNEL(256, false);
-      break;
-    default:
-      RuntimeCheck(false, "Unsupported head_dim: must be 64, 128, or 256");
-  }
+  static_assert(
+      JIT_HEAD_DIM == 64 || JIT_HEAD_DIM == 128 || JIT_HEAD_DIM == 256, "JIT_HEAD_DIM must be 64, 128, or 256");
+  static_assert(JIT_INTERLEAVE == 0 || JIT_INTERLEAVE == 1, "JIT_INTERLEAVE must be 0 or 1");
+  RuntimeCheck(head_dim == JIT_HEAD_DIM, "head_dim mismatch with JIT-compiled kernel");
+  RuntimeCheck(interleave == static_cast<bool>(JIT_INTERLEAVE), "interleave mismatch with JIT-compiled kernel");
+  LAUNCH_KERNEL(JIT_HEAD_DIM, static_cast<bool>(JIT_INTERLEAVE));
 
 #undef LAUNCH_KERNEL
 }

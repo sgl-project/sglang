@@ -82,7 +82,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_qk_norm_rope
+    from sglang.jit_kernel.fused_qknorm_rope import fused_qk_norm_rope
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -12,12 +13,18 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_fused_qknorm_rope_module() -> Module:
+def _jit_fused_qknorm_rope_module(head_dim: int, is_neox: bool) -> Module:
     return load_jit(
         "fused_qknorm_rope",
+        head_dim,
+        int(is_neox),
         cuda_files=["elementwise/fused_qknorm_rope.cuh"],
         cuda_wrappers=[("fused_qk_norm_rope", "fused_qk_norm_rope")],
-        extra_cuda_cflags=["--use_fast_math"],
+        extra_cuda_cflags=[
+            "--use_fast_math",
+            f"-DJIT_HEAD_DIM={head_dim}",
+            f"-DJIT_INTERLEAVE={0 if is_neox else 1}",
+        ],
     )
 
 
@@ -66,7 +73,7 @@ def fused_qk_norm_rope_out(
         attention_factor: scale applied to the rotary component
         rotary_dim:       number of elements per head to apply RoPE to
     """
-    module = _jit_fused_qknorm_rope_module()
+    module = _jit_fused_qknorm_rope_module(head_dim, is_neox)
     module.fused_qk_norm_rope(
         qkv,
         q_weight,
@@ -85,6 +92,33 @@ def fused_qk_norm_rope_out(
         attention_factor,
         rotary_dim,
     )
+
+
+@cache_once
+def can_use_fused_qk_norm_rope(
+    head_dim: int, is_neox: bool, dtype: torch.dtype
+) -> bool:
+    """Return True if the JIT fused QK-Norm + RoPE kernel can be used.
+
+    Args:
+        head_dim: head dimension; supported values are 64, 128, 256
+        dtype: tensor dtype; only bfloat16 is supported
+    """
+    logger = logging.getLogger(__name__)
+    if head_dim not in (64, 128, 256):
+        logger.warning(
+            f"Unsupported head_dim={head_dim} for JIT fused_qk_norm_rope kernel"
+        )
+        return False
+    if dtype != torch.bfloat16:
+        logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
+        return False
+    try:
+        _jit_fused_qknorm_rope_module(head_dim, is_neox)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT fused_qk_norm_rope kernel: {e}")
+        return False
 
 
 def fused_qk_norm_rope(

@@ -40,7 +40,7 @@ NUM_TOKENS_RANGE = get_benchmark_range(
 MODEL_CONFIGS = get_benchmark_range(
     full_range=[
         (64, 32, 8, 8),  # small
-        (128, 32, 8, 8),  # typical (e.g. LLaMA-style GQA)
+        (128, 32, 8, 8),  # typical (e.g. Qwen3-8B)
         (256, 16, 4, 4),  # large head_dim
     ],
     ci_range=[(128, 32, 8, 8)],
