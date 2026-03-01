@@ -1249,6 +1249,8 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
             info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
             info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
+            info["moe_dp_rank"] = self._dist.get_moe_data_parallel_rank()
+            info["moe_dp_size"] = self._dist.get_moe_data_parallel_world_size()
         except (AttributeError, AssertionError):
             info["distributed_error"] = True
 
@@ -1260,6 +1262,8 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
             info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
             info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
+            info["attn_cp_rank"] = self._dp_attn.get_attention_cp_rank()
+            info["attn_cp_size"] = self._dp_attn.get_attention_cp_size()
         except (AttributeError, AssertionError):
             info["dp_attention_error"] = True
 

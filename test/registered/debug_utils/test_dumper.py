@@ -2074,6 +2074,33 @@ class TestDumperE2E:
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
 
+            par = loaded["meta"].get("sglang_parallel_info", {})
+            expected_keys = [
+                "tp_rank",
+                "tp_size",
+                "pp_rank",
+                "pp_size",
+                "moe_ep_rank",
+                "moe_ep_size",
+                "moe_tp_rank",
+                "moe_tp_size",
+                "moe_dp_rank",
+                "moe_dp_size",
+                "enable_dp_attention",
+                "attn_tp_rank",
+                "attn_tp_size",
+                "attn_dp_rank",
+                "attn_dp_size",
+                "local_attn_dp_rank",
+                "local_attn_dp_size",
+                "attn_cp_rank",
+                "attn_cp_size",
+            ]
+            for key in expected_keys:
+                assert (
+                    key in par
+                ), f"Missing {key} in sglang_parallel_info, got: {sorted(par)}"
+
             rids_files = [f for f in dump_files if "name=rids" in f.name]
             rids_loaded = torch.load(
                 rids_files[0], map_location="cpu", weights_only=False

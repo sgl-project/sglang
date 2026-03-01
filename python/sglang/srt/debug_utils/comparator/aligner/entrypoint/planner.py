@@ -106,7 +106,7 @@ def compute_per_step_sub_plans(
     if dims_str is None:
         return []
 
-    dim_specs: list[DimSpec] = _SingletonDimUtil.filter_out(parse_dims(dims_str))
+    dim_specs: list[DimSpec] = _SingletonDimUtil.filter_out(parse_dims(dims_str).dims)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
 
     unsharder_plans = compute_unsharder_plan(

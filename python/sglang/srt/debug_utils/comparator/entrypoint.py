@@ -168,6 +168,26 @@ def _maybe_load_tokenizer(args: argparse.Namespace) -> Any:
         return None
 
 
+def _maybe_load_tokenizer(args: argparse.Namespace) -> Any:
+    tokenizer_path: Optional[str] = getattr(args, "tokenizer", None)
+
+    if tokenizer_path is None:
+        for directory in [Path(args.baseline_path), Path(args.target_path)]:
+            tokenizer_path = read_tokenizer_path(directory)
+            if tokenizer_path is not None:
+                break
+
+    if tokenizer_path is None:
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception:
+        return None
+
+
 def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
     df_baseline = read_meta(args.baseline_path)
 

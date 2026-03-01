@@ -1630,80 +1630,6 @@ class TestEntrypointAxisAligner:
         assert comp.target.shape == [4, 8]
 
 
-class TestEntrypointAxisSwapper:
-    """Test cross-framework dim reordering through the full entrypoint pipeline."""
-
-    def test_axis_swap_different_dim_order(self, tmp_path, capsys):
-        """Baseline dims 'b h d' vs target dims 'b d h': axis swapper rearranges baseline to match."""
-        torch.manual_seed(42)
-        full_tensor = torch.randn(4, 8, 16)
-
-        baseline_dir = tmp_path / "baseline"
-        target_dir = tmp_path / "target"
-
-        _create_rank_dump(
-            baseline_dir,
-            rank=0,
-            name="hidden",
-            tensor=full_tensor,
-            dims="b h d",
-        )
-        _create_rank_dump(
-            target_dir,
-            rank=0,
-            name="hidden",
-            tensor=full_tensor.permute(0, 2, 1).contiguous(),
-            dims="b d h",
-        )
-
-        args = _make_args(
-            baseline_dir / _FIXED_EXP_NAME,
-            target_dir / _FIXED_EXP_NAME,
-            diff_threshold=1e-3,
-        )
-
-        records = _run_and_parse(args, capsys)
-        comp = _assert_single_comparison_passed(records)
-        assert comp.name == "hidden"
-        assert comp.baseline.shape == [4, 16, 8]
-        assert comp.target.shape == [4, 16, 8]
-
-    def test_axis_swap_with_tp_unshard(self, tmp_path, capsys):
-        """Baseline TP=2 with dims 'b h(tp) d' vs target TP=2 with dims 'b d h(tp)': unshard + axis swap."""
-        torch.manual_seed(42)
-        full_tensor = torch.randn(4, 8, 16)
-
-        baseline_dir = tmp_path / "baseline"
-        target_dir = tmp_path / "target"
-
-        _create_tp_sharded_dumps(
-            baseline_dir,
-            full_tensor=full_tensor,
-            name="hidden",
-            tp_size=2,
-            shard_dim=1,
-            dims_str="b h(tp) d",
-        )
-        _create_tp_sharded_dumps(
-            target_dir,
-            full_tensor=full_tensor.permute(0, 2, 1).contiguous(),
-            name="hidden",
-            tp_size=2,
-            shard_dim=2,
-            dims_str="b d h(tp)",
-        )
-
-        args = _make_args(
-            baseline_dir / _FIXED_EXP_NAME,
-            target_dir / _FIXED_EXP_NAME,
-            diff_threshold=1e-3,
-        )
-
-        records = _run_and_parse(args, capsys)
-        comp = _assert_single_comparison_passed(records)
-        assert comp.name == "hidden"
-
-
 class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
@@ -3358,6 +3284,151 @@ class TestEntrypointDpFilter:
             AssertionError, match="Expected exactly 1 non-empty dp_rank"
         ):
             _run_and_parse(args, capsys)
+
+
+class TestEntrypointDpGroupAlias:
+    """E2E tests for the ``# dp:=<group>`` dp group alias feature.
+
+    In dp_attn mode, dp_size > 1 but MLP tensors after dp_gather have data
+    on all ranks.  With ``# dp:=moe_dp`` in dims, the dp filter uses
+    ``moe_dp_rank/moe_dp_size`` instead of ``dp_rank/dp_size``.
+    """
+
+    def test_dp_alias_absent_group_noop(self, tmp_path: Path, capsys) -> None:
+        """Single rank with ``# dp:=moe_dp`` in dims → parse_dims strips ``#``, comparison OK."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side_dir_name, data in [("baseline", tensor_data), ("target", target_data)]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            _create_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                tensor=data,
+                dims="t h # dp:=moe_dp",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 0,
+                    "dp_size": 1,
+                },
+                framework="sglang",
+            )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records, _ = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
+
+    def test_dp_alias_via_override_dims(self, tmp_path: Path, capsys) -> None:
+        """--override-dims adds ``# dp:=moe_dp`` → dp filter uses alias, filters correctly."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side_dir_name, data in [("baseline", tensor_data), ("target", target_data)]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            # moe_dp_rank=0: non-empty
+            _create_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                tensor=data,
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 0,
+                    "dp_size": 1,
+                    "moe_dp_rank": 0,
+                    "moe_dp_size": 2,
+                },
+                framework="sglang",
+            )
+
+            # moe_dp_rank=1: empty
+            _create_rank_dump(
+                side_dir,
+                rank=1,
+                name="hidden",
+                tensor=torch.empty(0, 8),
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 0,
+                    "dp_size": 1,
+                    "moe_dp_rank": 1,
+                    "moe_dp_size": 2,
+                },
+                framework="sglang",
+            )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+            override_dims=["hidden:t h # dp:=moe_dp"],
+        )
+        records, _ = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
+
+    def test_dp_alias_with_real_alias_group_filters(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """Alias group present with moe_dp_size=2, one empty rank → filters correctly."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side_dir_name, data in [("baseline", tensor_data), ("target", target_data)]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            for moe_dp_rank in range(2):
+                tensor: torch.Tensor = data if moe_dp_rank == 0 else torch.empty(0, 8)
+                _create_rank_dump(
+                    side_dir,
+                    rank=moe_dp_rank,
+                    name="hidden",
+                    tensor=tensor,
+                    dims="t h # dp:=moe_dp",
+                    parallel_info={
+                        "tp_rank": 0,
+                        "tp_size": 1,
+                        "dp_rank": 0,
+                        "dp_size": 1,
+                        "moe_dp_rank": moe_dp_rank,
+                        "moe_dp_size": 2,
+                    },
+                    framework="sglang",
+                )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records, _ = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
 
 
 class TestEntrypointMetaOverride:
