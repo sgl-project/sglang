@@ -26,11 +26,10 @@ def compute_reorderer_plans(
     plans: list[ReordererPlan] = []
 
     for spec in dim_specs:
-        if (
-            spec.ordering is not None
-            and spec.ordering != Ordering.NATURAL
-            and spec.parallel is not None
-        ):
+        for modifier in spec.parallel_modifiers:
+            if modifier.ordering is None or modifier.ordering == Ordering.NATURAL:
+                continue
+
             if spec.name not in _ALLOWED_ZIGZAG_DIM_NAMES:
                 raise ValueError(
                     f"Zigzag ordering is only supported on sequence dims "
@@ -39,11 +38,11 @@ def compute_reorderer_plans(
                     f"but got dim name {spec.name!r} in {spec}"
                 )
 
-            if spec.ordering != Ordering.ZIGZAG:
+            if modifier.ordering != Ordering.ZIGZAG:
                 raise ValueError(
-                    f"Unsupported ordering {spec.ordering!r} for dim {spec.name!r}"
+                    f"Unsupported ordering {modifier.ordering!r} for dim {spec.name!r}"
                 )
-            axis_size: int = parallel_infos[0][spec.parallel].axis_size
+            axis_size: int = parallel_infos[0][modifier.axis].axis_size
 
             if spec.name == TOKEN_DIM_NAME:
                 if thd_global_seq_lens is None:

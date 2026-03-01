@@ -32,10 +32,12 @@ def compute_axis_aligner_plan(
     dims_pair: Pair[str] = Pair(x=dims_str_pair.x, y=dims_str_pair.y)
 
     raw_names: Pair[list[str]] = dims_pair.map(
-        lambda s: [spec.name for spec in parse_dims(s)]
+        lambda s: [spec.name for spec in parse_dims(s).dims]
     )
     filtered_names: Pair[list[str]] = dims_pair.map(
-        lambda s: [spec.name for spec in _SingletonDimUtil.filter_out(parse_dims(s))]
+        lambda s: [
+            spec.name for spec in _SingletonDimUtil.filter_out(parse_dims(s).dims)
+        ]
     )
 
     target_order: Optional[list[str]] = _resolve_target_order(
