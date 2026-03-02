@@ -87,6 +87,7 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/classify", post(classify_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
             .route("/v1/responses/{response_id}", get(responses_get_handler))
@@ -1212,6 +1213,36 @@ fn response_exists_for_port(port: u16, response_id: &str) -> bool {
     map.get(&port)
         .map(|set| set.contains(response_id))
         .unwrap_or(false)
+}
+
+// Minimal classify handler returning mock reward scores
+async fn classify_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    // Return mock reward score (mimics SGLang /classify response for reward models)
+    let text = payload
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let score: f64 = if text.contains("good") { 2.5 } else { -1.359375 };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "embedding": [score]
+    })))
+        .into_response()
 }
 
 // Minimal rerank handler returning mock results; router shapes final response
