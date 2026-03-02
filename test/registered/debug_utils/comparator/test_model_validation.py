@@ -4,6 +4,12 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+    TracedAlignerPlan,
+    TracedSidePlan,
+    TracedStepPlan,
+    TracedSubPlan,
+)
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
@@ -362,13 +368,13 @@ class TestOutputRecordCategories:
         assert "Traceback" in text
 
 
-def _make_aligner_plan() -> AlignerPlan:
+def _make_traced_aligner_plan() -> TracedAlignerPlan:
     unsharder = UnsharderPlan(
         axis=ParallelAxis.TP,
         params=ConcatParams(dim_name="h"),
         groups=[[0, 1]],
     )
-    return AlignerPlan(
+    plan = AlignerPlan(
         per_step_plans=Pair(
             x=[
                 AlignerPerStepPlan(
@@ -382,54 +388,67 @@ def _make_aligner_plan() -> AlignerPlan:
             ],
         ),
     )
+    traced_sub = TracedSubPlan(plan=unsharder, snapshot=None)
+    traced_step = TracedStepPlan(
+        step=0, input_object_indices=[0, 1], sub_plans=[traced_sub]
+    )
+    return TracedAlignerPlan(
+        plan=plan,
+        per_side=Pair(
+            x=TracedSidePlan(step_plans=[traced_step]),
+            y=TracedSidePlan(step_plans=[traced_step]),
+        ),
+    )
 
 
 class TestAlignerPlanInComparisonTensorRecord:
-    def test_comparison_record_with_aligner_plan(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
+    def test_comparison_record_with_traced_plan(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
         record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
-        assert record_with_plan.aligner_plan is not None
-        assert record_with_plan.aligner_plan.per_step_plans.x[0].step == 0
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
+        assert record_with_plan.traced_plan is not None
+        assert record_with_plan.traced_plan.per_side.x.step_plans[0].step == 0
 
-    def test_aligner_plan_json_roundtrip(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
+    def test_traced_plan_json_roundtrip(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
         record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
 
         json_str: str = record_with_plan.model_dump_json()
         parsed = json.loads(json_str)
-        assert "aligner_plan" in parsed
+        assert "traced_plan" in parsed
         assert (
-            parsed["aligner_plan"]["per_step_plans"]["x"][0]["sub_plans"][0]["type"]
+            parsed["traced_plan"]["per_side"]["x"]["step_plans"][0]["sub_plans"][0][
+                "plan"
+            ]["type"]
             == "unsharder"
         )
 
         roundtripped: ComparisonTensorRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is not None
+        assert roundtripped.traced_plan is not None
         assert (
-            roundtripped.aligner_plan.per_step_plans.x[0].sub_plans[0].type
+            roundtripped.traced_plan.per_side.x.step_plans[0].sub_plans[0].plan.type
             == "unsharder"
         )
 
-    def test_comparison_record_without_aligner_plan(self) -> None:
+    def test_comparison_record_without_traced_plan(self) -> None:
         record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
         json_str: str = record.model_dump_json()
         roundtripped: ComparisonTensorRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is None
+        assert roundtripped.traced_plan is None
 
-    def test_aligner_plan_text_format(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
+    def test_traced_plan_text_format(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
         record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
 
         text: str = record_with_plan.to_text()
         assert "Aligner Plan:" in text
