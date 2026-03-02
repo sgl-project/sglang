@@ -46,7 +46,9 @@ _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+    from sgl_kernel import gelu_and_mul, silu_and_mul
+
+    from sglang.jit_kernel.moe_sum_reduce import moe_sum_reduce
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
