@@ -6,6 +6,12 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+/// \file runtime.cuh
+/// \brief Host-side CUDA runtime query helpers.
+///
+/// Thin wrappers around CUDA occupancy and device-property APIs with
+/// automatic error checking via `RuntimeDeviceCheck`.
+
 namespace host::runtime {
 
 // Return the maximum number of active blocks per SM for the given kernel
