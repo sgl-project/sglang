@@ -120,35 +120,23 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
-        # Padding for Aiter MFMA
-        padded_for_mfma = False
-        w13_inter_dim_padded = 2 * intermediate_size_per_partition
-        w2_inter_dim_padded = intermediate_size_per_partition
+        w13_processed = 2 * intermediate_size_per_partition
+        w2_processed = intermediate_size_per_partition
         if _use_aiter:
-            ALIGN_K = 128
-            align_k = lambda n: ((n + ALIGN_K - 1) // ALIGN_K) * ALIGN_K
-            if w2_inter_dim_padded % ALIGN_K:
-                w2_inter_dim_padded = align_k(w2_inter_dim_padded)
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                padding_size,  # Avoid circular import
+            )
+            align_k = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+            if w2_processed % padding_size:
+                w2_processed = align_k(w2_processed)
                 # up proj + gate fusion : 2x
-                w13_inter_dim_padded = w2_inter_dim_padded * 2
-                padded_for_mfma = True
-        logger.error(f'debug moe: w13      : ({num_experts}, {w13_inter_dim_padded}, {hidden_size}) <{padded_for_mfma}>')
-        logger.error(f'debug moe: w2       : ({num_experts}, {hidden_size}, {w2_inter_dim_padded}) <{padded_for_mfma}>')
-
-        #logger.error(f'debug moe: block_n={block_n}, block_k={block_k}')
-        #logger.error(f'debug moe: w13 scale: {2 * ((intermediate_size_per_partition + block_n - 1) // block_n)}, {(hidden_size + block_k - 1) // block_k}')
-        #logger.error(f'debug moe: w2 scale:  {(hidden_size + block_n - 1) // block_n}, {(intermediate_size_per_partition + block_k - 1) // block_k}')
+                w13_processed = w2_processed * 2
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                (
-                    w13_inter_dim_padded
-                    if padded_for_mfma
-                    else 2 * intermediate_size_per_partition
-                ),
-                #2 * intermediate_size_per_partition,
+                w13_processed,
                 hidden_size,
                 dtype=params_dtype,
             ),
@@ -161,13 +149,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                (
-                    w2_inter_dim_padded
-                    if padded_for_mfma
-                    else
-                    intermediate_size_per_partition
-                ),
-                #intermediate_size_per_partition,
+                w2_processed,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -191,12 +173,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    (
-                        w13_inter_dim_padded
-                        if padded_for_mfma
-                        else 2 * intermediate_size_per_partition
-                    ),
-                    #2 * intermediate_size_per_partition,
+                    w13_processed,
                     1,
                     dtype=torch.float32,
                 ),

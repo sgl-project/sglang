@@ -716,37 +716,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
+
+        w13_processed = 2 * intermediate_size_per_partition
+        w2_processed = intermediate_size_per_partition
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0 and not _is_hip:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
+            if _use_aiter:
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                    padding_size,  # Avoid circular import
                 )
-            if tp_size > 1:
-                # Required by row parallel
-                if intermediate_size_per_partition % block_k != 0 and not _is_hip:
+                align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+                if (intermediate_size_per_partition) % padding_size:
+                    w2_processed = align_aiter(intermediate_size_per_partition)
+                    w13_processed = w2_processed * 2
+            else:
+                # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+                # Required by column parallel or enabling merged weights
+                if intermediate_size_per_partition % block_n != 0:
                     raise ValueError(
-                        f"The input_size of down's weight = "
+                        f"The output_size of gate's and up's weight = "
                         f"{intermediate_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
+                        f"weight quantization block_n = {block_n}."
                     )
-            # Padding
-            ALIGN_K = 128
-            align_k = lambda n: (n + ALIGN_K - 1) // ALIGN_K * ALIGN_K
-            if (intermediate_size_per_partition) % ALIGN_K:
-                align_w2 = align_k(intermediate_size_per_partition)
-                align_w13 = align_w2 * 2
-#                logger.error(f'debug moe: w13      : ({num_experts}, {align_w13}, {hidden_size})')
-#                logger.error(f'debug moe: w2       : ({num_experts}, {hidden_size}, {align_w2})')
-#                logger.error(f'debug moe: w13 scale: ({num_experts}, {align_w13}, {hidden_size // OCP_MX_BLOCK_SIZE})')
-                padded_mfma = True
+                if tp_size > 1:
+                    # Required by row parallel
+                    if intermediate_size_per_partition % block_k != 0:
+                        raise ValueError(
+                            f"The input_size of down's weight = "
+                            f"{intermediate_size_per_partition} is not divisible by "
+                            f"weight quantization block_k = {block_k}."
+                        )
 
         # WEIGHTS
         if _is_hip and _use_hip_int4:
@@ -773,12 +775,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    (
-                        align_w13
-                        if padded_mfma
-                        else 2 * intermediate_size_per_partition
-                    ),
-                    #2 * intermediate_size_per_partition,
+                    w13_processed,
                     hidden_size,
                     dtype=params_dtype,
                 ),
@@ -788,12 +785,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 torch.empty(
                     num_experts,
                     hidden_size,
-                    (
-                        align_w2
-                        if padded_mfma
-                        else intermediate_size_per_partition
-                    ),
-                    #intermediate_size_per_partition,
+                    w2_processed,
                     dtype=params_dtype,
                 ),
                 requires_grad=False,

@@ -73,7 +73,10 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         # Fallback: vllm not available, will use native PyTorch implementations
         _has_vllm_ops = False
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+if _use_aiter:
+    padding_size = 128
+else:
+    padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
 @register_custom_op(mutates_args=["hidden_states"])

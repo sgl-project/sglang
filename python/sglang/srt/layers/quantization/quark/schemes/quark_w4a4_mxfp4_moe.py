@@ -81,31 +81,26 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         params_dtype = torch.uint8
 
-        # Padding for Aiter MFMA
-        padded_for_mfma = False
+        w13_processed = 2 * intermediate_size_per_partition
+        w2_processed = intermediate_size_per_partition // 2
         if _use_aiter:
-            ALIGN_K = 128
-            align_k = lambda n: (n + ALIGN_K - 1) // ALIGN_K * ALIGN_K
-            w13_inter_dim_padded = 2 * intermediate_size_per_partition
-            w2_inter_dim_padded = intermediate_size_per_partition // 2
-            if w2_inter_dim_padded % ALIGN_K:
-                w2_inter_dim_padded = align_k(w2_inter_dim_padded)
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                padding_size,  # Avoid circular import
+            )
+            align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+            if w2_processed % padding_size:
+                w2_processed = align_aiter(w2_processed)
                 # up proj + gate fusion : 2x
-                w13_inter_dim_padded = w2_inter_dim_padded * 2
+                w13_processed = w2_processed * 2
                 if hasattr(torch, "float4_e2m1fn_x2"):
                     # pack fp4: 2x
-                    w13_inter_dim_padded *= 2
-                padded_for_mfma = True
+                    w13_processed *= 2
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                (
-                    2 * intermediate_size_per_partition
-                    if not padded_for_mfma
-                    else w13_inter_dim_padded
-                ),
+                w13_processed,
                 hidden_size // 2,
                 dtype=params_dtype,
             ),
@@ -119,11 +114,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                (
-                    intermediate_size_per_partition // 2
-                    if not padded_for_mfma
-                    else w2_inter_dim_padded
-                ),
+                w2_processed,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -136,11 +127,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                (
-                    2 * intermediate_size_per_partition
-                    if not padded_for_mfma
-                    else w13_inter_dim_padded
-                ),
+                w13_processed,
                 hidden_size // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
