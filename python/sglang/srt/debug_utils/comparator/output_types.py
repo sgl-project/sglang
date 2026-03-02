@@ -177,6 +177,15 @@ class _TableRecord(_OutputRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_table_rich_body(self, verbosity=verbosity)
 
+        return _format_table_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_table_rich_body,
+        )
+
+        return _format_table_rich_body(self)
+
 
 class RankInfoRecord(_TableRecord):
     type: Literal["rank_info"] = "rank_info"
@@ -236,6 +245,15 @@ class NonTensorComparisonRecord(_BaseComparisonRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_non_tensor_rich_body(self, verbosity=verbosity)
 
+        return _format_non_tensor_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_non_tensor_rich_body,
+        )
+
+        return _format_non_tensor_rich_body(self)
+
 
 class SummaryRecord(_OutputRecord):
     type: Literal["summary"] = "summary"
@@ -259,6 +277,7 @@ class SummaryRecord(_OutputRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_summary_rich_body(self, verbosity=verbosity)
 
+        return _format_summary_body(self)
 
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"

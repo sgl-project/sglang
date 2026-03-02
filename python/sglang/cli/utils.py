@@ -29,8 +29,20 @@ def get_is_diffusion_model(model_path: str) -> bool:
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
+    try:
+        from sglang.multimodal_gen.registry import (
+            is_known_non_diffusers_multimodal_model,
+        )
+    except ImportError:
+        is_known_non_diffusers_multimodal_model = lambda _: False
+
     if os.path.isdir(model_path):
-        return _is_diffusers_model_dir(model_path)
+        if _is_diffusers_model_dir(model_path):
+            return True
+        return is_known_non_diffusers_multimodal_model(model_path)
+
+    if is_known_non_diffusers_multimodal_model(model_path):
+        return True
 
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
