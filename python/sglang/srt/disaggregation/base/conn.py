@@ -29,13 +29,10 @@ class KVArgs:
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
-    # for different tp
-    decode_tp_size: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
     # for pp prefill
-    prefill_pp_size: int
     pp_rank: int
     prefill_start_layer: int
     # for system dp
