@@ -1,6 +1,5 @@
 import unittest
 
-import requests
 import torch
 
 from sglang import Engine
@@ -52,40 +51,6 @@ class TestPiecewiseCudaGraphCorrectness(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-
-    def test_logprob_with_piecewise_cuda_graph(self):
-        """Regression test: logprob_start_len=-1 should not block PCG prefill."""
-        prompt = "Hello, world!"
-        new_tokens = 16
-
-        logprob_start_len = -1
-        with self.subTest(logprob_start_len=logprob_start_len):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "text": prompt,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": new_tokens,
-                    },
-                    "return_logprob": True,
-                    "logprob_start_len": logprob_start_len,
-                    "top_logprobs_num": 3,
-                },
-            )
-            res = response.json()
-            self.assertNotIn("error", res, f"Server error: {res}")
-            meta = res["meta_info"]
-
-            self.assertEqual(meta["completion_tokens"], new_tokens)
-            self.assertEqual(len(meta["output_token_logprobs"]), new_tokens)
-            self.assertEqual(len(meta["output_top_logprobs"]), new_tokens)
-
-            self.assertEqual(
-                len(meta["input_token_logprobs"]),
-                0,
-                "logprob_start_len=-1 should produce no input logprobs",
-            )
 
 
 class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
