@@ -13,7 +13,10 @@ import os
 import time
 from typing import Any, List, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -223,6 +226,19 @@ class DiffGenerator:
                                     **common,
                                     prompt_index=idx,
                                     output_file_path=path,
+                                )
+                            )
+                        continue
+
+                    if req.data_type == DataType.MESH:
+                        for output_idx, sample in enumerate(
+                            output_batch.output_file_paths
+                        ):
+                            results.append(
+                                GenerationResult(
+                                    **common,
+                                    prompt_index=output_idx,
+                                    output_file_path=sample,
                                 )
                             )
                         continue
