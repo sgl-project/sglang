@@ -4,6 +4,7 @@
 """
 Input validation stage for diffusion pipelines.
 """
+
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -139,6 +140,8 @@ class InputValidationStage(PipelineStage):
                 batch.height = height
 
         elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+            if server_args.pipeline_config.skip_input_image_preprocess:
+                return
             # duplicate with vae_image_processor
             # further processing for ti2v task
             if isinstance(
@@ -158,7 +161,7 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.debug("resized img height: %s, img width: %s", img.height, img.width)
+            logger.debug("resized condition image to: %sx%s", img.height, img.width)
 
             # center-crop
             x1 = (img.width - ow) // 2

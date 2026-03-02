@@ -28,7 +28,7 @@ import abc
 import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -99,7 +99,7 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
+    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
@@ -153,16 +153,18 @@ class ReqToTokenPool:
         return len(self.free_slots)
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
-        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        # Indices of reqs that already have a req_pool_idx and will reuse
+        # their existing slot (e.g. chunked prefill continuing across chunks).
+        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
             assert (
-                len(chunked) <= 1
+                sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
             ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
-        ), "request has req_pool_idx but is not chunked"
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+        ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(chunked)
+        need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -191,11 +193,15 @@ class MambaPool:
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
-                    kwargs[k] = [conv[layer] for conv in v]
+            # Use fields instead of vars to avoid torch.compile graph break
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
+                if name in ("conv", "intermediate_conv_window"):
+                    kwargs[name] = [conv[layer] for conv in v]
                 else:
-                    kwargs[k] = v[layer]
+                    kwargs[name] = v[layer]
+
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
@@ -443,6 +449,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_overlap_schedule: bool = True,
     ):
         super().__init__(
             size=size,
@@ -450,9 +457,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
+            raise ValueError(
+                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
+                "Please set `--mamba-scheduler-strategy extra_buffer`."
+            )
+
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
@@ -1404,13 +1415,16 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        assert not (
-            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
-        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
+        self.nsa_kv_cache_store_fp8 = (
+            use_nsa
+            and dtype == torch.float8_e4m3fn
+            and override_kv_cache_dim is not None
+        )
+        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.use_nsa and self.nsa_kv_cache_store_fp8
+            if self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1492,7 +1506,7 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1512,7 +1526,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1661,7 +1675,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1686,7 +1700,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -1740,20 +1754,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
         device: str,
         index_head_dim: int,
         enable_memory_saver: bool,
+        kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        assert (
-            kv_lora_rank % self.quant_block_size == 0
-        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
 
-        # Calculate override_kv_cache_dim for FP8 storage:
-        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         override_dim = (
-            kv_lora_rank
-            + kv_lora_rank // self.quant_block_size * 4
-            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
+            kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
 
         super().__init__(

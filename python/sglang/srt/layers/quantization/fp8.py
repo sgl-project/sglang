@@ -60,7 +60,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     convert_to_channelwise,
@@ -117,8 +120,10 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
     ) -> None:
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -126,6 +131,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
@@ -167,12 +173,20 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
+        )
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
         if ignored_layers:
-            # hack for ministral
-            ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
+            # Keep both "model." and non-"model." variants for robust prefix matching.
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8 and weight_block_size is not None:
             logger.warning(
@@ -184,6 +198,7 @@ class Fp8Config(QuantizationConfig):
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
         )
 
@@ -195,10 +210,18 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
@@ -674,6 +697,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -703,8 +727,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.with_bias = with_bias
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -778,6 +804,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # BIAS (optional, e.g. GPT-OSS)
+        if self.with_bias:
+            w13_up_dim = (
+                2 * intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else intermediate_size_per_partition
+            )
+            w13_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
+            w2_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
         if self.block_quant:
@@ -1504,6 +1551,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
                 use_fp8_w8a8=True,
                 w13_scale=(
                     layer.w13_weight_scale_inv

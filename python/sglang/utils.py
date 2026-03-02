@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import urllib.request
+import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -120,6 +121,19 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
             fout.write(
                 "=" * 40 + f" {i} " + "=" * 40 + "\n" + s + "\n" + "=" * 80 + "\n\n"
             )
+
+
+def normalize_base_url(host: str, port: int) -> str:
+    if host.startswith("http://") or host.startswith("https://"):
+        warnings.warn(
+            f"Including the scheme in --host ('{host}') is deprecated. "
+            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    else:
+        host = f"http://{host}"
+    return f"{host}:{port}"
 
 
 class HttpResponse:
@@ -408,10 +422,28 @@ def release_port(lock_socket):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return its process handle.
+    Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
+    notebook/CI commands work without requiring shell=True.
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    env = os.environ.copy()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if "=" in part and not part.startswith("-") and not part.startswith("/"):
+            key, _, value = part.partition("=")
+            if key and value is not None and key.replace("_", "").isalnum():
+                env[key] = value
+                i += 1
+                continue
+        break
+    parts = parts[i:]
+    if not parts:
+        raise ValueError(
+            "Command contains only environment variable assignments, no executable"
+        )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
@@ -446,37 +478,80 @@ def terminate_process(process):
         release_port(lock_socket)
 
 
-def wait_for_server(base_url: str, timeout: int = None) -> None:
+def _raise_if_process_exited(process: Optional[Any]) -> None:
+    if process is None:
+        return
+
+    if hasattr(process, "poll"):
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"Server process exited with code {return_code}")
+        return
+
+    if hasattr(process, "is_alive") and not process.is_alive():
+        return_code = getattr(process, "exitcode", None)
+        if return_code is None:
+            raise RuntimeError("Server process exited")
+        raise RuntimeError(f"Server process exited with code {return_code}")
+
+
+def _is_wait_timeout(start_time: float, timeout: Optional[int]) -> bool:
+    if timeout is None:
+        return False
+    return time.perf_counter() - start_time > timeout
+
+
+def wait_for_http_ready(
+    url: str,
+    timeout: Optional[int] = None,
+    process: Optional[Any] = None,
+    headers: Optional[dict] = None,
+    request_timeout: int = 5,
+) -> None:
+    """Wait for an HTTP endpoint to return status 200."""
+    start_time = time.perf_counter()
+    while True:
+        _raise_if_process_exited(process)
+        try:
+            response = requests.get(url, headers=headers, timeout=request_timeout)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException:
+            _raise_if_process_exited(process)
+
+        if _is_wait_timeout(start_time, timeout):
+            raise TimeoutError(
+                f"Endpoint {url} did not become ready within timeout period"
+            )
+        time.sleep(1)
+
+
+def wait_for_server(
+    base_url: str,
+    timeout: int = None,
+    process: Optional[subprocess.Popen] = None,
+) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
-        base_url: The base URL of the server
+        base_url: The base URL of the server.
         timeout: Maximum time to wait in seconds. None means wait forever.
+        process: Optional server process used for early-exit checks.
     """
-    start_time = time.perf_counter()
-    while True:
-        try:
-            response = requests.get(
-                f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
-            )
-            if response.status_code == 200:
-                time.sleep(5)
-                print_highlight(
-                    """\n
-                    NOTE: Typically, the server runs in a separate terminal.
-                    In this notebook, we run the server and notebook code together, so their outputs are combined.
-                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
-                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-                    """
-                )
-                break
-
-            if timeout and time.perf_counter() - start_time > timeout:
-                raise TimeoutError("Server did not become ready within timeout period")
-        except requests.exceptions.RequestException:
-            time.sleep(1)
+    wait_for_http_ready(
+        url=f"{base_url}/v1/models",
+        timeout=timeout,
+        process=process,
+        headers={"Authorization": "Bearer None"},
+    )
+    time.sleep(5)
+    print_highlight("""\n
+        NOTE: Typically, the server runs in a separate terminal.
+        In this notebook, we run the server and notebook code together, so their outputs are combined.
+        To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+        To reduce the log length, we set the log level to warning for the server, the default log level is info.
+        We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
+        """)
 
 
 class TypeBasedDispatcher:
