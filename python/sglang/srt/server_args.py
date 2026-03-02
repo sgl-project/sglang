@@ -662,9 +662,6 @@ class ServerArgs:
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
-    disaggregation_decode_tp: Optional[int] = None
-    disaggregation_decode_dp: Optional[int] = None
-    disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
@@ -2604,13 +2601,6 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            assert (
-                self.disaggregation_decode_tp is None
-            ), "Cannot set --disaggregation-decode-tp for the decode engine."
-            assert (
-                self.disaggregation_decode_dp is None
-            ), "Cannot set --disaggregation-decode-dp for the decode engine."
-
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
@@ -2618,13 +2608,6 @@ class ServerArgs:
             assert (
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
-            if self.disaggregation_decode_tp is None:
-                self.disaggregation_decode_tp = self.tp_size
-            if self.disaggregation_decode_dp is None:
-                self.disaggregation_decode_dp = self.dp_size
-
-            self.disaggregation_prefill_pp = self.pp_size
-            self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
             if not self.enable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
@@ -4970,24 +4953,6 @@ class ServerArgs:
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
         parser.add_argument(
-            "--disaggregation-decode-tp",
-            type=int,
-            default=ServerArgs.disaggregation_decode_tp,
-            help="Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
-        )
-        parser.add_argument(
-            "--disaggregation-decode-dp",
-            type=int,
-            default=ServerArgs.disaggregation_decode_dp,
-            help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
-        )
-        parser.add_argument(
-            "--disaggregation-prefill-pp",
-            type=int,
-            default=ServerArgs.disaggregation_prefill_pp,
-            help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
-        )
-        parser.add_argument(
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
@@ -5541,14 +5506,6 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
-
-    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
-        larger_tp = max(decode_tp, prefill_tp)
-        smaller_tp = min(decode_tp, prefill_tp)
-        assert larger_tp % smaller_tp == 0, (
-            "Different tp size is supported only when one tp is multiple of the other. "
-            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
-        )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

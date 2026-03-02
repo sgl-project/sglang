@@ -1226,6 +1226,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
@@ -1985,21 +1986,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            self.mamba_track_indices = torch.tensor(
-                [
-                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                    for req in self.reqs
-                ],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.mamba_track_mask = torch.tensor(
-                [
-                    sl % get_global_server_args().mamba_track_interval == 0
-                    for sl in self.seq_lens_cpu
-                ],
-                dtype=torch.bool,
-                device=self.device,
+            if len(self.reqs) == 0:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+            else:
+                # already on device
+                all_buffers = torch.stack(
+                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
+                )
+                idx = (
+                    torch.tensor(
+                        [req.mamba_next_track_idx for req in self.reqs],
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    )
+                    .unsqueeze(1)
+                    .to(device=all_buffers.device, non_blocking=True)
+                )
+                self.mamba_track_indices = (
+                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+                )
+
+            # async H2D
+            self.mamba_track_mask = (
+                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                .pin_memory()
+                .to(device=self.device, non_blocking=True)
             )
 
     def maybe_wait_verify_done(self):
@@ -2088,9 +2101,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # NOTE: in spec v2 mode, we do not need wait verify here because
-        # 1) current batch is always prefill, whose seq_lens is not a future
-        # 2) other batch is always decode, which is finished in previous step
+        # In the regular scheduler path:
+        # 1) self is always prefill, whose seq_lens is not a future
+        # 2) other is always decode, which is finished in previous step
+        # so verify_done is already synced and this is a no-op.
+        # In disagg decode + overlap, merge_batch can be called before
+        # filter_batch, so running_batch.seq_lens may still be a forward_stream
+        # future. Synchronize here to avoid a cross-stream data race.
+        self.maybe_wait_verify_done()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2170,6 +2188,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
@@ -2213,9 +2232,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result
+        # Only contain fields that will be used by process_batch_result.
+        # Shallow-copy the reqs list so that in-place mutations (filter_batch,
+        # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
@@ -2227,6 +2248,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
@@ -2331,6 +2353,7 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     is_extend_in_batch: bool
+    all_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
