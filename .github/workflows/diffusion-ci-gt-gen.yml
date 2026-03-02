@@ -1,0 +1,129 @@
+name: Diffusion CI Ground Truth Generation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        default: ''
+        type: string
+      case_ids:
+        description: 'Specific case IDs to run (space-separated, optional)'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: diffusion-ci-gt-gen-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  multimodal-diffusion-gen-1gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    strategy:
+      matrix:
+        part: [0, 1]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Generate outputs
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
+            --suite 1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            --out-dir ./diffusion-ci-outputs \
+            --continue-on-error \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-gen-1gpu-part${{ matrix.part }}
+          path: python/diffusion-ci-outputs
+          retention-days: 7
+
+  multimodal-diffusion-gen-2gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    strategy:
+      matrix:
+        part: [0, 1]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Generate outputs
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
+            --suite 2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            --out-dir ./diffusion-ci-outputs \
+            --continue-on-error \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-gen-2gpu-part${{ matrix.part }}
+          path: python/diffusion-ci-outputs
+          retention-days: 7
+
+  diffusion-ci-push:
+    needs: [multimodal-diffusion-gen-1gpu, multimodal-diffusion-gen-2gpu]
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sgl-test-files
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sgl-test-files
+          path: sgl-test-files
+          ref: main
+          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: diffusion-gen-*
+          path: combined
+          merge-multiple: true
+
+      - name: Copy image and video frame files
+        run: |
+          mkdir -p sgl-test-files/diffusion-ci/consistency_gt
+          find combined \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \) -type f -exec cp -f {} sgl-test-files/diffusion-ci/consistency_gt/ \;
+
+      - name: Git commit and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          cd sgl-test-files
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}@github.com/sgl-project/sgl-test-files.git"
+          git add diffusion-ci/consistency_gt/
+          git diff --staged --quiet || git commit -m "diffusion-ci: update consistency_gt images [automated]"
+          git push origin main

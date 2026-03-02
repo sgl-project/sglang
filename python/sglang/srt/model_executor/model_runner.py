@@ -1061,6 +1061,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if dumper.may_enable:
+            dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
@@ -1133,7 +1134,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)
@@ -1763,9 +1764,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_new_workspace=init_new_workspace,
             )
 
-        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
-            self.server_args.get_attention_backends()
-        )
+        (
+            self.prefill_attention_backend_str,
+            self.decode_attention_backend_str,
+        ) = self.server_args.get_attention_backends()
 
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (

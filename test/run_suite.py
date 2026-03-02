@@ -21,6 +21,7 @@ PER_COMMIT_SUITES = {
     HWBackend.AMD: [
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-nondeterministic",
         "stage-b-test-small-1-gpu-amd-mi35x",
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-large-1-gpu-amd",

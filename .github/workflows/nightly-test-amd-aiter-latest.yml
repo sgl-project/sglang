@@ -1,0 +1,1354 @@
+name: Test AITER Latest (AMD Nightly)
+
+on:
+  workflow_dispatch:
+    inputs:
+      aiter_ref:
+        description: 'AITER git ref to test (branch, tag, or SHA). Default: main (latest commit)'
+        required: false
+        type: string
+        default: 'main'
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          # MI30x Unit Tests
+          - 'nightly-test-1-gpu-unit'
+          # MI30x Accuracy Tests (GSM8K / MMMU)
+          - 'nightly-accuracy-2-gpu'
+          - 'nightly-accuracy-2-gpu-vlm'
+          - 'nightly-perf-2-gpu-text'
+          - 'nightly-perf-2-gpu-vlm'
+          - 'nightly-accuracy-8-gpu'
+          # MI30x Accuracy + Performance Tests (combined)
+          - 'nightly-8-gpu-grok1-int4'
+          - 'nightly-8-gpu-grok2'
+          - 'nightly-8-gpu-deepseek-v31'
+          - 'nightly-8-gpu-deepseek-v32'
+          - 'nightly-8-gpu-deepseek-v32-mtp'
+          - 'nightly-8-gpu-kimi-k25'
+          - 'nightly-8-gpu-qwen3-235b'
+          - 'nightly-8-gpu-glm5'
+          # MI35x jobs
+          - 'nightly-test-1-gpu-mi35x'
+          - 'nightly-8-gpu-mi35x-qwen3-235b-mxfp4'
+          - 'nightly-8-gpu-mi35x-kimi-k25'
+          - 'nightly-8-gpu-mi35x-glm5'
+          - 'nightly-accuracy-8-gpu-mi35x'
+          - 'nightly-8-gpu-mi35x-grok1-int4'
+          - 'nightly-8-gpu-mi35x-grok2'
+          - 'nightly-8-gpu-mi35x-deepseek-r1-mxfp4'
+          - 'nightly-accuracy-8-gpu-mi35x-deepseek-v32'
+          - 'nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp'
+          - 'nightly-perf-8-gpu-mi35x-deepseek-v32-basic'
+          - 'nightly-perf-8-gpu-mi35x-deepseek-v32-mtp'
+
+concurrency:
+  group: nightly-test-amd-aiter-latest-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================== Resolve AITER Ref ==============================================
+  resolve-aiter:
+    runs-on: ubuntu-latest
+    outputs:
+      aiter_sha: ${{ steps.resolve.outputs.sha }}
+      aiter_short_sha: ${{ steps.resolve.outputs.short_sha }}
+      aiter_ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve AITER commit
+        id: resolve
+        run: |
+          REF="${{ inputs.aiter_ref || 'main' }}"
+          echo "Resolving AITER ref: ${REF}"
+
+          SHA=$(git ls-remote https://github.com/ROCm/aiter.git "${REF}" | head -1 | cut -f1)
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/heads/${REF}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/tags/${REF}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA="${REF}"
+          fi
+
+          SHORT_SHA="${SHA:0:12}"
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "ref=${REF}" >> $GITHUB_OUTPUT
+
+          echo "### AITER Ref Resolution" >> $GITHUB_STEP_SUMMARY
+          echo "- **Requested ref:** \`${REF}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resolved SHA:** \`${SHA}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER repo:** https://github.com/ROCm/aiter/commit/${SHA}" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================== MI30x Unit Tests ==============================================
+  nightly-test-1-gpu-unit:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-1-gpu-unit'
+    runs-on: linux-mi325-gpu-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+          echo "Overriding AITER_COMMIT to: ${AITER_SHA}"
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang pip show amd-aiter 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "amd-aiter not installed" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --format='%H %s'" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Nightly Unit Test (1-GPU)
+        timeout-minutes: 90
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 900 --continue-on-error || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== MI30x Accuracy Tests ==============================================
+  nightly-accuracy-2-gpu:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-2-gpu'
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Nightly Test (2-GPU)
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-accuracy-2-gpu-vlm:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-2-gpu-vlm'
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Nightly Accuracy Test (2-GPU VLM MMMU)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu-vlm --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-perf-2-gpu-text:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-2-gpu-text'
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Performance Test (2-GPU Text Models)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-perf-text-2-gpu --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-perf-2-gpu-vlm:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-2-gpu-vlm'
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Performance Test (2-GPU VLM Models)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-perf-vlm-2-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-accuracy-8-gpu:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU GPT-OSS)
+        timeout-minutes: 180
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-gpt-oss --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy Test (8-GPU Grok1-FP8)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok1-fp8 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== MI30x Combined Accuracy + Performance Tests ==============================================
+  nightly-8-gpu-grok1-int4:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-grok1-int4'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU Grok1-INT4)
+        timeout-minutes: 60
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok1-int4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU Grok1-INT4)
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok1-int4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-grok2:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-grok2'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU Grok2)
+        timeout-minutes: 60
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok2 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU Grok2)
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok2 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-deepseek-v31:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-v31'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.1)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v31 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-V3.1)
+        timeout-minutes: 300
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_ROCM700A=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v31 --nightly --timeout-per-file 18000 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-deepseek-v32:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-v32'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 Basic)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-V3.2 Basic)
+        timeout-minutes: 150
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-basic --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-deepseek-v32-mtp:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-v32-mtp'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 MTP)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-V3.2 MTP)
+        timeout-minutes: 180
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-kimi-k25:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-kimi-k25'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU Kimi-K2.5)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-kimi-k25 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-qwen3-235b:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-qwen3-235b'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test + Performance Test (8-GPU Qwen3)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-8-gpu-qwen3-235b --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-glm5:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-glm5'
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test (8-GPU GLM-5 NSA)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm5 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== MI35x Tests ==============================================
+  nightly-test-1-gpu-mi35x:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-1-gpu-mi35x'
+    runs-on: linux-mi35x-gpu-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Nightly Test MI35x (1-GPU)
+        timeout-minutes: 90
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x --nightly --timeout-per-file 900 --continue-on-error || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-accuracy-8-gpu-mi35x:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU GPT-OSS)
+        timeout-minutes: 180
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-grok1-int4:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-grok1-int4'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU Grok1-INT4)
+        timeout-minutes: 90
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU Grok1-INT4)
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-grok2:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-grok2'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU Grok2)
+        timeout-minutes: 60
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU Grok2)
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-deepseek-r1-mxfp4:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-deepseek-r1-mxfp4'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU DeepSeek-R1-MXFP4)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU DeepSeek-R1-MXFP4)
+        timeout-minutes: 300
+        continue-on-error: true
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-accuracy-8-gpu-mi35x-deepseek-v32:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2 TP+MTP)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-perf-8-gpu-mi35x-deepseek-v32-basic:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32-basic'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 Basic)
+        timeout-minutes: 150
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-kimi-k25:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-kimi-k25'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU Kimi-K2.5)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k25 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-qwen3-235b-mxfp4:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-qwen3-235b-mxfp4'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test + Performance Test MI35x (8-GPU Qwen3-235B-MXFP4)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-8-gpu-mi35x-glm5:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-glm5'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Accuracy Test MI35x (8-GPU GLM-5 NSA)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-perf-8-gpu-mi35x-deepseek-v32-mtp:
+    needs: resolve-aiter
+    if: inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32-mtp'
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Override AITER commit in Dockerfile
+        run: |
+          AITER_SHA="${{ needs.resolve-aiter.outputs.aiter_sha }}"
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm.Dockerfile
+          sed -i "s/AITER_COMMIT=\"[^\"]*\"/AITER_COMMIT=\"${AITER_SHA}\"/g" docker/rocm720.Dockerfile
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Verify AITER version
+        run: |
+          echo "### AITER Version Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\` (\`${{ needs.resolve-aiter.outputs.aiter_short_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          docker exec ci_sglang bash -c "cd /sgl-workspace/aiter 2>/dev/null && git log -1 --oneline" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+      - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 MTP)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== Summary ==============================================
+  check-all-jobs:
+    if: always()
+    needs:
+      - resolve-aiter
+      # MI30x Unit Tests
+      - nightly-test-1-gpu-unit
+      # MI30x Accuracy Tests
+      - nightly-accuracy-2-gpu
+      - nightly-accuracy-2-gpu-vlm
+      - nightly-accuracy-8-gpu
+      # MI30x Combined Accuracy + Performance Tests
+      - nightly-8-gpu-grok1-int4
+      - nightly-8-gpu-grok2
+      - nightly-8-gpu-deepseek-v31
+      - nightly-8-gpu-deepseek-v32
+      - nightly-8-gpu-deepseek-v32-mtp
+      - nightly-8-gpu-kimi-k25
+      - nightly-8-gpu-qwen3-235b
+      - nightly-8-gpu-glm5
+      # MI35x jobs
+      - nightly-test-1-gpu-mi35x
+      - nightly-accuracy-8-gpu-mi35x
+      - nightly-8-gpu-mi35x-grok1-int4
+      - nightly-8-gpu-mi35x-grok2
+      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
+      - nightly-accuracy-8-gpu-mi35x-deepseek-v32
+      - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
+      - nightly-8-gpu-mi35x-kimi-k25
+      - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
+      - nightly-8-gpu-mi35x-glm5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## AITER Latest Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER ref:** \`${{ needs.resolve-aiter.outputs.aiter_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### MI30x Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-1-gpu-unit | \`${{ needs.nightly-test-1-gpu-unit.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-2-gpu | \`${{ needs.nightly-accuracy-2-gpu.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-2-gpu-vlm | \`${{ needs.nightly-accuracy-2-gpu-vlm.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-perf-2-gpu-text | \`${{ needs.nightly-perf-2-gpu-text.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-perf-2-gpu-vlm | \`${{ needs.nightly-perf-2-gpu-vlm.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-8-gpu | \`${{ needs.nightly-accuracy-8-gpu.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-grok1-int4 | \`${{ needs.nightly-8-gpu-grok1-int4.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-grok2 | \`${{ needs.nightly-8-gpu-grok2.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-deepseek-v31 | \`${{ needs.nightly-8-gpu-deepseek-v31.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-deepseek-v32 | \`${{ needs.nightly-8-gpu-deepseek-v32.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-deepseek-v32-mtp | \`${{ needs.nightly-8-gpu-deepseek-v32-mtp.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-kimi-k25 | \`${{ needs.nightly-8-gpu-kimi-k25.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-qwen3-235b | \`${{ needs.nightly-8-gpu-qwen3-235b.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-glm5 | \`${{ needs.nightly-8-gpu-glm5.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### MI35x Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-1-gpu-mi35x | \`${{ needs.nightly-test-1-gpu-mi35x.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-8-gpu-mi35x | \`${{ needs.nightly-accuracy-8-gpu-mi35x.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-grok1-int4 | \`${{ needs.nightly-8-gpu-mi35x-grok1-int4.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-grok2 | \`${{ needs.nightly-8-gpu-mi35x-grok2.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-deepseek-r1-mxfp4 | \`${{ needs.nightly-8-gpu-mi35x-deepseek-r1-mxfp4.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-8-gpu-mi35x-deepseek-v32 | \`${{ needs.nightly-accuracy-8-gpu-mi35x-deepseek-v32.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp | \`${{ needs.nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-perf-8-gpu-mi35x-deepseek-v32-basic | \`${{ needs.nightly-perf-8-gpu-mi35x-deepseek-v32-basic.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-perf-8-gpu-mi35x-deepseek-v32-mtp | \`${{ needs.nightly-perf-8-gpu-mi35x-deepseek-v32-mtp.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-kimi-k25 | \`${{ needs.nightly-8-gpu-mi35x-kimi-k25.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-qwen3-235b-mxfp4 | \`${{ needs.nightly-8-gpu-mi35x-qwen3-235b-mxfp4.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-8-gpu-mi35x-glm5 | \`${{ needs.nightly-8-gpu-mi35x-glm5.result }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more test jobs failed with AITER ref: ${{ needs.resolve-aiter.outputs.aiter_ref }}"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more test jobs were cancelled"
+            exit 1
+          fi
+          echo "All test jobs passed with AITER ${{ needs.resolve-aiter.outputs.aiter_ref }} (${{ needs.resolve-aiter.outputs.aiter_short_sha }})"

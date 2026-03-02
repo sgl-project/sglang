@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     SeqId,
     TokenAlignerGlobalAux,
     TokenAlignerSeqInfo,

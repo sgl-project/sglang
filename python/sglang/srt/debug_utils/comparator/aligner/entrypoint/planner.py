@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from sglang.srt.debug_utils.comparator.aligner.axis_swapper import (
-    AxisSwapperPlan,
-    compute_axis_swapper_plan,
+from sglang.srt.debug_utils.comparator.aligner.axis_aligner import (
+    AxisAlignerPlan,
+    compute_axis_aligner_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
@@ -14,7 +14,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
 from sglang.srt.debug_utils.comparator.aligner.reorderer.planner import (
     compute_reorderer_plans,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
@@ -23,13 +23,18 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
 from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.dims import DimSpec, parse_dims
+from sglang.srt.debug_utils.comparator.dims import (
+    DimSpec,
+    _SingletonDimUtil,
+    parse_dims,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 
 
 def compute_aligner_plan(
     *,
     metas_pair: Pair[list[dict[str, Any]]],
+    token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
@@ -38,7 +43,7 @@ def compute_aligner_plan(
     dims_str_pair: Pair[Optional[str]] = metas_pair.map(
         lambda metas: metas[0].get("dims") if metas else None
     )
-    axis_swapper_plan: Optional[AxisSwapperPlan] = compute_axis_swapper_plan(
+    axis_aligner_plan: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
         dims_str_pair=dims_str_pair
     )
 
@@ -53,8 +58,9 @@ def compute_aligner_plan(
                 thd_seq_lens_by_step=thd_seq_lens_by_step_pair.y,
             ),
         ),
+        token_aligner_mode=token_aligner_mode,
         token_aligner_plan=token_aligner_plan,
-        axis_swapper_plan=axis_swapper_plan,
+        axis_aligner_plan=axis_aligner_plan,
     )
 
 
@@ -100,7 +106,7 @@ def compute_per_step_sub_plans(
     if dims_str is None:
         return []
 
-    dim_specs: list[DimSpec] = parse_dims(dims_str)
+    dim_specs: list[DimSpec] = _SingletonDimUtil.filter_out(parse_dims(dims_str).dims)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
 
     unsharder_plans = compute_unsharder_plan(
