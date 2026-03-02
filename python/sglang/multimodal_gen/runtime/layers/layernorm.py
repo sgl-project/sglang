@@ -11,16 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.accel_capabilities import (
-    has_sgl_kernel,
-    has_triton,
-)
 
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
-_triton_available = has_triton()
 _has_sgl_kernel_rmsnorm = False
-if _is_cuda and has_sgl_kernel():
+if _is_cuda:
     try:
         from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
@@ -35,33 +30,23 @@ if _is_npu:
 
 _has_triton_norm = False
 _has_triton_scale_shift = False
-if _triton_available:
-    try:
-        from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
-        from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import (
-            triton_one_pass_rms_norm,
-        )
+try:
+    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import (
+        triton_one_pass_rms_norm,
+    )
 
-        _has_triton_norm = True
-    except Exception:
-        norm_infer = None
-        rms_norm_fn = None
-        triton_one_pass_rms_norm = None
-else:
+    _has_triton_norm = True
+except Exception:
     norm_infer = None
     rms_norm_fn = None
     triton_one_pass_rms_norm = None
 
-if _triton_available:
-    try:
-        from sglang.jit_kernel.diffusion.triton.scale_shift import (
-            fuse_scale_shift_kernel,
-        )
+try:
+    from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 
-        _has_triton_scale_shift = True
-    except Exception:
-        fuse_scale_shift_kernel = None
-else:
+    _has_triton_scale_shift = True
+except Exception:
     fuse_scale_shift_kernel = None
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -120,6 +105,7 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        device = x.device
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -132,11 +118,8 @@ class RMSNorm(CustomOp):
                 return out[0].view(shape), out[1].view(residual_shape)
             out = out.view(shape)
             return out
-        if self.variance_size_override is not None:
-            out = self.forward_native(x, residual)
-            if residual is not None:
-                return out[0].view(shape), out[1].view(residual_shape)
-            return out.view(shape)
+        elif self.variance_size_override is not None:
+            return self.forward_native(x, residual)
         elif residual is not None and _has_sgl_kernel_rmsnorm:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)

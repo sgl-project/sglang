@@ -3,8 +3,7 @@ import platform
 
 from sglang.multimodal_gen._triton_stub import install_triton_stub_if_needed
 
-# Windows native runtime does not have official Triton support today; install a
-# no-op compatibility shim so Triton-importing modules can be imported safely.
+# Native Windows runtime needs import compatibility for Triton-backed modules.
 if platform.system() == "Windows":
     install_triton_stub_if_needed()
 

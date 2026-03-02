@@ -36,10 +36,6 @@ jobs:
         run: |
           pip install -e python --no-deps
 
-      - name: Verify Windows packaging markers
-        run: |
-          python -c "import tomllib, pathlib; data = tomllib.loads(pathlib.Path('python/pyproject.toml').read_text(encoding='utf-8')); deps = data['project']['dependencies']; assert any(d == \"sgl-kernel==0.3.21 ; sys_platform == 'linux'\" for d in deps); assert any(d == \"uvloop ; sys_platform != 'win32'\" for d in deps); print('Packaging markers verified.')"
-
       - name: Run tiny diffusion generation on Windows CPU
         shell: pwsh
         run: |

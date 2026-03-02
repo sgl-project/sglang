@@ -20,21 +20,13 @@ try:
         flash_attn_varlen_func as flash_attn_varlen_func_fa4,
     )
 
-    _flash_attn_import_error = None
-
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
             return flash_attn_varlen_func_fa4(*args, **kwargs)
         return flash_attn_varlen_func(*args, ver=ver, **kwargs)
 
 except ImportError as e:
-    _flash_attn_import_error = e
-
-    def flash_attn_func(*args, ver: int = 3, **kwargs):
-        raise ImportError(
-            "sgl_kernel.flash_attn is unavailable. Install sgl-kernel or use torch_sdpa."
-        ) from _flash_attn_import_error
-
+    raise e
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

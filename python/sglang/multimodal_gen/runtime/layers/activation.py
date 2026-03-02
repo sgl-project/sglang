@@ -12,24 +12,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.accel_capabilities import has_sgl_kernel
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
 _has_sgl_kernel_silu = False
-if (_is_cuda or _is_hip) and has_sgl_kernel():
+if _is_cuda or _is_hip:
     try:
         from sgl_kernel import silu_and_mul
 
         _has_sgl_kernel_silu = True
-    except Exception as e:
-        logger.info(
-            "sgl-kernel silu_and_mul is unavailable, falling back to native: %s", e
-        )
+    except Exception:
+        _has_sgl_kernel_silu = False
 
 if _is_npu:
     import torch_npu
