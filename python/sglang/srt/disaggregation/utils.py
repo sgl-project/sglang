@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Type, overload
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
@@ -422,6 +422,59 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     # ceil(num_kv_indices / page_size)
     return (num_kv_indices + page_size - 1) // page_size
+
+
+def get_cp_rank_page_range(
+    total_pages: int,
+    cp_rank: int,
+    cp_size: int,
+) -> Tuple[int, int]:
+    """
+    Even split of total_pages across cp_size ranks by contiguous page ranges.
+    Each rank has full KV cache; we assign each a contiguous [start_page, end_page) to send.
+    When not divisible: first (total_pages % cp_size) ranks get one extra page.
+
+    Returns:
+        (start_page, end_page) for this cp_rank, end_page exclusive.
+    """
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    start_page = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    end_page = start_page + n_pages
+    return (start_page, end_page)
+
+
+def page_indices_to_cp_rank_page_indices(
+    page_indices: np.ndarray,
+    total_pages: int,
+    cp_rank: int,
+    cp_size: int,
+) -> np.ndarray:
+    """
+    Filter page_indices to those belonging to the given CP rank.
+    Page range is split evenly across cp_size ranks; when total_pages is not
+    divisible by cp_size, the first (total_pages % cp_size) ranks get one extra page.
+
+    Returns:
+        Subset of page_indices that fall in this rank's [start_page, end_page).
+    """
+    if cp_size <= 1:
+        return page_indices
+
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+
+    if rem == 0:
+        start_page = cp_rank * base
+        end_page = start_page + base
+    else:
+        start_page = cp_rank * base + min(cp_rank, rem)
+        n_pages = base + (1 if cp_rank < rem else 0)
+        end_page = start_page + n_pages
+
+    mask = (page_indices >= start_page) & (page_indices < end_page)
+    return np.asarray(page_indices)[mask]
 
 
 #########################

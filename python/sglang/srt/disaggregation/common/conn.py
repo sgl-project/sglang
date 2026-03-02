@@ -110,6 +110,7 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        self.cp_all_ranks_transfer = envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
 
         # bind zmq socket
         context = zmq.Context()
@@ -124,9 +125,13 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # TODO(shangming): Fix me when we support MHA/GQA + CP, or when we utilize all cp ranks for KV transfer in CP mode.
+            # When SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER is True, all CP ranks
+            # participate in KV transfer (page-split); otherwise only rank 0 sends (MLA+CP).
             self.is_dummy_cp_rank = (
-                is_mla_backend and self.attn_cp_size > 1 and self.attn_cp_rank != 0
+                self.cp_all_ranks_transfer
+                and is_mla_backend
+                and self.attn_cp_size > 1
+                and self.attn_cp_rank != 0
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
@@ -501,10 +506,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            # TODO(shangming): Support KVCache transfer for multiple prefill cp ranks -> 1 decode cp rank
-            # For now, we handle the control plane in advance, but we need to support the data plane in the future.
-            if self.kv_mgr.is_mla_backend:
-                # For MLA: we only need to retrieve KVCache from the first CP rank now
+            if self.kv_mgr.is_mla_backend and not self.kv_mgr.cp_all_ranks_transfer:
+                # MLA + CP: only retrieve from prefill CP rank 0 when not using all ranks
                 self.target_cp_ranks = self.target_cp_ranks[:1]
                 self.required_prefill_response_num *= 1
             else:

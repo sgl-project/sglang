@@ -35,10 +35,12 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_cp_rank_page_range,
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
+    page_indices_to_cp_rank_page_indices,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
@@ -309,6 +311,20 @@ class PrefillBootstrapQueue:
             assert req.metadata_buffer_index is not None
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+
+            # When cp_all_ranks_transfer is on, each CP rank inits with its share of
+            # pages; otherwise only rank 0 sends and uses full num_pages.
+            if (
+                self.kv_manager.cp_all_ranks_transfer
+                and self.kv_manager.attn_cp_size > 1
+            ):
+                start_page, end_page = get_cp_rank_page_range(
+                    num_pages,
+                    self.kv_manager.attn_cp_rank,
+                    self.kv_manager.attn_cp_size,
+                )
+                num_pages = max(0, end_page - start_page)
+
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -738,4 +754,19 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+
+        # When cp_all_ranks_transfer is on, all CP ranks send their page range;
+        # otherwise only rank 0 sends and sends all pages.
+        if (
+            self.kv_manager.cp_all_ranks_transfer
+            and self.kv_manager.attn_cp_size > 1
+        ):
+            total_pages = kv_to_page_num(len(req.origin_input_ids), page_size)
+            page_indices = page_indices_to_cp_rank_page_indices(
+                page_indices,
+                total_pages,
+                self.kv_manager.attn_cp_rank,
+                self.kv_manager.attn_cp_size,
+            )
+
         req.disagg_kv_sender.send(page_indices, state_indices)
