@@ -1,0 +1,159 @@
+name: Scheduled Full AMD Test (AITER Latest)
+
+on:
+  schedule:
+    - cron: '0 20 * * 1'   # Monday 20:00 UTC
+    - cron: '0 20 * * 4'   # Thursday 20:00 UTC
+  workflow_dispatch:
+    inputs:
+      aiter_ref:
+        description: 'AITER git ref (branch, tag, or SHA). Default: main (latest commit)'
+        required: false
+        type: string
+        default: 'main'
+      job_filter:
+        description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
+        required: false
+        type: string
+        default: 'all'
+      continue_on_error:
+        description: 'Continue running other workflows even if one fails'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: scheduled-aiter-latest-full-test-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-aiter:
+    runs-on: ubuntu-latest
+    outputs:
+      aiter_sha: ${{ steps.resolve.outputs.sha }}
+      run_nightly_amd: ${{ steps.parse.outputs.run_nightly_amd }}
+      run_nightly_amd_rocm720: ${{ steps.parse.outputs.run_nightly_amd_rocm720 }}
+      run_pr_test_amd: ${{ steps.parse.outputs.run_pr_test_amd }}
+      run_pr_test_amd_rocm720: ${{ steps.parse.outputs.run_pr_test_amd_rocm720 }}
+    steps:
+      - name: Resolve AITER commit
+        id: resolve
+        run: |
+          REF="${{ inputs.aiter_ref || 'main' }}"
+          echo "Resolving AITER ref: ${REF}"
+
+          SHA=$(git ls-remote https://github.com/ROCm/aiter.git "${REF}" | head -1 | cut -f1)
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/heads/${REF}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/tags/${REF}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA="${REF}"
+          fi
+
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "### AITER Ref Resolution" >> $GITHUB_STEP_SUMMARY
+          echo "- **Requested ref:** \`${REF}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resolved SHA:** \`${SHA}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${SHA}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Parse job filter
+        id: parse
+        run: |
+          FILTER="${{ inputs.job_filter || 'all' }}"
+          echo "Job filter: ${FILTER}"
+
+          if [[ "$FILTER" == "all" ]]; then
+            echo "run_nightly_amd=true" >> $GITHUB_OUTPUT
+            echo "run_nightly_amd_rocm720=true" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd=true" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd_rocm720=true" >> $GITHUB_OUTPUT
+          else
+            # Wrap with commas for exact substring matching (avoids "nightly-amd" matching "nightly-amd-rocm720")
+            PADDED=",${FILTER// /},"
+            echo "run_nightly_amd=$(echo "$PADDED" | grep -q ',nightly-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "run_nightly_amd_rocm720=$(echo "$PADDED" | grep -q ',nightly-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd=$(echo "$PADDED" | grep -q ',pr-test-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd_rocm720=$(echo "$PADDED" | grep -q ',pr-test-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
+          fi
+
+          echo "### Job Filter" >> $GITHUB_STEP_SUMMARY
+          echo "- **Filter:** \`${FILTER}\`" >> $GITHUB_STEP_SUMMARY
+
+  call-nightly-amd:
+    if: needs.resolve-aiter.outputs.run_nightly_amd == 'true'
+    needs: resolve-aiter
+    uses: ./.github/workflows/nightly-test-amd.yml
+    secrets: inherit
+    with:
+      aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      job_filter: 'all'
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
+
+  call-nightly-amd-rocm720:
+    if: needs.resolve-aiter.outputs.run_nightly_amd_rocm720 == 'true'
+    needs: resolve-aiter
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
+    secrets: inherit
+    with:
+      aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      job_filter: 'all'
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
+
+  call-pr-test-amd:
+    if: needs.resolve-aiter.outputs.run_pr_test_amd == 'true'
+    needs: resolve-aiter
+    uses: ./.github/workflows/pr-test-amd.yml
+    secrets: inherit
+    with:
+      run_all_tests: true
+      aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
+
+  call-pr-test-amd-rocm720:
+    if: needs.resolve-aiter.outputs.run_pr_test_amd_rocm720 == 'true'
+    needs: resolve-aiter
+    uses: ./.github/workflows/pr-test-amd-rocm720.yml
+    secrets: inherit
+    with:
+      run_all_tests: true
+      aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
+
+  check-all-jobs:
+    if: always()
+    needs:
+      - resolve-aiter
+      - call-nightly-amd
+      - call-nightly-amd-rocm720
+      - call-pr-test-amd
+      - call-pr-test-amd-rocm720
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## Scheduled Full AMD Test (AITER Latest) Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD (AITER Latest) | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD ROCm 7.2 | \`${{ needs.call-nightly-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD (AITER Latest) | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.2 | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more workflows failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more workflows were cancelled"
+            exit 1
+          fi
+          echo "All workflows passed"
