@@ -42,7 +42,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         # Support both standard format (functions.{func_name}:{index}) and UUID format (call_{uuid})
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>(?:[\w\.\-]+:\d+|call_[\w]+))\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>(?:[\w\.\-]+:\d+|call_[\w\-]+))\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
         )
 
         # Use a pattern that stops at <|tool_call_end|> or end of string
@@ -50,7 +50,7 @@ class KimiK2Detector(BaseFormatDetector):
         # except when it would start <|tool_call_end|>
         # Support both standard format and UUID format
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>(?:[\w\.\-]+:\d+|call_[\w]+))\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{(?:(?!<\|tool_call_end\|>).)*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>(?:[\w\.\-]+:\d+|call_[\w\-]+))\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{(?:(?!<\|tool_call_end\|>).)*)",
             re.DOTALL,
         )
 
@@ -69,7 +69,7 @@ class KimiK2Detector(BaseFormatDetector):
         # Note: function names may contain hyphens (e.g., mcp__portal__search-documents)
         # For UUID format, we'll extract function name from JSON arguments
         self.tool_call_id_regex = re.compile(
-            r"^(?:(?:functions\.)?(?P<name>[\w\.\-]+):(?P<index>\d+)|(?P<call_id>call_[\w]+))$"
+            r"^(?:(?:functions\.)?(?P<name>[\w\.\-]+):(?P<index>\d+)|(?P<call_id>call_[\w\-]+))$"
         )
 
     def reset(self):
