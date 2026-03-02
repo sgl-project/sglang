@@ -2118,9 +2118,7 @@ class ServerArgs:
                 self.tp_size % (self.dp_size * self.attn_cp_size) == 0
             ), "tp_size must be divisible by dp_size * attn_cp_size"
             if not self.enable_nsa_prefill_context_parallel:
-                assert (
-                    self.pp_size == 1
-                ), "PP is not supported with context parallelism"
+                assert self.pp_size == 1, "PP is not supported with context parallelism"
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
