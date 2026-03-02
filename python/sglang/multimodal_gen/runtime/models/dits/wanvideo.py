@@ -136,6 +136,7 @@ class WanSelfAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         is_cross_attention: bool = False,
         quant_config: QuantizationConfig | None = None,
+        is_cross_attention: bool = False,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -174,7 +175,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
-            is_cross_attention=is_cross_attention,
+            skip_sequence_parallel=is_cross_attention,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
@@ -195,6 +196,9 @@ class WanT2VCrossAttention(WanSelfAttention):
             **kwargs,
             is_cross_attention=True,
         )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, is_cross_attention=True)
 
     def forward(self, x, context, context_lens):
         r"""
@@ -220,7 +224,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        x = self.attn(q, k, v, skip_sp=True)
+        x = self.attn(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -249,6 +253,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
             is_cross_attention=True,
             quant_config=quant_config,
+            is_cross_attention=True,
         )
 
         self.add_k_proj = ColumnParallelLinear(
@@ -296,8 +301,8 @@ class WanI2VCrossAttention(WanSelfAttention):
         v_img, _ = self.add_v_proj(context_img)
         v_img = v_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        img_x = self.attn(q, k_img, v_img, skip_sp=True)
-        x = self.attn(q, k, v, skip_sp=True)
+        img_x = self.attn(q, k_img, v_img)
+        x = self.attn(q, k, v)
 
         # output
         x = x.flatten(2)
