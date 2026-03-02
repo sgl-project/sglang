@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import sglang.srt.debug_utils.comparator.entrypoint as _entrypoint_module
 import sglang.srt.debug_utils.dumper as _dumper_module
 from sglang.srt.debug_utils.comparator.entrypoint import (
     parse_args,
@@ -14,14 +15,15 @@ from sglang.srt.debug_utils.comparator.entrypoint import (
 )
 from sglang.srt.debug_utils.comparator.output_types import (
     AnyRecord,
+    ComparisonErrorRecord,
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
     InfoLog,
     LogRecord,
-    ComparisonNonTensorRecord,
     ReplicatedCheckResult,
-    ComparisonSkipRecord,
     SummaryRecord,
-    ComparisonTensorRecord,
     _OutputRecord,
     parse_record_json,
 )
@@ -4458,6 +4460,78 @@ class TestEntrypointAutoDescend:
         argv: list[str] = _make_argv(baseline_exp, empty_dir, preset="raw")
         with pytest.raises(ValueError, match="no .pt files found"):
             run(parse_args(argv))
+
+
+class TestErrorResilience:
+    """Bundle comparison exception → continue with remaining bundles."""
+
+    def test_one_bundle_errors_others_continue(self, tmp_path, capsys, monkeypatch):
+        """One bundle raises exception → other bundles still compared, summary correct."""
+        baseline_path, target_path = _create_dumps(
+            tmp_path, ["tensor_a", "tensor_b", "tensor_c"]
+        )
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        original = _entrypoint_module.compare_bundle_pair
+
+        def _patched(**kwargs):
+            if kwargs["name"] == "tensor_b":
+                raise RuntimeError("intentional test error")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _patched)
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert errors[0].name == "tensor_b"
+        assert errors[0].exception_type == "RuntimeError"
+        assert "intentional test error" in errors[0].traceback_str
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.errored == 1
+        assert summary.passed == 2
+        assert summary.total == 3
+
+        assert exit_code == 1
+
+    def test_all_bundles_error_exits_one(self, tmp_path, capsys, monkeypatch):
+        """All bundles error → exit 1, summary all errored."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _always_raise(**kwargs):
+            raise ValueError("always fail")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _always_raise)
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.errored == 1
+        assert summary.passed == 0
+        assert exit_code == 1
+
+    def test_error_record_json_roundtrip_in_output(self, tmp_path, capsys, monkeypatch):
+        """ComparisonErrorRecord correctly serializes and deserializes in output."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _raise(**kwargs):
+            raise TypeError("bad type")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _raise)
+
+        records, _ = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert errors[0].exception_type == "TypeError"
 
 
 if __name__ == "__main__":

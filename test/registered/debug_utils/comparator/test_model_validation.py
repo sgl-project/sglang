@@ -22,11 +22,12 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
-    ErrorLog,
+    ComparisonErrorRecord,
     ComparisonNonTensorRecord,
     ComparisonSkipRecord,
-    SummaryRecord,
     ComparisonTensorRecord,
+    ErrorLog,
+    SummaryRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
@@ -155,6 +156,14 @@ class TestSummaryRecord:
     def test_total_mismatch(self):
         with pytest.raises(ValidationError, match="total=10"):
             SummaryRecord(total=10, passed=5, failed=2, skipped=1)
+
+    def test_valid_with_errored(self):
+        record = SummaryRecord(total=10, passed=6, failed=2, skipped=1, errored=1)
+        assert record.errored == 1
+
+    def test_total_mismatch_with_errored(self):
+        with pytest.raises(ValidationError, match="total=10"):
+            SummaryRecord(total=10, passed=6, failed=2, skipped=1, errored=0)
 
 
 class TestAxisInfo:
@@ -327,6 +336,30 @@ class TestOutputRecordCategories:
         text: str = record.to_text()
         assert "baseline" in text
         assert "target" in text
+
+    def test_error_record_category_is_errored(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="ValueError", traceback_str="..."
+        )
+        assert record.category == "errored"
+
+    def test_error_record_json_roundtrip(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="ValueError", traceback_str="traceback..."
+        )
+        json_str: str = record.model_dump_json()
+        roundtripped = parse_record_json(json_str)
+        assert isinstance(roundtripped, ComparisonErrorRecord)
+        assert roundtripped.name == "t"
+        assert roundtripped.exception_type == "ValueError"
+
+    def test_error_record_text_format(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="RuntimeError", traceback_str="Traceback..."
+        )
+        text: str = record.to_text()
+        assert "RuntimeError" in text
+        assert "Traceback" in text
 
 
 def _make_aligner_plan() -> AlignerPlan:
