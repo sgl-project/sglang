@@ -208,7 +208,7 @@ class TestPerTokenHeatmapManualVerify:
         rows for different tensor names. Colorbar shows log10 scale.
         """
         from sglang.srt.debug_utils.comparator.output_types import (
-            TensorComparisonRecord,
+            ComparisonTensorRecord,
         )
         from sglang.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
@@ -222,7 +222,7 @@ class TestPerTokenHeatmapManualVerify:
         hidden_dim: int = 128
         num_tensors: int = 5
 
-        records: list[TensorComparisonRecord] = []
+        records: list[ComparisonTensorRecord] = []
         for i in range(num_tensors):
             baseline: torch.Tensor = torch.randn(seq_len, hidden_dim)
             noise_scale: torch.Tensor = torch.linspace(
@@ -237,7 +237,7 @@ class TestPerTokenHeatmapManualVerify:
                 diff_threshold=1e-3,
                 seq_dim=0,
             )
-            records.append(TensorComparisonRecord(**info.model_dump()))
+            records.append(ComparisonTensorRecord(**info.model_dump()))
 
         output_path: Path = tmp_path / "per_token_increasing_diff.png"
         result = generate_per_token_heatmap(records=records, output_path=output_path)
@@ -253,7 +253,7 @@ class TestPerTokenHeatmapManualVerify:
         rest is dark/cold.
         """
         from sglang.srt.debug_utils.comparator.output_types import (
-            TensorComparisonRecord,
+            ComparisonTensorRecord,
         )
         from sglang.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
@@ -268,7 +268,7 @@ class TestPerTokenHeatmapManualVerify:
         spike_pos: int = 32
         num_tensors: int = 4
 
-        records: list[TensorComparisonRecord] = []
+        records: list[ComparisonTensorRecord] = []
         for i in range(num_tensors):
             baseline: torch.Tensor = torch.randn(seq_len, hidden_dim)
             target: torch.Tensor = baseline.clone()
@@ -281,7 +281,7 @@ class TestPerTokenHeatmapManualVerify:
                 diff_threshold=1e-3,
                 seq_dim=0,
             )
-            records.append(TensorComparisonRecord(**info.model_dump()))
+            records.append(ComparisonTensorRecord(**info.model_dump()))
 
         output_path: Path = tmp_path / "per_token_single_spike.png"
         result = generate_per_token_heatmap(records=records, output_path=output_path)

@@ -26,11 +26,11 @@ from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
     ConfigRecord,
-    NonTensorComparisonRecord,
+    ComparisonNonTensorRecord,
     RecordLocation,
-    SkipComparisonRecord,
+    ComparisonSkipRecord,
     SummaryRecord,
-    TensorComparisonRecord,
+    ComparisonTensorRecord,
 )
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
@@ -213,7 +213,7 @@ def _compare_bundle_pairs(
     compute_per_token: bool = False,
     meta_overrider: Optional[MetaOverrider] = None,
 ) -> Iterator[
-    Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]
+    Union[ComparisonTensorRecord, ComparisonSkipRecord, ComparisonNonTensorRecord]
 ]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
@@ -224,7 +224,7 @@ def _compare_bundle_pairs(
             lambda infos: [info.filename for info in infos]
         )
         record: Union[
-            TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord
+            ComparisonTensorRecord, ComparisonSkipRecord, ComparisonNonTensorRecord
         ] = compare_bundle_pair(
             name=name,
             filenames_pair=filenames_pair,
@@ -249,24 +249,24 @@ def _compare_bundle_pairs(
 def _consume_comparison_records(
     *,
     comparison_records: Iterator[
-        Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]
+        Union[ComparisonTensorRecord, ComparisonSkipRecord, ComparisonNonTensorRecord]
     ],
     visualize_per_token: Optional[Path] = None,
 ) -> tuple[SummaryRecord, list[str], list[str]]:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
-    collected_comparisons: list[TensorComparisonRecord] = []
+    collected_comparisons: list[ComparisonTensorRecord] = []
     skipped_names: list[str] = []
     failed_names: list[str] = []
 
     for record in comparison_records:
         counts[record.category] += 1
         report_sink.add(record)
-        if isinstance(record, SkipComparisonRecord) and record.category == "skipped":
+        if isinstance(record, ComparisonSkipRecord) and record.category == "skipped":
             skipped_names.append(record.name)
         if record.category == "failed":
             failed_names.append(record.name)
         if visualize_per_token is not None and isinstance(
-            record, TensorComparisonRecord
+            record, ComparisonTensorRecord
         ):
             collected_comparisons.append(record)
 

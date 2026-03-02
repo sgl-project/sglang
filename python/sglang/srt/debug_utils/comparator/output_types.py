@@ -146,8 +146,8 @@ class ConfigRecord(_OutputRecord):
         return _format_config_rich_body(self, verbosity=verbosity)
 
 
-class SkipComparisonRecord(_BaseComparisonRecord):
-    type: Literal["skip"] = "skip"
+class ComparisonSkipRecord(_BaseComparisonRecord):
+    type: Literal["comparison_skip"] = "comparison_skip"
     name: str
     reason: str
 
@@ -192,10 +192,10 @@ class InputIdsRecord(_TableRecord):
         return f"{self.label} input_ids & positions"
 
 
-class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
+class ComparisonTensorRecord(TensorComparisonInfo, _BaseComparisonRecord):
     model_config = ConfigDict(extra="forbid", defer_build=True)
 
-    type: Literal["comparison"] = "comparison"
+    type: Literal["comparison_tensor"] = "comparison_tensor"
     traced_plan: Optional[TracedAlignerPlan] = None
     replicated_checks: list[ReplicatedCheckResult] = Field(default_factory=list)
     raw_bundle_info: Optional[Pair[BundleSideInfo]] = None
@@ -215,8 +215,8 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
         return _format_tensor_comparison_rich_body(self, verbosity=verbosity)
 
 
-class NonTensorComparisonRecord(_BaseComparisonRecord):
-    type: Literal["non_tensor"] = "non_tensor"
+class ComparisonNonTensorRecord(_BaseComparisonRecord):
+    type: Literal["comparison_non_tensor"] = "comparison_non_tensor"
     name: str
     baseline_value: str
     target_value: str
@@ -272,9 +272,9 @@ AnyRecord = Annotated[
         ConfigRecord,
         RankInfoRecord,
         InputIdsRecord,
-        SkipComparisonRecord,
-        TensorComparisonRecord,
-        NonTensorComparisonRecord,
+        ComparisonSkipRecord,
+        ComparisonTensorRecord,
+        ComparisonNonTensorRecord,
         SummaryRecord,
         LogRecord,
     ],

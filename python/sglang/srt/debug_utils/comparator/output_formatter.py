@@ -30,10 +30,10 @@ if TYPE_CHECKING:
         ErrorLog,
         InfoLog,
         LogRecord,
-        NonTensorComparisonRecord,
-        SkipComparisonRecord,
+        ComparisonNonTensorRecord,
+        ComparisonSkipRecord,
         SummaryRecord,
-        TensorComparisonRecord,
+        ComparisonTensorRecord,
         _OutputRecord,
         _TableRecord,
     )
@@ -111,15 +111,15 @@ def _format_config_rich_body(
     return Panel("\n".join(lines), title="Comparator Config", border_style="cyan")
 
 
-# ── SkipComparisonRecord ─────────────────────────────────────────────
+# ── ComparisonSkipRecord ─────────────────────────────────────────────
 
 
-def _format_skip_body(record: SkipComparisonRecord) -> str:
+def _format_skip_body(record: ComparisonSkipRecord) -> str:
     return f"Skip: {record.name}{record._format_location_suffix()} ({record.reason})"
 
 
 def _format_skip_rich_body(
-    record: SkipComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonSkipRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
     return (
@@ -154,10 +154,10 @@ def _format_table_rich_body(
     )
 
 
-# ── TensorComparisonRecord ───────────────────────────────────────────
+# ── ComparisonTensorRecord ───────────────────────────────────────────
 
 
-def _format_tensor_comparison_body(record: TensorComparisonRecord) -> str:
+def _format_tensor_comparison_body(record: ComparisonTensorRecord) -> str:
     body: str = record._format_location_prefix() + format_comparison(record)
     if record.replicated_checks:
         body += "\n" + format_replicated_checks(record.replicated_checks)
@@ -167,7 +167,7 @@ def _format_tensor_comparison_body(record: TensorComparisonRecord) -> str:
 
 
 def _format_tensor_comparison_rich_body(
-    record: TensorComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonTensorRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
         format_comparison_rich,
@@ -178,10 +178,10 @@ def _format_tensor_comparison_rich_body(
     )
 
 
-# ── NonTensorComparisonRecord ────────────────────────────────────────
+# ── ComparisonNonTensorRecord ────────────────────────────────────────
 
 
-def _format_non_tensor_body(record: NonTensorComparisonRecord) -> str:
+def _format_non_tensor_body(record: ComparisonNonTensorRecord) -> str:
     suffix: str = record._format_location_suffix()
     if record.values_equal:
         return f"NonTensor: {record.name}{suffix} = {record.baseline_value} ({record.baseline_type}) [equal]"
@@ -193,7 +193,7 @@ def _format_non_tensor_body(record: NonTensorComparisonRecord) -> str:
 
 
 def _format_non_tensor_rich_body(
-    record: NonTensorComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonNonTensorRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
     name: str = escape(record.name)

@@ -17,11 +17,11 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ConfigRecord,
     InfoLog,
     LogRecord,
-    NonTensorComparisonRecord,
+    ComparisonNonTensorRecord,
     ReplicatedCheckResult,
-    SkipComparisonRecord,
+    ComparisonSkipRecord,
     SummaryRecord,
-    TensorComparisonRecord,
+    ComparisonTensorRecord,
     _OutputRecord,
     parse_record_json,
 )
@@ -39,7 +39,7 @@ class TestEntrypointGroupingRaw:
     """Test `--grouping-skip-keys` empty (raw) scenarios"""
 
     def test_run_basic(self, tmp_path, capsys):
-        """Two matching tensors produce ConfigRecord, 2 TensorComparisonRecords, and SummaryRecord."""
+        """Two matching tensors produce ConfigRecord, 2 ComparisonTensorRecords, and SummaryRecord."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         argv = _make_argv(baseline_path, target_path, preset="raw")
 
@@ -54,7 +54,7 @@ class TestEntrypointGroupingRaw:
         assert summary.skipped == 0
 
     def test_filter(self, tmp_path, capsys):
-        """--filter selects only the matching tensor, producing 1 TensorComparisonRecord."""
+        """--filter selects only the matching tensor, producing 1 ComparisonTensorRecord."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         argv = _make_argv(baseline_path, target_path, filter="tensor_a", preset="raw")
 
@@ -62,7 +62,7 @@ class TestEntrypointGroupingRaw:
         assert len(_get_comparisons(records)) == 1
 
     def test_no_baseline_skip(self, tmp_path, capsys):
-        """Target tensor missing from baseline emits a SkipComparisonRecord with reason baseline_load_failed."""
+        """Target tensor missing from baseline emits a ComparisonSkipRecord with reason baseline_load_failed."""
         baseline_path, target_path = _create_dumps(
             tmp_path,
             tensor_names=["tensor_a", "tensor_extra"],
@@ -71,7 +71,7 @@ class TestEntrypointGroupingRaw:
         argv = _make_argv(baseline_path, target_path, preset="raw")
 
         records, _ = _run_and_parse(argv, capsys)
-        skips = [r for r in records if isinstance(r, SkipComparisonRecord)]
+        skips = [r for r in records if isinstance(r, ComparisonSkipRecord)]
         assert len(skips) == 1
         assert skips[0].reason == "baseline_load_failed"
 
@@ -100,7 +100,7 @@ class TestEntrypointGroupingRaw:
         assert all(isinstance(r, _OutputRecord) for r in records)
 
     def test_comparison_failed(self, tmp_path, capsys):
-        """Completely different tensors produce a failed TensorComparisonRecord."""
+        """Completely different tensors produce a failed ComparisonTensorRecord."""
         torch.manual_seed(42)
         baseline_path = _create_rank_dump(
             tmp_path / "baseline", rank=0, name="tensor_a", tensor=torch.randn(10, 10)
@@ -251,7 +251,7 @@ class TestEntrypointGroupingRaw:
         assert summary.total == 0
 
     def test_raw_multi_rank(self, tmp_path, capsys):
-        """Two ranks in raw grouping produce two TensorComparisonRecords (one per rank)."""
+        """Two ranks in raw grouping produce two ComparisonTensorRecords (one per rank)."""
         torch.manual_seed(42)
         tensor = torch.randn(4, 4)
 
@@ -480,7 +480,7 @@ class TestEntrypointGroupingLogical:
         ],
     )
     def test_ambiguous_no_dims_skip(self, tmp_path, capsys, bad_side, expected_reason):
-        """Multi-rank without dims on one side produces a SkipComparisonRecord with the appropriate reason."""
+        """Multi-rank without dims on one side produces a ComparisonSkipRecord with the appropriate reason."""
         torch.manual_seed(42)
         tensor = torch.randn(4, 8)
 
@@ -500,7 +500,7 @@ class TestEntrypointGroupingLogical:
         )
 
         records, _ = _run_and_parse(argv, capsys)
-        skips = [r for r in records if isinstance(r, SkipComparisonRecord)]
+        skips = [r for r in records if isinstance(r, ComparisonSkipRecord)]
         assert len(skips) == 1
         assert skips[0].reason == expected_reason
 
@@ -1092,7 +1092,7 @@ class TestEntrypointPerStepMode:
     """Test per-step comparison mode (sglang_dev preset behavior)."""
 
     def test_multi_step_per_step_comparison(self, tmp_path, capsys):
-        """Multiple steps produce one TensorComparisonRecord per step with step field set."""
+        """Multiple steps produce one ComparisonTensorRecord per step with step field set."""
         torch.manual_seed(42)
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"], num_steps=3)
         argv = _make_argv(baseline_path, target_path, diff_threshold=0.1)
@@ -1149,7 +1149,7 @@ class TestEntrypointPerStepMode:
         assert all(c.baseline.shape == [4, 8] for c in comparisons)
 
     def test_single_step_has_step_field(self, tmp_path, capsys):
-        """Single step produces TensorComparisonRecord with location.step=0."""
+        """Single step produces ComparisonTensorRecord with location.step=0."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"], num_steps=1)
         argv = _make_argv(baseline_path, target_path)
 
@@ -1458,7 +1458,7 @@ class TestEntrypointConcatMode:
         assert len(comparisons) == 3
 
     def test_concat_aligner_plan_fields(self, tmp_path, capsys):
-        """TensorComparisonRecord.traced_plan reports mode='concat' with plan=None."""
+        """ComparisonTensorRecord.traced_plan reports mode='concat' with plan=None."""
         torch.manual_seed(42)
 
         records = self._run_concat(
@@ -1599,8 +1599,8 @@ class TestEntrypointConcatMode:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
-        hidden_comparisons: list[TensorComparisonRecord] = [
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonTensorRecord] = [
             c for c in comparisons if c.name == "hidden_states"
         ]
         assert len(hidden_comparisons) >= 1
@@ -2158,7 +2158,7 @@ class TestEntrypointNonTensorValues:
     """Test non-tensor value comparison through the full entrypoint pipeline."""
 
     def test_non_tensor_float_same_value(self, tmp_path: Path, capsys) -> None:
-        """Two sides dump the same float → NonTensorComparisonRecord with values_equal=True, category=passed."""
+        """Two sides dump the same float → ComparisonNonTensorRecord with values_equal=True, category=passed."""
         baseline_path, target_path = _create_non_tensor_dumps(
             tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.125
         )
@@ -2177,7 +2177,7 @@ class TestEntrypointNonTensorValues:
         assert summary.failed == 0
 
     def test_non_tensor_float_different_value(self, tmp_path: Path, capsys) -> None:
-        """Two sides dump different floats → NonTensorComparisonRecord with values_equal=False, category=failed."""
+        """Two sides dump different floats → ComparisonNonTensorRecord with values_equal=False, category=failed."""
         baseline_path, target_path = _create_non_tensor_dumps(
             tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.25
         )
@@ -2262,7 +2262,7 @@ class TestEntrypointNonTensorValues:
         assert non_tensors[0].target_type == "dict"
 
     def test_non_tensor_none_value(self, tmp_path: Path, capsys) -> None:
-        """Dumping None is displayed as NonTensorComparisonRecord, not skipped as load failure."""
+        """Dumping None is displayed as ComparisonNonTensorRecord, not skipped as load failure."""
         baseline_path, target_path = _create_non_tensor_dumps(
             tmp_path, name="optional_param", baseline_value=None, target_value=None
         )
@@ -2278,7 +2278,7 @@ class TestEntrypointNonTensorValues:
         assert non_tensors[0].category == "passed"
 
     def test_non_tensor_json_roundtrip(self, tmp_path: Path, capsys) -> None:
-        """NonTensorComparisonRecord JSON output can be parsed back correctly."""
+        """ComparisonNonTensorRecord JSON output can be parsed back correctly."""
         baseline_path, target_path = _create_non_tensor_dumps(
             tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.125
         )
@@ -2290,7 +2290,7 @@ class TestEntrypointNonTensorValues:
 
         json_str: str = non_tensors[0].model_dump_json()
         roundtripped = parse_record_json(json_str)
-        assert isinstance(roundtripped, NonTensorComparisonRecord)
+        assert isinstance(roundtripped, ComparisonNonTensorRecord)
         assert roundtripped.name == "sm_scale"
         assert roundtripped.values_equal is True
 
@@ -2344,17 +2344,17 @@ class TestEntrypointVisualize:
 # --------------------------- Assertion helpers -------------------
 
 
-def _get_comparisons(records: list[AnyRecord]) -> list[TensorComparisonRecord]:
-    return [r for r in records if isinstance(r, TensorComparisonRecord)]
+def _get_comparisons(records: list[AnyRecord]) -> list[ComparisonTensorRecord]:
+    return [r for r in records if isinstance(r, ComparisonTensorRecord)]
 
 
-def _get_non_tensors(records: list[AnyRecord]) -> list[NonTensorComparisonRecord]:
-    return [r for r in records if isinstance(r, NonTensorComparisonRecord)]
+def _get_non_tensors(records: list[AnyRecord]) -> list[ComparisonNonTensorRecord]:
+    return [r for r in records if isinstance(r, ComparisonNonTensorRecord)]
 
 
 def _assert_single_comparison_passed(
     records: list[AnyRecord],
-) -> TensorComparisonRecord:
+) -> ComparisonTensorRecord:
     comparisons = _get_comparisons(records)
     assert len(comparisons) == 1
     assert comparisons[0].diff is not None
@@ -3235,8 +3235,8 @@ class TestEntrypointThdCpZigzag:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
-        hidden_comparisons: list[TensorComparisonRecord] = [
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonTensorRecord] = [
             c for c in comparisons if c.name == "hidden_states"
         ]
         assert len(hidden_comparisons) >= 1
@@ -3287,8 +3287,8 @@ class TestEntrypointThdCpZigzag:
         records, _ = _run_and_parse(argv, capsys)
 
         # hidden_states should pass comparison (after unshard + reorder)
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
-        hidden_comparisons: list[TensorComparisonRecord] = [
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonTensorRecord] = [
             c for c in comparisons if c.name == "hidden_states"
         ]
         assert len(hidden_comparisons) >= 1
@@ -3355,7 +3355,7 @@ class TestEntrypointDpFilter:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
     def test_dp2_megatron_both_sides(self, tmp_path: Path, capsys) -> None:
@@ -3410,7 +3410,7 @@ class TestEntrypointDpFilter:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
     def test_dp2_tp2_sglang(self, tmp_path: Path, capsys) -> None:
@@ -3458,7 +3458,7 @@ class TestEntrypointDpFilter:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
     def test_dp2_both_nonempty_raises(self, tmp_path: Path, capsys) -> None:
@@ -3542,7 +3542,7 @@ class TestEntrypointDpGroupAlias:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
     def test_dp_alias_via_override_dims(self, tmp_path: Path, capsys) -> None:
@@ -3599,7 +3599,7 @@ class TestEntrypointDpGroupAlias:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
     def test_dp_alias_with_real_alias_group_filters(
@@ -3640,7 +3640,7 @@ class TestEntrypointDpGroupAlias:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        comparison: TensorComparisonRecord = _assert_single_comparison_passed(records)
+        comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
 
@@ -3679,7 +3679,7 @@ class TestEntrypointMetaOverride:
         records: list[AnyRecord], *, expected_count: int = 1
     ) -> None:
         """Assert that exactly expected_count comparisons exist and all passed."""
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
         assert len(comparisons) == expected_count
         assert all(c.diff is not None and c.diff.passed for c in comparisons)
 
@@ -3975,14 +3975,14 @@ class TestEntrypointMetaOverride:
         )
         records, _ = _run_and_parse(argv, capsys)
 
-        non_tensors: list[NonTensorComparisonRecord] = [
-            r for r in records if isinstance(r, NonTensorComparisonRecord)
+        non_tensors: list[ComparisonNonTensorRecord] = [
+            r for r in records if isinstance(r, ComparisonNonTensorRecord)
         ]
         assert len(non_tensors) == 1
         assert non_tensors[0].name == "sm_scale"
         assert non_tensors[0].values_equal
 
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
         assert len(comparisons) == 1
         assert comparisons[0].name == "hidden"
 
@@ -4356,9 +4356,9 @@ class TestEntrypointDpAttentionMissingAlias:
 
         assert exit_code == 1
 
-        comparisons: list[TensorComparisonRecord] = _get_comparisons(records)
+        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
         assert len(comparisons) == 1
-        comparison: TensorComparisonRecord = comparisons[0]
+        comparison: ComparisonTensorRecord = comparisons[0]
         assert comparison.shape_mismatch is True
         assert comparison.diff is None
         assert comparison.category == "failed"

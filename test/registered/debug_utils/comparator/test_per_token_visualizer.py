@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.output_types import TensorComparisonRecord
+from sglang.srt.debug_utils.comparator.output_types import ComparisonTensorRecord
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     compare_tensor_pair,
 )
@@ -31,8 +31,8 @@ def _make_comparison_record(
     baseline: torch.Tensor,
     target: torch.Tensor,
     seq_dim: int = 0,
-) -> TensorComparisonRecord:
-    """Build a TensorComparisonRecord with per-token data from raw tensors."""
+) -> ComparisonTensorRecord:
+    """Build a ComparisonTensorRecord with per-token data from raw tensors."""
     info = compare_tensor_pair(
         x_baseline=baseline,
         x_target=target,
@@ -40,7 +40,7 @@ def _make_comparison_record(
         diff_threshold=1e-3,
         seq_dim=seq_dim,
     )
-    return TensorComparisonRecord(**info.model_dump())
+    return ComparisonTensorRecord(**info.model_dump())
 
 
 class TestPerTokenVisualizer:
@@ -68,7 +68,7 @@ class TestPerTokenVisualizer:
             name="no_per_token",
             diff_threshold=1e-3,
         )
-        record = TensorComparisonRecord(**info.model_dump())
+        record = ComparisonTensorRecord(**info.model_dump())
 
         output_path: Path = tmp_path / "no_data.png"
         result = generate_per_token_heatmap(records=[record], output_path=output_path)
@@ -82,7 +82,7 @@ class TestPerTokenVisualizer:
         )
 
         torch.manual_seed(42)
-        records: list[TensorComparisonRecord] = [
+        records: list[ComparisonTensorRecord] = [
             _make_comparison_record(
                 name=f"tensor_{i}",
                 baseline=torch.randn(16, 32),
@@ -108,7 +108,7 @@ class TestPerTokenVisualizer:
         )
 
         torch.manual_seed(42)
-        records: list[TensorComparisonRecord] = [
+        records: list[ComparisonTensorRecord] = [
             _make_comparison_record(
                 name="short",
                 baseline=torch.randn(4, 8),
