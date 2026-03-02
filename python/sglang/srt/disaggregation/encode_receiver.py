@@ -186,9 +186,16 @@ class WaitingImageRequest:
 
     def send_encode_request(self):
         def _run():
-            asyncio.run(self._send_embedding_port())
+            try:
+                asyncio.run(self._send_embedding_port())
+            except Exception:
+                logger.error(
+                    f"Error in _send_embedding_port thread for request {self.rid}",
+                    exc_info=True,
+                )
 
-        threading.Thread(target=_run).start()
+        self.thread = threading.Thread(target=_run, daemon=True)
+        self.thread.start()
 
     def _try_recv_mm_data(self):
         if self.status != WaitingImageRequestStatus.PENDING:
