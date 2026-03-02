@@ -1963,7 +1963,11 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
+        if (
+            self.prefill_attention_backend == "fa4"
+            and not self.use_mla_backend()
+            and is_sm100_supported()
+        ):
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
             )
@@ -2750,13 +2754,6 @@ class ServerArgs:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
-                )
-            if (
-                self.disaggregation_mode == "decode"
-                and envs.SGLANG_ENABLE_SPEC_V2.get()
-            ):
-                raise ValueError(
-                    "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
