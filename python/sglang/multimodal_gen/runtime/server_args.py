@@ -333,11 +333,11 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def _adjust_path(self):
-        self.model_path = os.path.expanduser(self.model_path)
+        expand_path_fields(self)
+        self._adjust_save_paths()
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
-        self._adjust_save_paths()
         self._adjust_offload()
         self._adjust_path()
         self._adjust_quant_config()
