@@ -34,9 +34,9 @@ from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayou
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
+    ComparisonTensorRecord,
     ReplicatedCheckResult,
     ShapeSnapshot,
-    TensorComparisonRecord,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     _format_abs_diff_percentiles_rich,
@@ -273,9 +273,9 @@ def _make_comparison_record(
     replicated_checks: list[ReplicatedCheckResult] | None = None,
     raw_bundle_info: Pair[BundleSideInfo] | None = None,
     traced_plan: TracedAlignerPlan | None = None,
-) -> TensorComparisonRecord:
+) -> ComparisonTensorRecord:
     s: list[int] = shape if shape is not None else [4, 8]
-    return TensorComparisonRecord(
+    return ComparisonTensorRecord(
         name=name,
         baseline=_make_tensor_info(shape=s, dtype=dtype, sample=sample),
         target=_make_tensor_info(shape=s, dtype=dtype, sample=sample),
@@ -417,7 +417,7 @@ class TestFormatComparisonRichMinimal:
     """format_comparison_rich() with verbosity='minimal'."""
 
     def test_passed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(rel_diff=1e-4, passed=True),
         )
         result: str = format_comparison_rich(record, verbosity="minimal")
@@ -428,7 +428,7 @@ class TestFormatComparisonRichMinimal:
         )
 
     def test_failed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(rel_diff=0.5, passed=False),
         )
         result: str = format_comparison_rich(record, verbosity="minimal")
@@ -439,7 +439,7 @@ class TestFormatComparisonRichMinimal:
         )
 
     def test_shape_mismatch(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             shape_mismatch=True,
         )
         result: str = format_comparison_rich(record, verbosity="minimal")
@@ -450,7 +450,7 @@ class TestFormatComparisonRichMinimal:
         )
 
     def test_no_diff(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record()
+        record: ComparisonTensorRecord = _make_comparison_record()
         result: str = format_comparison_rich(record, verbosity="minimal")
 
         assert result == ("[red]❌[/] [bold red]hidden_states                 [/]")
@@ -460,7 +460,7 @@ class TestFormatComparisonRichNormal:
     """format_comparison_rich() with verbosity='normal'."""
 
     def test_passed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(rel_diff=1e-4, passed=True),
         )
         result: str = format_comparison_rich(record, verbosity="normal")
@@ -477,7 +477,7 @@ class TestFormatComparisonRichNormal:
         )
 
     def test_failed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(
                 rel_diff=0.5, max_abs_diff=1.0, mean_abs_diff=0.3, passed=False
             ),
@@ -499,7 +499,7 @@ class TestFormatComparisonRichNormal:
         )
 
     def test_shape_mismatch(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             shape_mismatch=True,
         )
         result: str = format_comparison_rich(record, verbosity="normal")
@@ -516,7 +516,7 @@ class TestFormatComparisonRichNormal:
         )
 
     def test_with_downcast(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(rel_diff=0.01, passed=False),
             diff_downcast=_make_diff(rel_diff=1e-5, passed=True),
             downcast_dtype="torch.bfloat16",
@@ -543,7 +543,7 @@ class TestFormatComparisonRichNormal:
             x=_make_bundle_side_info(num_files=2, dims="b s h(tp) d"),
             y=_make_bundle_side_info(num_files=2, dims="b s h(tp) d"),
         )
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(passed=True),
             raw_bundle_info=bundle_info,
         )
@@ -565,7 +565,7 @@ class TestFormatComparisonRichNormal:
 
     def test_with_plan(self) -> None:
         plan: AlignerPlan = _make_simple_aligner_plan(with_unsharder=True)
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(passed=True),
             traced_plan=_make_traced_plan(plan),
         )
@@ -590,7 +590,7 @@ class TestFormatComparisonRichVerbose:
     """format_comparison_rich() with verbosity='verbose'."""
 
     def test_passed_full_detail(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(rel_diff=1e-4, passed=True),
             sample="tensor([0.1, 0.2, ...])",
         )
@@ -624,7 +624,7 @@ class TestFormatComparisonRichVerbose:
             x=_make_bundle_side_info(num_files=2, with_parallel_info=True),
             y=_make_bundle_side_info(num_files=2, with_parallel_info=True),
         )
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(passed=True),
             raw_bundle_info=bundle_info,
         )
@@ -659,7 +659,7 @@ class TestFormatComparisonRichVerbose:
 
     def test_with_plan_and_traces(self) -> None:
         plan: AlignerPlan = _make_simple_aligner_plan(with_unsharder=True)
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff(passed=True),
             traced_plan=_make_traced_plan(
                 plan,

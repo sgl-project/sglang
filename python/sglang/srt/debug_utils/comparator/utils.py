@@ -141,8 +141,12 @@ def compute_exit_code(
     skipped_names: list[str],
     allow_failed_pattern: Optional[str],
     failed_names: list[str],
+    errored_names: Optional[list[str]] = None,
 ) -> int:
     if summary.passed == 0:
+        return 1
+
+    if errored_names:
         return 1
 
     if not _is_all_match_pattern(pattern=allow_failed_pattern, strings=failed_names):

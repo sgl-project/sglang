@@ -34,15 +34,15 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
     ErrorLog,
     InfoLog,
     LogRecord,
-    NonTensorComparisonRecord,
     RecordLocation,
-    SkipComparisonRecord,
     SummaryRecord,
-    TensorComparisonRecord,
     _format_aligner_plan,
     _split_logs,
 )
@@ -150,20 +150,20 @@ class TestConfigRecord:
 
 
 # ---------------------------------------------------------------------------
-# SkipComparisonRecord
+# ComparisonSkipRecord
 # ---------------------------------------------------------------------------
 
 
-class TestSkipComparisonRecord:
+class TestComparisonSkipRecord:
     def test_format_body_no_step(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="layer.weight",
             reason="zero-dim tensor",
         )
         assert record._format_body() == "Skip: layer.weight (zero-dim tensor)"
 
     def test_format_body_with_step(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="layer.weight",
             reason="scalar",
             location=RecordLocation(step=3),
@@ -171,7 +171,7 @@ class TestSkipComparisonRecord:
         assert record._format_body() == "Skip: layer.weight (step=3) (scalar)"
 
     def test_format_rich_body(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="attn.qkv",
             reason="no baseline",
         )
@@ -179,14 +179,14 @@ class TestSkipComparisonRecord:
         assert body == "[dim]⊘ attn.qkv ── skipped (no baseline)[/]"
 
     def test_category_skipped(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="x",
             reason="r",
         )
         assert record.category == "skipped"
 
     def test_category_failed(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="x",
             reason="r",
             errors=[ErrorLog(category="e", message="boom")],
@@ -195,13 +195,13 @@ class TestSkipComparisonRecord:
 
 
 # ---------------------------------------------------------------------------
-# NonTensorComparisonRecord
+# ComparisonNonTensorRecord
 # ---------------------------------------------------------------------------
 
 
-class TestNonTensorComparisonRecord:
+class TestComparisonNonTensorRecord:
     def test_format_body_equal(self) -> None:
-        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        record: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="config.lr",
             baseline_value="0.001",
             target_value="0.001",
@@ -212,7 +212,7 @@ class TestNonTensorComparisonRecord:
         assert record._format_body() == "NonTensor: config.lr = 0.001 (float) [equal]"
 
     def test_format_body_not_equal(self) -> None:
-        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        record: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="config.lr",
             baseline_value="0.001",
             target_value="0.01",
@@ -227,7 +227,7 @@ class TestNonTensorComparisonRecord:
         )
 
     def test_format_rich_body_equal(self) -> None:
-        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        record: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="config.lr",
             baseline_value="0.001",
             target_value="0.001",
@@ -238,7 +238,7 @@ class TestNonTensorComparisonRecord:
         assert record._format_rich_body() == ("═ config.lr = 0.001 (float) [green]✓[/]")
 
     def test_format_rich_body_not_equal(self) -> None:
-        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        record: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="config.lr",
             baseline_value="0.001",
             target_value="0.01",
@@ -253,7 +253,7 @@ class TestNonTensorComparisonRecord:
         )
 
     def test_with_step(self) -> None:
-        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        record: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="bias",
             baseline_value="True",
             target_value="True",
@@ -265,7 +265,7 @@ class TestNonTensorComparisonRecord:
         assert "(step=5)" in record._format_body()
 
     def test_category(self) -> None:
-        passed: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        passed: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="x",
             baseline_value="1",
             target_value="1",
@@ -273,7 +273,7 @@ class TestNonTensorComparisonRecord:
             target_type="int",
             values_equal=True,
         )
-        failed: NonTensorComparisonRecord = NonTensorComparisonRecord(
+        failed: ComparisonNonTensorRecord = ComparisonNonTensorRecord(
             name="x",
             baseline_value="1",
             target_value="2",
@@ -328,13 +328,13 @@ class TestSummaryRecord:
 
 
 # ---------------------------------------------------------------------------
-# TensorComparisonRecord._format_body
+# ComparisonTensorRecord._format_body
 # ---------------------------------------------------------------------------
 
 
-class TestTensorComparisonRecordFormatBody:
+class TestComparisonTensorRecordFormatBody:
     def test_basic(self) -> None:
-        record: TensorComparisonRecord = TensorComparisonRecord(
+        record: ComparisonTensorRecord = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -365,7 +365,7 @@ class TestTensorComparisonRecordFormatBody:
     def test_with_replicated_checks(self) -> None:
         from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 
-        record: TensorComparisonRecord = TensorComparisonRecord(
+        record: ComparisonTensorRecord = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -420,7 +420,7 @@ class TestTensorComparisonRecordFormatBody:
                 y=TracedSidePlan(step_plans=[]),
             ),
         )
-        record: TensorComparisonRecord = TensorComparisonRecord(
+        record: ComparisonTensorRecord = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -453,7 +453,7 @@ class TestTensorComparisonRecordFormatBody:
         )
 
     def test_with_step(self) -> None:
-        record: TensorComparisonRecord = TensorComparisonRecord(
+        record: ComparisonTensorRecord = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -679,7 +679,7 @@ class TestOutputRecordLogAttachment:
         assert text == "Config: {'a': 1}\n  ✗ err1\n  ℹ note1"
 
     def test_to_rich_string_body(self) -> None:
-        record: SkipComparisonRecord = SkipComparisonRecord(
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
             name="x",
             reason="r",
             errors=[ErrorLog(category="e", message="oops")],

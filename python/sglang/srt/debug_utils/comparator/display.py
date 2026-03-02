@@ -3,13 +3,9 @@ from __future__ import annotations
 from collections import defaultdict
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import polars as pl
-import rich.table
-
-if TYPE_CHECKING:
-    from rich.table import Table
 
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -43,43 +39,17 @@ def emit_display_records(
 
 def _render_polars_as_text(df: pl.DataFrame, *, title: Optional[str] = None) -> str:
     from rich.console import Console
+    from rich.table import Table
 
-    table = _build_rich_table(df, title=title)
+    table = Table(title=title)
+    for col in df.columns:
+        table.add_column(col)
+    for row in df.iter_rows():
+        table.add_row(*[str(v) for v in row])
 
     buf = StringIO()
     Console(file=buf, force_terminal=False, width=200).print(table)
     return buf.getvalue().rstrip("\n")
-
-
-def _render_polars_as_rich_table(
-    df: pl.DataFrame, *, title: Optional[str] = None
-) -> "Table":
-    return _build_rich_table(df, title=title)
-
-
-def _build_rich_table(df: pl.DataFrame, *, title: Optional[str] = None) -> "Table":
-    from rich.table import Table
-
-    table = Table(title=title)
-    for col in df.columns:
-        table.add_column(col)
-    for row in df.iter_rows():
-        table.add_row(*[str(v) for v in row])
-
-    return table
-
-
-def _render_polars_as_rich_table(
-    df: pl.DataFrame, *, title: Optional[str] = None
-) -> "rich.table.Table":
-    from rich.table import Table
-
-    table = Table(title=title)
-    for col in df.columns:
-        table.add_column(col)
-    for row in df.iter_rows():
-        table.add_row(*[str(v) for v in row])
-    return table
 
 
 def _collect_rank_info(
@@ -99,7 +69,7 @@ def _collect_rank_info(
 
         row_data: dict[str, Any] = {"rank": row["rank"]}
         for key in PARALLEL_INFO_KEYS:
-            extract_parallel_info(row_data=row_data, info=meta.get(key, {}))
+            _extract_parallel_info(row_data=row_data, info=meta.get(key, {}))
         table_rows.append(row_data)
 
     return table_rows or None
@@ -149,7 +119,7 @@ def _collect_input_ids_and_positions(
     return table_rows or None
 
 
-def extract_parallel_info(row_data: dict[str, Any], info: dict[str, Any]) -> None:
+def _extract_parallel_info(row_data: dict[str, Any], info: dict[str, Any]) -> None:
     if not info or info.get("error"):
         return
 

@@ -410,6 +410,36 @@ class TestComputeExitCode:
             == 1
         )
 
+    def test_errored_with_passed_exits_one(self):
+        """Has errored bundle even with passed → exit 1."""
+        summary = SummaryRecord(total=3, passed=2, failed=0, skipped=0, errored=1)
+        assert (
+            compute_exit_code(
+                summary,
+                allow_skipped_pattern=".*",
+                skipped_names=[],
+                allow_failed_pattern=None,
+                failed_names=[],
+                errored_names=["broken_tensor"],
+            )
+            == 1
+        )
+
+    def test_errored_only_exits_one(self):
+        """All errored → exit 1 (passed==0 already exits 1, but errored also independently triggers)."""
+        summary = SummaryRecord(total=1, passed=0, failed=0, skipped=0, errored=1)
+        assert (
+            compute_exit_code(
+                summary,
+                allow_skipped_pattern=".*",
+                skipped_names=[],
+                allow_failed_pattern=None,
+                failed_names=[],
+                errored_names=["broken_tensor"],
+            )
+            == 1
+        )
+
 
 def _make_pt(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)

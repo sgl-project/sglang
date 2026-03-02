@@ -26,14 +26,15 @@ if TYPE_CHECKING:
     )
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
     from sglang.srt.debug_utils.comparator.output_types import (
+        ComparisonErrorRecord,
+        ComparisonNonTensorRecord,
+        ComparisonSkipRecord,
+        ComparisonTensorRecord,
         ConfigRecord,
         ErrorLog,
         InfoLog,
         LogRecord,
-        NonTensorComparisonRecord,
-        SkipComparisonRecord,
         SummaryRecord,
-        TensorComparisonRecord,
         _OutputRecord,
         _TableRecord,
     )
@@ -111,20 +112,44 @@ def _format_config_rich_body(
     return Panel("\n".join(lines), title="Comparator Config", border_style="cyan")
 
 
-# ── SkipComparisonRecord ─────────────────────────────────────────────
+# ── ComparisonSkipRecord ─────────────────────────────────────────────
 
 
-def _format_skip_body(record: SkipComparisonRecord) -> str:
+def _format_skip_body(record: ComparisonSkipRecord) -> str:
     return f"Skip: {record.name}{record._format_location_suffix()} ({record.reason})"
 
 
 def _format_skip_rich_body(
-    record: SkipComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonSkipRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
     return (
         f"[dim]⊘ {escape(record.name)}{suffix} ── skipped ({escape(record.reason)})[/]"
     )
+
+
+# ── ComparisonErrorRecord ────────────────────────────────────────────
+
+
+def _format_error_body(record: ComparisonErrorRecord) -> str:
+    prefix: str = record._format_location_prefix()
+    return (
+        f"{prefix}Error: {record.name} ({record.exception_type})\n"
+        f"{record.traceback_str}"
+    )
+
+
+def _format_error_rich_body(
+    record: ComparisonErrorRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
+    prefix: str = record._format_location_prefix_rich()
+    name: str = escape(record.name)
+    header: str = (
+        f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)})[/]"
+    )
+    if verbosity == "minimal":
+        return header
+    return header + f"\n[dim]{escape(record.traceback_str)}[/]"
 
 
 # ── _TableRecord ─────────────────────────────────────────────────────
@@ -154,10 +179,10 @@ def _format_table_rich_body(
     )
 
 
-# ── TensorComparisonRecord ───────────────────────────────────────────
+# ── ComparisonTensorRecord ───────────────────────────────────────────
 
 
-def _format_tensor_comparison_body(record: TensorComparisonRecord) -> str:
+def _format_tensor_comparison_body(record: ComparisonTensorRecord) -> str:
     body: str = record._format_location_prefix() + format_comparison(record)
     if record.replicated_checks:
         body += "\n" + format_replicated_checks(record.replicated_checks)
@@ -167,7 +192,7 @@ def _format_tensor_comparison_body(record: TensorComparisonRecord) -> str:
 
 
 def _format_tensor_comparison_rich_body(
-    record: TensorComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonTensorRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
         format_comparison_rich,
@@ -178,10 +203,10 @@ def _format_tensor_comparison_rich_body(
     )
 
 
-# ── NonTensorComparisonRecord ────────────────────────────────────────
+# ── ComparisonNonTensorRecord ────────────────────────────────────────
 
 
-def _format_non_tensor_body(record: NonTensorComparisonRecord) -> str:
+def _format_non_tensor_body(record: ComparisonNonTensorRecord) -> str:
     suffix: str = record._format_location_suffix()
     if record.values_equal:
         return f"NonTensor: {record.name}{suffix} = {record.baseline_value} ({record.baseline_type}) [equal]"
@@ -193,7 +218,7 @@ def _format_non_tensor_body(record: NonTensorComparisonRecord) -> str:
 
 
 def _format_non_tensor_rich_body(
-    record: NonTensorComparisonRecord, verbosity: Verbosity = "normal"
+    record: ComparisonNonTensorRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
     name: str = escape(record.name)
@@ -216,10 +241,13 @@ def _format_non_tensor_rich_body(
 
 
 def _format_summary_body(record: SummaryRecord) -> str:
-    return (
+    text: str = (
         f"Summary: {record.passed} passed, {record.failed} failed, "
         f"{record.skipped} skipped (total {record.total})"
     )
+    if record.errored > 0:
+        text += f", {record.errored} errored"
+    return text
 
 
 def _format_summary_rich_body(
@@ -231,6 +259,8 @@ def _format_summary_rich_body(
         f"[yellow]{record.skipped} skipped[/] │ "
         f"{record.total} total"
     )
+    if record.errored > 0:
+        text += f" │ [bold red]{record.errored} errored[/]"
     return Panel(text, title="SUMMARY", border_style="bold")
 
 

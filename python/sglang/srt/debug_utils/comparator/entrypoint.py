@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback as _traceback_module
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
@@ -25,12 +26,13 @@ from sglang.srt.debug_utils.comparator.bundle_matcher import (
 from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonErrorRecord,
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
-    NonTensorComparisonRecord,
     RecordLocation,
-    SkipComparisonRecord,
     SummaryRecord,
-    TensorComparisonRecord,
 )
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
@@ -82,12 +84,6 @@ def run(args: argparse.Namespace) -> int:
         report_path=report_path,
         verbosity=args.verbosity,
     )
-
-    report_path: Optional[Path] = _resolve_report_path(
-        target_path=dir_pair.y,
-        report_path_arg=args.report_path,
-    )
-    report_sink.configure(output_format=args.output_format, report_path=report_path)
 
     try:
         report_sink.add(ConfigRecord(config=vars(args)))
@@ -142,9 +138,11 @@ def run(args: argparse.Namespace) -> int:
             compute_per_token=visualize_per_token is not None,
             meta_overrider=meta_overrider,
         )
-        summary, skipped_names, failed_names = _consume_comparison_records(
-            comparison_records=comparison_records,
-            visualize_per_token=visualize_per_token,
+        summary, skipped_names, failed_names, errored_names = (
+            _consume_comparison_records(
+                comparison_records=comparison_records,
+                visualize_per_token=visualize_per_token,
+            )
         )
         return compute_exit_code(
             summary,
@@ -152,6 +150,7 @@ def run(args: argparse.Namespace) -> int:
             skipped_names=skipped_names,
             allow_failed_pattern=args.allow_failed_pattern,
             failed_names=failed_names,
+            errored_names=errored_names,
         )
     finally:
         report_sink.close()
@@ -219,7 +218,12 @@ def _compare_bundle_pairs(
     compute_per_token: bool = False,
     meta_overrider: Optional[MetaOverrider] = None,
 ) -> Iterator[
-    Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]
+    Union[
+        ComparisonTensorRecord,
+        ComparisonSkipRecord,
+        ComparisonNonTensorRecord,
+        ComparisonErrorRecord,
+    ]
 ]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
@@ -229,20 +233,32 @@ def _compare_bundle_pairs(
         filenames_pair: Pair[list[str]] = bundle_info_pair.map(
             lambda infos: [info.filename for info in infos]
         )
+
         record: Union[
-            TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord
-        ] = compare_bundle_pair(
-            name=name,
-            filenames_pair=filenames_pair,
-            dir_pair=dir_pair,
-            token_aligner_mode=token_aligner_mode,
-            token_aligner_plan=token_aligner_plan,
-            diff_threshold=diff_threshold,
-            thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
-            viz_output_dir=viz_output_dir,
-            compute_per_token=compute_per_token,
-            meta_overrider=meta_overrider,
-        )
+            ComparisonTensorRecord,
+            ComparisonSkipRecord,
+            ComparisonNonTensorRecord,
+            ComparisonErrorRecord,
+        ]
+        try:
+            record = compare_bundle_pair(
+                name=name,
+                filenames_pair=filenames_pair,
+                dir_pair=dir_pair,
+                token_aligner_mode=token_aligner_mode,
+                token_aligner_plan=token_aligner_plan,
+                diff_threshold=diff_threshold,
+                thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
+                viz_output_dir=viz_output_dir,
+                compute_per_token=compute_per_token,
+                meta_overrider=meta_overrider,
+            )
+        except Exception as exc:
+            record = ComparisonErrorRecord(
+                name=name,
+                exception_type=type(exc).__name__,
+                traceback_str=_traceback_module.format_exc(),
+            )
 
         target_steps: set[int] = {info.step for info in bundle_info_pair.y}
         step: Optional[int] = target_steps.pop() if len(target_steps) == 1 else None
@@ -255,24 +271,32 @@ def _compare_bundle_pairs(
 def _consume_comparison_records(
     *,
     comparison_records: Iterator[
-        Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]
+        Union[
+            ComparisonTensorRecord,
+            ComparisonSkipRecord,
+            ComparisonNonTensorRecord,
+            ComparisonErrorRecord,
+        ]
     ],
     visualize_per_token: Optional[Path] = None,
-) -> tuple[SummaryRecord, list[str], list[str]]:
-    counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
-    collected_comparisons: list[TensorComparisonRecord] = []
+) -> tuple[SummaryRecord, list[str], list[str], list[str]]:
+    counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0, "errored": 0}
+    collected_comparisons: list[ComparisonTensorRecord] = []
     skipped_names: list[str] = []
     failed_names: list[str] = []
+    errored_names: list[str] = []
 
     for record in comparison_records:
         counts[record.category] += 1
         report_sink.add(record)
-        if isinstance(record, SkipComparisonRecord) and record.category == "skipped":
+        if isinstance(record, ComparisonSkipRecord) and record.category == "skipped":
             skipped_names.append(record.name)
         if record.category == "failed":
             failed_names.append(record.name)
+        if isinstance(record, ComparisonErrorRecord):
+            errored_names.append(record.name)
         if visualize_per_token is not None and isinstance(
-            record, TensorComparisonRecord
+            record, ComparisonTensorRecord
         ):
             collected_comparisons.append(record)
 
@@ -285,7 +309,7 @@ def _consume_comparison_records(
             output_path=visualize_per_token,
         )
 
-    return summary, skipped_names, failed_names
+    return summary, skipped_names, failed_names, errored_names
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

@@ -4,6 +4,12 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+    TracedAlignerPlan,
+    TracedSidePlan,
+    TracedStepPlan,
+    TracedSubPlan,
+)
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
@@ -22,11 +28,12 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonErrorRecord,
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ErrorLog,
-    NonTensorComparisonRecord,
-    SkipComparisonRecord,
     SummaryRecord,
-    TensorComparisonRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
@@ -156,6 +163,14 @@ class TestSummaryRecord:
         with pytest.raises(ValidationError, match="total=10"):
             SummaryRecord(total=10, passed=5, failed=2, skipped=1)
 
+    def test_valid_with_errored(self):
+        record = SummaryRecord(total=10, passed=6, failed=2, skipped=1, errored=1)
+        assert record.errored == 1
+
+    def test_total_mismatch_with_errored(self):
+        with pytest.raises(ValidationError, match="total=10"):
+            SummaryRecord(total=10, passed=6, failed=2, skipped=1, errored=0)
+
 
 class TestAxisInfo:
     def test_valid(self):
@@ -208,9 +223,9 @@ def _make_comparison_record(
     *,
     diff: DiffInfo | None,
     errors: list | None = None,
-) -> TensorComparisonRecord:
+) -> ComparisonTensorRecord:
     ti: TensorInfo = _make_tensor_info()
-    return TensorComparisonRecord(
+    return ComparisonTensorRecord(
         name="t",
         baseline=ti,
         target=ti,
@@ -223,7 +238,7 @@ def _make_comparison_record(
 
 class TestOutputRecordCategories:
     def test_skip_record_with_errors_is_failed(self) -> None:
-        record = SkipComparisonRecord(
+        record = ComparisonSkipRecord(
             name="t",
             reason="test",
             errors=[ErrorLog(category="c", message="m")],
@@ -231,28 +246,28 @@ class TestOutputRecordCategories:
         assert record.category == "failed"
 
     def test_skip_record_no_warnings_is_skipped(self) -> None:
-        record = SkipComparisonRecord(name="t", reason="test")
+        record = ComparisonSkipRecord(name="t", reason="test")
         assert record.category == "skipped"
 
     def test_comparison_record_diff_none_is_failed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(diff=None)
+        record: ComparisonTensorRecord = _make_comparison_record(diff=None)
         assert record.category == "failed"
 
     def test_comparison_record_passed_with_errors_is_failed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
             errors=[ErrorLog(category="c", message="m")],
         )
         assert record.category == "failed"
 
     def test_comparison_record_passed_no_warnings_is_passed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
         assert record.category == "passed"
 
     def test_non_tensor_record_equal_is_passed(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.125",
@@ -263,7 +278,7 @@ class TestOutputRecordCategories:
         assert record.category == "passed"
 
     def test_non_tensor_record_different_is_failed(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.25",
@@ -274,7 +289,7 @@ class TestOutputRecordCategories:
         assert record.category == "failed"
 
     def test_non_tensor_record_with_errors_is_failed(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.125",
@@ -286,7 +301,7 @@ class TestOutputRecordCategories:
         assert record.category == "failed"
 
     def test_non_tensor_record_json_roundtrip(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.25",
@@ -296,14 +311,14 @@ class TestOutputRecordCategories:
         )
         json_str: str = record.model_dump_json()
         roundtripped = parse_record_json(json_str)
-        assert isinstance(roundtripped, NonTensorComparisonRecord)
+        assert isinstance(roundtripped, ComparisonNonTensorRecord)
         assert roundtripped.name == "sm_scale"
         assert roundtripped.values_equal is False
         assert roundtripped.baseline_value == "0.125"
         assert roundtripped.target_value == "0.25"
 
     def test_non_tensor_record_text_format_equal(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.125",
@@ -316,7 +331,7 @@ class TestOutputRecordCategories:
         assert "[equal]" in text
 
     def test_non_tensor_record_text_format_different(self) -> None:
-        record = NonTensorComparisonRecord(
+        record = ComparisonNonTensorRecord(
             name="sm_scale",
             baseline_value="0.125",
             target_value="0.25",
@@ -328,14 +343,38 @@ class TestOutputRecordCategories:
         assert "baseline" in text
         assert "target" in text
 
+    def test_error_record_category_is_errored(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="ValueError", traceback_str="..."
+        )
+        assert record.category == "errored"
 
-def _make_aligner_plan() -> AlignerPlan:
+    def test_error_record_json_roundtrip(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="ValueError", traceback_str="traceback..."
+        )
+        json_str: str = record.model_dump_json()
+        roundtripped = parse_record_json(json_str)
+        assert isinstance(roundtripped, ComparisonErrorRecord)
+        assert roundtripped.name == "t"
+        assert roundtripped.exception_type == "ValueError"
+
+    def test_error_record_text_format(self) -> None:
+        record = ComparisonErrorRecord(
+            name="t", exception_type="RuntimeError", traceback_str="Traceback..."
+        )
+        text: str = record.to_text()
+        assert "RuntimeError" in text
+        assert "Traceback" in text
+
+
+def _make_traced_aligner_plan() -> TracedAlignerPlan:
     unsharder = UnsharderPlan(
         axis=ParallelAxis.TP,
         params=ConcatParams(dim_name="h"),
         groups=[[0, 1]],
     )
-    return AlignerPlan(
+    plan = AlignerPlan(
         per_step_plans=Pair(
             x=[
                 AlignerPerStepPlan(
@@ -349,54 +388,67 @@ def _make_aligner_plan() -> AlignerPlan:
             ],
         ),
     )
+    traced_sub = TracedSubPlan(plan=unsharder, snapshot=None)
+    traced_step = TracedStepPlan(
+        step=0, input_object_indices=[0, 1], sub_plans=[traced_sub]
+    )
+    return TracedAlignerPlan(
+        plan=plan,
+        per_side=Pair(
+            x=TracedSidePlan(step_plans=[traced_step]),
+            y=TracedSidePlan(step_plans=[traced_step]),
+        ),
+    )
 
 
-class TestAlignerPlanInTensorComparisonRecord:
-    def test_comparison_record_with_aligner_plan(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: TensorComparisonRecord = _make_comparison_record(
+class TestAlignerPlanInComparisonTensorRecord:
+    def test_comparison_record_with_traced_plan(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
-        assert record_with_plan.aligner_plan is not None
-        assert record_with_plan.aligner_plan.per_step_plans.x[0].step == 0
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
+        assert record_with_plan.traced_plan is not None
+        assert record_with_plan.traced_plan.per_side.x.step_plans[0].step == 0
 
-    def test_aligner_plan_json_roundtrip(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: TensorComparisonRecord = _make_comparison_record(
+    def test_traced_plan_json_roundtrip(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
 
         json_str: str = record_with_plan.model_dump_json()
         parsed = json.loads(json_str)
-        assert "aligner_plan" in parsed
+        assert "traced_plan" in parsed
         assert (
-            parsed["aligner_plan"]["per_step_plans"]["x"][0]["sub_plans"][0]["type"]
+            parsed["traced_plan"]["per_side"]["x"]["step_plans"][0]["sub_plans"][0][
+                "plan"
+            ]["type"]
             == "unsharder"
         )
 
-        roundtripped: TensorComparisonRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is not None
+        roundtripped: ComparisonTensorRecord = parse_record_json(json_str)
+        assert roundtripped.traced_plan is not None
         assert (
-            roundtripped.aligner_plan.per_step_plans.x[0].sub_plans[0].type
+            roundtripped.traced_plan.per_side.x.step_plans[0].sub_plans[0].plan.type
             == "unsharder"
         )
 
-    def test_comparison_record_without_aligner_plan(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
+    def test_comparison_record_without_traced_plan(self) -> None:
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
         json_str: str = record.model_dump_json()
-        roundtripped: TensorComparisonRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is None
+        roundtripped: ComparisonTensorRecord = parse_record_json(json_str)
+        assert roundtripped.traced_plan is None
 
-    def test_aligner_plan_text_format(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: TensorComparisonRecord = _make_comparison_record(
+    def test_traced_plan_text_format(self) -> None:
+        traced_plan: TracedAlignerPlan = _make_traced_aligner_plan()
+        record: ComparisonTensorRecord = _make_comparison_record(
             diff=_make_diff_info(passed=True),
         )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+        record_with_plan = record.model_copy(update={"traced_plan": traced_plan})
 
         text: str = record_with_plan.to_text()
         assert "Aligner Plan:" in text

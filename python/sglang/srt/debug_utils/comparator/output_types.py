@@ -13,6 +13,8 @@ from sglang.srt.debug_utils.comparator.output_formatter import (  # noqa: F401 â
 from sglang.srt.debug_utils.comparator.output_formatter import (
     _format_config_body,
     _format_config_rich_body,
+    _format_error_body,
+    _format_error_rich_body,
     _format_log_body,
     _format_non_tensor_body,
     _format_non_tensor_rich_body,
@@ -146,8 +148,8 @@ class ConfigRecord(_OutputRecord):
         return _format_config_rich_body(self, verbosity=verbosity)
 
 
-class SkipComparisonRecord(_BaseComparisonRecord):
-    type: Literal["skip"] = "skip"
+class ComparisonSkipRecord(_BaseComparisonRecord):
+    type: Literal["comparison_skip"] = "comparison_skip"
     name: str
     reason: str
 
@@ -164,6 +166,23 @@ class SkipComparisonRecord(_BaseComparisonRecord):
         return _format_skip_rich_body(self, verbosity=verbosity)
 
 
+class ComparisonErrorRecord(_BaseComparisonRecord):
+    type: Literal["comparison_error"] = "comparison_error"
+    name: str
+    exception_type: str
+    traceback_str: str
+
+    @property
+    def category(self) -> str:
+        return "errored"
+
+    def _format_body(self) -> str:
+        return _format_error_body(self)
+
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_error_rich_body(self, verbosity=verbosity)
+
+
 class _TableRecord(_OutputRecord):
     label: str
     rows: list[dict[str, Any]]
@@ -176,15 +195,6 @@ class _TableRecord(_OutputRecord):
 
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_table_rich_body(self, verbosity=verbosity)
-
-        return _format_table_body(self)
-
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_table_rich_body,
-        )
-
-        return _format_table_rich_body(self)
 
 
 class RankInfoRecord(_TableRecord):
@@ -201,10 +211,10 @@ class InputIdsRecord(_TableRecord):
         return f"{self.label} input_ids & positions"
 
 
-class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
+class ComparisonTensorRecord(TensorComparisonInfo, _BaseComparisonRecord):
     model_config = ConfigDict(extra="forbid", defer_build=True)
 
-    type: Literal["comparison"] = "comparison"
+    type: Literal["comparison_tensor"] = "comparison_tensor"
     traced_plan: Optional[TracedAlignerPlan] = None
     replicated_checks: list[ReplicatedCheckResult] = Field(default_factory=list)
     raw_bundle_info: Optional[Pair[BundleSideInfo]] = None
@@ -224,8 +234,8 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
         return _format_tensor_comparison_rich_body(self, verbosity=verbosity)
 
 
-class NonTensorComparisonRecord(_BaseComparisonRecord):
-    type: Literal["non_tensor"] = "non_tensor"
+class ComparisonNonTensorRecord(_BaseComparisonRecord):
+    type: Literal["comparison_non_tensor"] = "comparison_non_tensor"
     name: str
     baseline_value: str
     target_value: str
@@ -245,15 +255,6 @@ class NonTensorComparisonRecord(_BaseComparisonRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_non_tensor_rich_body(self, verbosity=verbosity)
 
-        return _format_non_tensor_body(self)
-
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_non_tensor_rich_body,
-        )
-
-        return _format_non_tensor_rich_body(self)
-
 
 class SummaryRecord(_OutputRecord):
     type: Literal["summary"] = "summary"
@@ -261,13 +262,15 @@ class SummaryRecord(_OutputRecord):
     passed: int
     failed: int
     skipped: int
+    errored: int = 0
 
     @model_validator(mode="after")
     def _validate_totals(self) -> "SummaryRecord":
-        expected: int = self.passed + self.failed + self.skipped
+        expected: int = self.passed + self.failed + self.skipped + self.errored
         if self.total != expected:
             raise ValueError(
-                f"total={self.total} != passed({self.passed}) + failed({self.failed}) + skipped({self.skipped}) = {expected}"
+                f"total={self.total} != passed({self.passed}) + failed({self.failed}) "
+                f"+ skipped({self.skipped}) + errored({self.errored}) = {expected}"
             )
         return self
 
@@ -277,7 +280,6 @@ class SummaryRecord(_OutputRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_summary_rich_body(self, verbosity=verbosity)
 
-        return _format_summary_body(self)
 
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"
@@ -291,9 +293,10 @@ AnyRecord = Annotated[
         ConfigRecord,
         RankInfoRecord,
         InputIdsRecord,
-        SkipComparisonRecord,
-        TensorComparisonRecord,
-        NonTensorComparisonRecord,
+        ComparisonSkipRecord,
+        ComparisonErrorRecord,
+        ComparisonTensorRecord,
+        ComparisonNonTensorRecord,
         SummaryRecord,
         LogRecord,
     ],

@@ -31,10 +31,10 @@ from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ErrorLog,
-    NonTensorComparisonRecord,
-    SkipComparisonRecord,
-    TensorComparisonRecord,
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
@@ -51,7 +51,7 @@ def _collect_bundle_side_info(
     metas: list[dict[str, Any]],
 ) -> BundleSideInfo:
     from sglang.srt.debug_utils.comparator.display import (
-        PARALLEL_INFO_KEYS,
+        _PARALLEL_INFO_KEYS,
         extract_parallel_info,
     )
 
@@ -61,7 +61,7 @@ def _collect_bundle_side_info(
         tensor: torch.Tensor = item.value
 
         parallel_info: dict[str, str] = {}
-        for key in PARALLEL_INFO_KEYS:
+        for key in _PARALLEL_INFO_KEYS:
             extract_parallel_info(row_data=parallel_info, info=meta.get(key, {}))
 
         files.append(
@@ -91,7 +91,7 @@ def compare_bundle_pair(
     viz_output_dir: Optional[Path] = None,
     compute_per_token: bool = False,
     meta_overrider: Optional[MetaOverrider] = None,
-) -> Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]:
+) -> Union[ComparisonTensorRecord, ComparisonSkipRecord, ComparisonNonTensorRecord]:
     with log_sink.context() as collected_logs:
         result = _compare_bundle_pair_inner(
             name=name,
@@ -124,7 +124,7 @@ def _compare_bundle_pair_inner(
     viz_output_dir: Optional[Path] = None,
     compute_per_token: bool = False,
     meta_overrider: Optional[MetaOverrider] = None,
-) -> Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]:
+) -> Union[ComparisonTensorRecord, ComparisonSkipRecord, ComparisonNonTensorRecord]:
     # 1. Load all successfully loaded values
     all_pair: Pair[list[ValueWithMeta]] = Pair(
         x=_load_all_values(filenames=filenames_pair.x, base_path=dir_pair.x),
@@ -133,7 +133,7 @@ def _compare_bundle_pair_inner(
 
     if not all_pair.x or not all_pair.y:
         reason = "baseline_load_failed" if not all_pair.x else "target_load_failed"
-        return SkipComparisonRecord(name=name, reason=reason)
+        return ComparisonSkipRecord(name=name, reason=reason)
 
     # 1b. Dims override: patch meta["dims"] before DP filter reads it
     # (--override-dims may add ``# dp:=moe_dp``, so it must run first)
@@ -203,10 +203,10 @@ def _compare_bundle_pair_tensor_type(
     ),
     viz_output_dir: Optional[Path] = None,
     compute_per_token: bool = False,
-) -> Union[TensorComparisonRecord, SkipComparisonRecord]:
+) -> Union[ComparisonTensorRecord, ComparisonSkipRecord]:
     if not valid_pair.x or not valid_pair.y:
         reason = "baseline_load_failed" if not valid_pair.x else "target_load_failed"
-        return SkipComparisonRecord(name=name, reason=reason)
+        return ComparisonSkipRecord(name=name, reason=reason)
 
     # Plan (meta only, no tensor)
     metas_pair: Pair[list[dict[str, Any]]] = valid_pair.map(
@@ -245,7 +245,7 @@ def _compare_bundle_pair_tensor_type(
         assert aligner_result.failed_side_xy is not None
         side_name: str = _FAILED_SIDE_MAP[aligner_result.failed_side_xy]
         reason: str = f"{side_name}_load_failed"
-        return SkipComparisonRecord(name=name, reason=reason)
+        return ComparisonSkipRecord(name=name, reason=reason)
 
     # Resolve seq_dim for per-token computation
     seq_dim: Optional[int] = (
@@ -263,7 +263,7 @@ def _compare_bundle_pair_tensor_type(
         diff_threshold=diff_threshold,
         seq_dim=seq_dim,
     )
-    record = TensorComparisonRecord(
+    record = ComparisonTensorRecord(
         **info.model_dump(),
         traced_plan=aligner_result.traced_plan,
         replicated_checks=replicated_checks,
@@ -331,7 +331,7 @@ def _compare_bundle_pair_non_tensor_type(
     *,
     name: str,
     value_pair: Pair[list[ValueWithMeta]],
-) -> NonTensorComparisonRecord:
+) -> ComparisonNonTensorRecord:
     baseline_value: Any = value_pair.x[0].value
     target_value: Any = value_pair.y[0].value
 
@@ -340,7 +340,7 @@ def _compare_bundle_pair_non_tensor_type(
     except Exception:
         values_equal = False
 
-    return NonTensorComparisonRecord(
+    return ComparisonNonTensorRecord(
         name=name,
         baseline_value=repr(baseline_value),
         target_value=repr(target_value),

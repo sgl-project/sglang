@@ -4,14 +4,14 @@ import sys
 import pytest
 
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
     ErrorLog,
     InfoLog,
     LogRecord,
     ReplicatedCheckResult,
-    SkipComparisonRecord,
     SummaryRecord,
-    TensorComparisonRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
@@ -84,7 +84,7 @@ class TestStrictBase:
 
 class TestRecordTypes:
     def test_comparison_record_inherits_tensor_fields(self):
-        record = TensorComparisonRecord(
+        record = ComparisonTensorRecord(
             name="hidden_states",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -93,7 +93,7 @@ class TestRecordTypes:
             diff=_make_diff(),
         )
         parsed = json.loads(record.model_dump_json())
-        assert parsed["type"] == "comparison"
+        assert parsed["type"] == "comparison_tensor"
         assert parsed["name"] == "hidden_states"
         assert "baseline" in parsed
         assert "diff" in parsed
@@ -109,8 +109,8 @@ class TestRecordTypes:
                     "end_step": 100,
                 }
             ),
-            SkipComparisonRecord(name="attn", reason="no_baseline"),
-            TensorComparisonRecord(
+            ComparisonSkipRecord(name="attn", reason="no_baseline"),
+            ComparisonTensorRecord(
                 name="mlp",
                 baseline=_make_tensor_info(),
                 target=_make_tensor_info(),
@@ -149,8 +149,8 @@ def _make_replicated_check(**overrides) -> ReplicatedCheckResult:
 
 class TestWarnings:
     def test_comparison_record_failed_when_diff_passed_but_errors(self):
-        """TensorComparisonRecord with diff.passed=True but errors → category=='failed'."""
-        record = TensorComparisonRecord(
+        """ComparisonTensorRecord with diff.passed=True but errors → category=='failed'."""
+        record = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -162,8 +162,8 @@ class TestWarnings:
         assert record.category == "failed"
 
     def test_skip_record_failed_when_errors(self):
-        """SkipComparisonRecord with errors → category=='failed' instead of 'skipped'."""
-        record = SkipComparisonRecord(
+        """ComparisonSkipRecord with errors → category=='failed' instead of 'skipped'."""
+        record = ComparisonSkipRecord(
             name="x",
             reason="no_baseline",
             errors=[ErrorLog(category="test", message="some warning")],
@@ -171,8 +171,8 @@ class TestWarnings:
         assert record.category == "failed"
 
     def test_replicated_checks_all_passed(self):
-        """TensorComparisonRecord with all replicated_checks passed → category=='passed'."""
-        record = TensorComparisonRecord(
+        """ComparisonTensorRecord with all replicated_checks passed → category=='passed'."""
+        record = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -184,8 +184,8 @@ class TestWarnings:
         assert record.category == "passed"
 
     def test_replicated_checks_failed_means_record_failed(self):
-        """TensorComparisonRecord with any replicated_check.passed=False → category=='failed'."""
-        record = TensorComparisonRecord(
+        """ComparisonTensorRecord with any replicated_check.passed=False → category=='failed'."""
+        record = ComparisonTensorRecord(
             name="hidden",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -197,7 +197,7 @@ class TestWarnings:
         assert record.category == "failed"
 
     def test_replicated_check_json_round_trip(self):
-        """ReplicatedCheckResult survives JSON round-trip via TensorComparisonRecord."""
+        """ReplicatedCheckResult survives JSON round-trip via ComparisonTensorRecord."""
         check = _make_replicated_check(
             axis="cp",
             group_index=2,
@@ -205,7 +205,7 @@ class TestWarnings:
             baseline_index=0,
             passed=False,
         )
-        record = TensorComparisonRecord(
+        record = ComparisonTensorRecord(
             name="mlp",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -216,7 +216,7 @@ class TestWarnings:
         )
 
         restored = parse_record_json(record.model_dump_json())
-        assert isinstance(restored, TensorComparisonRecord)
+        assert isinstance(restored, ComparisonTensorRecord)
         assert len(restored.replicated_checks) == 1
 
         restored_check: ReplicatedCheckResult = restored.replicated_checks[0]

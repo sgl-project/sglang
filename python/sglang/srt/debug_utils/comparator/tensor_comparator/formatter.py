@@ -20,9 +20,9 @@ if TYPE_CHECKING:
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
     from sglang.srt.debug_utils.comparator.output_types import (
         BundleSideInfo,
+        ComparisonTensorRecord,
         ReplicatedCheckResult,
         ShapeSnapshot,
-        TensorComparisonRecord,
     )
     from sglang.srt.debug_utils.comparator.utils import Pair
 
@@ -207,7 +207,7 @@ def _format_diff(diff: DiffInfo, prefix_text: str = "") -> list[str]:
 
 
 def format_comparison_rich(
-    record: TensorComparisonRecord,
+    record: ComparisonTensorRecord,
     verbosity: Verbosity = "normal",
 ) -> str:
     if verbosity == "minimal":
@@ -219,7 +219,7 @@ def format_comparison_rich(
     )
 
 
-def _format_comparison_minimal(record: TensorComparisonRecord) -> str:
+def _format_comparison_minimal(record: ComparisonTensorRecord) -> str:
     passed, color, marker = _category_marker(record.category)
 
     name_part: str = f"[bold {color}]{escape(record.name):30s}[/]"
@@ -233,7 +233,7 @@ def _format_comparison_minimal(record: TensorComparisonRecord) -> str:
 
 def _format_comparison_normal_or_verbose(
     *,
-    record: TensorComparisonRecord,
+    record: ComparisonTensorRecord,
     verbose: bool,
 ) -> str:
     passed, color, marker = _category_marker(record.category)
