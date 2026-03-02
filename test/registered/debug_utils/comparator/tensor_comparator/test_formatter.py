@@ -409,12 +409,55 @@ def _make_traced_plan(
 
 
 # ---------------------------------------------------------------------------
-# Rich format snapshot tests (normal mode only)
+# Rich format snapshot tests
 # ---------------------------------------------------------------------------
 
 
+class TestFormatComparisonRichMinimal:
+    """format_comparison_rich() with verbosity='minimal'."""
+
+    def test_passed(self) -> None:
+        record: TensorComparisonRecord = _make_comparison_record(
+            diff=_make_diff(rel_diff=1e-4, passed=True),
+        )
+        result: str = format_comparison_rich(record, verbosity="minimal")
+
+        assert result == (
+            "[green]✅[/] [bold green]hidden_states                 [/] "
+            "rel_diff=1.00e-04"
+        )
+
+    def test_failed(self) -> None:
+        record: TensorComparisonRecord = _make_comparison_record(
+            diff=_make_diff(rel_diff=0.5, passed=False),
+        )
+        result: str = format_comparison_rich(record, verbosity="minimal")
+
+        assert result == (
+            "[red]❌[/] [bold red]hidden_states                 [/] "
+            "rel_diff=5.00e-01"
+        )
+
+    def test_shape_mismatch(self) -> None:
+        record: TensorComparisonRecord = _make_comparison_record(
+            shape_mismatch=True,
+        )
+        result: str = format_comparison_rich(record, verbosity="minimal")
+
+        assert result == (
+            "[red]❌[/] [bold red]hidden_states                 [/] "
+            "[yellow]shape mismatch[/]"
+        )
+
+    def test_no_diff(self) -> None:
+        record: TensorComparisonRecord = _make_comparison_record()
+        result: str = format_comparison_rich(record, verbosity="minimal")
+
+        assert result == ("[red]❌[/] [bold red]hidden_states                 [/]")
+
+
 class TestFormatComparisonRichNormal:
-    """format_comparison_rich() snapshot tests."""
+    """format_comparison_rich() with verbosity='normal'."""
 
     def test_passed(self) -> None:
         record: TensorComparisonRecord = _make_comparison_record(
@@ -541,49 +584,6 @@ class TestFormatComparisonRichNormal:
             "      [blue]std       [/]     1.0000 vs     1.0000  Δ [dim]+0.00e+00[/]\n"
             "      [blue]range     [/] [-2.0000, 2.0000] vs [-2.0000, 2.0000]"
         )
-
-
-class TestFormatComparisonRichMinimal:
-    """format_comparison_rich() with verbosity='minimal'."""
-
-    def test_passed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
-            diff=_make_diff(rel_diff=1e-4, passed=True),
-        )
-        result: str = format_comparison_rich(record, verbosity="minimal")
-
-        assert result == (
-            "[green]✅[/] [bold green]hidden_states                 [/] "
-            "rel_diff=1.00e-04"
-        )
-
-    def test_failed(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
-            diff=_make_diff(rel_diff=0.5, passed=False),
-        )
-        result: str = format_comparison_rich(record, verbosity="minimal")
-
-        assert result == (
-            "[red]❌[/] [bold red]hidden_states                 [/] "
-            "rel_diff=5.00e-01"
-        )
-
-    def test_shape_mismatch(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record(
-            shape_mismatch=True,
-        )
-        result: str = format_comparison_rich(record, verbosity="minimal")
-
-        assert result == (
-            "[red]❌[/] [bold red]hidden_states                 [/] "
-            "[yellow]shape mismatch[/]"
-        )
-
-    def test_no_diff(self) -> None:
-        record: TensorComparisonRecord = _make_comparison_record()
-        result: str = format_comparison_rich(record, verbosity="minimal")
-
-        assert result == ("[red]❌[/] [bold red]hidden_states                 [/]")
 
 
 class TestFormatComparisonRichVerbose:
