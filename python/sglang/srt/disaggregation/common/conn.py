@@ -128,10 +128,9 @@ class CommonKVManager(BaseKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER is True, all CP ranks
-            # participate in KV transfer (page-split); otherwise only rank 0 sends (MLA+CP).
+            # participate in KV transfer (page-split); otherwise only rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_cp_all_ranks_transfer
-                and is_mla_backend
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -495,24 +494,22 @@ class CommonKVReceiver(BaseKVReceiver):
                     self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
                 )
 
-        # Decode cp size should be equal to prefill cp size or 1
-        assert (
-            self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size
-            or self.kv_mgr.attn_cp_size == 1
-        ), (
-            f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to prefill cp size ({self.prefill_info.attn_cp_size}) or 1",
+        # Decode cp size should be equal to 1
+        assert self.kv_mgr.attn_cp_size == 1, (
+            f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to 1",
         )
         if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
+            # This means that the prefill cp size is 1, so we only need to retrieve from the prefill cp rank
+            assert self.prefill_info.attn_cp_size == 1, (
+                f"When prefill cp size is 1, attn cp size should be 1, but got {self.kv_mgr.attn_cp_size}",
+            )
             self.target_cp_ranks = [self.kv_mgr.attn_cp_rank]
         else:
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            if (
-                self.kv_mgr.is_mla_backend
-                and not self.kv_mgr.enable_cp_all_ranks_transfer
-            ):
-                # MLA + CP: only retrieve from prefill CP rank 0 when not using all ranks
+            if not self.kv_mgr.enable_cp_all_ranks_transfer:
+                # Only retrieve from prefill CP rank 0 when not using all ranks
                 self.target_cp_ranks = self.target_cp_ranks[:1]
                 self.required_prefill_response_num *= 1
             else:
