@@ -48,14 +48,14 @@ def compute_maybe_token_aligner_result(
     args: argparse.Namespace,
     dfs: Pair[pl.DataFrame],
 ) -> TokenAlignerResult:
-    if args.grouping != "logical":
+    token_aligner_mode: Optional[TokenAlignerMode] = getattr(
+        args, "token_aligner", None
+    )
+
+    if token_aligner_mode is None:
         return TokenAlignerResult(
             mode=None, plan=None, thd_seq_lens_by_step_pair=_NONE_THD
         )
-
-    token_aligner_mode: TokenAlignerMode = getattr(
-        args, "token_aligner", "concat_steps"
-    )
 
     if token_aligner_mode == "concat_steps":
         thd_pair: Pair[Optional[dict[int, list[int]]]] = _load_thd_seq_lens_pair(

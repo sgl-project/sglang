@@ -9,12 +9,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from sglang.srt.debug_utils.comparator.output_types import ComparisonRecord
+from sglang.srt.debug_utils.comparator.output_types import TensorComparisonRecord
 
 
 def generate_per_token_heatmap(
     *,
-    records: list[ComparisonRecord],
+    records: list[TensorComparisonRecord],
     output_path: Path,
 ) -> Optional[Path]:
     """Generate a per-token relative difference heatmap PNG.
@@ -31,7 +31,7 @@ def generate_per_token_heatmap(
 
 def _collect_per_token_data(
     *,
-    records: list[ComparisonRecord],
+    records: list[TensorComparisonRecord],
 ) -> list[tuple[str, list[float]]]:
     rows: list[tuple[str, list[float]]] = []
     for record in records:

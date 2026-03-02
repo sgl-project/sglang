@@ -1,6 +1,6 @@
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (  # noqa: F401
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.output_types import ComparisonRecord
+from sglang.srt.debug_utils.comparator.output_types import TensorComparisonRecord
 
-ComparisonRecord.model_rebuild()
+TensorComparisonRecord.model_rebuild()
