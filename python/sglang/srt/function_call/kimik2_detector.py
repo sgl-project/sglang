@@ -66,7 +66,7 @@ class KimiK2Detector(BaseFormatDetector):
         self.streamed_args_for_tool = []
 
         # Robust parser for ids like "functions.search:0", "search:0", or "call_{uuid}"
-        # Note: function names may contain hyphens (e.g., mcp__tencent-cloud-portal__search-documents)
+        # Note: function names may contain hyphens (e.g., mcp__portal__search-documents)
         # For UUID format, we'll extract function name from JSON arguments
         self.tool_call_id_regex = re.compile(
             r"^(?:(?:functions\.)?(?P<name>[\w\.\-]+):(?P<index>\d+)|(?P<call_id>call_[\w]+))$"
