@@ -137,7 +137,7 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
                     "--trust-remote-code",
                     "--piecewise-cuda-graph-max-tokens",
                     "8192",
-                    "--enable-piecewise-cuda-graph",
+                    "--enforce-piecewise-cuda-graph",
                     "--tp=8",
                     "--piecewise-cuda-graph-compiler=eager",
                     "--disable-radix-cache",

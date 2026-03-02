@@ -98,7 +98,10 @@ diffusion_hip = [
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
-  "addict"
+  "addict",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -128,7 +131,10 @@ diffusion_musa = [
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
-  "addict"
+  "addict",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 test = [
