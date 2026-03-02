@@ -85,8 +85,8 @@ class TestComputePerStepSubPlans:
     def test_zigzag_returns_both_plans(self) -> None:
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
             metas=[
-                _make_meta(dims="b s(cp,zigzag) h", cp_rank=0, cp_size=2),
-                _make_meta(dims="b s(cp,zigzag) h", cp_rank=1, cp_size=2),
+                _make_meta(dims="b s(cp:zigzag) h", cp_rank=0, cp_size=2),
+                _make_meta(dims="b s(cp:zigzag) h", cp_rank=1, cp_size=2),
             ]
         )
         unsharder_plans: list[UnsharderPlan] = [
@@ -143,6 +143,7 @@ class TestComputeAlignerPlan:
 
         plan: AlignerPlan = compute_aligner_plan(
             metas_pair=Pair(x=metas_x, y=metas_y),
+            token_aligner_mode=None,
             token_aligner_plan=None,
         )
 
@@ -151,7 +152,7 @@ class TestComputeAlignerPlan:
         assert plan.token_aligner_plan is None
 
     def test_preserves_token_aligner_plan(self) -> None:
-        from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+        from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
             TokenAlignerPlan,
             TokenLocator,
         )
@@ -166,41 +167,43 @@ class TestComputeAlignerPlan:
 
         plan: AlignerPlan = compute_aligner_plan(
             metas_pair=Pair(x=[_make_meta()], y=[_make_meta()]),
+            token_aligner_mode="smart",
             token_aligner_plan=ta_plan,
         )
 
         assert plan.token_aligner_plan is ta_plan
+        assert plan.token_aligner_mode == "smart"
 
 
 class TestComputePerStepSubPlansThd:
     def test_thd_zigzag_returns_thd_plans(self) -> None:
-        """t(cp,zigzag) h(tp) generates THD-typed unsharder + reorderer plans."""
+        """t(cp:zigzag) h(tp) generates THD-typed unsharder + reorderer plans."""
         thd_global_seq_lens: list[int] = [100, 64, 92]
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
             metas=[
                 _make_meta(
-                    dims="t(cp,zigzag) h(tp)",
+                    dims="t(cp:zigzag) h(tp)",
                     cp_rank=0,
                     cp_size=2,
                     tp_rank=0,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp,zigzag) h(tp)",
+                    dims="t(cp:zigzag) h(tp)",
                     cp_rank=0,
                     cp_size=2,
                     tp_rank=1,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp,zigzag) h(tp)",
+                    dims="t(cp:zigzag) h(tp)",
                     cp_rank=1,
                     cp_size=2,
                     tp_rank=0,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp,zigzag) h(tp)",
+                    dims="t(cp:zigzag) h(tp)",
                     cp_rank=1,
                     cp_size=2,
                     tp_rank=1,

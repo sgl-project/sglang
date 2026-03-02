@@ -8,7 +8,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     TokenAlignerPlan,
     TokenAlignerSeqInfo,
@@ -327,80 +327,6 @@ class TestOutputRecordCategories:
         text: str = record.to_text()
         assert "baseline" in text
         assert "target" in text
-
-
-def _make_aligner_plan() -> AlignerPlan:
-    unsharder = UnsharderPlan(
-        axis=ParallelAxis.TP,
-        params=ConcatParams(dim_name="h"),
-        groups=[[0, 1]],
-    )
-    return AlignerPlan(
-        per_step_plans=Pair(
-            x=[
-                AlignerPerStepPlan(
-                    step=0, input_object_indices=[0, 1], sub_plans=[unsharder]
-                )
-            ],
-            y=[
-                AlignerPerStepPlan(
-                    step=0, input_object_indices=[0, 1], sub_plans=[unsharder]
-                )
-            ],
-        ),
-    )
-
-
-class TestAlignerPlanInComparisonRecord:
-    def test_comparison_record_with_aligner_plan(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: ComparisonRecord = _make_comparison_record(
-            diff=_make_diff_info(passed=True),
-        )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
-        assert record_with_plan.aligner_plan is not None
-        assert record_with_plan.aligner_plan.per_step_plans.x[0].step == 0
-
-    def test_aligner_plan_json_roundtrip(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: ComparisonRecord = _make_comparison_record(
-            diff=_make_diff_info(passed=True),
-        )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
-
-        json_str: str = record_with_plan.model_dump_json()
-        parsed = json.loads(json_str)
-        assert "aligner_plan" in parsed
-        assert (
-            parsed["aligner_plan"]["per_step_plans"]["x"][0]["sub_plans"][0]["type"]
-            == "unsharder"
-        )
-
-        roundtripped: ComparisonRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is not None
-        assert (
-            roundtripped.aligner_plan.per_step_plans.x[0].sub_plans[0].type
-            == "unsharder"
-        )
-
-    def test_comparison_record_without_aligner_plan(self) -> None:
-        record: ComparisonRecord = _make_comparison_record(
-            diff=_make_diff_info(passed=True),
-        )
-        json_str: str = record.model_dump_json()
-        roundtripped: ComparisonRecord = parse_record_json(json_str)
-        assert roundtripped.aligner_plan is None
-
-    def test_aligner_plan_text_format(self) -> None:
-        plan: AlignerPlan = _make_aligner_plan()
-        record: ComparisonRecord = _make_comparison_record(
-            diff=_make_diff_info(passed=True),
-        )
-        record_with_plan = record.model_copy(update={"aligner_plan": plan})
-
-        text: str = record_with_plan.to_text()
-        assert "Aligner Plan:" in text
-        assert "unsharder" in text
 
 
 def _make_aligner_plan() -> AlignerPlan:

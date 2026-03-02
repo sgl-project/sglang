@@ -66,3 +66,23 @@ def calc_rel_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def calc_per_token_rel_diff(
+    x: torch.Tensor, y: torch.Tensor, *, seq_dim: int
+) -> torch.Tensor:
+    """Cosine-distance-like metric per token position.
+
+    Sums over all dims except seq_dim.
+    """
+    x, y = x.double(), y.double()
+    other_dims: list[int] = [d for d in range(x.dim()) if d != seq_dim]
+
+    if other_dims:
+        denominator: torch.Tensor = (x * x + y * y).sum(dim=other_dims)
+        sim: torch.Tensor = 2 * (x * y).sum(dim=other_dims) / (denominator + 1e-10)
+    else:
+        denominator = x * x + y * y
+        sim = 2 * (x * y) / (denominator + 1e-10)
+
+    return (1 - sim).float()

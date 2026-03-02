@@ -6,7 +6,7 @@ from pydantic import Discriminator
 
 from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
@@ -26,5 +26,6 @@ class AlignerPerStepPlan(_FrozenBase):
 
 class AlignerPlan(_FrozenBase):
     per_step_plans: Pair[list[AlignerPerStepPlan]]
+    token_aligner_mode: Optional[str] = None  # "concat_steps" | "smart" | None
     token_aligner_plan: Optional[TokenAlignerPlan] = None
     axis_aligner_plan: Optional[AxisAlignerPlan] = None

@@ -1,5 +1,4 @@
 import sys
-from typing import Optional
 
 import pytest
 import torch
@@ -15,7 +14,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
@@ -32,22 +31,25 @@ register_cpu_ci(est_time=15, suite="default", nightly=True)
 
 class TestExecuteSubPlans:
     def test_empty_tensors_returns_none(self) -> None:
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=[], plans=[])
+        result, checks = execute_sub_plans(tensors=[], plans=[])
         assert result is None
+        assert checks == []
 
     def test_no_plans_single_tensor_passthrough(self) -> None:
         tensor: torch.Tensor = torch.tensor([1.0, 2.0, 3.0])
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=[tensor], plans=[])
+        result, checks = execute_sub_plans(tensors=[tensor], plans=[])
         assert result is not None
         assert torch.equal(result, tensor)
+        assert checks == []
 
     def test_no_plans_multiple_tensors_returns_none(self) -> None:
         tensors: list[torch.Tensor] = [
             torch.tensor([1.0]),
             torch.tensor([2.0]),
         ]
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=tensors, plans=[])
+        result, checks = execute_sub_plans(tensors=tensors, plans=[])
         assert result is None
+        assert checks == []
 
     def test_with_unsharder_plan(self) -> None:
         t0: torch.Tensor = torch.tensor([[1.0, 2.0]]).refine_names("b", "h")
@@ -59,13 +61,12 @@ class TestExecuteSubPlans:
             groups=[[0, 1]],
         )
 
-        result: Optional[torch.Tensor] = execute_sub_plans(
-            tensors=[t0, t1], plans=[plan]
-        )
+        result, checks = execute_sub_plans(tensors=[t0, t1], plans=[plan])
 
         assert result is not None
         expected: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
         assert torch.equal(result.rename(None), expected)
+        assert checks == []
 
 
 class TestExecuteSubPlan:
@@ -74,7 +75,7 @@ class TestExecuteSubPlan:
             pass
 
         with pytest.raises(NotImplementedError, match="Unknown"):
-            execute_sub_plan(tensors=[torch.tensor([1.0])], plan=_FakePlan())  # type: ignore[arg-type]
+            execute_sub_plan(tensors=[torch.tensor([1.0])], plan=_FakePlan())
 
 
 class TestExecuteStepPlans:
@@ -90,11 +91,10 @@ class TestExecuteStepPlans:
             sub_plans=[],
         )
 
-        result: dict[int, torch.Tensor] = _execute_step_plans(
-            tensors=tensors, step_plans=[step_plan]
-        )
+        result, checks = _execute_step_plans(tensors=tensors, step_plans=[step_plan])
 
         assert result == {}
+        assert checks == []
 
     def test_single_step_passthrough(self) -> None:
         tensor: torch.Tensor = torch.tensor([1.0, 2.0])
@@ -105,12 +105,11 @@ class TestExecuteStepPlans:
             sub_plans=[],
         )
 
-        result: dict[int, torch.Tensor] = _execute_step_plans(
-            tensors=[tensor], step_plans=[step_plan]
-        )
+        result, checks = _execute_step_plans(tensors=[tensor], step_plans=[step_plan])
 
         assert 5 in result
         assert torch.equal(result[5], tensor)
+        assert checks == []
 
 
 class TestExecuteAlignerPlan:
@@ -235,6 +234,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 
@@ -286,6 +286,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 

@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
     TensorStats,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 
 
 def format_comparison(info: TensorComparisonInfo) -> str:
@@ -50,6 +57,22 @@ def format_comparison(info: TensorComparisonInfo) -> str:
         lines.append(f"x_baseline(sample)={baseline.sample}")
     if target.sample is not None:
         lines.append(f"x_target(sample)={target.sample}")
+
+    return "\n".join(lines)
+
+
+def format_replicated_checks(checks: list[ReplicatedCheckResult]) -> str:
+    lines: list[str] = ["Replicated checks:"]
+
+    for check in checks:
+        marker: str = "✅" if check.passed else "❌"
+        lines.append(
+            f"  {marker} axis={check.axis} group={check.group_index} "
+            f"idx={check.compared_index} vs {check.baseline_index}: "
+            f"rel_diff={check.diff.rel_diff:.6e} "
+            f"max_abs_diff={check.diff.max_abs_diff:.6e} "
+            f"mean_abs_diff={check.diff.mean_abs_diff:.6e}"
+        )
 
     return "\n".join(lines)
 

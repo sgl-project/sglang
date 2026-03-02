@@ -12,12 +12,12 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.planner import (
     compute_per_step_sub_plans,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_plugins import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
     AUX_NAMES,
     _AuxFrameworkPlugin,
     _plugins,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerGlobalAux,
     TokenAlignerStepAux,
 )
@@ -30,12 +30,17 @@ from sglang.srt.debug_utils.comparator.dims import (
     apply_dim_names,
     resolve_dim_names,
 )
+from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
 from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta, filter_rows
 
 # re-export for existing callers
-__all__ = ["AUX_NAMES", "has_aux_tensors", "load_and_normalize_aux"]
+__all__ = [
+    "AUX_NAMES",
+    "has_aux_tensors",
+    "load_and_normalize_aux",
+]
 
 
 def load_and_normalize_aux(
@@ -123,7 +128,7 @@ def _load_step_data(
     """
     result: dict[str, object] = {}
 
-    # Pass 1: non-tensor values
+    # Pass 0: non-tensor values
     for name in non_tensor_names:
         value = _load_non_tensor_aux(name=name, step=step, df=df, dump_path=dump_path)
         if value is not None:
@@ -170,6 +175,7 @@ def _load_non_tensor_aux(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
+    loaded = filter_to_non_empty_dp_rank(loaded)
 
     if len(loaded) > 1:
         first_value = loaded[0].value
@@ -206,6 +212,7 @@ def _load_and_align_aux_tensor(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
+    loaded = filter_to_non_empty_dp_rank(loaded)
 
     tensors: list[torch.Tensor] = [
         item.value for item in loaded if isinstance(item.value, torch.Tensor)
@@ -233,7 +240,7 @@ def _load_and_align_aux_tensor(
             dim_names: list[str] = resolve_dim_names(dims_str)
             tensors = [apply_dim_names(t, dim_names) for t in tensors]
 
-        result = execute_sub_plans(tensors=tensors, plans=sub_plans)
+        result, _replicated_checks = execute_sub_plans(tensors=tensors, plans=sub_plans)
         assert result is not None
         return result.rename(None)  # strip named dims before returning to plugin
 

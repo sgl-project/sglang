@@ -10,7 +10,7 @@ import polars as pl
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
     RankInfoRecord,
-    print_record,
+    report_sink,
 )
 from sglang.srt.debug_utils.dump_loader import LOAD_FAILED, ValueWithMeta
 
@@ -23,25 +23,18 @@ def emit_display_records(
     dump_dir: Path,
     label: str,
     tokenizer: Any,
-    output_format: str,
 ) -> None:
     rank_rows: Optional[list[dict[str, Any]]] = _collect_rank_info(
         df, dump_dir=dump_dir
     )
     if rank_rows is not None:
-        print_record(
-            RankInfoRecord(label=label, rows=rank_rows),
-            output_format=output_format,
-        )
+        report_sink.add(RankInfoRecord(label=label, rows=rank_rows))
 
     input_ids_rows: Optional[list[dict[str, Any]]] = _collect_input_ids_and_positions(
         df, dump_dir=dump_dir, tokenizer=tokenizer
     )
     if input_ids_rows is not None:
-        print_record(
-            InputIdsRecord(label=label, rows=input_ids_rows),
-            output_format=output_format,
-        )
+        report_sink.add(InputIdsRecord(label=label, rows=input_ids_rows))
 
 
 def _render_polars_as_text(df: pl.DataFrame, *, title: Optional[str] = None) -> str:

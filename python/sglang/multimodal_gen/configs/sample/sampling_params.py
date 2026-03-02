@@ -66,12 +66,14 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    MESH = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
-        else:
+        if self == DataType.VIDEO:
             return "mp4"
+        return "glb"
 
 
 @dataclass
@@ -170,7 +172,7 @@ class SamplingParams:
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp"]
+            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
         ):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -356,6 +358,19 @@ class SamplingParams:
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        if self.guidance_scale is None:
+            try:
+                from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+                    Hunyuan3D2PipelineConfig,
+                )
+
+                if isinstance(pipeline_config, Hunyuan3D2PipelineConfig):
+                    self.guidance_scale = pipeline_config.guidance_scale
+                else:
+                    self.guidance_scale = 1.0
+            except ImportError:
+                self.guidance_scale = 1.0
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 

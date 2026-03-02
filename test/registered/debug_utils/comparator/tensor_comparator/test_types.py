@@ -7,7 +7,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
     GeneralWarning,
-    ReplicatedMismatchWarning,
+    ReplicatedCheckResult,
     SkipRecord,
     SummaryRecord,
     WarningRecord,
@@ -126,16 +126,24 @@ class TestRecordTypes:
             assert restored == record
 
 
-def _make_warning(**overrides) -> ReplicatedMismatchWarning:
+def _make_replicated_check(**overrides) -> ReplicatedCheckResult:
     defaults: dict = dict(
         axis="tp",
         group_index=0,
-        differing_index=1,
+        compared_index=1,
         baseline_index=0,
-        max_abs_diff=0.1,
+        passed=False,
+        atol=1e-6,
+        diff=_make_diff(
+            rel_diff=0.1,
+            max_abs_diff=0.1,
+            mean_abs_diff=0.05,
+            diff_threshold=1e-6,
+            passed=False,
+        ),
     )
     defaults.update(overrides)
-    return ReplicatedMismatchWarning(**defaults)
+    return ReplicatedCheckResult(**defaults)
 
 
 class TestWarnings:
@@ -148,7 +156,7 @@ class TestWarnings:
             unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(passed=True),
-            warnings=[_make_warning()],
+            warnings=[GeneralWarning(category="test", message="some warning")],
         )
         assert record.category == "failed"
 
@@ -157,18 +165,44 @@ class TestWarnings:
         record = SkipRecord(
             name="x",
             reason="no_baseline",
-            warnings=[_make_warning()],
+            warnings=[GeneralWarning(category="test", message="some warning")],
         )
         assert record.category == "failed"
 
-    def test_warnings_json_round_trip(self):
-        """warnings survive model_dump_json → parse_record_json round-trip."""
-        warning = _make_warning(
+    def test_replicated_checks_all_passed(self):
+        """ComparisonRecord with all replicated_checks passed → category=='passed'."""
+        record = ComparisonRecord(
+            name="hidden",
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(),
+            unified_shape=[4, 8],
+            shape_mismatch=False,
+            diff=_make_diff(passed=True),
+            replicated_checks=[_make_replicated_check(passed=True)],
+        )
+        assert record.category == "passed"
+
+    def test_replicated_checks_failed_means_record_failed(self):
+        """ComparisonRecord with any replicated_check.passed=False → category=='failed'."""
+        record = ComparisonRecord(
+            name="hidden",
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(),
+            unified_shape=[4, 8],
+            shape_mismatch=False,
+            diff=_make_diff(passed=True),
+            replicated_checks=[_make_replicated_check(passed=False)],
+        )
+        assert record.category == "failed"
+
+    def test_replicated_check_json_round_trip(self):
+        """ReplicatedCheckResult survives JSON round-trip via ComparisonRecord."""
+        check = _make_replicated_check(
             axis="cp",
             group_index=2,
-            differing_index=3,
+            compared_index=3,
             baseline_index=0,
-            max_abs_diff=0.42,
+            passed=False,
         )
         record = ComparisonRecord(
             name="mlp",
@@ -177,30 +211,23 @@ class TestWarnings:
             unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
-            warnings=[warning],
+            replicated_checks=[check],
         )
 
         restored = parse_record_json(record.model_dump_json())
         assert isinstance(restored, ComparisonRecord)
-        assert len(restored.warnings) == 1
+        assert len(restored.replicated_checks) == 1
 
-        restored_warning = restored.warnings[0]
-        assert restored_warning.axis == "cp"
-        assert restored_warning.group_index == 2
-        assert restored_warning.differing_index == 3
-        assert restored_warning.baseline_index == 0
-        assert restored_warning.max_abs_diff == pytest.approx(0.42)
+        restored_check: ReplicatedCheckResult = restored.replicated_checks[0]
+        assert restored_check.axis == "cp"
+        assert restored_check.group_index == 2
+        assert restored_check.compared_index == 3
+        assert restored_check.baseline_index == 0
+        assert not restored_check.passed
 
     def test_any_warning_discriminated_union_round_trip(self):
         """All AnyWarning variants survive JSON round-trip via a WarningRecord."""
         all_warnings = [
-            ReplicatedMismatchWarning(
-                axis="tp",
-                group_index=0,
-                differing_index=1,
-                baseline_index=0,
-                max_abs_diff=0.1,
-            ),
             GeneralWarning(
                 category="aux_tensors_missing",
                 message="Aux tensors missing, skipping token alignment",

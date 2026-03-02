@@ -34,7 +34,7 @@ register_cuda_ci(est_time=120, suite="nightly-2-gpu", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 EXP_NAME = "e2e_source_patcher"
-DUMPER_FILTER = r"layer_id=[012]"
+DUMPER_FILTER = "layer_id in [0, 1, 2]"
 
 PATCH_CONFIG_YAML: str = """\
 patches:
