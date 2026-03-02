@@ -196,8 +196,6 @@ class _TableRecord(_OutputRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_table_rich_body(self, verbosity=verbosity)
 
-        return _format_table_rich_body(self)
-
 
 class RankInfoRecord(_TableRecord):
     type: Literal["rank_info"] = "rank_info"
@@ -257,8 +255,6 @@ class ComparisonNonTensorRecord(_BaseComparisonRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_non_tensor_rich_body(self, verbosity=verbosity)
 
-        return _format_non_tensor_rich_body(self)
-
 
 class SummaryRecord(_OutputRecord):
     type: Literal["summary"] = "summary"
@@ -280,9 +276,6 @@ class SummaryRecord(_OutputRecord):
 
     def _format_body(self) -> str:
         return _format_summary_body(self)
-
-    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
-        return _format_summary_rich_body(self, verbosity=verbosity)
 
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_summary_rich_body(self, verbosity=verbosity)
