@@ -53,6 +53,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
+    I2M = auto()  # Image to Mesh
 
     def is_image_gen(self) -> bool:
         return (
@@ -62,7 +63,11 @@ class ModelTaskType(Enum):
         )
 
     def requires_image_input(self) -> bool:
-        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.I2M
+        )
 
     def accepts_image_input(self) -> bool:
         return (
@@ -70,9 +75,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
+            or self == ModelTaskType.I2M
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.I2M:
+            return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
         else:
@@ -531,7 +539,7 @@ class PipelineConfig:
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
         """
-        Load PipelineConfig from kwargs Dictionary.
+        Load PipelineConfig from kwargs Dictionary, as part of the ServerArg initialization process
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
@@ -575,7 +583,11 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+                model_info = get_model_info(
+                    model_path,
+                    backend=kwargs.get("backend"),
+                    model_id=kwargs.get("model_id"),
+                )
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -591,7 +603,11 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+            model_info = get_model_info(
+                model_path,
+                backend=kwargs.get("backend"),
+                model_id=kwargs.get("model_id"),
+            )
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
