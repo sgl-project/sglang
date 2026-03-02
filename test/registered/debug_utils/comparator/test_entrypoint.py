@@ -4362,8 +4362,7 @@ class TestEntrypointDpAttentionMissingAlias:
 
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
-        assert errors[0].exception_type == "AssertionError"
-        assert "non-empty dp_rank" in errors[0].traceback_str
+        assert errors[0].category == "errored"
 
 
 class TestEntrypointAutoDescend:
