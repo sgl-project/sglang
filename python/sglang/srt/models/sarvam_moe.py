@@ -70,21 +70,16 @@ if _is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
-        _has_concat_mla_k = True
     except ImportError:
         _has_fp8_support = False
-        _has_concat_mla_k = False
         bmm_fp8 = None
         merge_state_v2 = None
         per_tensor_quant_mla_fp8 = None
 else:
     _has_fp8_support = False
-    _has_concat_mla_k = False
     bmm_fp8 = None
     merge_state_v2 = None
     per_tensor_quant_mla_fp8 = None
-
-_MHA_DEBUG_PRINTED = False
 
 
 class AttnForwardMethod(IntEnum):
@@ -595,6 +590,20 @@ class SarvamMoEMLAAttention(nn.Module):
             self, k_nope, k_pe, forward_batch
         )
 
+    def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
+        if self._server_args is None:
+            self._server_args = get_global_server_args()
+        if forward_batch.forward_mode.is_decode_or_idle():
+            self.current_attention_backend = (
+                self._server_args.decode_attention_backend
+                or self._server_args.attention_backend
+            )
+        else:
+            self.current_attention_backend = (
+                self._server_args.prefill_attention_backend
+                or self._server_args.attention_backend
+            )
+
     def _maybe_fp8_bmm(
         self,
         x_bmk: torch.Tensor,
@@ -632,10 +641,6 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        global _MHA_DEBUG_PRINTED
-        if not _MHA_DEBUG_PRINTED:
-
-            _MHA_DEBUG_PRINTED = True
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -661,7 +666,8 @@ class SarvamMoEMLAAttention(nn.Module):
             forward_batch.extend_prefix_lens_cpu
         )
 
-        can_use_prefix_cache = not get_global_server_args().disable_radix_cache
+        self._set_current_attention_backend(forward_batch)
+        can_use_prefix_cache = not self._server_args.disable_radix_cache
         do_prefix_merge = has_extend_prefix and can_use_prefix_cache
 
         if do_prefix_merge and forward_batch.num_prefix_chunks is None:
@@ -744,20 +750,9 @@ class SarvamMoEMLAAttention(nn.Module):
 
         if self._server_args is None:
             self._server_args = get_global_server_args()
+        self._set_current_attention_backend(forward_batch)
 
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
-
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        if is_decode:
-            self.current_attention_backend = (
-                self._server_args.decode_attention_backend
-                or self._server_args.attention_backend
-            )
-        else:
-            self.current_attention_backend = (
-                self._server_args.prefill_attention_backend
-                or self._server_args.attention_backend
-            )
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             return self._run_mha_prefill(
@@ -869,6 +864,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         if self._server_args is None:
             self._server_args = get_global_server_args()
+        self._set_current_attention_backend(forward_batch)
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
@@ -926,6 +922,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         if self._server_args is None:
             self._server_args = get_global_server_args()
+        self._set_current_attention_backend(forward_batch)
 
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
 
@@ -983,6 +980,8 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
             config.n_routed_experts = config.num_experts
         if not hasattr(config, "n_shared_experts"):
             config.n_shared_experts = getattr(config, "num_shared_experts", None)
+
+        config.n_shared_experts = None
         if not hasattr(config, "num_experts"):
             config.num_experts = config.n_routed_experts
         if not hasattr(config, "norm_topk_prob"):
@@ -1023,27 +1022,39 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
                     rope_scaling = self.config.rope_scaling
 
                 layer_prefix = f"model.layers.{layer_id}"
-                # Important: release old module first to avoid transient double-allocation
-                # spikes (RHS construction before assignment) on large TP2 models.
                 old_self_attn = layer.self_attn
                 layer.self_attn = None
                 del old_self_attn
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
-                layer.self_attn = SarvamMoEMLAAttention(
-                    config=self.config,
-                    hidden_size=self.config.hidden_size,
-                    num_heads=self.config.num_attention_heads,
-                    layer_id=layer_id,
-                    rope_theta=rope_theta,
-                    rope_scaling=rope_scaling,
-                    max_position_embeddings=self.config.max_position_embeddings,
-                    quant_config=quant_config,
-                    prefix=add_prefix("self_attn", layer_prefix),
-                    alt_stream=getattr(layer, "alt_stream", None),
-                )
+                try:
+                    layer.self_attn = SarvamMoEMLAAttention(
+                        config=self.config,
+                        hidden_size=self.config.hidden_size,
+                        num_heads=self.config.num_attention_heads,
+                        layer_id=layer_id,
+                        rope_theta=rope_theta,
+                        rope_scaling=rope_scaling,
+                        max_position_embeddings=self.config.max_position_embeddings,
+                        quant_config=quant_config,
+                        prefix=add_prefix("self_attn", layer_prefix),
+                        alt_stream=getattr(layer, "alt_stream", None),
+                    )
+                except torch.OutOfMemoryError:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    layer.self_attn = SarvamMoEMLAAttention(
+                        config=self.config,
+                        hidden_size=self.config.hidden_size,
+                        num_heads=self.config.num_attention_heads,
+                        layer_id=layer_id,
+                        rope_theta=rope_theta,
+                        rope_scaling=rope_scaling,
+                        max_position_embeddings=self.config.max_position_embeddings,
+                        quant_config=quant_config,
+                        prefix=add_prefix("self_attn", layer_prefix),
+                        alt_stream=getattr(layer, "alt_stream", None),
+                    )
                 if hasattr(layer, "layer_communicator") and hasattr(
                     layer.layer_communicator, "qkv_latent_func"
                 ):
@@ -1055,17 +1066,33 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
                     old_mlp = layer.mlp
                     layer.mlp = None
                     del old_mlp
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
-                    layer.mlp = SarvamMoESparseMoeBlock(
-                        config=self.config,
-                        layer_id=layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix("mlp", layer_prefix),
-                        alt_stream=getattr(layer, "alt_stream", None),
-                    )
+                    try:
+                        layer.mlp = SarvamMoESparseMoeBlock(
+                            config=self.config,
+                            layer_id=layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix("mlp", layer_prefix),
+                            alt_stream=getattr(layer, "alt_stream", None),
+                        )
+                    except torch.OutOfMemoryError:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        layer.mlp = SarvamMoESparseMoeBlock(
+                            config=self.config,
+                            layer_id=layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix("mlp", layer_prefix),
+                            alt_stream=getattr(layer, "alt_stream", None),
+                        )
+
+    def determine_num_fused_shared_experts(
+        self, architecture: str = "SarvamMLAForCausalLM"
+    ):
+        del architecture
+        self.num_fused_shared_experts = 0
+        get_global_server_args().disable_shared_experts_fusion = True
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1082,7 +1109,7 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ) -> None:
-        def _center_bias(
+        def _remap_bias_name(
             ws: Iterable[Tuple[str, torch.Tensor]],
         ) -> Iterable[Tuple[str, torch.Tensor]]:
             for name, w in ws:
@@ -1091,11 +1118,9 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
                         ".mlp.gate.e_score_correction_bias",
                         ".mlp.e_score_correction_bias",
                     )
-                if "e_score_correction_bias" in name and w.numel() > 0:
-                    w = w - w.mean()
                 yield name, w
 
-        super().load_weights(_center_bias(weights), is_nextn)
+        super().load_weights(_remap_bias_name(weights), is_nextn)
         self._set_mla_wkc_wvc()
 
     def _set_mla_wkc_wvc(self) -> None:
