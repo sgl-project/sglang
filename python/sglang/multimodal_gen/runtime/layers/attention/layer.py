@@ -374,6 +374,7 @@ class USPAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
+            # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
 

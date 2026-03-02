@@ -181,9 +181,6 @@ class WanSelfAttention(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
@@ -223,6 +220,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
+        # compute attention
         x = self.attn(q, k, v)
 
         # output
