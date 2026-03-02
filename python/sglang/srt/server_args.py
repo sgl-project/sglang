@@ -1778,6 +1778,11 @@ class ServerArgs:
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
             else:
+                if envs.SGLANG_ENABLE_SPEC_V2.get():
+                    raise ValueError(
+                        "Spec v2 is not compatible with mamba no_buffer strategy when radix cache is enabled. "
+                        "Please use --mamba-scheduler-strategy extra_buffer"
+                    )
                 logger.warning(
                     f"Disabling radix cache since speculative decoding for {model_arch} is not supported with radix cache yet."
                 )
