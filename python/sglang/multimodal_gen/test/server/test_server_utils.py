@@ -781,6 +781,13 @@ def get_generate_fn(
         extra_body = {}
         if sampling_params.enable_teacache:
             extra_body["enable_teacache"] = True
+        if sampling_params.enable_upscaling:
+            extra_body["enable_upscaling"] = True
+            if sampling_params.upscaling_model_path:
+                extra_body["upscaling_model_path"] = (
+                    sampling_params.upscaling_model_path
+                )
+            extra_body["upscaling_scale"] = sampling_params.upscaling_scale
 
         response = client.images.with_raw_response.generate(
             model=model_path,
@@ -805,6 +812,9 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(output_size)
+        if sampling_params.enable_upscaling and expected_width and expected_height:
+            expected_width *= sampling_params.upscaling_scale
+            expected_height *= sampling_params.upscaling_scale
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -992,6 +1002,13 @@ def get_generate_fn(
             extra_body["frame_interpolation_exp"] = (
                 sampling_params.frame_interpolation_exp
             )
+        if sampling_params.enable_upscaling:
+            extra_body["enable_upscaling"] = True
+            if sampling_params.upscaling_model_path:
+                extra_body["upscaling_model_path"] = (
+                    sampling_params.upscaling_model_path
+                )
+            extra_body["upscaling_scale"] = sampling_params.upscaling_scale
 
         # Compute expected output frame count for validation
         expected_frame_count = None

@@ -222,6 +222,11 @@ class DiffusionSamplingParams:
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
 
+    # Upscaling
+    enable_upscaling: bool = False
+    upscaling_model_path: str | None = None
+    upscaling_scale: int = 4
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
@@ -458,6 +463,20 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(model_path="Qwen/Qwen-Image-Layered", modality="image"),
         MULTI_FRAME_I2I_sampling_params,
     ),
+    # Upscaling (Real-ESRGAN 4×) for T2I
+    DiffusionTestCase(
+        "flux_2_image_t2i_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki",
+            output_size="1024x1024",
+            enable_upscaling=True,
+            upscaling_scale=4,
+        ),
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
@@ -498,7 +517,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             enable_teacache=True,
         ),
     ),
-    # Frame interpolation correctness (2× / exp=1)
+    # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_frame_interp_2x",
@@ -512,6 +531,21 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             num_frames=5,
             enable_frame_interpolation=True,
             frame_interpolation_exp=1,
+        ),
+    ),
+    # Upscaling (Real-ESRGAN 4×)
+    # Uses the same 1.3B model already in the suite;
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            enable_upscaling=True,
+            upscaling_scale=4,
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test

@@ -257,18 +257,38 @@ class UpscalerModel:
 
     def __init__(self, net: nn.Module, scale: int):
         self.net = net
-        self.scale = scale
+        self.scale = scale  # the model's native upscaling factor (e.g. 4)
 
     @property
     def device(self) -> torch.device:
         return next(self.net.parameters()).device
 
-    def upscale(self, frame: np.ndarray) -> np.ndarray:
-        """Upscale a single HWC uint8 frame → HWC uint8 frame."""
+    def upscale(self, frame: np.ndarray, outscale: float | None = None) -> np.ndarray:
+        """Upscale a single HWC uint8 frame → HWC uint8 frame.
+
+        Args:
+            frame:    Input HWC uint8 numpy array.
+            outscale: Desired final upscaling factor. If different from the
+                      model's native scale, a cheap resize is applied after
+                      the network output (same approach as the official
+                      Real-ESRGAN ``inference_realesrgan.py --outscale``).
+                      ``None`` means use the model's native scale as-is.
+        """
+        h, w = frame.shape[:2]
         img = frame.astype(np.float32) / 255.0
         img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
         with torch.no_grad():
             out = self.net(img_t)
+
+        # If the desired outscale differs from the model's native scale,
+        # resize to (h * outscale, w * outscale).
+        if outscale is not None and outscale != self.scale:
+            target_h = int(h * outscale)
+            target_w = int(w * outscale)
+            out = F.interpolate(
+                out, size=(target_h, target_w), mode="bicubic", align_corners=False
+            )
+
         out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy()
         return (out_np * 255.0).astype(np.uint8)
 
@@ -324,24 +344,34 @@ class ImageUpscaler:
             net = net.half()
         net = net.to(device)
 
-        # Detect scale from network if not explicitly set
-        scale = self._scale
+        # Detect the model's native scale from network architecture
+        native_scale = 4  # sensible default
         if hasattr(net, "upscale"):
-            scale = net.upscale
+            native_scale = net.upscale
         elif hasattr(net, "scale"):
-            scale = net.scale
+            native_scale = net.scale
 
-        model = UpscalerModel(net=net, scale=scale)
+        model = UpscalerModel(net=net, scale=native_scale)
         _MODEL_CACHE[resolved_path] = model
-        logger.info("Real-ESRGAN model loaded on device: %s (scale=%dx)", device, scale)
+        logger.info(
+            "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s)",
+            device,
+            native_scale,
+            f"{self._scale}x" if self._scale != native_scale else "native",
+        )
         return model
 
     def upscale(self, frames: list[np.ndarray]) -> list[np.ndarray]:
-        """Upscale a list of HWC uint8 frames."""
+        """Upscale a list of HWC uint8 frames.
+
+        Uses the model's native scale for super-resolution, then resizes to
+        the desired ``outscale`` if it differs (cheap bicubic resize).
+        """
         if not frames:
             return frames
         model = self._ensure_model_loaded()
-        return [model.upscale(frame) for frame in frames]
+        outscale = self._scale if self._scale != model.scale else None
+        return [model.upscale(frame, outscale=outscale) for frame in frames]
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +424,19 @@ def upscale_frames(
     """
     Convenience wrapper around ImageUpscaler.
 
+    The model always runs at its native resolution (e.g. 4× for
+    ``RealESRGAN_x4.pth``).  If *scale* differs from the native factor,
+    a cheap bicubic resize is applied after the network output – the same
+    approach used by the official Real-ESRGAN ``--outscale`` flag.
+
     Args:
         frames:         List of uint8 HWC numpy frames.
         model_path:     Local .pth file or HuggingFace repo ID.
                         None → default ``ai-forever/Real-ESRGAN`` with
                         ``RealESRGAN_x4.pth``.
-        scale:          Upscaling factor (2 or 4).
+        scale:          Desired final upscaling factor (e.g. 2, 3, 4).
+                        The 4× model is used internally; the output is
+                        resized to match *scale* when it differs.
         half_precision: Use fp16 inference (faster on supported GPUs).
 
     Returns:

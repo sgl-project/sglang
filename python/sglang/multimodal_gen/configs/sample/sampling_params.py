@@ -113,7 +113,7 @@ class SamplingParams:
     upscaling_model_path: str | None = (
         None  # local .pth or HF repo ID (default: ai-forever/Real-ESRGAN)
     )
-    upscaling_scale: int = 4  # 2 or 4
+    upscaling_scale: int = 4
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -872,7 +872,7 @@ class SamplingParams:
             "--upscaling-scale",
             type=int,
             default=SamplingParams.upscaling_scale,
-            help="Upscaling factor: 2 or 4 (default: 4).",
+            help="Upscaling factor (default: 4).",
         )
         return parser
 

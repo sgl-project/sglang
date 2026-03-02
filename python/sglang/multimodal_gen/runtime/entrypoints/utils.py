@@ -462,7 +462,7 @@ def post_process_sample(
         )
         fps = fps * multiplier
 
-    # 2.5 Upscaling (images and videos)
+    # 3. Upscaling (images and videos)
     if enable_upscaling and frames:
         from sglang.multimodal_gen.runtime.postprocess import upscale_frames
 
@@ -472,7 +472,7 @@ def post_process_sample(
             scale=upscaling_scale,
         )
 
-    # 3. Save outputs if requested
+    # 4. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
