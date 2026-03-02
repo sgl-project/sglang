@@ -95,8 +95,6 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
-        decode_tp_size: int,
-        decode_dp_size: int,
         scheduler: Scheduler,
         pp_rank: int,
         pp_size: int,
@@ -109,8 +107,6 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.decode_tp_size = decode_tp_size
-        self.decode_dp_size = decode_dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.gpu_id = gpu_id
@@ -135,8 +131,6 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
-        kv_args.prefill_pp_size = self.pp_size
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()

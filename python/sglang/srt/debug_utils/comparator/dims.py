@@ -73,6 +73,13 @@ class DimsSpec(_FrozenBase):
     dp_group_alias: Optional[str] = None
 
 
+class DimsSpec(_FrozenBase):
+    """Parsed result of a full dims string like ``"b s h(tp) # dp:=moe_dp"``."""
+
+    dims: list[DimSpec]
+    dp_group_alias: Optional[str] = None
+
+
 class _SingletonDimUtil:
     """Utilities for squeeze dims (name="1") and their singleton tensor-name mapping."""
 

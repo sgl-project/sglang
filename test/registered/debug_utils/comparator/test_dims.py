@@ -120,6 +120,13 @@ class TestParseDim:
         with pytest.raises(ValueError, match="Invalid dim token"):
             parse_dim("1(tp)")
 
+    def test_squeeze_dim(self) -> None:
+        assert parse_dim("1") == DimSpec(name="1")
+
+    def test_squeeze_dim_rejects_modifiers(self) -> None:
+        with pytest.raises(ValueError, match="Invalid dim token"):
+            parse_dim("1(tp)")
+
 
 class TestParseDims:
     def test_multi_dims(self) -> None:

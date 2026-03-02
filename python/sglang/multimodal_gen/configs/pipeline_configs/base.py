@@ -53,6 +53,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
+    I2M = auto()  # Image to Mesh
 
     def is_image_gen(self) -> bool:
         return (
@@ -62,7 +63,11 @@ class ModelTaskType(Enum):
         )
 
     def requires_image_input(self) -> bool:
-        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.I2M
+        )
 
     def accepts_image_input(self) -> bool:
         return (
@@ -70,9 +75,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
+            or self == ModelTaskType.I2M
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.I2M:
+            return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
         else:

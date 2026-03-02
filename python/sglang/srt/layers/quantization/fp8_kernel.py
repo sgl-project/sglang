@@ -37,6 +37,8 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1286,9 +1288,16 @@ def mxfp8_block_scaled_matmul_triton(
     block_m: int = 128,
     block_n: int = 256,
     block_k: int = 128,
-    num_stages: int = 4,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
-    """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
+    """Block-scaled matmul for MXFP8 using Triton dot_scaled.
+
+    Args:
+        num_stages: Number of pipeline stages. If None, auto-selects based on GPU:
+            SM120: 1, SM100: 4.
+    """
+    if num_stages is None:
+        num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b
