@@ -34,9 +34,9 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | Method | Draft source | Separate draft model? | How to enable | Notes / constraints |
 |---|---|---:|---|---|
 | EAGLE-2 | EAGLE draft model (feature drafting + tree) | Typically yes | `--speculative-algorithm EAGLE` + `--speculative-draft-model-path ...` | Tune `--speculative-num-steps`, `--speculative-eagle-topk`, `--speculative-num-draft-tokens` |
-| EAGLE-2 + `torch.compile` | Same as EAGLE-2 | Typically yes | Add `--enable-torch-compile` (optionally `--torch-compile-max-bs`) | Further kernel-level optimizations |
+| EAGLE-2 + `torch.compile` | Same as EAGLE-2 | Typically yes | Add `--enable-torch-compile` (optionally `--torch-compile-max-bs`) | Benefit varies by hardware/model; benchmark to verify |
 | EAGLE-2 + FR-Spec | Same as EAGLE-2 + token subset | Typically yes | Add `--speculative-token-map ...` | Reduces `lm_head` overhead with high-frequency token vocab |
-| EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark above |
+| EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
@@ -79,9 +79,9 @@ For `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-nu
 You can find the best combinations of these parameters with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py).
 
 
-### EAGLE-2 decoding
+### EAGLE-2 Decoding
 
-You can enable EAGLE-2 decoding by setting `--speculative-algorithm EAGLE` and choosing an appropriate model.
+You can enable EAGLE-2 Decoding by setting `--speculative-algorithm EAGLE` and choosing an appropriate model.
 
 **Launch the server:**
 
@@ -121,7 +121,9 @@ print(response.choices[0].message.content)
 
 ### EAGLE-2 Decoding with `torch.compile`
 
-You can also enable `torch.compile` for further optimizations and optionally set `--torch-compile-max-bs`:
+You can optionally enable `torch.compile` to apply kernel-level optimizations (operator fusion, autotune) to the draft model. The actual speedup depends on your hardware, model architecture, and batch size. In some configurations (e.g., small draft models on H100 where cuBLAS is already optimal and CUDA graphs are enabled), the benefit may be negligible. We recommend benchmarking with and without this flag on your specific setup to verify whether it helps.
+
+To enable it, add `--enable-torch-compile` and optionally set `--torch-compile-max-bs`:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -160,9 +162,9 @@ print(response.choices[0].message.content)
 
 ### EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling
 
-By employing a truncated high-frequency token vocabulary in the draft model, Eagle speculative decoding reduces `lm_head` computational overhead while accelerating the pipeline without quality degradation. For more details, checkout [the paper](https://arxiv.org/pdf/2502.14856).
+By employing a truncated high-frequency token vocabulary in the draft model, EAGLE speculative decoding reduces `lm_head` computational overhead while accelerating the pipeline without quality degradation. For more details, check out [the paper](https://arxiv.org/pdf/2502.14856).
 
-In our implementation, set `--speculative-token-map` to enable the optimization. You can get the high-frequency token in FR-Spec from [this model](https://huggingface.co/thunlp/LLaMA3-Instruct-8B-FR-Spec). Or you can obtain high-frequency token by directly downloading these token from [this repo](https://github.com/thunlp/FR-Spec/tree/main?tab=readme-ov-file#prepare-fr-spec-vocabulary-subset).
+In our implementation, set `--speculative-token-map` to enable the optimization. You can get the high-frequency tokens in FR-Spec from [this model](https://huggingface.co/thunlp/LLaMA3-Instruct-8B-FR-Spec). Or you can obtain high-frequency tokens by directly downloading these tokens from [this repo](https://github.com/thunlp/FR-Spec/tree/main?tab=readme-ov-file#prepare-fr-spec-vocabulary-subset).
 
 Thanks for the contribution from [Weilin Zhao](https://github.com/Achazwl) and [Zhousx](https://github.com/Zhou-sx).
 
@@ -243,7 +245,7 @@ print(response.choices[0].message.content)
 
 ## Multi Token Prediction
 
-We support [MTP(Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [deepseek_v32 doc](../basic_usage/deepseek_v32.md#multi-token-prediction)).
+We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [deepseek_v32 doc](../basic_usage/deepseek_v32.md#multi-token-prediction)).
 
 ```bash
 python3 -m sglang.launch_server \
@@ -492,7 +494,26 @@ Below is a comprehensive list of all speculative decoding parameters available i
 > [!WARNING]
 > **Out of Memory (OOM)?** Speculative decoding may increase GPU memory usage because the draft tree, CUDA graphs, and verification-related buffers consume additional VRAM. If you encounter OOM errors, try the following adjustments.
 
-### Step 1: Reduce draft tree size (most effective)
+### Step 1: Lower static memory fraction (most effective)
+
+```bash
+--mem-fraction-static 0.5   # when omitted, this value is auto-computed
+```
+
+- `--mem-fraction-static` controls the memory budget for model weights + KV cache pool.
+- Lowering it directly increases dynamic headroom for activations and CUDA graph buffers.
+- If omitted, SGLang auto-estimates this value from other settings, and those auto settings can still be too aggressive for some workloads.
+
+### Step 2: Reduce CUDA graph batch size
+
+```bash
+# Fewer CUDA graph captures = less memory reserved
+--cuda-graph-max-bs 4   # or even 2 for tight memory situations
+```
+
+- If omitted, `--cuda-graph-max-bs` is auto-selected based on GPU memory and TP size, and can be much larger on high-memory GPUs.
+
+### Step 3: Reduce draft tree size
 
 These three parameters directly control how much memory the draft tree consumes:
 
@@ -501,25 +522,7 @@ These three parameters directly control how much memory the draft tree consumes:
 --speculative-num-steps 5 --speculative-eagle-topk 8 --speculative-num-draft-tokens 64
 
 # After (conservative, lower memory)
---speculative-num-steps 3 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16
-```
-
-- **`--speculative-num-draft-tokens`**: This is the single most impactful parameter. Reducing from 64 → 16 can cut draft-related memory by ~75%. Start here.
-- **`--speculative-eagle-topk`**: Reducing from 8 → 4 or even 2 halves the branching factor.
-- **`--speculative-num-steps`**: Reducing from 5 → 3 shortens the draft depth.
-
-### Step 2: Lower static memory fraction
-
-```bash
-# Give more room for dynamic allocations (CUDA graphs, draft model, etc.)
---mem-fraction-static 0.5   # when omitted, this value is auto-computed
-```
-
-### Step 3: Reduce CUDA graph batch size
-
-```bash
-# Fewer CUDA graph captures = less memory reserved
---cuda-graph-max-bs 4   # or even 2 for tight memory situations
+--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 
 ### Step 4: Limit concurrent requests
@@ -528,29 +531,6 @@ These three parameters directly control how much memory the draft tree consumes:
 # Fewer concurrent requests lowers in-flight load and can reduce OOM risk
 --max-running-requests 4
 ```
-
-### Step 5: Use quantization
-
-```bash
-# Quantize the target model (if supported by your checkpoint/hardware)
---quantization fp8
-
-# Or quantize only the draft model (keep target at full precision)
---speculative-draft-model-quantization fp8
-```
-
-### Step 6: Use a smaller dtype
-
-```bash
---dtype float16   # instead of bfloat16/float32 (when supported)
-```
-
-### Step 7: Use FR-Spec to reduce lm_head memory (EAGLE-2 / STANDALONE)
-
-```bash
---speculative-token-map thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt
-```
-> Note: For EAGLE-3, `--speculative-token-map` is ignored because EAGLE-3 models already provide built-in hot-token handling.
 
 ### Quick OOM recovery recipe
 
@@ -561,20 +541,16 @@ python3 -m sglang.launch_server \
     --model <your-model> \
     --speculative-algorithm EAGLE \
     --speculative-draft-model-path <your-draft-model> \
-    --speculative-num-steps 2 \
-    --speculative-eagle-topk 2 \
-    --speculative-num-draft-tokens 8 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
     --cuda-graph-max-bs 2 \
     --mem-fraction-static 0.5 \
     --max-running-requests 4 \
-    --dtype float16 \
     --log-level warning
 ```
 
-Then gradually increase `--speculative-num-draft-tokens`, `--speculative-eagle-topk`, and `--cuda-graph-max-bs` until you find the sweet spot for your GPU.
-
-> [!TIP]
-> **Memory budget rule of thumb**: during automatic `--mem-fraction-static` estimation, STANDALONE reserves about 6 GB and EAGLE/EAGLE3 reserves about 2 GB as additional headroom. Plan your `--mem-fraction-static` accordingly.
+Then gradually increase `--speculative-num-draft-tokens`, `--speculative-eagle-topk`, and `--cuda-graph-max-bs`. Increase `--mem-fraction-static` last, only after the run is stable.
 
 ---
 
@@ -589,4 +565,4 @@ EAGLE process is as follows:
 
 This enhances drafting accuracy by operating on features instead of tokens for more regular inputs and by additionally passing tokens from the next timestep to reduce sampling randomness. For more details, see the [EAGLE-2](https://arxiv.org/abs/2406.16858) and [EAGLE-3](https://arxiv.org/abs/2503.01840) papers.
 
-For guidance how to train your own EAGLE model please see the [EAGLE repo](https://github.com/SafeAILab/EAGLE/tree/main?tab=readme-ov-file#train).
+For guidance on how to train your own EAGLE model please see the [EAGLE repo](https://github.com/SafeAILab/EAGLE/tree/main?tab=readme-ov-file#train). For EAGLE-3 training specifically, check out [SpecForge](https://github.com/sgl-project/SpecForge), the SGLang team's training framework designed for EAGLE-3 speculative decoding models with seamless porting to SGLang serving. See the [SpecForge documentation](https://docs.sglang.ai/SpecForge/) and [blog post](https://lmsys.org/blog/2025-07-25-spec-forge) for details.
