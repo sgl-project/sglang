@@ -6,10 +6,11 @@ import torch
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     QUANTILE_NUMEL_THRESHOLD,
     SAMPLE_DIFF_THRESHOLD,
-    _compute_diff,
     _compute_tensor_stats,
     compare_tensor_pair,
+    compute_diff,
 )
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="default", nightly=True)
@@ -54,7 +55,7 @@ class TestComputeTensorStats:
 class TestComputeDiff:
     def test_identical_tensors(self):
         x = torch.ones(10, 10)
-        diff = _compute_diff(x_baseline=x, x_target=x)
+        diff = compute_diff(x_baseline=x, x_target=x)
 
         assert diff.rel_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
@@ -69,7 +70,7 @@ class TestComputeDiff:
         y = x.clone()
         y[3, 7] = 1.5
 
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.max_abs_diff == pytest.approx(0.5, abs=1e-4)
         assert diff.max_diff_coord == [3, 7]
@@ -84,17 +85,58 @@ class TestComputeDiff:
     def test_large_tensor_skips_diff_quantiles(self):
         x = torch.randn(QUANTILE_NUMEL_THRESHOLD + 1)
         y = x + 0.001
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.abs_diff_percentiles == {}
 
     def test_rel_diff_value(self):
         x = torch.tensor([1.0, 0.0])
         y = torch.tensor([0.0, 1.0])
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
         assert diff.passed is False
+
+    def test_per_token_with_seq_dim(self) -> None:
+        """seq_dim provided → per_token_rel_diff is list[float]."""
+        torch.manual_seed(42)
+        x: torch.Tensor = torch.randn(8, 16)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = compute_diff(
+            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
+        )
+
+        assert diff.per_token_rel_diff is not None
+        assert isinstance(diff.per_token_rel_diff, list)
+        assert len(diff.per_token_rel_diff) == 8
+        assert all(isinstance(v, float) for v in diff.per_token_rel_diff)
+
+    def test_per_token_without_seq_dim(self) -> None:
+        """No seq_dim → per_token_rel_diff is None."""
+        x: torch.Tensor = torch.randn(8, 16)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
+
+        assert diff.per_token_rel_diff is None
+
+    def test_per_token_json_roundtrip(self) -> None:
+        """DiffInfo with per_token_rel_diff survives JSON serialization."""
+        torch.manual_seed(42)
+        x: torch.Tensor = torch.randn(4, 8)
+        y: torch.Tensor = x + torch.randn_like(x) * 0.01
+
+        diff: DiffInfo = compute_diff(
+            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
+        )
+
+        json_str: str = diff.model_dump_json()
+        assert "per_token_rel_diff" in json_str
+
+        roundtripped: DiffInfo = DiffInfo.model_validate_json(json_str)
+        assert roundtripped.per_token_rel_diff is not None
+        assert len(roundtripped.per_token_rel_diff) == 4
 
 
 class TestCompareTensors:

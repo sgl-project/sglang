@@ -118,7 +118,7 @@ def _inject_preamble(*, config: PatchConfig, extra_imports: list[str]) -> PatchC
     for spec in config.patches:
         existing: str = spec.preamble
         combined: str = (
-            existing + "\n" + import_block if existing.strip() else import_block
+            import_block + "\n" + existing if existing.strip() else import_block
         )
         new_patches.append(
             PatchSpec(target=spec.target, edits=spec.edits, preamble=combined)

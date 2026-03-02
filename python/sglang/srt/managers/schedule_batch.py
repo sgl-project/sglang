@@ -1449,21 +1449,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
+        _pin = self.device != "cpu" and torch.cuda.is_available()
         input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64
+            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
+        orig_seq_lens_tensor = torch.tensor(
+            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
             token_type_ids_tensor = torch.tensor(
-                sum(token_type_ids, []), dtype=torch.int64
+                sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
             ).to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
@@ -1601,7 +1602,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
-            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            torch.tensor(input_embeds, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
             if input_embeds
             else None
         )
@@ -1986,34 +1989,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            # Build indices fully on GPU without scalar extraction.
-            # Each slice is shape [1]; cat -> [bs].
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                self.mamba_track_indices = torch.cat(
-                    [
-                        (
-                            req.mamba_ping_pong_track_buffer[1:]
-                            if req.mamba_next_track_idx == 1
-                            else req.mamba_ping_pong_track_buffer[:1]
-                        )
-                        for req in self.reqs
-                    ],
-                    dim=0,
-                ).to(torch.int64)
+                # already on device
+                all_buffers = torch.stack(
+                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
+                )
+                idx = (
+                    torch.tensor(
+                        [req.mamba_next_track_idx for req in self.reqs],
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    )
+                    .unsqueeze(1)
+                    .to(device=all_buffers.device, non_blocking=True)
+                )
+                self.mamba_track_indices = (
+                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+                )
 
-            # Keep mask construction in the pinned-tensor form.
-            self.mamba_track_mask = torch.tensor(
-                [
-                    sl % get_global_server_args().mamba_track_interval == 0
-                    for sl in self.seq_lens_cpu
-                ],
-                dtype=torch.bool,
-                pin_memory=True,
-            ).to(device=self.device, non_blocking=True)
+            # async H2D
+            self.mamba_track_mask = (
+                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                .pin_memory()
+                .to(device=self.device, non_blocking=True)
+            )
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
@@ -2101,9 +2104,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # NOTE: in spec v2 mode, we do not need wait verify here because
-        # 1) current batch is always prefill, whose seq_lens is not a future
-        # 2) other batch is always decode, which is finished in previous step
+        # In the regular scheduler path:
+        # 1) self is always prefill, whose seq_lens is not a future
+        # 2) other is always decode, which is finished in previous step
+        # so verify_done is already synced and this is a no-op.
+        # In disagg decode + overlap, merge_batch can be called before
+        # filter_batch, so running_batch.seq_lens may still be a forward_stream
+        # future. Synchronize here to avoid a cross-stream data race.
+        self.maybe_wait_verify_done()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2227,9 +2235,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result
+        # Only contain fields that will be used by process_batch_result.
+        # Shallow-copy the reqs list so that in-place mutations (filter_batch,
+        # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
@@ -2260,7 +2270,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             if (
                 self.forward_mode.is_decode()
-                and server_args.enable_piecewise_cuda_graph
+                and not server_args.disable_piecewise_cuda_graph
                 and not self.tree_cache.is_chunk_cache()
             ):
                 return

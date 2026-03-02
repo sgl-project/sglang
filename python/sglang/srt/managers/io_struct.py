@@ -1229,6 +1229,21 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class PinPrefixReqInput(BaseReq):
+    """Pin a prefix by token_ids to resist eviction."""
+
+    token_ids: List[int] = field(default_factory=list)
+    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
+
+
+@dataclass
+class PinPrefixReqOutput(BaseReq):
+    success: bool
+    nodes_pinned: int = 0
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
