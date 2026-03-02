@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
-    _ulysses_input_split,
     _usp_input_all_to_all,
     _usp_output_all_to_all,
     ring_attn,
@@ -345,7 +344,6 @@ class USPAttention(nn.Module):
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
-        self.is_cross_attention = is_cross_attention
 
         self.skip_sequence_parallel = skip_sequence_parallel
 
@@ -382,15 +380,11 @@ class USPAttention(nn.Module):
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S, H_local, D]
             q = _usp_input_all_to_all(q, head_dim=2)
-            if self.is_cross_attention:
-                k = _ulysses_input_split(k, dim=2)
-                v = _ulysses_input_split(v, dim=2)
-            else:
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
-        if get_ring_parallel_world_size() > 1 and not self.is_cross_attention:
+        if get_ring_parallel_world_size() > 1:
             out = ring_attn(
                 q,
                 k,
