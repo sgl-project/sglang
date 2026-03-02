@@ -273,6 +273,7 @@ sgl-kernel/csrc/**/*_musa/
 *.mudmp
 
 # Others
+# diffusion 3D outputs
 *.glb
 *.ply
 *.npz
