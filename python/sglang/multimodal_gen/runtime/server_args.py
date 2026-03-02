@@ -39,7 +39,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean, expand_path_fields
 
 logger = init_logger(__name__)
 
