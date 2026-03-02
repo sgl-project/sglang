@@ -4360,12 +4360,10 @@ class TestEntrypointDpAttentionMissingAlias:
 
         assert exit_code == 1
 
-        comparisons: list[ComparisonTensorRecord] = _get_comparisons(records)
-        assert len(comparisons) == 1
-        comparison: ComparisonTensorRecord = comparisons[0]
-        assert comparison.shape_mismatch is True
-        assert comparison.diff is None
-        assert comparison.category == "failed"
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert errors[0].exception_type == "AssertionError"
+        assert "non-empty dp_rank" in errors[0].traceback_str
 
 
 class TestEntrypointAutoDescend:
