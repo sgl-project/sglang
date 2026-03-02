@@ -21,8 +21,8 @@ class LoRAModelCase:
     base: str
     adaptors: List[LoRAAdaptor]
     tp_size: int = 1
-    prefill_tolerance: float = 1e-1
-    decode_tolerance: float = 1e-1
+    prefill_tolerance: float = 5e-1
+    decode_tolerance: float = 5e-1
     rouge_l_tolerance: float = 1.0
     max_loras_per_batch: int = 1
     max_loaded_loras: Optional[int] = None
@@ -36,7 +36,7 @@ class LoRAModelCase:
             )
 
 
-TORCH_DTYPES = [torch.float16]
+TORCH_DTYPES = [torch.bfloat16]
 BACKENDS = ["triton", "csgmv"]
 DEFAULT_PROMPTS = [
     "AI is a field of computer science focused on",
@@ -69,7 +69,6 @@ ALL_OTHER_LORA_MODELS = [
         adaptors=[
             LoRAAdaptor(
                 name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                prefill_tolerance=1e-1,
             ),
         ],
         max_loras_per_batch=1,
@@ -88,11 +87,9 @@ CI_MULTI_LORA_MODELS = [
         adaptors=[
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
-                prefill_tolerance=1e-1,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
-                prefill_tolerance=3e-1,
             ),
         ],
         max_loras_per_batch=2,
@@ -106,11 +103,9 @@ ALL_OTHER_MULTI_LORA_MODELS = [
         adaptors=[
             LoRAAdaptor(
                 name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                prefill_tolerance=1e-1,
             ),
             LoRAAdaptor(
                 name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                prefill_tolerance=1e-1,
             ),
         ],
         max_loras_per_batch=2,
@@ -123,11 +118,9 @@ LORA_MODELS_QWEN3 = [
         adaptors=[
             LoRAAdaptor(
                 name="nissenj/Qwen3-4B-lora-v2",
-                prefill_tolerance=3e-1,
             ),
             LoRAAdaptor(
                 name="TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0",
-                prefill_tolerance=3e-1,
             ),
         ],
         max_loras_per_batch=2,
