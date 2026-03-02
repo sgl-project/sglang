@@ -884,50 +884,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model=self.target_worker.model_runner.model,
             )
 
-    def move_accepted_tokens_to_target_kvcache(
-        self,
-        batch: ModelWorkerBatch,
-        accept_index: torch.Tensor,
-        accept_length: torch.Tensor,
-    ):
-        """
-        Move accepted tokens to the target KV cache.
-
-        Args:
-            batch: The batch to run.
-            accept_index: The index of the accepted tokens.
-            accept_length: The length of the accepted tokens.
-        """
-        bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
-
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length,
-            tgt_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        fill_accepted_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accepted_out_cache_loc,
-            next_power_of_2(size),
-        )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
-        )
-
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
