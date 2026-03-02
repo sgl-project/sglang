@@ -1597,25 +1597,6 @@ class ServerArgs:
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
-        ]:
-            if is_sm100_supported():
-                quant_method = get_quantization_config(hf_config)
-                if self.quantization is None and quant_method is not None:
-                    self.quantization = quant_method
-                if (
-                    (
-                        self.quantization in ("fp8", "modelopt_fp4")
-                        or self.quantization is None
-                    )
-                    and self.moe_a2a_backend == "none"
-                    and self.moe_runner_backend == "auto"
-                ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                        f"{model_arch}"
-                    )
-        elif model_arch in [
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
@@ -1634,14 +1615,39 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for "
+                        f"{model_arch}"
                     )
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=True,
-                sm100_default_attention_backend="triton",
-            )
+
+            if model_arch in [
+                "Qwen3NextForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+            ]:
+                sm100_default_attn_backend = "triton"
+                if is_sm100_supported():
+                    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
+                    # _get_default_attn_backend handles the eagle_topk check.
+                    # There is only one case where page_size=1 is required,
+                    # which is when radix cache is enabled and both extra_buffer
+                    # and spec decoding are disabled.
+                    default_attn_backend = self._get_default_attn_backend(
+                        use_mla_backend=self.use_mla_backend(),
+                        model_config=self.get_model_config(),
+                    )
+                    if default_attn_backend == "trtllm_mha" and not (
+                        not self.enable_mamba_extra_buffer()
+                        and not self.disable_radix_cache
+                        and self.speculative_algorithm is None
+                    ):
+                        sm100_default_attn_backend = "trtllm_mha"
+
+                self._handle_mamba_radix_cache(
+                    model_arch=model_arch,
+                    support_mamba_cache=True,
+                    support_mamba_cache_extra_buffer=True,
+                    sm100_default_attention_backend=sm100_default_attn_backend,
+                )
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -1815,6 +1821,56 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
+    def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
+        """
+        Auto select the fastest attention backend.
+
+        1. Models with MHA Architecture (e.g: Llama, QWen)
+            1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+            1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+               Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
+            1.3 In other cases, we will use flashinfer if available, otherwise use triton.
+        2. Models with MLA Architecture and using FA3
+            2.1 We will use FA3 backend on hopper.
+            2.2 We will use Flashinfer backend on blackwell.
+            2.3 Otherwise, we will use triton backend.
+        """
+        if not use_mla_backend:
+            # MHA architecture
+            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+                # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
+                # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
+                # ref: https://github.com/sgl-project/sglang/issues/17411
+                return "fa3"
+            elif (
+                is_sm100_supported()
+                and is_no_spec_infer_or_topk_one(self)
+                and (
+                    self.speculative_algorithm is None
+                    or self.speculative_eagle_topk is not None
+                )
+            ):
+                return "trtllm_mha"
+            elif is_hip():
+                return "aiter"
+            else:
+                return "flashinfer" if is_flashinfer_available() else "triton"
+        else:
+            # MLA architecture
+            if is_hopper_with_cuda_12_3():
+                return "fa3"
+            elif is_sm100_supported():
+                return "flashinfer"
+            elif is_hip():
+                head_num = model_config.get_num_kv_heads(self.tp_size)
+                # TODO current aiter only support head number 16 or 128 head number
+                if head_num == 128 or head_num == 16:
+                    return "aiter"
+                else:
+                    return "triton"
+            else:
+                return "triton"
+
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
         use_mla_backend = self.use_mla_backend()
@@ -1826,57 +1882,9 @@ class ServerArgs:
 
         # Pick the default attention backend if not specified
         if self.attention_backend is None:
-            """
-            Auto select the fastest attention backend.
-
-            1. Models with MHA Architecture (e.g: Llama, QWen)
-                1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
-                   Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
-                1.3 In other cases, we will use flashinfer if available, otherwise use triton.
-            2. Models with MLA Architecture and using FA3
-                2.1 We will use FA3 backend on hopper.
-                2.2 We will use Flashinfer backend on blackwell.
-                2.3 Otherwise, we will use triton backend.
-            """
-
-            if not use_mla_backend:
-                # MHA architecture
-                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
-                    # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
-                    # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
-                    # ref: https://github.com/sgl-project/sglang/issues/17411
-                    self.attention_backend = "fa3"
-                elif (
-                    is_sm100_supported()
-                    and is_no_spec_infer_or_topk_one(self)
-                    and (
-                        self.speculative_algorithm is None
-                        or self.speculative_eagle_topk is not None
-                    )
-                ):
-                    self.attention_backend = "trtllm_mha"
-                elif is_hip():
-                    self.attention_backend = "aiter"
-                else:
-                    self.attention_backend = (
-                        "flashinfer" if is_flashinfer_available() else "triton"
-                    )
-            else:
-                # MLA architecture
-                if is_hopper_with_cuda_12_3():
-                    self.attention_backend = "fa3"
-                elif is_sm100_supported():
-                    self.attention_backend = "flashinfer"
-                elif is_hip():
-                    head_num = model_config.get_num_kv_heads(self.tp_size)
-                    # TODO current aiter only support head number 16 or 128 head number
-                    if head_num == 128 or head_num == 16:
-                        self.attention_backend = "aiter"
-                    else:
-                        self.attention_backend = "triton"
-                else:
-                    self.attention_backend = "triton"
+            self.attention_backend = self._get_default_attn_backend(
+                use_mla_backend, model_config
+            )
 
             logger.info(
                 f"Attention backend not specified. Use {self.attention_backend} backend by default."
