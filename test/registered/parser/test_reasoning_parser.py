@@ -484,6 +484,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
 
+        parser = ReasoningParser("kimi_k2")
+        self.assertIsInstance(parser.detector, KimiK2ReasoningDetector)
+
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
         with self.assertRaises(ValueError) as context:
@@ -817,6 +820,40 @@ class TestKimiK2ReasoningDetector(CustomTestCase):
                 ),
             ),
         ]
+
+    def test_init(self):
+        """Test KimiK2ReasoningDetector initialization and tool_start_token."""
+        detector = KimiK2ReasoningDetector()
+        self.assertEqual(detector.think_start_token, "<think>")
+        self.assertEqual(detector.think_end_token, "</think>")
+        self.assertEqual(detector.tool_start_token, "<|tool_calls_section_begin|>")
+        self.assertFalse(detector._in_reasoning)
+        self.assertTrue(detector.stream_reasoning)
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """Test that tool token interrupts reasoning without </think>."""
+        detector = KimiK2ReasoningDetector()
+        text = "<think>Let me think about this<|tool_calls_section_begin|>tool data"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "<|tool_calls_section_begin|>tool data")
+
+    def test_streaming_tool_interrupt(self):
+        """Test streaming tool interruption at the detector level."""
+        detector = KimiK2ReasoningDetector()
+        r1 = detector.parse_streaming_increment("<think>")
+        self.assertEqual(r1.reasoning_text, "")
+        self.assertTrue(detector._in_reasoning)
+
+        r2 = detector.parse_streaming_increment("thinking...")
+        self.assertEqual(r2.reasoning_text, "thinking...")
+
+        r3 = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>tool data"
+        )
+        self.assertEqual(r3.reasoning_text, "")
+        self.assertEqual(r3.normal_text, "<|tool_calls_section_begin|>tool data")
+        self.assertFalse(detector._in_reasoning)
 
     def _run_pipeline_non_stream(self, full_text):
         """Simulate the non-streaming pipeline: reasoning parse then tool call parse."""

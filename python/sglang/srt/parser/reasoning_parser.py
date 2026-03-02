@@ -247,12 +247,11 @@ class KimiK2ReasoningDetector(BaseReasoningFormatDetector):
     Detector for Kimi-K2/K2.5 reasoning format.
 
     The model may emit tool call tokens (<|tool_calls_section_begin|>) without
-    first closing the reasoning block with </think>. This detector treats tool
-    call tokens as an implicit end of reasoning so they pass through as
-    normal_text and reach the downstream tool call parser.
+    first closing the reasoning block with </think>. This detector uses the
+    base class tool_start_token mechanism to treat tool call tokens as an
+    implicit end of reasoning so they pass through as normal_text and reach
+    the downstream tool call parser.
     """
-
-    TOOL_CALL_TOKEN = "<|tool_calls_section_begin|>"
 
     def __init__(
         self,
@@ -266,88 +265,10 @@ class KimiK2ReasoningDetector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token="<|tool_calls_section_begin|>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
-
-    def _split_on_tool_token(self, text: str):
-        """If text contains tool call tokens, split into (reasoning, tool_text)."""
-        idx = text.find(self.TOOL_CALL_TOKEN)
-        if idx == -1:
-            return None
-        return text[:idx], text[idx:]
-
-    def detect_and_parse(self, text: str) -> StreamingParseResult:
-        in_reasoning = self._in_reasoning or self.think_start_token in text
-        if not in_reasoning:
-            return StreamingParseResult(normal_text=text)
-
-        processed_text = text.replace(self.think_start_token, "").strip()
-
-        if self.think_end_token in processed_text:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
-            return StreamingParseResult(
-                normal_text=splits[1].strip(), reasoning_text=splits[0]
-            )
-
-        if self.think_end_token in self.previous_content:
-            return StreamingParseResult(normal_text=processed_text)
-
-        split = self._split_on_tool_token(processed_text)
-        if split is not None:
-            reasoning_part, tool_part = split
-            return StreamingParseResult(
-                normal_text=tool_part, reasoning_text=reasoning_part
-            )
-
-        return StreamingParseResult(reasoning_text=processed_text)
-
-    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        self._buffer += new_text
-        current_text = self._buffer
-
-        if any(
-            token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
-        ):
-            return StreamingParseResult()
-
-        if not self.stripped_think_start and self.think_start_token in current_text:
-            current_text = current_text.replace(self.think_start_token, "")
-            self.stripped_think_start = True
-            self._in_reasoning = True
-
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
-            reasoning_text = current_text[:end_idx]
-            self._buffer = ""
-            self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
-            return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
-            )
-
-        if self._in_reasoning:
-            split = self._split_on_tool_token(current_text)
-            if split is not None:
-                reasoning_part, tool_part = split
-                self._buffer = ""
-                self._in_reasoning = False
-                return StreamingParseResult(
-                    normal_text=tool_part, reasoning_text=reasoning_part.rstrip()
-                )
-
-            if self.stream_reasoning:
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
-            else:
-                return StreamingParseResult()
-
-        if not self._in_reasoning:
-            self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
-
-        return StreamingParseResult()
 
 
 class KimiDetector(BaseReasoningFormatDetector):
