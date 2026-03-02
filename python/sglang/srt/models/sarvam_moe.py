@@ -3,7 +3,6 @@
 - SarvamMoEForCausalLM (30B)
 """
 
-import gc
 import math
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -14,17 +13,23 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
+    get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -33,24 +38,27 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -58,6 +66,8 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
+    make_layers,
+    next_power_of_2,
 )
 
 _is_cuda = is_cuda()
@@ -65,19 +75,24 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from sgl_kernel import bmm_fp8, merge_state_v2
+        from sgl_kernel import bmm_fp8, concat_mla_k, merge_state_v2
 
         from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
+        _has_concat_mla_k = True
     except ImportError:
         _has_fp8_support = False
+        _has_concat_mla_k = False
         bmm_fp8 = None
+        concat_mla_k = None
         merge_state_v2 = None
         per_tensor_quant_mla_fp8 = None
 else:
     _has_fp8_support = False
+    _has_concat_mla_k = False
     bmm_fp8 = None
+    concat_mla_k = None
     merge_state_v2 = None
     per_tensor_quant_mla_fp8 = None
 
@@ -132,7 +147,6 @@ for backend in CONCAT_ROPE_BACKENDS:
 
 
 def get_attn_forward_method(server_args, forward_batch) -> AttnForwardMethod:
-
     is_decode = forward_batch.forward_mode.is_decode_or_idle()
     if is_decode:
         backend = server_args.decode_attention_backend or server_args.attention_backend
@@ -220,13 +234,13 @@ class SarvamMoESparseMoeBlock(nn.Module):
         self.topk_group = getattr(config, "topk_group", None)
         self.alt_stream = alt_stream
 
+        dtype_map = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
         router_dtype_cfg = getattr(config, "router_dtype", "fp32")
-        if router_dtype_cfg is None:
-            self.router_dtype = None
-        elif router_dtype_cfg == "fp32":
-            self.router_dtype = torch.float32
-        else:
-            self.router_dtype = torch.bfloat16
+        self.router_dtype = dtype_map.get(router_dtype_cfg, None)
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -295,17 +309,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
-            self.ep_size = get_moe_expert_parallel_world_size()
-            self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
-            )
-            self.top_k = config.num_experts_per_tok
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -315,12 +318,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
     ) -> torch.Tensor:
         del gemm_output_zero_allocator
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
-            return self.forward_deepep(hidden_states, forward_batch)
 
         if (
             self.shared_experts is not None
@@ -586,9 +583,40 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        return DeepseekMHAForwardMixin._concat_and_cast_mha_k(
-            self, k_nope, k_pe, forward_batch
-        )
+        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
+
+        if (
+            _is_cuda
+            and _has_concat_mla_k
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            k = k_nope.new_empty(*k_shape)
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+            return k
+
+        if (
+            _is_cuda
+            and next_power_of_2(self.num_local_heads) == self.num_local_heads
+            and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
+            and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+        ):
+            if (
+                self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                attn_dtype = forward_batch.token_to_kv_pool.dtype
+            else:
+                attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+            return k
+
+        k = k_nope.new_empty(*k_shape)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        return k
 
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
         if self._server_args is None:
@@ -962,7 +990,157 @@ class SarvamMoEMLAAttention(nn.Module):
         return latent_cache
 
 
-class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
+class SarvamMoEMLADecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.config = config
+        self.layer_id = layer_id
+
+        if hasattr(config, "rope_parameters"):
+            rope_theta = config.rope_parameters.get("rope_theta")
+            rope_type = config.rope_parameters.get("rope_type")
+            rope_scaling = config.rope_parameters if rope_type != "default" else None
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        self.self_attn = SarvamMoEMLAAttention(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
+        )
+
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        self.is_layer_sparse = (
+            has_moe
+            and layer_id >= first_k_dense
+            and (layer_id - first_k_dense) % moe_layer_freq == 0
+        )
+        is_previous_layer_sparse = (
+            has_moe
+            and layer_id > 0
+            and (layer_id - 1) >= first_k_dense
+            and (layer_id - 1 - first_k_dense) % moe_layer_freq == 0
+        )
+        is_next_layer_sparse = (
+            has_moe
+            and layer_id < config.num_hidden_layers - 1
+            and (layer_id + 1) >= first_k_dense
+            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
+        )
+
+        if self.is_layer_sparse:
+            self.mlp = SarvamMoESparseMoeBlock(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+                alt_stream=alt_stream,
+            )
+        else:
+            if enable_moe_dense_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
+            self.mlp = SarvamMoEMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
+            )
+
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        self.attn_tp_size = get_attention_tp_size()
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
+        if (
+            not self.is_layer_sparse
+            and self.attn_tp_size > 1
+            and not use_reduce_scatter
+            and not should_allreduce_fusion
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+        return hidden_states, residual
+
+
+class SarvamMLAModel(nn.Module):
 
     def __init__(
         self,
@@ -970,25 +1148,107 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
+                enable_tp=not is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = nn.Identity()
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: SarvamMoEMLADecoderLayer(
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix="model.layers",
+        )
+
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = nn.Identity()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions, hidden_states, forward_batch, residual
+            )
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
+        return hidden_states
+
+
+class SarvamMLAForCausalLM(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
         self._remap_config(config)
-        super().__init__(config, quant_config, prefix)
-        self._swap_sarvam_blocks(quant_config)
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
 
     @staticmethod
     def _remap_config(config: PretrainedConfig) -> None:
-        if not hasattr(config, "n_routed_experts"):
-            config.n_routed_experts = config.num_experts
-        if not hasattr(config, "n_shared_experts"):
-            config.n_shared_experts = getattr(config, "num_shared_experts", None)
-
-        config.n_shared_experts = None
-        if not hasattr(config, "num_experts"):
-            config.num_experts = config.n_routed_experts
-        if not hasattr(config, "norm_topk_prob"):
-            config.norm_topk_prob = True
-        if not hasattr(config, "topk_method"):
-            config.topk_method = "noaux_tc"
-
         defaults = {
             "first_k_dense_replace": 1,
             "moe_layer_freq": 1,
@@ -999,108 +1259,87 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
             "router_dtype": "fp32",
             "routed_scaling_factor": 2.5,
             "score_function": "sigmoid",
+            "norm_topk_prob": True,
+            "topk_method": "noaux_tc",
         }
         for attr, default in defaults.items():
             if not hasattr(config, attr):
                 setattr(config, attr, default)
 
-    def _swap_sarvam_blocks(self, quant_config: Optional[QuantizationConfig]) -> None:
-        if hasattr(self.model, "layers"):
-            for layer_id in range(self.start_layer, self.end_layer):
-                layer = self.model.layers[layer_id]
-                if not hasattr(layer, "self_attn") or not hasattr(layer, "mlp"):
-                    continue
+    @property
+    def start_layer(self):
+        return self.model.start_layer
 
-                if hasattr(self.config, "rope_parameters"):
-                    rope_theta = self.config.rope_parameters.get("rope_theta")
-                    rope_type = self.config.rope_parameters.get("rope_type")
-                    rope_scaling = (
-                        self.config.rope_parameters if rope_type != "default" else None
-                    )
-                else:
-                    rope_theta = self.config.rope_theta
-                    rope_scaling = self.config.rope_scaling
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
-                layer_prefix = f"model.layers.{layer_id}"
-                old_self_attn = layer.self_attn
-                layer.self_attn = None
-                del old_self_attn
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
-                try:
-                    layer.self_attn = SarvamMoEMLAAttention(
-                        config=self.config,
-                        hidden_size=self.config.hidden_size,
-                        num_heads=self.config.num_attention_heads,
-                        layer_id=layer_id,
-                        rope_theta=rope_theta,
-                        rope_scaling=rope_scaling,
-                        max_position_embeddings=self.config.max_position_embeddings,
-                        quant_config=quant_config,
-                        prefix=add_prefix("self_attn", layer_prefix),
-                        alt_stream=getattr(layer, "alt_stream", None),
-                    )
-                except torch.OutOfMemoryError:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    layer.self_attn = SarvamMoEMLAAttention(
-                        config=self.config,
-                        hidden_size=self.config.hidden_size,
-                        num_heads=self.config.num_attention_heads,
-                        layer_id=layer_id,
-                        rope_theta=rope_theta,
-                        rope_scaling=rope_scaling,
-                        max_position_embeddings=self.config.max_position_embeddings,
-                        quant_config=quant_config,
-                        prefix=add_prefix("self_attn", layer_prefix),
-                        alt_stream=getattr(layer, "alt_stream", None),
-                    )
-                if hasattr(layer, "layer_communicator") and hasattr(
-                    layer.layer_communicator, "qkv_latent_func"
-                ):
-                    layer.layer_communicator.qkv_latent_func = (
-                        layer.self_attn.prepare_qkv_latent
-                    )
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> LogitsProcessorOutput:
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        return hidden_states
 
-                if getattr(layer, "is_layer_sparse", False):
-                    old_mlp = layer.mlp
-                    layer.mlp = None
-                    del old_mlp
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ) -> Optional[LogitsProcessorOutput]:
+        start, end = split_interval
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+            forward_batch.residual = None
 
-                    try:
-                        layer.mlp = SarvamMoESparseMoeBlock(
-                            config=self.config,
-                            layer_id=layer_id,
-                            quant_config=quant_config,
-                            prefix=add_prefix("mlp", layer_prefix),
-                            alt_stream=getattr(layer, "alt_stream", None),
-                        )
-                    except torch.OutOfMemoryError:
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        layer.mlp = SarvamMoESparseMoeBlock(
-                            config=self.config,
-                            layer_id=layer_id,
-                            quant_config=quant_config,
-                            prefix=add_prefix("mlp", layer_prefix),
-                            alt_stream=getattr(layer, "alt_stream", None),
-                        )
+        for i in range(start, end):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.model.layers[i]
+                forward_batch.hidden_states, forward_batch.residual = layer(
+                    positions,
+                    forward_batch.hidden_states,
+                    forward_batch,
+                    forward_batch.residual,
+                )
 
-    def determine_num_fused_shared_experts(
-        self, architecture: str = "SarvamMLAForCausalLM"
-    ):
-        del architecture
-        self.num_fused_shared_experts = 0
-        get_global_server_args().disable_shared_experts_fusion = True
+        if end == self.model.config.num_hidden_layers:
+            if forward_batch.residual is None:
+                hidden_states = self.model.norm(forward_batch.hidden_states)
+            else:
+                hidden_states, _ = self.model.norm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            forward_batch.hidden_states = hidden_states
+            return self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        return None
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=getattr(
-                config, "n_routed_experts", getattr(config, "num_experts", None)
-            ),
+            num_logical_experts=config.num_experts,
             num_groups=getattr(config, "n_group", None),
         )
 
@@ -1109,26 +1348,92 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ) -> None:
-        def _remap_bias_name(
-            ws: Iterable[Tuple[str, torch.Tensor]],
-        ) -> Iterable[Tuple[str, torch.Tensor]]:
-            for name, w in ws:
-                if ".mlp.gate.e_score_correction_bias" in name:
-                    name = name.replace(
-                        ".mlp.gate.e_score_correction_bias",
-                        ".mlp.e_score_correction_bias",
-                    )
-                yield name, w
+        del is_nextn
+        stacked_params_mapping = [
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        params_dict = dict(self.named_parameters())
 
-        super().load_weights(_remap_bias_name(weights), is_nextn)
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.start_layer or layer_id >= self.end_layer
+            ):
+                continue
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            if ".mlp.gate.e_score_correction_bias" in name:
+                name = name.replace(
+                    ".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias"
+                )
+
+            is_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name or "mlp.experts" in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    continue
+                if mapped_name not in params_dict:
+                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                is_stacked = True
+                break
+            if is_stacked:
+                continue
+
+            is_expert = False
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                if weight_name not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
+                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    mapped_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                is_expert = True
+                break
+            if is_expert:
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
         self._set_mla_wkc_wvc()
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, SarvamMoESparseMoeBlock)
+            }
 
     def _set_mla_wkc_wvc(self) -> None:
         for layer_id in range(self.start_layer, self.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
-            if not isinstance(self_attn, SarvamMoEMLAAttention):
-                continue
             if not hasattr(self_attn, "kv_b_proj") or self_attn.kv_b_proj is None:
                 continue
 
