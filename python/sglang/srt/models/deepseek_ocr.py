@@ -1509,18 +1509,26 @@ class DeepseekOCRForCausalLM(nn.Module):
         return values
 
     def _encode_ocr2_features(self, images: torch.Tensor) -> torch.Tensor:
+        sam_dtype = next(self.sam_model.parameters()).dtype
+        projector_dtype = next(self.projector.parameters()).dtype
+        images = images.to(dtype=sam_dtype)
         features = self.sam_model(images)
         features = self.qwen2_model(features)
+        features = features.to(dtype=projector_dtype)
         features = self.projector(features)
         return features.view(-1, features.shape[-1])
 
     def _encode_ocr1_features(self, images: torch.Tensor) -> torch.Tensor:
+        sam_dtype = next(self.sam_model.parameters()).dtype
+        vision_dtype = self.vision_model.dtype
+        projector_dtype = next(self.projector.parameters()).dtype
+        images = images.to(dtype=sam_dtype)
         features_1 = self.sam_model(images)
-        features_2 = self.vision_model(images, features_1)
+        features_2 = self.vision_model(images, features_1.to(dtype=vision_dtype))
         features = torch.cat(
             (
-                features_2[:, 1:],
-                features_1.flatten(2).permute(0, 2, 1),
+                features_2[:, 1:].to(dtype=projector_dtype),
+                features_1.flatten(2).permute(0, 2, 1).to(dtype=projector_dtype),
             ),
             dim=-1,
         )
@@ -1612,7 +1620,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         if not self.is_ocr2:
             with torch.no_grad():
                 for jdx in range(images_spatial_crop.size(0)):
-                    patches = images_crop[jdx][0].to(torch.bfloat16)
+                    patches = images_crop[jdx][0]
                     image_ori = pixel_values[jdx]
                     crop_shape = images_spatial_crop[jdx][0]
                     use_local_crops = (
@@ -1648,7 +1656,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         with torch.no_grad():
             for jdx in range(images_spatial_crop.size(0)):
-                patches = images_crop[jdx][0].to(torch.bfloat16)
+                patches = images_crop[jdx][0]
                 image_ori = pixel_values[jdx]
                 use_local_crops = (
                     has_local_crops[jdx]
@@ -1685,7 +1693,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_crop = (
             torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(torch.long)
+            .type(target_dtype)
             .to(device=pixel_values.device)
         )
         images_spatial_crop = (
