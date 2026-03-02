@@ -24,7 +24,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
     TokenLayout,
     apply_dim_names,

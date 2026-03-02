@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     PickParams,
     ReduceSumParams,
 )
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, parse_dims
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
@@ -40,12 +40,11 @@ class TestComputeUnsharderPlan:
             compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_missing_axis_in_all_parallel_infos_skipped(self) -> None:
-        """Axis in dims but absent from all parallel_infos -> axis_size=1, auto-skip."""
+        """Axis in dims but absent from all parallel_infos -> axis_size=1, auto-skip.
+        But CP is active and undeclared → raises undeclared error."""
         dim_specs = parse_dims("h[tp]").dims
         parallel_infos = [{ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2)}]
-        # TP not in any parallel_info → skipped; CP is replicated but only 1 rank
-        # with size=2 → incomplete coverage
-        with pytest.raises(ValueError, match="axis_rank coverage"):
+        with pytest.raises(ValueError, match="not declared"):
             compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_empty_parallel_infos_raises(self) -> None:
@@ -394,9 +393,208 @@ class TestComputeUnsharderPlan:
             compute_unsharder_plan(dim_specs, parallel_infos)
 
 
-class TestReplicatedAxes:
+class TestExplicitReplicatedAxes:
     def test_replicated_tp_with_sharded_cp(self) -> None:
-        """CP2 TP2, dims='b s[cp] d' → PickPlan(TP) + ConcatPlan(CP)."""
+        """CP2 TP2, dims='b s[cp] d # tp:replicated' → PickPlan(TP) + ConcatPlan(CP)."""
+        dim_specs = parse_dims("b s[cp] d # tp:replicated").dims
+        replicated = frozenset({ParallelAxis.TP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 2
+        assert plans[0].axis == ParallelAxis.TP
+        assert isinstance(plans[0].params, PickParams)
+        assert len(plans[0].groups) == 2
+        for group in plans[0].groups:
+            assert len(group) == 2
+
+        assert plans[1].axis == ParallelAxis.CP
+        assert isinstance(plans[1].params, ConcatParams)
+        assert plans[1].params.dim_name == "s"
+
+    def test_fully_replicated(self) -> None:
+        """CP2 TP2, dims='b h d # cp:replicated tp:replicated' → PickPlan(CP) + PickPlan(TP)."""
+        dim_specs = parse_dims("b h d # cp:replicated tp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP, ParallelAxis.TP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 2
+        assert all(isinstance(p.params, PickParams) for p in plans)
+        axes = {p.axis for p in plans}
+        assert axes == {ParallelAxis.CP, ParallelAxis.TP}
+
+    def test_multiple_replicated_one_sharded(self) -> None:
+        """CP2 TP2 EP2, dims='h[tp] # cp:replicated ep:replicated'."""
+        dim_specs = parse_dims("h[tp] # cp:replicated ep:replicated").dims
+        replicated = frozenset({ParallelAxis.CP, ParallelAxis.EP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for ep_rank in range(2):
+                for tp_rank in range(2):
+                    parallel_infos.append(
+                        {
+                            ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                            ParallelAxis.EP: AxisInfo(axis_rank=ep_rank, axis_size=2),
+                            ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                        }
+                    )
+
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 3
+        pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
+        concat_plans = [p for p in plans if isinstance(p.params, ConcatParams)]
+        assert len(pick_plans) == 2
+        assert len(concat_plans) == 1
+        assert concat_plans[0].axis == ParallelAxis.TP
+
+        replicated_axes_in_plan = {p.axis for p in pick_plans}
+        assert replicated_axes_in_plan == {ParallelAxis.CP, ParallelAxis.EP}
+
+    def test_replicated_scrambled_ranks(self) -> None:
+        """Scrambled world_rank order with explicit replicated axis."""
+        dim_specs = parse_dims("h[tp] # cp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 2
+        assert plans[0].axis == ParallelAxis.CP
+        assert isinstance(plans[0].params, PickParams)
+        assert plans[1].axis == ParallelAxis.TP
+        assert isinstance(plans[1].params, ConcatParams)
+
+    def test_replicated_axis_inconsistent_size_raises(self) -> None:
+        """Replicated axis with inconsistent sizes raises ValueError."""
+        dim_specs = parse_dims("h[tp] # cp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=4),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="Inconsistent axis_size"):
+            compute_unsharder_plan(
+                dim_specs, parallel_infos, explicit_replicated_axes=replicated
+            )
+
+    def test_replicated_axis_missing_from_rank_raises(self) -> None:
+        """A rank missing a replicated axis that other ranks have raises ValueError."""
+        dim_specs = parse_dims("h[tp] # cp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                # missing CP — replicated axis absent from this rank
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="missing parallel_info"):
+            compute_unsharder_plan(
+                dim_specs, parallel_infos, explicit_replicated_axes=replicated
+            )
+
+    def test_recompute_pseudo_auto_replicated(self) -> None:
+        """RECOMPUTE_PSEUDO is auto-replicated without explicit declaration."""
+        dim_specs = parse_dims("h d").dims
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.RECOMPUTE_PSEUDO
+        assert isinstance(plans[0].params, PickParams)
+        assert plans[0].groups == [[0, 1]]
+
+    def test_recompute_pseudo_explicit_replicated_also_works(self) -> None:
+        """RECOMPUTE_PSEUDO with explicit # recompute_pseudo:replicated also works."""
+        dim_specs = parse_dims("h d # recompute_pseudo:replicated").dims
+        replicated = frozenset({ParallelAxis.RECOMPUTE_PSEUDO})
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.RECOMPUTE_PSEUDO
+        assert isinstance(plans[0].params, PickParams)
+        assert plans[0].groups == [[0, 1]]
+
+    def test_undeclared_active_axis_raises(self) -> None:
+        """Active axis not declared as sharded or replicated raises ValueError."""
         dim_specs = parse_dims("b s[cp] d").dims
         parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
             {
@@ -416,148 +614,87 @@ class TestReplicatedAxes:
                 ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 2
-        assert plans[0].axis == ParallelAxis.TP
-        assert isinstance(plans[0].params, PickParams)
-        assert len(plans[0].groups) == 2
-        for group in plans[0].groups:
-            assert len(group) == 2
-
-        assert plans[1].axis == ParallelAxis.CP
-        assert isinstance(plans[1].params, ConcatParams)
-        assert plans[1].params.dim_name == "s"
-
-    def test_fully_replicated(self) -> None:
-        """CP2 TP2, dims='b h d' → PickPlan(CP) + PickPlan(TP)."""
-        dim_specs = parse_dims("b h d").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 2
-        assert all(isinstance(p.params, PickParams) for p in plans)
-        axes = {p.axis for p in plans}
-        assert axes == {ParallelAxis.CP, ParallelAxis.TP}
-
-    def test_multiple_replicated_one_sharded(self) -> None:
-        """CP2 TP2 EP2, dims='h[tp]' → PickPlan(CP) + PickPlan(EP) + ConcatPlan(TP)."""
-        dim_specs = parse_dims("h[tp]").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
-        for cp_rank in range(2):
-            for ep_rank in range(2):
-                for tp_rank in range(2):
-                    parallel_infos.append(
-                        {
-                            ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
-                            ParallelAxis.EP: AxisInfo(axis_rank=ep_rank, axis_size=2),
-                            ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
-                        }
-                    )
-
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 3
-        pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
-        concat_plans = [p for p in plans if isinstance(p.params, ConcatParams)]
-        assert len(pick_plans) == 2
-        assert len(concat_plans) == 1
-        assert concat_plans[0].axis == ParallelAxis.TP
-
-        replicated_axes = {p.axis for p in pick_plans}
-        assert replicated_axes == {ParallelAxis.CP, ParallelAxis.EP}
-
-    def test_replicated_scrambled_ranks(self) -> None:
-        """Scrambled world_rank order with replicated axis."""
-        dim_specs = parse_dims("h[tp]").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 2
-        assert plans[0].axis == ParallelAxis.CP
-        assert isinstance(plans[0].params, PickParams)
-        assert plans[1].axis == ParallelAxis.TP
-        assert isinstance(plans[1].params, ConcatParams)
-
-    def test_replicated_axis_inconsistent_size_raises(self) -> None:
-        """Replicated axis with inconsistent sizes raises ValueError."""
-        dim_specs = parse_dims("h[tp]").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=4),
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
-        ]
-        with pytest.raises(ValueError, match="Inconsistent axis_size"):
+        with pytest.raises(ValueError, match="tp.*not declared"):
             compute_unsharder_plan(dim_specs, parallel_infos)
 
-    def test_replicated_axis_missing_from_rank_raises(self) -> None:
-        """A rank missing a replicated axis that other ranks have raises ValueError."""
-        dim_specs = parse_dims("h[tp]").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
-            {
-                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                # missing CP — replicated axis absent from this rank
-                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
-            },
+    def test_replicated_not_in_parallel_infos_raises(self) -> None:
+        """Declaring replicated axis not in parallel_infos raises ValueError."""
+        dim_specs = parse_dims("h[tp] # ep:replicated").dims
+        replicated = frozenset({ParallelAxis.EP})
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
-        with pytest.raises(ValueError, match="missing parallel_info"):
-            compute_unsharder_plan(dim_specs, parallel_infos)
+        with pytest.raises(ValueError, match="not found in parallel_infos"):
+            compute_unsharder_plan(
+                dim_specs, parallel_infos, explicit_replicated_axes=replicated
+            )
 
-    def test_recompute_pseudo_replicated(self) -> None:
-        """RECOMPUTE_PSEUDO with no dim annotation → replicated → PickParams."""
-        dim_specs = parse_dims("h d").dims
-        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
-            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=0, axis_size=2)},
-            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2)},
+    def test_explicit_replicated_conflicts_with_sharded_raises(self) -> None:
+        """Planner-level defense: replicated overlaps sharded → ValueError."""
+        dim_specs = parse_dims("h[tp]").dims
+        replicated = frozenset({ParallelAxis.TP})
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
+        ]
+        with pytest.raises(ValueError, match="both sharded and replicated"):
+            compute_unsharder_plan(
+                dim_specs, parallel_infos, explicit_replicated_axes=replicated
+            )
+
+
+class TestComputeUnsharderPlanFusedDims:
+    def test_fused_dim_tp2(self) -> None:
+        """Fused dim "(num_heads*head_dim)[tp]" should unshard on the fused tensor name."""
+        dim_specs = parse_dims("t (num_heads*head_dim)[tp]").dims
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
         plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 1
-        assert plans[0].axis == ParallelAxis.RECOMPUTE_PSEUDO
-        assert isinstance(plans[0].params, PickParams)
+        assert plans[0].axis == ParallelAxis.TP
+        assert isinstance(plans[0].params, ConcatParams)
+        assert plans[0].params.dim_name == "num_heads___head_dim"
         assert plans[0].groups == [[0, 1]]
+
+    def test_fused_dim_modifier_on_second_sub(self) -> None:
+        """Modifier on fused dim: "(a*b)[tp]" should produce concat plan."""
+        dim_specs = parse_dims("t (a*b)[tp]").dims
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
+        ]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.TP
+        assert isinstance(plans[0].params, ConcatParams)
+        assert plans[0].params.dim_name == "a___b"
+
+    def test_fused_dim_no_modifier(self) -> None:
+        """Fused dim without modifier + explicit replicated TP → PickParams."""
+        dim_specs = parse_dims("t (a*b) # tp:replicated").dims
+        replicated = frozenset({ParallelAxis.TP})
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
+
+        assert len(plans) == 1
+        assert isinstance(plans[0].params, PickParams)
+
+    def test_fused_dim_with_reduction(self) -> None:
+        """Fused dim with partial reduction: "(a*b)[tp:partial]"."""
+        dim_specs = parse_dims("t (a*b)[tp:partial]").dims
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
+        ]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.TP
+        assert isinstance(plans[0].params, ReduceSumParams)
 
 
 class TestComputeUnsharderPlanFusedDims:

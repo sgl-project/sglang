@@ -7,7 +7,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     TokenAlignerPlan,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     BATCH_DIM_NAME,
     SEQ_DIM_NAME,
     TOKEN_DIM_NAME,

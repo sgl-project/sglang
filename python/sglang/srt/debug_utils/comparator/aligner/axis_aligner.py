@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from einops import rearrange
 
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     _FUSED_NAME_SEP,
     DimSpec,
     _SingletonDimUtil,

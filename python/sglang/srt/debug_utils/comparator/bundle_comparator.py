@@ -18,7 +18,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPl
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     SEQ_DIM_NAME,
     TOKEN_DIM_NAME,
     apply_dim_names,

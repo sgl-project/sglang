@@ -20,7 +20,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis, TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
     ErrorLog,
     NonTensorComparisonRecord,

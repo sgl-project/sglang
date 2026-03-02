@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     SGLangSeqId,
     TokenAlignerStepAux,
 )
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)

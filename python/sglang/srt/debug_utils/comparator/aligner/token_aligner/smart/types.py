@@ -5,7 +5,7 @@ from typing import NamedTuple, Optional, Union
 
 from pydantic import model_validator
 
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     _check_equal_lengths,

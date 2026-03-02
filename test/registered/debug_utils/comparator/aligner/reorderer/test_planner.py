@@ -17,7 +17,11 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     compute_unsharder_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
-from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis, parse_dims
+from sglang.srt.debug_utils.comparator.dims_spec import (
+    DimSpec,
+    ParallelAxis,
+    parse_dims,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)

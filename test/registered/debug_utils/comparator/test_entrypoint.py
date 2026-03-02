@@ -1738,7 +1738,7 @@ class TestEntrypointReplicatedAxis:
                 cp_size=2,
                 tp_size=2,
                 seq_dim=1,
-                dims_str="b s[cp] d",
+                dims_str="b s[cp] d # tp:replicated",
             )
 
         argv = _make_argv(
@@ -1777,7 +1777,7 @@ class TestEntrypointReplicatedAxis:
                 cp_size=2,
                 tp_size=2,
                 seq_dim=1,
-                dims_str="b s[cp] d",
+                dims_str="b s[cp] d # tp:replicated",
                 tp_noise=0.5,
             )
 
@@ -1813,7 +1813,7 @@ class TestEntrypointReplicatedAxis:
             cp_size=2,
             tp_size=2,
             seq_dim=1,
-            dims_str="b s[cp] d",
+            dims_str="b s[cp] d # tp:replicated",
             tp_noise=0.5,
         )
         _create_replicated_tp_sharded_cp_dumps(
@@ -1823,7 +1823,7 @@ class TestEntrypointReplicatedAxis:
             cp_size=2,
             tp_size=2,
             seq_dim=1,
-            dims_str="b s[cp] d",
+            dims_str="b s[cp] d # tp:replicated",
             tp_noise=0.5,
         )
 
@@ -1862,7 +1862,7 @@ class TestEntrypointReplicatedAxis:
                 rank=0,
                 name="attn_out",
                 tensor=torch.randn(4, 4, 6),
-                dims="b s[cp] d",
+                dims="b s[cp] d # tp:replicated",
                 parallel_info={
                     "cp_rank": 0,
                     "cp_size": 2,
@@ -1876,7 +1876,7 @@ class TestEntrypointReplicatedAxis:
                 rank=1,
                 name="attn_out",
                 tensor=torch.randn(4, 4, 3),
-                dims="b s[cp] d",
+                dims="b s[cp] d # tp:replicated",
                 parallel_info={
                     "cp_rank": 0,
                     "cp_size": 2,
@@ -1890,7 +1890,7 @@ class TestEntrypointReplicatedAxis:
                 rank=2,
                 name="attn_out",
                 tensor=torch.randn(4, 4, 6),
-                dims="b s[cp] d",
+                dims="b s[cp] d # tp:replicated",
                 parallel_info={
                     "cp_rank": 1,
                     "cp_size": 2,
@@ -1904,7 +1904,7 @@ class TestEntrypointReplicatedAxis:
                 rank=3,
                 name="attn_out",
                 tensor=torch.randn(4, 4, 3),
-                dims="b s[cp] d",
+                dims="b s[cp] d # tp:replicated",
                 parallel_info={
                     "cp_rank": 1,
                     "cp_size": 2,

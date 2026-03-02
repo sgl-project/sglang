@@ -19,7 +19,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ReduceSumParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     DimSpec,
     ParallelAxis,
     parse_dims,
@@ -307,13 +307,16 @@ class TestPickOperation:
     def test_pick_single_group(self) -> None:
         """PickParams picks the first tensor from a single group."""
         tensor = torch.randn(4, 8)
-        dim_specs = parse_dims("h d").dims
+        dim_specs = parse_dims("h d # tp:replicated").dims
+        replicated = frozenset({ParallelAxis.TP})
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
             {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
         ]
 
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
         assert len(plans) == 1
         assert isinstance(plans[0].params, PickParams)
 
@@ -326,7 +329,8 @@ class TestPickOperation:
 
     def test_pick_multiple_groups(self) -> None:
         """PickParams with multiple groups picks one from each."""
-        dim_specs = parse_dims("h[tp]").dims
+        dim_specs = parse_dims("h[tp] # cp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP})
         parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
             {
                 ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
@@ -346,7 +350,9 @@ class TestPickOperation:
             },
         ]
 
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
         pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
         assert len(pick_plans) == 1
         assert pick_plans[0].axis == ParallelAxis.CP
@@ -361,7 +367,7 @@ class TestPickOperation:
         assert all(c.passed for c in unsharder_result.replicated_checks)
 
     def test_replicated_tp_sharded_cp_e2e(self) -> None:
-        """CP2 TP2, dims='b s[cp] d': replicated TP pick + sharded CP concat round-trip."""
+        """CP2 TP2, dims='b s[cp] d # tp:replicated': replicated TP pick + sharded CP concat round-trip."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8, 16)
         cp_chunks = list(full_tensor.chunk(2, dim=1))
@@ -378,8 +384,11 @@ class TestPickOperation:
                     }
                 )
 
-        dim_specs = parse_dims("b s[cp] d").dims
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        dim_specs = parse_dims("b s[cp] d # tp:replicated").dims
+        replicated = frozenset({ParallelAxis.TP})
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
         assert len(plans) == 2
 
         current: list[torch.Tensor] = _name_tensors(tensors, dim_specs)
@@ -391,7 +400,7 @@ class TestPickOperation:
         assert torch.allclose(current[0].rename(None), full_tensor)
 
     def test_fully_replicated_e2e(self) -> None:
-        """CP2 TP2, dims='b h d': fully replicated -> 2 pick steps -> 1 tensor."""
+        """CP2 TP2, dims='b h d # cp:replicated tp:replicated': fully replicated -> 2 pick steps -> 1 tensor."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8, 16)
 
@@ -407,8 +416,11 @@ class TestPickOperation:
                     }
                 )
 
-        dim_specs = parse_dims("b h d").dims
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        dim_specs = parse_dims("b h d # cp:replicated tp:replicated").dims
+        replicated = frozenset({ParallelAxis.CP, ParallelAxis.TP})
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
         assert len(plans) == 2
         assert all(isinstance(p.params, PickParams) for p in plans)
 
@@ -472,12 +484,15 @@ class TestVerifyReplicatedGroup:
 
     def test_execute_returns_replicated_checks(self) -> None:
         """execute_unsharder_plan returns replicated checks for mismatch."""
-        dim_specs = parse_dims("h d").dims
+        dim_specs = parse_dims("h d # tp:replicated").dims
+        replicated = frozenset({ParallelAxis.TP})
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
             {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
         ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, explicit_replicated_axes=replicated
+        )
 
         tensor_a = torch.zeros(4)
         tensor_b = torch.ones(4)
