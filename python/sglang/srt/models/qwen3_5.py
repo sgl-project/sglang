@@ -98,6 +98,22 @@ def _reshuffle_q_proj_weight_for_gated_attn(
     return torch.cat([q_parts, gate_parts], dim=0)
 
 
+def _reshuffle_qkv_proj_weight_q_k_v_gate(
+    weight: torch.Tensor,
+    q_size: int,
+    gate_size: int,
+    kv_size: int,
+) -> torch.Tensor:
+    """Reshuffle qkv_proj weight from [q, gate, k, v] to [q, k, v, gate].
+    Weight shape: [q_size + gate_size + kv_size + kv_size, in_features].
+    """
+    q = weight[:q_size]
+    gate = weight[q_size : q_size + gate_size]
+    k = weight[q_size + gate_size : q_size + gate_size + kv_size]
+    v = weight[q_size + gate_size + kv_size :]
+    return torch.cat([q, k, v, gate], dim=0)
+
+
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
@@ -604,17 +620,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     
     def _fused_qk_norm_rope_cache_quant_aiter(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        qkv: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """AITER fused qk_norm + RoPE + set_kv (HIP only, bf16 KV cache). Returns (q, k, v)."""
+        """AITER fused qk_norm + RoPE + set_kv (HIP only, bf16 KV cache).
+        qkv: [batch, q_size + kv_size + kv_size]. Returns (q, k, v)."""
         import aiter
         from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
-        num_tokens = q.shape[0]
+        num_tokens = qkv.shape[0]
         head_size = self.head_dim
         num_heads_q = self.num_heads
         num_heads_k = self.num_kv_heads
@@ -622,16 +637,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         eps = self.q_norm.variance_epsilon
 
         # GemmaRMSNorm: (1 + weight) * x
-        qw = (1.0 + self.q_norm.weight.data).contiguous().to(q.dtype)
-        kw = (1.0 + self.k_norm.weight.data).contiguous().to(q.dtype)
+        qw = (1.0 + self.q_norm.weight.data).contiguous().to(qkv.dtype)
+        kw = (1.0 + self.k_norm.weight.data).contiguous().to(qkv.dtype)
 
-        qkv = torch.cat([q, k, v], dim=-1).contiguous()
+        qkv = qkv.contiguous()
 
         rotary_emb = self.rotary_emb
         if hasattr(rotary_emb, "_ensure_cos_sin_cache_length"):
             max_pos = int(positions.flatten().max().item()) + 1
             rotary_emb._ensure_cos_sin_cache_length(max_pos)
-        cos_sin = rotary_emb.cos_sin_cache.to(device=q.device, dtype=q.dtype)
+        cos_sin = rotary_emb.cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
         positions_1d = positions.flatten().to(torch.int64)
 
         layer_id = self.attn.layer_id
@@ -642,7 +657,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         q_out = torch.empty(
             num_tokens, num_heads_q, head_size,
-            dtype=q.dtype, device=q.device,
+            dtype=qkv.dtype, device=qkv.device,
         )
         k_out = torch.empty(
             num_tokens, num_heads_k, head_size,
@@ -653,8 +668,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=v_cache.dtype, device=v_cache.device,
         )
 
-        k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
-        v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+        k_scale = torch.tensor(1.0, dtype=torch.float32, device=qkv.device)
+        v_scale = torch.tensor(1.0, dtype=torch.float32, device=qkv.device)
 
         is_mrope = not isinstance(rotary_emb, RotaryEmbedding)
         if is_mrope:
@@ -702,8 +717,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q, gate, k, v = qkv.split(
-                [self.q_size, self.q_size, self.kv_size, self.kv_size], dim=-1
+            qkv, gate = qkv.split(
+                [self.q_size + self.kv_size + self.kv_size, self.q_size], dim=-1
+            )
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -711,9 +729,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         save_kv_cache = True
         if enable_fused_qk_norm_rope_set_kv_aiter(forward_batch) and is_gfx95_supported():
             q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
-                q, k, v, positions, forward_batch,
+                qkv, positions, forward_batch,
             )
-            save_kv_cache=False
+            save_kv_cache = False
         else:
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
@@ -963,6 +981,25 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
+        for layer in self.layers:
+            if hasattr(layer, "self_attn") and getattr(
+                layer.self_attn, "attn_output_gate", False
+            ):
+                block = layer.self_attn
+                for pname, param in block.qkv_proj.named_parameters():
+                    if "weight" in pname:
+                        w = param.data
+                        q_size = block.q_size
+                        gate_size = block.q_size
+                        kv_size = block.kv_size
+                        param.data.copy_(
+                            _reshuffle_qkv_proj_weight_q_k_v_gate(
+                                w, q_size, gate_size, kv_size
+                            )
+                        )
+                        break
         return loaded_params
 
 
@@ -1166,6 +1203,24 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
+        for layer in self.layers:
+            if hasattr(layer, "self_attn") and getattr(
+                layer.self_attn, "attn_output_gate", False
+            ):
+                block = layer.self_attn
+                for pname, param in block.qkv_proj.named_parameters():
+                    if "weight" in pname:
+                        w = param.data
+                        q_size = block.q_size
+                        gate_size = block.q_size
+                        kv_size = block.kv_size
+                        param.data.copy_(
+                            _reshuffle_qkv_proj_weight_q_k_v_gate(
+                                w, q_size, gate_size, kv_size
+                            )
+                        )
+                        break
         return loaded_params
 
 
@@ -1266,6 +1321,25 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
+        for layer in self.model.layers:
+            if hasattr(layer, "self_attn") and getattr(
+                layer.self_attn, "attn_output_gate", False
+            ):
+                block = layer.self_attn
+                for pname, param in block.qkv_proj.named_parameters():
+                    if "weight" in pname:
+                        w = param.data
+                        q_size = block.q_size
+                        gate_size = block.q_size
+                        kv_size = block.kv_size
+                        param.data.copy_(
+                            _reshuffle_qkv_proj_weight_q_k_v_gate(
+                                w, q_size, gate_size, kv_size
+                            )
+                        )
+                        break
         return loaded_params
 
 
@@ -1497,6 +1571,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
+        for layer in self.model.layers:
+            if hasattr(layer, "self_attn") and getattr(
+                layer.self_attn, "attn_output_gate", False
+            ):
+                block = layer.self_attn
+                for pname, param in block.qkv_proj.named_parameters():
+                    if "weight" in pname:
+                        w = param.data
+                        q_size = block.q_size
+                        gate_size = block.q_size
+                        kv_size = block.kv_size
+                        param.data.copy_(
+                            _reshuffle_qkv_proj_weight_q_k_v_gate(
+                                w, q_size, gate_size, kv_size
+                            )
+                        )
+                        break
         return loaded_params
 
     @classmethod
