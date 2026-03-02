@@ -195,10 +195,10 @@ class PipelineStage(ABC):
         with StageProfiler(
             stage_name,
             logger=logger,
-            timings=batch.timings,
-            perf_dump_path_provided=batch.perf_dump_path is not None,
+            metrics=batch.metrics,
             log_stage_start_end=not batch.is_warmup
             and not (self.server_args and self.server_args.comfyui_mode),
+            perf_dump_path_provided=batch.perf_dump_path is not None,
         ):
             result = self.forward(batch, server_args)
 

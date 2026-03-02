@@ -52,16 +52,19 @@ on:
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{branch}-{pr_sha}-{stage}
+  # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
+  # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
+  #   (without it, both resolve the branch segment to 'main' and block each other)
   # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
   # - pr_head_sha isolates /rerun-stage from main branch runs
   # - target_stage allows parallel stage dispatches to run independently
-  # This ensures pull_request and workflow_dispatch on same branch cancel each other
-  group: pr-test-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
 
 permissions:
   actions: write
@@ -129,6 +132,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
               - "python/pyproject.toml"
               - ".github/workflows/pr-test.yml"
@@ -872,6 +876,9 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   stage-a-cpu-only:
     needs: [check-changes, call-gate]
     if: |
@@ -974,6 +981,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
+
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1024,6 +1036,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1076,6 +1093,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1130,6 +1152,9 @@ jobs:
         run: |
           IS_BLACKWELL=1 python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
@@ -1182,6 +1207,10 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -1236,6 +1265,11 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1285,6 +1319,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1324,14 +1363,22 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
-      # - name: Warmup Weights and JIT Compilation
-      #   timeout-minutes: 20
-      #   run: |
-      #     # An example command for testing the warmup. TODO: make this more general and move them to python scripts.
-      #     python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            inclusionAI/Ring-2.5-1T:8
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1339,6 +1386,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1390,6 +1442,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-deepep-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1435,6 +1492,9 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1470,6 +1530,19 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8
+
       - name: Run test
         timeout-minutes: 45
         run: |
@@ -1479,6 +1552,9 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1530,52 +1606,62 @@ jobs:
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
-  stage-c-test-4-gpu-gb200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-gb200
-    timeout-minutes: 240
-    env:
-      RUNNER_LABELS: 4-gpu-gb200
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          artifact-suffix: ${{ matrix.part }}
 
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9-aarch64
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
+  # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
+  # Re-enable when a 4-gpu-gb200 runner is provisioned.
+  # stage-c-test-4-gpu-gb200:
+  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   runs-on: 4-gpu-gb200
+  #   timeout-minutes: 240
+  #   env:
+  #     RUNNER_LABELS: 4-gpu-gb200
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+  #
+  #     - name: Download artifacts
+  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda12.9-aarch64
+  #
+  #     - name: Install dependencies
+  #       timeout-minutes: 20
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
+  #
+  #     - name: Run test
+  #       timeout-minutes: 45
+  #       run: |
+  #         cd test
+  #         CONTINUE_ON_ERROR_FLAG=""
+  #         if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+  #           CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+  #         fi
+  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
+  #
+  #     - uses: ./.github/actions/upload-cuda-coredumps
+  #       if: always()
 
   pr-test-finish:
     needs:
@@ -1609,7 +1695,7 @@ jobs:
         stage-c-test-deepep-4-gpu,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
-        stage-c-test-4-gpu-gb200,
+        # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()
     runs-on: ubuntu-latest
