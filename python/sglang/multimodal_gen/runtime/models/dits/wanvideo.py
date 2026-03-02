@@ -136,7 +136,6 @@ class WanSelfAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         is_cross_attention: bool = False,
         quant_config: QuantizationConfig | None = None,
-        is_cross_attention: bool = False,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -253,7 +252,6 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
             is_cross_attention=True,
             quant_config=quant_config,
-            is_cross_attention=True,
         )
 
         self.add_k_proj = ColumnParallelLinear(
