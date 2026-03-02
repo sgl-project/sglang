@@ -190,6 +190,8 @@ class DiffusionServerArgs:
             self.custom_validator = "image"
         elif self.modality == "video":
             self.custom_validator = "video"
+        elif self.modality == "3d":
+            self.custom_validator = "mesh"
 
 
 @dataclass(frozen=True)
@@ -460,6 +462,11 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
 ]
 
+HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
+    prompt="",
+    image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
+)
+
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -591,7 +598,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+# Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
+if not current_platform.is_hip():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "hunyuan3d_shape_gen",
+            DiffusionServerArgs(
+                model_path="tencent/Hunyuan3D-2",
+                modality="3d",
+            ),
+            HUNYUAN3D_SHAPE_sampling_params,
+        ),
+    )
+# Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
     ONE_GPU_CASES_B.append(
         DiffusionTestCase(
