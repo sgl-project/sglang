@@ -423,7 +423,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_track_interval = get_global_server_args().mamba_track_interval
+        self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -635,7 +635,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert page_aligned_len == len(
             kv_indices
-        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_track_interval=}"
+        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
@@ -1032,8 +1032,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # does not have a mamba value.
         if len(value) > best_value_len:
             chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // self.mamba_track_interval
-            ) * self.mamba_track_interval
+                sum(len(v) for v in value) // self.mamba_cache_chunk_size
+            ) * self.mamba_cache_chunk_size
             mamba_branching_seqlen = (
                 chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
             )
