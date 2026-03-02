@@ -10,10 +10,12 @@ import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_MXFP8,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_blackwell_system,
     is_in_ci,
     popen_launch_server,
 )
@@ -303,6 +305,100 @@ class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
         print(f"[Server Mode] updated_model_path: {updated_model_path}")
         self.assertEqual(updated_model_path, new_model_path)
         self.assertNotEqual(updated_model_path, origin_model_path)
+
+
+@unittest.skipIf(not is_blackwell_system(), "MXFP8 requires Blackwell (CUDA)")
+class TestServerUpdateWeightsFromDiskMXFP8(CustomTestCase):
+    model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP8
+    base_url = DEFAULT_URL_FOR_TEST
+    backend_test_suites = [
+        {"fp8_gemm_backend": "triton", "moe_runner_backend": "cutlass"},
+        {"fp8_gemm_backend": "auto", "moe_runner_backend": "auto"},
+    ]
+
+    def _launch_server(self, fp8_gemm_backend, moe_runner_backend):
+        return popen_launch_server(
+            self.model,
+            self.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--fp8-gemm-backend",
+                fp8_gemm_backend,
+                "--moe-runner-backend",
+                moe_runner_backend,
+            ],
+        )
+
+    def run_decode(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+        )
+        payload = response.json()
+        return payload["text"]
+
+    def get_model_info(self):
+        response = requests.get(self.base_url + "/get_model_info")
+        return response.json()["model_path"]
+
+    def run_update_weights(
+        self,
+        model_path,
+        flush_cache=True,
+        abort_all_requests=False,
+    ):
+        response = requests.post(
+            self.base_url + "/update_weights_from_disk",
+            json={
+                "model_path": model_path,
+                "flush_cache": flush_cache,
+                "abort_all_requests": abort_all_requests,
+            },
+        )
+        ret = response.json()
+        print(json.dumps(ret))
+        return ret
+
+    def test_parameterized_update_weights_mxfp8(self):
+        update_test_suites = [
+            {"flush_cache": True, "abort_all_requests": False},
+            {"flush_cache": False, "abort_all_requests": False},
+        ]
+        for backend_test_suite in self.backend_test_suites:
+            with self.subTest(**backend_test_suite):
+                process = self._launch_server(
+                    backend_test_suite["fp8_gemm_backend"],
+                    backend_test_suite["moe_runner_backend"],
+                )
+                try:
+                    origin_model_path = self.get_model_info()
+                    self.assertEqual(origin_model_path, self.model)
+                    origin_response = self.run_decode()
+                    self.assertTrue(len(origin_response) > 0)
+
+                    for update_test_suite in update_test_suites:
+                        with self.subTest(
+                            fp8_gemm_backend=backend_test_suite["fp8_gemm_backend"],
+                            moe_runner_backend=backend_test_suite["moe_runner_backend"],
+                            flush_cache=update_test_suite["flush_cache"],
+                            abort_all_requests=update_test_suite["abort_all_requests"],
+                        ):
+                            ret = self.run_update_weights(
+                                self.model,
+                                flush_cache=update_test_suite["flush_cache"],
+                                abort_all_requests=update_test_suite[
+                                    "abort_all_requests"
+                                ],
+                            )
+                            self.assertTrue(ret["success"])
+                            self.assertEqual(self.get_model_info(), self.model)
+                            updated_response = self.run_decode()
+                            self.assertTrue(len(updated_response) > 0)
+                finally:
+                    kill_process_tree(process.pid)
 
 
 ###############################################################################

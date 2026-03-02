@@ -12,15 +12,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import torch
+from transformers import AutoConfig
 
 import sglang as sgl
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_MXFP8,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_blackwell_system,
     popen_launch_server,
 )
 
@@ -287,6 +290,127 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                     assert torch.allclose(
                         actual_values, torch.tensor([1.5] * 5), atol=0.002
                     ), f"{actual_values=}"
+
+
+@unittest.skipIf(not is_blackwell_system(), "MXFP8 requires Blackwell (CUDA)")
+class TestServerUpdateWeightsFromTensorMXFP8(CustomTestCase):
+    model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP8
+    base_url = DEFAULT_URL_FOR_TEST
+    backend_test_suites = [
+        {"fp8_gemm_backend": "triton", "moe_runner_backend": "cutlass"},
+        {"fp8_gemm_backend": "auto", "moe_runner_backend": "auto"},
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        config = AutoConfig.from_pretrained(cls.model, trust_remote_code=True)
+        cls.hidden_size = getattr(
+            config,
+            "hidden_size",
+            getattr(getattr(config, "text_config", None), "hidden_size", None),
+        )
+        if cls.hidden_size is None:
+            raise ValueError("Cannot resolve hidden_size for MXFP8 model config.")
+
+    def _launch_server(self, fp8_gemm_backend, moe_runner_backend):
+        return popen_launch_server(
+            self.model,
+            self.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--fp8-gemm-backend",
+                fp8_gemm_backend,
+                "--moe-runner-backend",
+                moe_runner_backend,
+            ],
+        )
+
+    def _run_update_weights(self, serialized_named_tensors, load_format=None):
+        payload = {
+            "serialized_named_tensors": serialized_named_tensors,
+            "flush_cache": True,
+        }
+        if load_format is not None:
+            payload["load_format"] = load_format
+        response = requests.post(
+            self.base_url + "/update_weights_from_tensor",
+            json=payload,
+        )
+        ret = response.json()
+        print(json.dumps(ret))
+        return ret
+
+    def _run_decode(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+        )
+        response.raise_for_status()
+        return response.json()["text"]
+
+    def test_parameterized_update_weights_from_tensor_mxfp8(self):
+        param_name = "model.norm.weight"
+        update_test_suites = [
+            {"load_format": None, "target_value": 1.125},
+            {"load_format": "flattened_bucket", "target_value": 1.25},
+        ]
+
+        for backend_test_suite in self.backend_test_suites:
+            with self.subTest(**backend_test_suite):
+                process = self._launch_server(
+                    backend_test_suite["fp8_gemm_backend"],
+                    backend_test_suite["moe_runner_backend"],
+                )
+                try:
+                    for update_test_suite in update_test_suites:
+                        with self.subTest(
+                            fp8_gemm_backend=backend_test_suite["fp8_gemm_backend"],
+                            moe_runner_backend=backend_test_suite["moe_runner_backend"],
+                            load_format=update_test_suite["load_format"],
+                            target_value=update_test_suite["target_value"],
+                        ):
+                            origin_response = self._run_decode()
+                            self.assertTrue(len(origin_response) > 0)
+
+                            new_tensor = torch.full(
+                                (self.hidden_size,),
+                                update_test_suite["target_value"],
+                                device="cuda",
+                                dtype=torch.bfloat16,
+                            )
+
+                            if update_test_suite["load_format"] == "flattened_bucket":
+                                bucket = FlattenedTensorBucket(
+                                    named_tensors=[(param_name, new_tensor)]
+                                )
+                                bucket_dict = {
+                                    "flattened_tensor": bucket.get_flattened_tensor(),
+                                    "metadata": bucket.get_metadata(),
+                                }
+                                serialized_named_tensors = [
+                                    MultiprocessingSerializer.serialize(
+                                        bucket_dict, output_str=True
+                                    )
+                                ]
+                            else:
+                                serialized_named_tensors = [
+                                    MultiprocessingSerializer.serialize(
+                                        [(param_name, new_tensor)], output_str=True
+                                    )
+                                ]
+
+                            ret = self._run_update_weights(
+                                serialized_named_tensors=serialized_named_tensors,
+                                load_format=update_test_suite["load_format"],
+                            )
+                            self.assertTrue(ret["success"])
+                            updated_response = self._run_decode()
+                            self.assertTrue(len(updated_response) > 0)
+                finally:
+                    kill_process_tree(process.pid)
 
 
 def _check_param(engine, param_name, expect_values):
