@@ -51,7 +51,7 @@ def _collect_bundle_side_info(
     metas: list[dict[str, Any]],
 ) -> BundleSideInfo:
     from sglang.srt.debug_utils.comparator.display import (
-        PARALLEL_INFO_KEYS,
+        _PARALLEL_INFO_KEYS,
         extract_parallel_info,
     )
 
@@ -61,7 +61,7 @@ def _collect_bundle_side_info(
         tensor: torch.Tensor = item.value
 
         parallel_info: dict[str, str] = {}
-        for key in PARALLEL_INFO_KEYS:
+        for key in _PARALLEL_INFO_KEYS:
             extract_parallel_info(row_data=parallel_info, info=meta.get(key, {}))
 
         files.append(
