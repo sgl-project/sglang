@@ -140,11 +140,9 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_mla:
             # For MLA models, get v_head_dim from model config
             self.v_head_dim = model_runner.model_config.v_head_dim
-        elif (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-        ):
-            # For hybrid linear models, layer_id = 0 may not be full attention
+        elif hasattr(model_runner.token_to_kv_pool, "get_v_head_dim"):
+            # For hybrid models (Mamba+attention, GDN, Kimi linear),
+            # layer_id=0 may not be a full attention layer
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
@@ -1487,9 +1485,7 @@ class AiterAttnBackend(AttentionBackend):
                             k = k.to(fp8_dtype)
                         if v.dtype != fp8_dtype:
                             v = v.to(fp8_dtype)
-                        one_scale = torch.tensor(
-                            1.0, dtype=torch.float32, device=q.device
-                        )
+                        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
 
                         kv_indptr_asm = qo_indptr
                         kv_indices_asm = self.forward_metadata.fp8_prefill_kv_indices

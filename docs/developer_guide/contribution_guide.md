@@ -73,6 +73,8 @@ Then your PR can be merged.
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
+**PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
+
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
@@ -86,7 +88,7 @@ To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also t
 
 Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
 
-If you don’t have permission, please ask maintainers to trigger CI for you.
+If you don’t have permission and you’re not the PR author, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
 

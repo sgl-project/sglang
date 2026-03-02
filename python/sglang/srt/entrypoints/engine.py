@@ -36,6 +36,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -491,12 +492,18 @@ class Engine(EngineBase):
         self,
         capacity_of_str_len: int,
         session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
     ) -> str:
         """Open a session for multi-turn conversation with shared context.
 
         Args:
             capacity_of_str_len: Maximum string length capacity for the session.
             session_id: Optional session ID. If not provided, a UUID will be generated.
+            streaming: Use low-overhead path for realtime streaming (append-only mode).
+            timeout: If set, the session is automatically closed after being inactive
+                for this many seconds. Inactivity is measured from session open or the
+                most recent request submission.
 
         Returns:
             The session ID (either the provided one or a newly generated UUID).
@@ -504,6 +511,8 @@ class Engine(EngineBase):
         obj = OpenSessionReqInput(
             capacity_of_str_len=capacity_of_str_len,
             session_id=session_id,
+            streaming=streaming,
+            timeout=timeout,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.open_session(obj, None)
@@ -1067,6 +1076,12 @@ def _launch_subprocesses(
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
     )
+
+    if (
+        server_args.enable_elastic_expert_backup
+        and server_args.elastic_ep_backend is not None
+    ):
+        run_expert_backup_manager(server_args, port_args)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
