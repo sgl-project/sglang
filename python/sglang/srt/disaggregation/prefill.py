@@ -312,10 +312,10 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
 
-            # When cp_all_ranks_transfer is on, each CP rank inits with its share of
+            # When enable_cp_all_ranks_transfer is on, each CP rank inits with its share of
             # pages; otherwise only rank 0 sends and uses full num_pages.
             if (
-                self.kv_manager.cp_all_ranks_transfer
+                self.kv_manager.enable_cp_all_ranks_transfer
                 and self.kv_manager.attn_cp_size > 1
             ):
                 start_page, end_page = get_cp_rank_page_range(
@@ -755,10 +755,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
-        # When cp_all_ranks_transfer is on, all CP ranks send their page range;
+        # When enable_cp_all_ranks_transfer is on, all CP ranks send their page range;
         # otherwise only rank 0 sends and sends all pages.
         if (
-            self.kv_manager.cp_all_ranks_transfer
+            self.kv_manager.enable_cp_all_ranks_transfer
             and self.kv_manager.attn_cp_size > 1
         ):
             total_pages = kv_to_page_num(len(req.origin_input_ids), page_size)
