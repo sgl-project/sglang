@@ -140,6 +140,7 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         result = run_benchmark(args)
 
         self.assertEqual(result["completed"], num_prompts)
+        self.assertLess(result["p99_itl_ms"], 20)
 
 
 @unittest.skip(
