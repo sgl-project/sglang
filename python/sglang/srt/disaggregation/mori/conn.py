@@ -865,6 +865,12 @@ class MoriKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
+        if self.kv_mgr.is_dummy_cp_rank:
+            if not is_last:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
