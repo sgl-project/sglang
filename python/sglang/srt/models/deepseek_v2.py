@@ -1301,6 +1301,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
@@ -1308,6 +1309,7 @@ class DeepseekV2AttentionMLA(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
         )
         return self.forward_core(s)
@@ -1318,6 +1320,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
@@ -1370,15 +1373,30 @@ class DeepseekV2AttentionMLA(
             )
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             inner_state = forward_mha_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         else:
             raise NotImplementedError
@@ -1505,6 +1523,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
+        if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
+            raise ValueError(
+                "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
+            )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
@@ -1627,6 +1649,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
+            layer_scatter_modes=self.layer_scatter_modes,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
