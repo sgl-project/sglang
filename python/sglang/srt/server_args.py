@@ -608,7 +608,8 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
-    enable_piecewise_cuda_graph: bool = False
+    disable_piecewise_cuda_graph: bool = False
+    enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: Optional[int] = None
@@ -730,6 +731,9 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+
+        # Handle piecewise CUDA graph.
+        self._handle_piecewise_cuda_graph()
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -901,6 +905,66 @@ class ServerArgs:
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
 
+    def _handle_piecewise_cuda_graph(self):
+        # Skip auto-disable when enforce flag is set (for testing)
+        if self.enforce_piecewise_cuda_graph:
+            self.disable_piecewise_cuda_graph = False
+            return
+
+        # Disable piecewise cuda graph with following conditions:
+        # 1. Disable Model Arch
+        if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+            self.disable_piecewise_cuda_graph = True
+        # 2. Speculative decoding
+        if self.speculative_algorithm is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 3. DP attention
+        if self.enable_dp_attention:
+            self.disable_piecewise_cuda_graph = True
+        # 4. Torch compile
+        if self.enable_torch_compile:
+            self.disable_piecewise_cuda_graph = True
+        # 5. Pipeline parallelism
+        if self.pp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 6. Non-CUDA hardware (AMD, NPU, etc.)
+        if is_hip() or is_npu():
+            self.disable_piecewise_cuda_graph = True
+        # 7. MoE A2A backend
+        if self.moe_a2a_backend != "none":
+            self.disable_piecewise_cuda_graph = True
+        # 8. LoRA
+        if self.lora_paths or self.enable_lora:
+            self.disable_piecewise_cuda_graph = True
+        # 9. Multimodal / VLM models
+        if self.get_model_config().is_multimodal:
+            self.disable_piecewise_cuda_graph = True
+        # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)
+        if (
+            self.load_format == "gguf"
+            or self.quantization == "gguf"
+            or check_gguf_file(self.model_path)
+        ):
+            self.disable_piecewise_cuda_graph = True
+        # 11. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
+        if self.dllm_algorithm is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 12. CPU offload (breaks dynamo)
+        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+            self.disable_piecewise_cuda_graph = True
+        # 13. Deterministic inference
+        if self.enable_deterministic_inference:
+            self.disable_piecewise_cuda_graph = True
+        # 14. PD disaggregation
+        if self.disaggregation_mode != "null":
+            self.disable_piecewise_cuda_graph = True
+        # 15. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
+        if self.enable_symm_mem:
+            self.disable_piecewise_cuda_graph = True
+        # 16. Expert distribution recorder
+        if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
@@ -1005,6 +1069,19 @@ class ServerArgs:
             else:
                 self.piecewise_cuda_graph_max_tokens = 2048
 
+            # If max_total_tokens is set, cap pcg tokens to not exceed max_total_tokens
+            if self.max_total_tokens is not None:
+                self.piecewise_cuda_graph_max_tokens = min(
+                    self.piecewise_cuda_graph_max_tokens, self.max_total_tokens
+                )
+
+            # For Llama2 series models, the max tokens is limited to 4096
+            # TODO(yuwei): remove this after the issue is fixed
+            if "llama-2" in self.model_path.lower():
+                self.piecewise_cuda_graph_max_tokens = min(
+                    self.piecewise_cuda_graph_max_tokens, 4096
+                )
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -1034,9 +1111,13 @@ class ServerArgs:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
+            if not self.disable_piecewise_cuda_graph:
+                if not self.use_mla_backend():
+                    # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
+                    reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
+                else:
+                    # For MLA backend the memory overhead is much higher than expected with fa3
+                    reserved_mem += 1.5 * 1024
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
@@ -1267,7 +1348,7 @@ class ServerArgs:
 
             else:
                 # DeepSeek V3/R1/V3.1
-                if self.enable_piecewise_cuda_graph:
+                if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
                 if is_sm100_supported():
@@ -2239,6 +2320,22 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
+        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
+        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
+        # custom op (moe_impl), so bypassed topk is handled inside the op body.
+        if (
+            not self.enforce_piecewise_cuda_graph
+            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
+            and self.get_model_config().hf_config.architectures[0]
+            != "GptOssForCausalLM"
+        ):
+            self.disable_piecewise_cuda_graph = True
+            logger.info(
+                f"Piecewise cuda graph is disabled for MoE runner backend "
+                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
+                f"with torch.compile)."
+            )
+
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -2624,7 +2721,7 @@ class ServerArgs:
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
 
-            if not self.enable_piecewise_cuda_graph:
+            if self.disable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
@@ -4712,9 +4809,19 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
-            "--enable-piecewise-cuda-graph",
+            "--disable-piecewise-cuda-graph",
             action="store_true",
-            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+            help="Disable piecewise cuda graph for extend/prefill.",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action=DeprecatedAction,
+            help="Deprecated: Piecewise cuda graph is enabled by default. Use --enforce-piecewise-cuda-graph to skip auto-disable conditions.",
+        )
+        parser.add_argument(
+            "--enforce-piecewise-cuda-graph",
+            action="store_true",
+            help="Enforce piecewise cuda graph, skipping all auto-disable conditions. Used for testing.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",

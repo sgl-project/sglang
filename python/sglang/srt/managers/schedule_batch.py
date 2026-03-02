@@ -2270,7 +2270,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             if (
                 self.forward_mode.is_decode()
-                and server_args.enable_piecewise_cuda_graph
+                and not server_args.disable_piecewise_cuda_graph
                 and not self.tree_cache.is_chunk_cache()
             ):
                 return
