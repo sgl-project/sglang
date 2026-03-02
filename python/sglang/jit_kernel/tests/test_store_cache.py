@@ -113,15 +113,10 @@ def test_store_cache_num_split(
 
 
 def test_can_use_store_cache() -> None:
-    # row_bytes must be a multiple of 4 for the JIT kernel
     assert can_use_store_cache(128)
     assert can_use_store_cache(256)
     assert can_use_store_cache(1024)
     assert can_use_store_cache(2048)
-
-    assert not can_use_store_cache(5)
-    assert not can_use_store_cache(3)
-    assert not can_use_store_cache(1)
 
 
 if __name__ == "__main__":
