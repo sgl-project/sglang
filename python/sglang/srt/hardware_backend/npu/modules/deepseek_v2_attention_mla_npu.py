@@ -10,12 +10,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -530,22 +530,6 @@ def npu_mla_preprocess(
         positions,
         dynamic_scale,
     )
-
-
-def scattered_to_tp_attn_full(
-    hidden_states: torch.Tensor,
-    forward_batch,
-) -> torch.Tensor:
-    hidden_states, local_hidden_states = (
-        torch.empty(
-            (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        ),
-        hidden_states,
-    )
-    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
-    return hidden_states
 
 
 # endregion
