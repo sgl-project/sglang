@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
+import contextlib
 import os
 import time
 from typing import List, Optional
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
+    temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -53,11 +55,13 @@ def _build_image_response_kwargs(
     b64_list: list[str] | None = None,
     cloud_url: str | None = None,
     fallback_url: str | None = None,
+    is_persistent: bool = True,
 ) -> dict:
     """Build ImageResponse data list.
 
     For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
     For url: uses cloud_url or fallback_url.
+    file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
     ret = None
     if resp_format == "b64_json":
@@ -67,7 +71,7 @@ def _build_image_response_kwargs(
             ImageResponseData(
                 b64_json=b64,
                 revised_prompt=prompt,
-                file_path=os.path.abspath(path),
+                file_path=os.path.abspath(path) if is_persistent else None,
             )
             for b64, path in zip(b64_list, save_file_path_list)
         ]
@@ -84,7 +88,11 @@ def _build_image_response_kwargs(
                 ImageResponseData(
                     url=url,
                     revised_prompt=prompt,
-                    file_path=os.path.abspath(save_file_path_list[0]),
+                    file_path=(
+                        os.path.abspath(save_file_path_list[0])
+                        if is_persistent
+                        else None
+                    ),
                 )
             ],
         }
@@ -103,65 +111,72 @@ async def generations(
     request: ImageGenerationsRequest,
 ):
     request_id = generate_request_id()
+    server_args = get_global_server_args()
     ext = choose_output_image_ext(request.output_format, request.background)
-    sampling = build_sampling_params(
-        request_id,
-        prompt=request.prompt,
-        size=request.size,
-        num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
-        output_file_name=f"{request_id}.{ext}",
-        seed=request.seed,
-        generator_device=request.generator_device,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        true_cfg_scale=request.true_cfg_scale,
-        negative_prompt=request.negative_prompt,
-        enable_teacache=request.enable_teacache,
-        output_compression=request.output_compression,
-        output_quality=request.output_quality,
-    )
-    batch = prepare_request(
-        server_args=get_global_server_args(),
-        sampling_params=sampling,
-    )
-    # Add diffusers_kwargs if provided
-    if request.diffusers_kwargs:
-        batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
 
-    save_file_path_list, result = await process_generation_batch(
-        async_scheduler_client, batch
-    )
-    save_file_path = save_file_path_list[0]
-    resp_format = (request.response_format or "b64_json").lower()
+    with temp_dir_if_disabled(server_args.output_path) as output_dir:
+        sampling = build_sampling_params(
+            request_id,
+            prompt=request.prompt,
+            size=request.size,
+            num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
+            output_file_name=f"{request_id}.{ext}",
+            output_path=output_dir,
+            seed=request.seed,
+            generator_device=request.generator_device,
+            num_inference_steps=request.num_inference_steps,
+            guidance_scale=request.guidance_scale,
+            true_cfg_scale=request.true_cfg_scale,
+            negative_prompt=request.negative_prompt,
+            enable_teacache=request.enable_teacache,
+            output_compression=request.output_compression,
+            output_quality=request.output_quality,
+        )
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling,
+        )
+        # Add diffusers_kwargs if provided
+        if request.diffusers_kwargs:
+            batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
 
-    # read b64 before cloud upload may delete the local file
-    b64_list = (
-        _read_b64_for_paths(save_file_path_list) if resp_format == "b64_json" else None
-    )
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
+        save_file_path = save_file_path_list[0]
+        resp_format = (request.response_format or "b64_json").lower()
 
-    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        # read b64 before cloud upload may delete the local file
+        b64_list = (
+            _read_b64_for_paths(save_file_path_list)
+            if resp_format == "b64_json"
+            else None
+        )
 
-    await IMAGE_STORE.upsert(
-        request_id,
-        {
-            "id": request_id,
-            "created_at": int(time.time()),
-            "file_path": None if cloud_url else save_file_path,
-            "url": cloud_url,
-        },
-    )
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-    response_kwargs = _build_image_response_kwargs(
-        save_file_path_list,
-        resp_format,
-        request.prompt,
-        request_id,
-        result,
-        b64_list=b64_list,
-        cloud_url=cloud_url,
-        # Provide a local fallback URL when cloud upload is unavailable, mirroring /v1/images/edits.
-        fallback_url=f"/v1/images/{request_id}/content",
-    )
+        is_persistent = server_args.output_path is not None
+        await IMAGE_STORE.upsert(
+            request_id,
+            {
+                "id": request_id,
+                "created_at": int(time.time()),
+                "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "url": cloud_url,
+            },
+        )
+
+        response_kwargs = _build_image_response_kwargs(
+            save_file_path_list,
+            resp_format,
+            request.prompt,
+            request_id,
+            result,
+            b64_list=b64_list,
+            cloud_url=cloud_url,
+            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            is_persistent=is_persistent,
+        )
 
     return ImageResponse(**response_kwargs)
 
@@ -193,6 +208,7 @@ async def edits(
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
+    server_args = get_global_server_args()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -202,83 +218,93 @@ async def edits(
             status_code=422, detail="Field 'image' or 'url' is required"
         )
 
-    # Save all input images; additional images beyond the first are saved for potential future use
-    uploads_dir = os.path.join("inputs", "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
-
     image_list = merge_image_input_list(images, urls)
 
-    input_paths = []
-    try:
-        for idx, img in enumerate(image_list):
-            filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
-            input_path = await save_image_to_path(
-                img, os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+    with contextlib.ExitStack() as stack:
+        uploads_dir = stack.enter_context(
+            temp_dir_if_disabled(server_args.input_save_path)
+        )
+        output_dir = stack.enter_context(temp_dir_if_disabled(server_args.output_path))
+
+        input_paths = []
+        try:
+            for idx, img in enumerate(image_list):
+                filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+                input_path = await save_image_to_path(
+                    img,
+                    os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                )
+                input_paths.append(input_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to process image source: {str(e)}",
             )
-            input_paths.append(input_path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to process image source: {str(e)}"
+
+        ext = choose_output_image_ext(output_format, background)
+        sampling = build_sampling_params(
+            request_id,
+            prompt=prompt,
+            size=size,
+            num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
+            output_file_name=f"{request_id}.{ext}",
+            output_path=output_dir,
+            image_path=input_paths,
+            seed=seed,
+            generator_device=generator_device,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            enable_teacache=enable_teacache,
+            num_frames=num_frames,
+            output_compression=output_compression,
+            output_quality=output_quality,
+        )
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling,
+        )
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
+        save_file_path = save_file_path_list[0]
+        resp_format = (response_format or "b64_json").lower()
+
+        # read b64 before cloud upload may delete the local file
+        b64_list = (
+            _read_b64_for_paths(save_file_path_list)
+            if resp_format == "b64_json"
+            else None
         )
 
-    ext = choose_output_image_ext(output_format, background)
-    sampling = build_sampling_params(
-        request_id,
-        prompt=prompt,
-        size=size,
-        num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
-        output_file_name=f"{request_id}.{ext}",
-        image_path=input_paths,
-        seed=seed,
-        generator_device=generator_device,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        true_cfg_scale=true_cfg_scale,
-        num_inference_steps=num_inference_steps,
-        enable_teacache=enable_teacache,
-        num_frames=num_frames,
-        output_compression=output_compression,
-        output_quality=output_quality,
-    )
-    batch = prepare_request(
-        server_args=get_global_server_args(),
-        sampling_params=sampling,
-    )
-    save_file_path_list, result = await process_generation_batch(
-        async_scheduler_client, batch
-    )
-    save_file_path = save_file_path_list[0]
-    resp_format = (response_format or "b64_json").lower()
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-    # read b64 before cloud upload may delete the local file
-    b64_list = (
-        _read_b64_for_paths(save_file_path_list) if resp_format == "b64_json" else None
-    )
+        is_persistent = server_args.output_path is not None
+        is_input_persistent = server_args.input_save_path is not None
+        await IMAGE_STORE.upsert(
+            request_id,
+            {
+                "id": request_id,
+                "created_at": int(time.time()),
+                "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "url": cloud_url,
+                "input_image_paths": input_paths if is_input_persistent else None,
+                "num_input_images": len(input_paths),
+            },
+        )
 
-    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
-
-    await IMAGE_STORE.upsert(
-        request_id,
-        {
-            "id": request_id,
-            "created_at": int(time.time()),
-            "file_path": None if cloud_url else save_file_path,
-            "url": cloud_url,
-            "input_image_paths": input_paths,
-            "num_input_images": len(input_paths),
-        },
-    )
-
-    response_kwargs = _build_image_response_kwargs(
-        save_file_path_list,
-        resp_format,
-        prompt,
-        request_id,
-        result,
-        b64_list=b64_list,
-        cloud_url=cloud_url,
-        fallback_url=f"/v1/images/{request_id}/content",
-    )
+        response_kwargs = _build_image_response_kwargs(
+            save_file_path_list,
+            resp_format,
+            prompt,
+            request_id,
+            result,
+            b64_list=b64_list,
+            cloud_url=cloud_url,
+            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            is_persistent=is_persistent,
+        )
 
     return ImageResponse(**response_kwargs)
 
@@ -298,7 +324,12 @@ async def download_image_content(
         )
 
     file_path = item.get("file_path")
-    if not file_path or not os.path.exists(file_path):
+    if not file_path:
+        raise HTTPException(
+            status_code=404,
+            detail="Image was not persisted on disk (output_path is disabled). Use b64_json response_format or configure cloud storage.",
+        )
+    if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Image is still being generated")
 
     ext = os.path.splitext(file_path)[1].lower()
