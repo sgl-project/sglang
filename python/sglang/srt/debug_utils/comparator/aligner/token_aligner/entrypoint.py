@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -45,13 +44,11 @@ class TokenAlignerResult:
 
 
 def compute_maybe_token_aligner_result(
-    args: argparse.Namespace,
+    *,
+    dir_pair: Pair[Path],
     dfs: Pair[pl.DataFrame],
+    token_aligner_mode: Optional[TokenAlignerMode],
 ) -> TokenAlignerResult:
-    token_aligner_mode: Optional[TokenAlignerMode] = getattr(
-        args, "token_aligner", None
-    )
-
     if token_aligner_mode is None:
         return TokenAlignerResult(
             mode=None, plan=None, thd_seq_lens_by_step_pair=_NONE_THD
@@ -59,7 +56,7 @@ def compute_maybe_token_aligner_result(
 
     if token_aligner_mode == "concat_steps":
         thd_pair: Pair[Optional[dict[int, list[int]]]] = _load_thd_seq_lens_pair(
-            args=args, dfs=dfs
+            dir_pair=dir_pair, dfs=dfs
         )
         return TokenAlignerResult(
             mode="concat_steps", plan=None, thd_seq_lens_by_step_pair=thd_pair
@@ -76,32 +73,27 @@ def compute_maybe_token_aligner_result(
                 mode=None, plan=None, thd_seq_lens_by_step_pair=_NONE_THD
             )
 
-        return _build_smart_result(args=args, dfs=dfs)
+        return _build_smart_result(dir_pair=dir_pair, dfs=dfs)
     else:
         raise NotImplementedError(f"Unknown {token_aligner_mode=}")
 
 
 def _build_smart_result(
     *,
-    args: argparse.Namespace,
+    dir_pair: Pair[Path],
     dfs: Pair[pl.DataFrame],
 ) -> TokenAlignerResult:
     """Load aux tensors, build token indices, and compute the alignment plan."""
-    dump_paths: Pair[Path] = Pair(x=Path(args.baseline_path), y=Path(args.target_path))
-
-    baseline_aux: Optional[TokenAlignerGlobalAux] = load_and_normalize_aux(
-        dump_path=dump_paths.x, df=dfs.x
-    )
-    target_aux: Optional[TokenAlignerGlobalAux] = load_and_normalize_aux(
-        dump_path=dump_paths.y, df=dfs.y
+    aux_pair: Pair[Optional[TokenAlignerGlobalAux]] = Pair(
+        x=load_and_normalize_aux(dump_path=dir_pair.x, df=dfs.x),
+        y=load_and_normalize_aux(dump_path=dir_pair.y, df=dfs.y),
     )
 
-    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
-        x=baseline_aux.thd_seq_lens_by_step if baseline_aux is not None else None,
-        y=target_aux.thd_seq_lens_by_step if target_aux is not None else None,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = aux_pair.map(
+        lambda aux: aux.thd_seq_lens_by_step if aux is not None else None
     )
 
-    if baseline_aux is None or target_aux is None:
+    if aux_pair.x is None or aux_pair.y is None:
         log_sink.add(
             InfoLog(
                 category="framework_detection_failed",
@@ -114,10 +106,7 @@ def _build_smart_result(
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         )
 
-    global_aux: Pair[TokenAlignerGlobalAux] = Pair(
-        x=baseline_aux,
-        y=target_aux,
-    )
+    global_aux: Pair[TokenAlignerGlobalAux] = Pair(x=aux_pair.x, y=aux_pair.y)
 
     seqs_info: Pair[TokenAlignerSeqsInfo] = global_aux.map(build_seqs_info)
 
@@ -133,12 +122,11 @@ def _build_smart_result(
 
 def _load_thd_seq_lens_pair(
     *,
-    args: argparse.Namespace,
+    dir_pair: Pair[Path],
     dfs: Pair[pl.DataFrame],
 ) -> Pair[Optional[dict[int, list[int]]]]:
     """Load only thd_seq_lens for each side (lightweight, no full aux loading)."""
-    dump_paths: Pair[Path] = Pair(x=Path(args.baseline_path), y=Path(args.target_path))
     return Pair(
-        x=load_thd_seq_lens_only(dump_path=dump_paths.x, df=dfs.x),
-        y=load_thd_seq_lens_only(dump_path=dump_paths.y, df=dfs.y),
+        x=load_thd_seq_lens_only(dump_path=dir_pair.x, df=dfs.x),
+        y=load_thd_seq_lens_only(dump_path=dir_pair.y, df=dfs.y),
     )

@@ -48,8 +48,7 @@ def compare_bundle_pair(
     *,
     name: str,
     filenames_pair: Pair[list[str]],
-    baseline_path: Path,
-    target_path: Path,
+    dir_pair: Pair[Path],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
@@ -64,8 +63,7 @@ def compare_bundle_pair(
         result = _compare_bundle_pair_inner(
             name=name,
             filenames_pair=filenames_pair,
-            baseline_path=baseline_path,
-            target_path=target_path,
+            dir_pair=dir_pair,
             token_aligner_mode=token_aligner_mode,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
@@ -83,8 +81,7 @@ def _compare_bundle_pair_inner(
     *,
     name: str,
     filenames_pair: Pair[list[str]],
-    baseline_path: Path,
-    target_path: Path,
+    dir_pair: Pair[Path],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
@@ -97,8 +94,8 @@ def _compare_bundle_pair_inner(
 ) -> Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]:
     # 1. Load all successfully loaded values
     all_pair: Pair[list[ValueWithMeta]] = Pair(
-        x=_load_all_values(filenames=filenames_pair.x, base_path=baseline_path),
-        y=_load_all_values(filenames=filenames_pair.y, base_path=target_path),
+        x=_load_all_values(filenames=filenames_pair.x, base_path=dir_pair.x),
+        y=_load_all_values(filenames=filenames_pair.y, base_path=dir_pair.y),
     )
 
     if not all_pair.x or not all_pair.y:

@@ -97,11 +97,6 @@ class ConfigRecord(_OutputRecord):
     type: Literal["config"] = "config"
     config: dict[str, Any]
 
-    @classmethod
-    def from_args(cls, args) -> "ConfigRecord":
-        """Create ConfigRecord from argparse.Namespace."""
-        return cls(config=vars(args))
-
     def _format_body(self) -> str:
         return f"Config: {self.config}"
 

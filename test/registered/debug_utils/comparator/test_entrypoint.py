@@ -4266,5 +4266,101 @@ class TestReportOutput:
         assert isinstance(parsed, ConfigRecord)
 
 
+class TestEntrypointAutoDescend:
+    """Test auto-descend: --baseline-path / --target-path pointing to a parent
+    directory that contains a single subdirectory with .pt files."""
+
+    def test_auto_descend_single_engine(self, tmp_path: Path, capsys) -> None:
+        """Parent dir wrapping a single engine subdir is auto-descended and comparison succeeds."""
+        baseline_exp, target_exp = _create_dumps(tmp_path, ["tensor_a"])
+
+        baseline_wrapper: Path = tmp_path / "baseline_wrap"
+        target_wrapper: Path = tmp_path / "target_wrap"
+        baseline_wrapper.mkdir()
+        target_wrapper.mkdir()
+        baseline_exp.rename(baseline_wrapper / "engine_0")
+        target_exp.rename(target_wrapper / "engine_0")
+
+        argv = _make_argv(baseline_wrapper, target_wrapper, preset="raw")
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 0
+        _assert_single_comparison_passed(records)
+
+    def test_no_descend_when_pt_at_root(self, tmp_path: Path, capsys) -> None:
+        """Direct .pt files — no descend needed, comparison still works."""
+        baseline_exp, target_exp = _create_dumps(tmp_path, ["tensor_a"])
+
+        argv = _make_argv(baseline_exp, target_exp, preset="raw")
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 0
+        _assert_single_comparison_passed(records)
+
+    def test_auto_descend_emits_log_record(self, tmp_path: Path, capsys) -> None:
+        """Auto-descend emits a LogRecord with the info message."""
+        baseline_exp, target_exp = _create_dumps(tmp_path, ["tensor_a"])
+
+        wrapper: Path = tmp_path / "target_wrap"
+        wrapper.mkdir()
+        target_exp.rename(wrapper / "engine_0")
+
+        argv = _make_argv(baseline_exp, wrapper, preset="raw")
+        records, _ = _run_and_parse(argv, capsys)
+
+        log_records: list[LogRecord] = [r for r in records if isinstance(r, LogRecord)]
+        auto_descend_msgs: list[str] = [
+            info.message
+            for lr in log_records
+            for info in lr.infos
+            if "auto-descend" in info.message
+        ]
+        assert any("target_path" in m for m in auto_descend_msgs)
+
+    def test_auto_descend_single_nonempty_among_empty(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """Two subdirs but only one has .pt — auto-descend picks the non-empty one."""
+        baseline_exp, target_exp = _create_dumps(tmp_path, ["tensor_a"])
+
+        wrapper: Path = tmp_path / "target_wrap"
+        wrapper.mkdir()
+        target_exp.rename(wrapper / "engine_0")
+        (wrapper / "empty_subdir").mkdir()
+
+        argv = _make_argv(baseline_exp, wrapper, preset="raw")
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 0
+        _assert_single_comparison_passed(records)
+
+    def test_error_multiple_nonempty_subdirs(self, tmp_path: Path) -> None:
+        """Two subdirs both with .pt — raises ValueError with clear message."""
+        baseline_exp, target_exp = _create_dumps(tmp_path, ["tensor_a"])
+
+        wrapper: Path = tmp_path / "target_wrap"
+        wrapper.mkdir()
+        target_exp.rename(wrapper / "engine_0")
+        engine_1: Path = wrapper / "engine_1"
+        engine_1.mkdir()
+        torch.save(torch.tensor([1.0]), engine_1 / "dummy.pt")
+
+        argv: list[str] = _make_argv(baseline_exp, wrapper, preset="raw")
+        with pytest.raises(ValueError, match="multiple subdirectories contain data"):
+            run(parse_args(argv))
+
+    def test_error_no_data_found(self, tmp_path: Path) -> None:
+        """No .pt files anywhere — raises ValueError."""
+        baseline_exp, _ = _create_dumps(tmp_path, ["tensor_a"])
+
+        empty_dir: Path = tmp_path / "empty_target"
+        empty_dir.mkdir()
+        (empty_dir / "subdir").mkdir()
+
+        argv: list[str] = _make_argv(baseline_exp, empty_dir, preset="raw")
+        with pytest.raises(ValueError, match="no .pt files found"):
+            run(parse_args(argv))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

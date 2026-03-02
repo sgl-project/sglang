@@ -924,7 +924,7 @@ class TestReduceSum:
         part_a = full_tensor * 0.6
         part_b = full_tensor * 0.4
 
-        dim_specs = parse_dims("h(tp:partial) d")
+        dim_specs = parse_dims("h[tp:partial] d").dims
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
@@ -946,7 +946,7 @@ class TestReduceSum:
         full_tensor = torch.randn(4, 8)
         parts: list[torch.Tensor] = [full_tensor * 0.25 for _ in range(4)]
 
-        dim_specs = parse_dims("h(tp:partial) d")
+        dim_specs = parse_dims("h[tp:partial] d").dims
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
         ]
@@ -980,7 +980,7 @@ class TestReduceSum:
                     }
                 )
 
-        dim_specs = parse_dims("b s(cp) h(tp:partial)")
+        dim_specs = parse_dims("b s[cp] h[tp:partial]").dims
         plans = compute_unsharder_plan(dim_specs, parallel_infos)
         assert len(plans) == 2
 
@@ -1009,7 +1009,7 @@ class TestReduceSum:
             {ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4)},
             {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4)},
         ]
-        dim_specs = parse_dims("h(tp:partial) d")
+        dim_specs = parse_dims("h[tp:partial] d").dims
         plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         named_parts: list[torch.Tensor] = _name_tensors(parts, dim_specs)
@@ -1022,7 +1022,7 @@ class TestReduceSum:
 
     def test_reduce_preserves_named_dims(self) -> None:
         """Named tensor dimensions are preserved through reduce_sum."""
-        dim_specs = parse_dims("h(tp:partial) d")
+        dim_specs = parse_dims("h[tp:partial] d").dims
         part_a = torch.randn(4, 8).refine_names("h", "d")
         part_b = torch.randn(4, 8).refine_names("h", "d")
 

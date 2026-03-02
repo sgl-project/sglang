@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar
 
 import torch
@@ -17,6 +18,46 @@ def _check_equal_lengths(**named_lists: list) -> None:
     if len(unique) > 1:
         details: str = ", ".join(f"{name}={length}" for name, length in lengths.items())
         raise ValueError(f"Length mismatch: {details}")
+
+
+def auto_descend_dir(directory: Path, label: str) -> Path:
+    """If directory has no .pt files but exactly one subdirectory does, descend into it.
+
+    Raises ValueError when the layout is ambiguous (>=2 subdirs with .pt)
+    or when no .pt data is found at all.
+    """
+    if any(directory.glob("*.pt")):
+        return directory
+
+    candidates: list[Path] = [
+        sub for sub in directory.iterdir() if sub.is_dir() and any(sub.glob("*.pt"))
+    ]
+
+    if len(candidates) >= 2:
+        names: str = ", ".join(sorted(c.name for c in candidates))
+        raise ValueError(
+            f"{label}: directory {directory} has no .pt files at top level "
+            f"and multiple subdirectories contain data ({names}). "
+            f"Please specify the exact subdirectory."
+        )
+
+    if len(candidates) == 0:
+        raise ValueError(
+            f"{label}: no .pt files found in {directory} or any of its subdirectories."
+        )
+
+    resolved: Path = candidates[0]
+
+    from sglang.srt.debug_utils.comparator.log_sink import log_sink
+    from sglang.srt.debug_utils.comparator.output_types import InfoLog
+
+    log_sink.add(
+        InfoLog(
+            category="auto_descend",
+            message=f"auto-descend {label}: {directory} -> {resolved}",
+        )
+    )
+    return resolved
 
 
 class _StrictBase(BaseModel):

@@ -697,58 +697,5 @@ class TestComputeUnsharderPlanFusedDims:
         assert isinstance(plans[0].params, ReduceSumParams)
 
 
-class TestComputeUnsharderPlanFusedDims:
-    def test_fused_dim_tp2(self) -> None:
-        """Fused dim "(num_heads*head_dim)[tp]" should unshard on the fused tensor name."""
-        dim_specs = parse_dims("t (num_heads*head_dim)[tp]").dims
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 1
-        assert plans[0].axis == ParallelAxis.TP
-        assert isinstance(plans[0].params, ConcatParams)
-        assert plans[0].params.dim_name == "num_heads___head_dim"
-        assert plans[0].groups == [[0, 1]]
-
-    def test_fused_dim_modifier_on_second_sub(self) -> None:
-        """Modifier on fused dim: "(a*b)[tp]" should produce concat plan."""
-        dim_specs = parse_dims("t (a*b)[tp]").dims
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 1
-        assert plans[0].axis == ParallelAxis.TP
-        assert isinstance(plans[0].params, ConcatParams)
-        assert plans[0].params.dim_name == "a___b"
-
-    def test_fused_dim_no_modifier(self) -> None:
-        """Fused dim without any modifier should have no unshard plans (beyond replicated)."""
-        dim_specs = parse_dims("t (a*b)").dims
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        # TP not annotated in dims → replicated → pick
-        assert len(plans) == 1
-        assert isinstance(plans[0].params, PickParams)
-
-    def test_fused_dim_with_reduction(self) -> None:
-        """Fused dim with partial reduction: "(a*b)[tp:partial]"."""
-        dim_specs = parse_dims("t (a*b)[tp:partial]").dims
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
-        ]
-        plans = compute_unsharder_plan(dim_specs, parallel_infos)
-
-        assert len(plans) == 1
-        assert plans[0].axis == ParallelAxis.TP
-        assert isinstance(plans[0].params, ReduceSumParams)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
