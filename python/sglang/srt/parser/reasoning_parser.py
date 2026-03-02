@@ -531,4 +531,3 @@ class ReasoningParser:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
-
