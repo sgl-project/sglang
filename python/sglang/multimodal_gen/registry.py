@@ -656,40 +656,61 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimagepipeline" in pipeline_class.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2512"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimagepipeline" in pipeline_class.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimageeditpipeline" in pipeline_class.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimageeditpluspipeline" in pipeline_class.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimageeditpluspipeline" in pipeline_class.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
+        model_detectors=[
+            lambda pipeline_class: "qwenimagelayeredpipeline" in pipeline_class.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=GlmImageSamplingParams,
         pipeline_config_cls=GlmImagePipelineConfig,
-        model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "glm-image" in hf_id.lower(),
+            lambda pipeline_class: "glmimagepipeline" in pipeline_class.lower(),
+        ],
     )
     register_configs(
         sampling_param_cls=Hunyuan3DSamplingParams,
