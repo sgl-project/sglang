@@ -246,6 +246,7 @@ def load_model_from_full_model_state_dict(
     """
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
+    param_dict.update(dict(model.named_buffers()))
 
     # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
