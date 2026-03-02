@@ -31,11 +31,15 @@ class TestSWARadixCacheKL(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # Use a lower mem-fraction-static to avoid OOM during input logprobs
+            # gathering. With PCG enabled, more memory is reserved for CUDA graph
+            # captures, so the static fraction should be lower.
             other_args=[
                 "--tp-size",
                 "1",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
+                "--disable-piecewise-cuda-graph",
             ],
         )
 

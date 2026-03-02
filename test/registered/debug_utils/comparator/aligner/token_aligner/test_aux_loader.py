@@ -15,8 +15,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins i
     _MegatronPlugin,
     _SGLangPlugin,
 )
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
-from sglang.srt.debug_utils.comparator.warning_sink import WarningSink
+from sglang.srt.debug_utils.comparator.log_sink import LogSink
+from sglang.srt.debug_utils.comparator.output_types import ErrorLog, InfoLog
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)
@@ -90,7 +90,7 @@ class TestEnsureDimsInMetas:
         assert result is metas
 
     def test_cp_sharded_sglang_input_ids_infers_dims(self):
-        """CP + input_ids in sglang infers dims 't(cp:zigzag)'."""
+        """CP + input_ids in sglang infers dims 't[cp:zigzag]'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
@@ -99,11 +99,11 @@ class TestEnsureDimsInMetas:
             name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
         )
         assert result is not metas
-        assert result[0]["dims"] == "t(cp:zigzag)"
-        assert result[1]["dims"] == "t(cp:zigzag)"
+        assert result[0]["dims"] == "t[cp:zigzag]"
+        assert result[1]["dims"] == "t[cp:zigzag]"
 
     def test_cp_sharded_sglang_positions_infers_dims(self):
-        """CP + positions in sglang infers dims 't(cp:zigzag)'."""
+        """CP + positions in sglang infers dims 't[cp:zigzag]'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
@@ -111,10 +111,10 @@ class TestEnsureDimsInMetas:
         result = _ensure_dims_in_metas(
             name="positions", plugin=_sglang_plugin, metas=metas, ndim=1
         )
-        assert result[0]["dims"] == "t(cp:zigzag)"
+        assert result[0]["dims"] == "t[cp:zigzag]"
 
     def test_cp_sharded_megatron_input_ids_infers_dims_1d(self):
-        """CP + input_ids in megatron (1D) infers dims 't(cp:zigzag)'."""
+        """CP + input_ids in megatron (1D) infers dims 't[cp:zigzag]'."""
         metas: list[dict] = [
             {"megatron_parallel_info": {"cp_rank": 0, "cp_size": 2}},
             {"megatron_parallel_info": {"cp_rank": 1, "cp_size": 2}},
@@ -122,10 +122,10 @@ class TestEnsureDimsInMetas:
         result = _ensure_dims_in_metas(
             name="input_ids", plugin=_megatron_plugin, metas=metas, ndim=1
         )
-        assert result[0]["dims"] == "t(cp:zigzag)"
+        assert result[0]["dims"] == "t[cp:zigzag]"
 
     def test_cp_sharded_megatron_input_ids_infers_dims_2d(self):
-        """CP + input_ids in megatron (2D) infers dims 'b s(cp:zigzag)'."""
+        """CP + input_ids in megatron (2D) infers dims 'b s[cp:zigzag]'."""
         metas: list[dict] = [
             {"megatron_parallel_info": {"cp_rank": 0, "cp_size": 2}},
             {"megatron_parallel_info": {"cp_rank": 1, "cp_size": 2}},
@@ -133,7 +133,7 @@ class TestEnsureDimsInMetas:
         result = _ensure_dims_in_metas(
             name="input_ids", plugin=_megatron_plugin, metas=metas, ndim=2
         )
-        assert result[0]["dims"] == "b s(cp:zigzag)"
+        assert result[0]["dims"] == "b s[cp:zigzag]"
 
     def test_cp_non_sharded_name_returns_metas_unchanged(self):
         """CP + non-sharded tensor name (seq_lens) returns metas as-is."""
@@ -209,12 +209,12 @@ class TestLoadNonTensorAux:
         fn1: str = _save_pt(tmp_path, name="rids", step=0, rank=1, value=["req_B"])
         df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context() as warnings:
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.warning_sink",
+                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_non_tensor_aux(
@@ -223,7 +223,7 @@ class TestLoadNonTensorAux:
 
         assert result == ["req_A"]
         assert len(warnings) == 1
-        assert isinstance(warnings[0], GeneralWarning)
+        assert isinstance(warnings[0], ErrorLog)
         assert "rids_mismatch" in warnings[0].category
 
     def test_no_rows_returns_none(self, tmp_path: Path) -> None:
@@ -268,12 +268,12 @@ class TestLoadAndAlignAuxTensor:
         )
         df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context() as warnings:
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.warning_sink",
+                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_and_align_aux_tensor(
@@ -287,7 +287,7 @@ class TestLoadAndAlignAuxTensor:
         assert result is not None
         assert torch.equal(result, torch.tensor([1, 2, 3]))
         assert len(warnings) == 1
-        assert isinstance(warnings[0], GeneralWarning)
+        assert isinstance(warnings[0], InfoLog)
         assert "aux_no_dims" in warnings[0].category
 
 
@@ -324,12 +324,12 @@ class TestLoadNonTensorAuxDp:
         )
         df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context():
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.warning_sink",
+                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_non_tensor_aux(

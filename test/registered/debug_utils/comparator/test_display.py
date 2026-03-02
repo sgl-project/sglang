@@ -1,16 +1,18 @@
 import sys
+from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 
 import polars as pl
 import pytest
 import torch
+from rich.console import Console
 
 from sglang.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
-    _extract_parallel_info,
     _render_polars_as_text,
+    extract_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -19,6 +21,12 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
+
+
+def _render_rich(renderable: object) -> str:
+    buf: StringIO = StringIO()
+    Console(file=buf, force_terminal=False, width=120).print(renderable)
+    return buf.getvalue().rstrip("\n")
 
 
 def _save_dump_file(
@@ -276,6 +284,24 @@ class TestRankInfoRecordSnapshot:
         assert "1/2" in text
         assert "0/1" in text
 
+    def test_to_rich_snapshot(self) -> None:
+        from rich.table import Table
+
+        record = RankInfoRecord(
+            label="baseline",
+            rows=[
+                {"rank": 0, "tp": "0/2", "pp": "0/1"},
+                {"rank": 1, "tp": "1/2", "pp": "0/1"},
+            ],
+        )
+        body = record._format_rich_body()
+
+        assert isinstance(body, Table)
+        rendered: str = _render_rich(body)
+        assert "baseline ranks" in rendered
+        assert "0/2" in rendered
+        assert "1/2" in rendered
+
     def test_json_roundtrip(self) -> None:
         record = RankInfoRecord(
             label="target",
@@ -309,6 +335,29 @@ class TestInputIdsRecordSnapshot:
         assert "num_tokens" in text
         assert "10, 20, 30" in text
         assert "0, 1, 2" in text
+
+    def test_to_rich_snapshot(self) -> None:
+        from rich.table import Table
+
+        record = InputIdsRecord(
+            label="target",
+            rows=[
+                {
+                    "step": 0,
+                    "rank": 0,
+                    "num_tokens": 3,
+                    "input_ids": "[10, 20, 30]",
+                    "positions": "[0, 1, 2]",
+                },
+            ],
+        )
+        body = record._format_rich_body()
+
+        assert isinstance(body, Table)
+        rendered: str = _render_rich(body)
+        assert "target input_ids & positions" in rendered
+        assert "10, 20, 30" in rendered
+        assert "0, 1, 2" in rendered
 
     def test_json_roundtrip(self) -> None:
         record = InputIdsRecord(
@@ -359,26 +408,26 @@ class TestExtractParallelInfo:
             "pp_size": 2,
         }
         row_data: dict = {}
-        _extract_parallel_info(row_data=row_data, info=info)
+        extract_parallel_info(row_data=row_data, info=info)
 
         assert row_data["tp"] == "1/4"
         assert row_data["pp"] == "0/2"
 
     def test_skips_error_info(self) -> None:
         row_data: dict = {}
-        _extract_parallel_info(
+        extract_parallel_info(
             row_data=row_data, info={"error": True, "tp_rank": 0, "tp_size": 1}
         )
         assert row_data == {}
 
     def test_skips_empty_info(self) -> None:
         row_data: dict = {}
-        _extract_parallel_info(row_data=row_data, info={})
+        extract_parallel_info(row_data=row_data, info={})
         assert row_data == {}
 
     def test_ignores_rank_without_size(self) -> None:
         row_data: dict = {}
-        _extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
+        extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
         assert "tp" not in row_data
 
 

@@ -4,7 +4,7 @@ from typing import Annotated, Literal, Union
 
 from pydantic import Field, model_validator
 
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
 
 
