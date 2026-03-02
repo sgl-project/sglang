@@ -31,12 +31,12 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SkipComparisonRecord,
     SummaryRecord,
     TensorComparisonRecord,
-    report_sink,
 )
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
 from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
+from sglang.srt.debug_utils.comparator.report_sink import report_sink
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     auto_descend_dir,
@@ -53,7 +53,11 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    report_sink.configure(output_format=args.output_format, report_path=None)
+    report_sink.configure(
+        output_format=args.output_format,
+        report_path=None,
+        verbosity=args.verbosity,
+    )
 
     dir_pair: Pair[Path] = Pair(
         x=auto_descend_dir(Path(args.baseline_path), label="baseline_path"),
@@ -67,6 +71,16 @@ def run(args: argparse.Namespace) -> int:
     )
     override_config: Optional[Path] = (
         Path(args.override_config) if args.override_config else None
+    )
+
+    report_path: Optional[Path] = _resolve_report_path(
+        target_path=dir_pair.y,
+        report_path_arg=args.report_path,
+    )
+    report_sink.configure(
+        output_format=args.output_format,
+        report_path=report_path,
+        verbosity=args.verbosity,
     )
 
     report_path: Optional[Path] = _resolve_report_path(
@@ -293,6 +307,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["text", "json"],
         default="text",
         help="Output format: text (default) or json (JSONL, one JSON object per line)",
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=str,
+        choices=["minimal", "normal", "verbose"],
+        default="normal",
+        help="Output verbosity: minimal (1 line per tensor), normal (compact lifecycle), "
+        "verbose (full detail). Default: normal",
     )
     parser.add_argument(
         "--preset",
