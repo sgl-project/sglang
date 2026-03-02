@@ -105,9 +105,10 @@ class DenoisingStage(PipelineStage):
         )
         attn_head_size = hidden_size // num_attention_heads
 
-        # torch compile
+        # torch compile & CUDA graph capture
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_enable_torch_compile(transformer)
+            self._maybe_enable_cuda_graph_capture(self.server_args, transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -128,6 +129,22 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _maybe_enable_cuda_graph_capture(
+        self, server_args: ServerArgs, module: object
+    ) -> None:
+        """
+        Enable CUDA graph capture on the module when server_args.enable_cuda_graph is set.
+        No-op if disabled or the module does not support it (e.g. only QwenImageTransformer2DModel).
+        """
+        if not getattr(server_args, "enable_cuda_graph", False):
+            return
+        if not hasattr(module, "enable_cuda_graph_capture"):
+            logger.warning(
+                f"Module {module.__class__.__name__} does not support CUDA graph capture"
+            )
+            return
+        module.enable_cuda_graph_capture(True)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -539,6 +556,7 @@ class DenoisingStage(PipelineStage):
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
             self._maybe_enable_torch_compile(self.transformer)
+            self._maybe_enable_cuda_graph_capture(server_args, self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True

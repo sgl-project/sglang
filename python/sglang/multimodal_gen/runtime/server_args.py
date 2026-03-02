@@ -266,6 +266,8 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    # CUDA graph capture
+    enable_cuda_graph: bool = False
 
     # warmup
     warmup: bool = False
@@ -808,6 +810,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.scheduler_port,
             help="Port for the scheduler server.",
+        )
+        parser.add_argument(
+            "--enable-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cuda_graph,
+            help="Enable CUDA graph capture for the model.",
         )
         parser.add_argument(
             "--host",
