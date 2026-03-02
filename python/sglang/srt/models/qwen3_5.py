@@ -63,7 +63,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.utils import enable_aiter_fused_qk_norm_mrope_set_kv
+from sglang.srt.models.utils import enable_fused_qk_norm_rope_set_kv_aiter
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -709,7 +709,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         save_kv_cache = True
-        if enable_fused_qk_norm_rope_set_kv_aiter and is_gfx95_supported():
+        if enable_fused_qk_norm_rope_set_kv_aiter(forward_batch) and is_gfx95_supported():
             q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
                 q, k, v, positions, forward_batch,
             )
