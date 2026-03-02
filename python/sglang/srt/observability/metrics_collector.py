@@ -101,6 +101,10 @@ class SchedulerStats:
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
 
+    # HiCache metrics
+    hicache_host_used_tokens: int = 0
+    hicache_host_total_tokens: int = 0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -144,6 +148,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        enable_hierarchical_cache: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -151,6 +156,7 @@ class SchedulerMetricsCollector:
 
         self.labels = labels
         self.enable_lora = enable_lora
+        self.enable_hierarchical_cache = enable_hierarchical_cache
         self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
@@ -599,6 +605,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # HiCache host-tier metrics (only created when hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self.hicache_host_used_tokens = Gauge(
+                name="sglang:hicache_host_used_tokens",
+                documentation="Number of tokens currently used in the host KV cache.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_total_tokens = Gauge(
+                name="sglang:hicache_host_total_tokens",
+                documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -893,6 +914,15 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        # HiCache host-tier metrics (only logged if hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self._log_gauge(
+                self.hicache_host_used_tokens, stats.hicache_host_used_tokens
+            )
+            self._log_gauge(
+                self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
 
         self._log_gauge(
             self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
