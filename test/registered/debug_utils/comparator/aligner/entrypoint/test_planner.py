@@ -56,7 +56,7 @@ class TestComputePerStepSubPlans:
 
     def test_single_meta(self) -> None:
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
-            metas=[_make_meta(dims="b h(tp)", tp_size=2)]
+            metas=[_make_meta(dims="b h[tp]", tp_size=2)]
         )
         assert result == []
 
@@ -72,8 +72,8 @@ class TestComputePerStepSubPlans:
     def test_tp_sharded_returns_unsharder_plan(self) -> None:
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
             metas=[
-                _make_meta(dims="b h(tp)", tp_rank=0, tp_size=2),
-                _make_meta(dims="b h(tp)", tp_rank=1, tp_size=2),
+                _make_meta(dims="b h[tp]", tp_rank=0, tp_size=2),
+                _make_meta(dims="b h[tp]", tp_rank=1, tp_size=2),
             ]
         )
         assert len(result) >= 1
@@ -85,8 +85,8 @@ class TestComputePerStepSubPlans:
     def test_zigzag_returns_both_plans(self) -> None:
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
             metas=[
-                _make_meta(dims="b s(cp:zigzag) h", cp_rank=0, cp_size=2),
-                _make_meta(dims="b s(cp:zigzag) h", cp_rank=1, cp_size=2),
+                _make_meta(dims="b s[cp:zigzag] h", cp_rank=0, cp_size=2),
+                _make_meta(dims="b s[cp:zigzag] h", cp_rank=1, cp_size=2),
             ]
         )
         unsharder_plans: list[UnsharderPlan] = [
@@ -177,33 +177,33 @@ class TestComputeAlignerPlan:
 
 class TestComputePerStepSubPlansThd:
     def test_thd_zigzag_returns_thd_plans(self) -> None:
-        """t(cp:zigzag) h(tp) generates THD-typed unsharder + reorderer plans."""
+        """t[cp:zigzag] h[tp] generates THD-typed unsharder + reorderer plans."""
         thd_global_seq_lens: list[int] = [100, 64, 92]
         result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
             metas=[
                 _make_meta(
-                    dims="t(cp:zigzag) h(tp)",
+                    dims="t[cp:zigzag] h[tp]",
                     cp_rank=0,
                     cp_size=2,
                     tp_rank=0,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp:zigzag) h(tp)",
+                    dims="t[cp:zigzag] h[tp]",
                     cp_rank=0,
                     cp_size=2,
                     tp_rank=1,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp:zigzag) h(tp)",
+                    dims="t[cp:zigzag] h[tp]",
                     cp_rank=1,
                     cp_size=2,
                     tp_rank=0,
                     tp_size=2,
                 ),
                 _make_meta(
-                    dims="t(cp:zigzag) h(tp)",
+                    dims="t[cp:zigzag] h[tp]",
                     cp_rank=1,
                     cp_size=2,
                     tp_rank=1,

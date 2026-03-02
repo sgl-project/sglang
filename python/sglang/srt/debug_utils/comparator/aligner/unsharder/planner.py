@@ -39,7 +39,9 @@ def compute_unsharder_plan(
 
     # Within each dim spec, reverse modifier order: innermost shard (rightmost) unshards first.
     reversed_sharded_modifiers: list[tuple[str, ParallelModifier]] = [
-        (spec.name, m) for spec in dim_specs for m in reversed(spec.parallel_modifiers)
+        (spec.sanitized_name, m)
+        for spec in dim_specs
+        for m in reversed(spec.parallel_modifiers)
     ]
 
     sharded_axes_raw: set[ParallelAxis] = {
