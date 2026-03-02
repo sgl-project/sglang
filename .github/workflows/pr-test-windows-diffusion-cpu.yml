@@ -28,13 +28,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
 
-      - name: Install minimal test dependencies
+      - name: Install SGLang with diffusion dependencies
         run: |
-          pip install pytest IPython torch==2.9.1 numpy pydantic psutil pyzmq fastapi uvicorn requests packaging pybase64 diffusers==0.36.0 addict==2.4.0 PyYAML==6.0.1
-
-      - name: Install project package without dependency resolution
-        run: |
-          pip install -e python --no-deps
+          pip install -e "python[diffusion]"
+          pip install pytest
 
       - name: Run tiny diffusion generation on Windows CPU
         shell: pwsh
