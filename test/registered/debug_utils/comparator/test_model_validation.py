@@ -34,6 +34,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonTensorRecord,
     ErrorLog,
     SummaryRecord,
+    TensorComparisonRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (

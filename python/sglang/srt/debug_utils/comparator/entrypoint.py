@@ -85,6 +85,12 @@ def run(args: argparse.Namespace) -> int:
         verbosity=args.verbosity,
     )
 
+    report_path: Optional[Path] = _resolve_report_path(
+        target_path=dir_pair.y,
+        report_path_arg=args.report_path,
+    )
+    report_sink.configure(output_format=args.output_format, report_path=report_path)
+
     try:
         report_sink.add(ConfigRecord(config=vars(args)))
 
@@ -259,6 +265,13 @@ def _compare_bundle_pairs(
                 exception_type=type(exc).__name__,
                 traceback_str=_traceback_module.format_exc(),
             )
+
+        target_steps: set[int] = {info.step for info in bundle_info_pair.y}
+        step: Optional[int] = target_steps.pop() if len(target_steps) == 1 else None
+        if step is not None:
+            record = record.model_copy(update={"location": RecordLocation(step=step)})
+
+        yield record
 
         target_steps: set[int] = {info.step for info in bundle_info_pair.y}
         step: Optional[int] = target_steps.pop() if len(target_steps) == 1 else None
