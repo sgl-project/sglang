@@ -206,7 +206,7 @@ python3 -m sglang.launch_server \
 ```bash
 python3 -m sglang.launch_server \
   --tp 4 \
-  --model Qwen/Qwen3.5-35B-A3B-FP8/ \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
   --attention-backend trtllm_mha \
   --trust-remote-code
 ```
@@ -216,7 +216,7 @@ Note that TRTLLM XQA backend only works well for pagesize 64.
 ```bash
 python3 -m sglang.launch_server \
   --tp 4 \
-  --model Qwen/Qwen3.5-35B-A3B-FP8/ \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
   --decode-attention-backend trtllm_mha \
   --trust-remote-code
 ```
