@@ -10,6 +10,11 @@ on:
       - "python/sglang/version.py"
   workflow_dispatch:
     inputs:
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
@@ -56,11 +61,19 @@ on:
         required: false
         type: string
         default: ''
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
+
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
 
 concurrency:
   group: nightly-test-amd-${{ inputs.ref || github.ref }}

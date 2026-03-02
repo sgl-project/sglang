@@ -10,6 +10,11 @@ on:
       - "python/sglang/version.py"
   workflow_dispatch:
     inputs:
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
@@ -56,11 +61,19 @@ on:
         required: false
         type: string
         default: ''
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
+
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
 
 concurrency:
   group: nightly-test-amd-rocm720-${{ inputs.ref || github.ref }}
@@ -86,8 +99,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Nightly Unit Test ROCm 7.2 (1-GPU)
         timeout-minutes: 90
         run: |
@@ -116,8 +128,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Nightly Test ROCm 7.2 (2-GPU)
         run: |
           > github_summary.md  # Clear summary file
@@ -145,8 +156,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Nightly Accuracy Test ROCm 7.2 (2-GPU VLM MMMU)
         timeout-minutes: 180
         run: |
@@ -175,8 +185,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Performance Test ROCm 7.2 (2-GPU Text Models)
         timeout-minutes: 120
         run: |
@@ -206,8 +215,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Performance Test ROCm 7.2 (2-GPU VLM Models)
         timeout-minutes: 180
         run: |
@@ -237,7 +245,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
@@ -277,7 +285,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU Grok1-INT4)
         timeout-minutes: 60
@@ -320,7 +328,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU Grok2)
         timeout-minutes: 60
@@ -363,7 +371,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V3.1)
         timeout-minutes: 120
@@ -406,7 +414,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 120
@@ -447,7 +455,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 120
@@ -488,7 +496,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU Kimi-K2.5)
         timeout-minutes: 120
@@ -518,7 +526,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test + Performance Test ROCm 7.2 (8-GPU Qwen3)
         timeout-minutes: 120
@@ -549,7 +557,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # GLM-5 requires latest transformers for glm_moe_dsa architecture
           bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
 
@@ -581,7 +589,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm 7.2 (8-GPU MiniMax-M2.5)
         timeout-minutes: 120
@@ -614,8 +622,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Nightly Test MI35x ROCm 7.2 (1-GPU)
         timeout-minutes: 90
         run: |
@@ -644,7 +651,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -676,7 +683,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -722,7 +729,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -768,7 +775,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -812,7 +819,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -845,7 +852,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -878,7 +885,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -911,7 +918,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -944,7 +951,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
@@ -976,7 +983,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
           # GLM-5 requires latest transformers for glm_moe_dsa architecture
@@ -1011,7 +1018,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU MiniMax-M2.5)
@@ -1044,7 +1051,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 

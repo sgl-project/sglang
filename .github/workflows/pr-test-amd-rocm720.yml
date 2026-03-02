@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: ""
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -49,6 +54,14 @@ on:
         required: false
         type: boolean
         default: false
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
 
 concurrency:
   # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
@@ -146,8 +159,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 14
         run: |
@@ -193,8 +205,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 20
         run: |
@@ -236,8 +247,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 10
         run: |
@@ -275,8 +285,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run JIT kernel unit tests
         timeout-minutes: 10
         run: |
@@ -315,8 +324,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -354,8 +362,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -393,8 +400,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -433,8 +439,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -473,8 +478,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -523,7 +527,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
           docker exec ci_sglang pip install amdsmi
 
       - name: Setup kernel caches
@@ -653,7 +657,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
           docker exec ci_sglang pip install amdsmi
 
       - name: Setup kernel caches
@@ -774,8 +778,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
         run: |
@@ -820,8 +823,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
         timeout-minutes: 60
         run: |

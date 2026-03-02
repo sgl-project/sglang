@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: ""
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -46,6 +51,14 @@ on:
         required: false
         type: boolean
         default: false
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
 
 concurrency:
   # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
