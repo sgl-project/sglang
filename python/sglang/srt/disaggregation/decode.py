@@ -46,7 +46,6 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
