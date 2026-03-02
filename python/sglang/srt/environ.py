@@ -278,6 +278,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
 
+    # KV Cache directly offload to L3
+    # enable decode instance extending distributed kv pool
+    SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT = EnvBool(False)
+
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
