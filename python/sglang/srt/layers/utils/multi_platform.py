@@ -4,6 +4,7 @@ from torch import nn
 
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -19,6 +20,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 class MultiPlatformOp(nn.Module):
@@ -97,11 +99,17 @@ class MultiPlatformOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_aiter(self, *args, **kwargs):
+        return self.forward_hip(*args, **kwargs)
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
-            return self.forward_hip
+            if _use_aiter:
+                return self.forward_aiter
+            else:
+                return self.forward_hip
         elif _is_cpu and _is_cpu_amx_available:
             return self.forward_cpu
         elif _is_npu:
