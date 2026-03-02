@@ -139,6 +139,9 @@ class RMSNorm(MultiPlatformOp):
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
+            post_residual_addition = kwargs.get("post_residual_addition")
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
