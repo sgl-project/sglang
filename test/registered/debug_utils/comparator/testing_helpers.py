@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import Optional
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(
+    est_time=0, suite="default", nightly=True, disabled="helper module, no tests"
+)
+
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
