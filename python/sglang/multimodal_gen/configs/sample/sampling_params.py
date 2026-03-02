@@ -108,6 +108,13 @@ class SamplingParams:
         None  # local dir or HF repo ID with flownet.pkl (default: elfgum/RIFE-4.22.lite)
     )
 
+    # Upscaling
+    enable_upscaling: bool = False
+    upscaling_model_path: str | None = (
+        None  # local .pth or HF repo ID (default: ai-forever/Real-ESRGAN)
+    )
+    upscaling_scale: int = 4  # 2 or 4
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
@@ -848,6 +855,24 @@ class SamplingParams:
             default=SamplingParams.frame_interpolation_model_path,
             help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
             "(default: elfgum/RIFE-4.22.lite, downloaded automatically).",
+        )
+        parser.add_argument(
+            "--enable-upscaling",
+            action="store_true",
+            help="Enable post-generation upscaling using Real-ESRGAN.",
+        )
+        parser.add_argument(
+            "--upscaling-model-path",
+            type=str,
+            default=SamplingParams.upscaling_model_path,
+            help="Local .pth file or HuggingFace repo ID for Real-ESRGAN weights "
+            "(default: ai-forever/Real-ESRGAN with realesr-animevideov3.pth).",
+        )
+        parser.add_argument(
+            "--upscaling-scale",
+            type=int,
+            default=SamplingParams.upscaling_scale,
+            help="Upscaling factor: 2 or 4 (default: 4).",
         )
         return parser
 
