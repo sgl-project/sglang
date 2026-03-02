@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
         TracedAlignerPlan,
     )
+    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
+    from sglang.srt.debug_utils.comparator.report_sink import Verbosity
 
 
 class BaseLog(_StrictBase):
@@ -97,6 +99,29 @@ class _OutputRecord(_StrictBase):
         )
 
         return _render_record_text(self)
+
+
+class RecordLocation(_StrictBase):
+    step: Optional[int] = None
+
+
+class _BaseComparisonRecord(_OutputRecord):
+    location: RecordLocation = Field(default_factory=RecordLocation)
+
+    def _format_location_prefix(self) -> str:
+        if self.location.step is not None:
+            return f"[step={self.location.step}] "
+        return ""
+
+    def _format_location_prefix_rich(self) -> str:
+        if self.location.step is not None:
+            return escape(f"[step={self.location.step}]") + " "
+        return ""
+
+    def _format_location_suffix(self) -> str:
+        if self.location.step is not None:
+            return f" (step={self.location.step})"
+        return ""
 
 
 class RecordLocation(_StrictBase):

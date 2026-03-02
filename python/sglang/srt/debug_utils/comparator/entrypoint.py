@@ -83,6 +83,12 @@ def run(args: argparse.Namespace) -> int:
         verbosity=args.verbosity,
     )
 
+    report_path: Optional[Path] = _resolve_report_path(
+        target_path=dir_pair.y,
+        report_path_arg=args.report_path,
+    )
+    report_sink.configure(output_format=args.output_format, report_path=report_path)
+
     try:
         report_sink.add(ConfigRecord(config=vars(args)))
 
