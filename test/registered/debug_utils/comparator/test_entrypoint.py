@@ -4308,9 +4308,7 @@ class TestEntrypointAutoDescend:
         argv = _make_argv(baseline_exp, wrapper, preset="raw")
         records, _ = _run_and_parse(argv, capsys)
 
-        log_records: list[LogRecord] = [
-            r for r in records if isinstance(r, LogRecord)
-        ]
+        log_records: list[LogRecord] = [r for r in records if isinstance(r, LogRecord)]
         auto_descend_msgs: list[str] = [
             info.message
             for lr in log_records
