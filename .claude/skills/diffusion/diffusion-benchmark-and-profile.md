@@ -273,7 +273,7 @@ sglang generate \
   --enable-torch-compile \
   --prompt "An astronaut hatching from an egg, on the surface of the moon, the darkness and depth of space realised in the background. High quality, ultrarealistic detail and breath-taking movie-like camera shot." \
   --negative-prompt "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards" \
-  --image-path "astronaut.jpg" \
+  --image-path=/workspace/gen_benchmark/figs/astronaut.jpg \
   --num-frames 81 \
   --720p \
   --num-inference-steps 50 \
