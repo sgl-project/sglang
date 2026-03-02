@@ -430,9 +430,30 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_native
+
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """AITER path: Gemma uses weight = 1 + self.weight, so pass that to aiter."""
+        weight = 1.0 + self.weight.data
+        if residual is not None:
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            fused_add_rms_norm(
+                output,
+                x,
+                residual,
+                residual_out,
+                weight,
+                self.variance_epsilon,
+            )
+            return output, residual_out
+        return rms_norm(x, weight, self.variance_epsilon)
 
     def _forward_impl(
         self,
