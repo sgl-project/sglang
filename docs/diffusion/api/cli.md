@@ -69,6 +69,56 @@ sglang generate \
   --save-output
 ```
 
+**Upscaling** (image and video)
+
+Upscaling is a post-processing step that increases the spatial resolution of
+generated images or video frames using [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN).
+The model weights are downloaded automatically on first use and cached for
+subsequent runs.
+
+- `--enable-upscaling`: Enable post-generation upscaling using Real-ESRGAN.
+- `--upscaling-scale {SCALE}`: Desired upscaling factor (default: `4`). The 4× model is used internally; if a different scale is requested, a bicubic resize is applied after the network output.
+- `--upscaling-model-path {PATH}`: Local `.pth` file or HuggingFace repo ID for Real-ESRGAN weights (default: `ai-forever/Real-ESRGAN` with `RealESRGAN_x4.pth`, downloaded automatically).
+
+Example — generate a 1024×1024 image and upscale to 4096×4096:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --prompt "A cat sitting on a windowsill" \
+  --output-size 1024x1024 \
+  --enable-upscaling \
+  --save-output
+```
+
+Example — generate a video and upscale each frame by 4×:
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --prompt "A curious raccoon" \
+  --enable-upscaling \
+  --upscaling-scale 4 \
+  --save-output
+```
+
+Frame interpolation and upscaling can be combined in a single run. Interpolation
+is applied first (increasing the frame count), then upscaling is applied to every
+frame (increasing the spatial resolution). Example — generate 5 frames,
+interpolate to 9 frames, and upscale each frame by 4×:
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --prompt "A curious raccoon" \
+  --num-frames 5 \
+  --enable-frame-interpolation \
+  --frame-interpolation-exp 1 \
+  --enable-upscaling \
+  --upscaling-scale 4 \
+  --save-output
+```
+
 **Output Options**
 
 - `--output-path {PATH}`: Directory to save the generated video
