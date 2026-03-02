@@ -94,9 +94,10 @@ def apply_spk_emb(
         mask_ = input_ids_ == spk_emb_token_id  # [batch_size, seq_len_max]
         nonzero_position_idx = mask_.nonzero(as_tuple=True)[0]  # [num_spk_emb]
         assert nonzero_position_idx.shape[0] == num_spk_embs
-        begin_idx = nonzero_position_idx.min()
-        end_idx = nonzero_position_idx.max()
-        input_embeds[idx, begin_idx : end_idx + 1, :] = spk_emb_
+        if num_spk_embs > 0:
+            begin_idx = nonzero_position_idx.min()
+            end_idx = nonzero_position_idx.max()
+            input_embeds[idx, begin_idx : end_idx + 1, :] = spk_emb_
 
     return
 
