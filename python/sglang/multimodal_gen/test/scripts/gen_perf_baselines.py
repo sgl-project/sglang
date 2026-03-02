@@ -90,9 +90,9 @@ def _torch_cleanup() -> None:
     try:
         import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        if torch.get_device_module().is_available():
+            torch.get_device_module().synchronize()
+            torch.get_device_module().empty_cache()
     except Exception:
         pass
 
@@ -117,7 +117,7 @@ def _run_case(case: DiffusionTestCase) -> dict:
             modality=case.server_args.modality,
             sampling_params=sp,
         )
-        rid = gen(case.id, client)
+        rid, _ = gen(case.id, client)
         rec = wait_for_req_perf_record(
             rid,
             ctx.perf_log_path,

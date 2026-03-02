@@ -125,6 +125,61 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertLess(result["mean_tpot_ms"], 20)
         self.assertEqual(result["completed"], 1000)
 
+    def test_bench_serving_itl(self):
+        num_prompts = 512
+        args = get_benchmark_args(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=num_prompts,
+            random_input_len=512,
+            random_output_len=64,
+            request_rate=float("inf"),
+            max_concurrency=64,
+        )
+        result = run_benchmark(args)
+
+        self.assertEqual(result["completed"], num_prompts)
+        self.assertLess(result["p99_itl_ms"], 20)
+
+
+@unittest.skip(
+    "Skip this test until new testing logic in mini-lb has been updated in docker image."
+)
+class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention):
+    """Test external DP rank assignment via mini-lb --test-external-dp-routing.
+
+    NOTE: In PD disaggregation the response comes from the decode server,
+    so meta_info["dp_rank"] reflects the decode-side DP rank. Prefill DP
+    rank correctness is verified implicitly — if the wrong prefill DP
+    worker were used, KV transfer would fail and the request would error.
+    The mini-lb internally verifies meta_info["dp_rank"] matches the
+    assigned decode dp_rank; a mismatch returns HTTP 500.
+    """
+
+    @classmethod
+    def launch_lb(cls):
+        from sglang.test.test_utils import popen_with_error_check
+
+        lb_command = [
+            "python3",
+            "-m",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",
+            "--test-external-dp-routing",
+            "--prefill",
+            cls.prefill_url,
+            "--decode",
+            cls.decode_url,
+            "--host",
+            cls.base_host,
+            "--port",
+            cls.lb_port,
+        ]
+        cls.process_lb = popen_with_error_check(lb_command)
+        cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
+
 
 if __name__ == "__main__":
     unittest.main()

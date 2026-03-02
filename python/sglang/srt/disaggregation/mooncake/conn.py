@@ -53,7 +53,7 @@ class TransferKVChunk:
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
     index_slice: slice
-    is_last: bool
+    is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
 
@@ -391,22 +391,32 @@ class MooncakeKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
         page_size = self.kv_args.page_size
 
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * self.attn_tp_size // dst_attn_tp_size
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
+
+        # GQA replication: how many prefill ranks share the same KV head
+        src_replication = max(1, self.attn_tp_size // total_kv_heads)
 
         # Determine slicing parameters based on TP configuration
         if self.attn_tp_size > dst_attn_tp_size:
             # Send KVCache from multiple prefill instances to 1 decode instance
             src_head_start_offset = 0
             num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
             src_head_start_offset = (
@@ -851,7 +861,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             break
 
-                        if kv_chunk.is_last:
+                        if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
                                 self.maybe_send_extra(
                                     req,
@@ -883,7 +893,7 @@ class MooncakeKVManager(CommonKVManager):
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
-                        if kv_chunk.is_last and req.room in self.request_status:
+                        if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
                 if (
@@ -1028,12 +1038,12 @@ class MooncakeKVManager(CommonKVManager):
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
-        is_last: bool,
+        is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1062,7 +1072,7 @@ class MooncakeKVManager(CommonKVManager):
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
-                is_last=is_last,
+                is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
             )
@@ -1124,9 +1134,16 @@ class MooncakeKVSender(CommonKVSender):
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if not is_last:
+        if self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
+        if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,

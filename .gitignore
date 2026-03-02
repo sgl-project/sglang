@@ -245,7 +245,6 @@ sgl-model-gateway/tests/fixtures/golden/
 
 lmms-eval
 
-**/.claude/
 **/.serena/
 ctags/
 outputs/
@@ -271,3 +270,8 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# Others
+*.glb
+*.ply
+*.npz

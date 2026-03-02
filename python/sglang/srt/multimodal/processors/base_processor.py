@@ -182,6 +182,13 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
 
+        # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
+        # directly as _processor rather than a processor that wraps a tokenizer.
+        if hasattr(self._processor, "tokenizer"):
+            self._tokenizer = self._processor.tokenizer
+        else:
+            self._tokenizer = self._processor
+
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
@@ -255,7 +262,7 @@ class BaseMultimodalProcessor(ABC):
         Supports image, video, and audio tokens.
         """
         if not isinstance(prompt, list):
-            prompt = self._processor.tokenizer.encode(prompt)
+            prompt = self._tokenizer.encode(prompt)
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
@@ -747,7 +754,7 @@ class BaseMultimodalProcessor(ABC):
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._processor.tokenizer.decode(prompt)
+            prompt = self._tokenizer.decode(prompt)
         else:
             prompt = prompt
 
@@ -820,7 +827,7 @@ class BaseMultimodalProcessor(ABC):
         # Convert prompt into str
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt_str = self._processor.tokenizer.decode(prompt)
+            prompt_str = self._tokenizer.decode(prompt)
         else:
             assert isinstance(prompt, str)
             prompt_str = prompt
@@ -904,7 +911,7 @@ class BaseMultimodalProcessor(ABC):
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._processor.tokenizer.decode(prompt)
+            prompt = self._tokenizer.decode(prompt)
         else:
             prompt = prompt
 
@@ -1099,7 +1106,7 @@ class BaseMultimodalProcessor(ABC):
         all_loaded_data = base_output.organize_results()
         # Handle text-only case
         if not all_loaded_data:
-            input_ids = self._processor.tokenizer(
+            input_ids = self._tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1155,7 +1162,7 @@ class BaseMultimodalProcessor(ABC):
                 )
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
-            input_ids = self._processor.tokenizer(
+            input_ids = self._tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
