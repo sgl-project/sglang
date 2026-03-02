@@ -26,14 +26,15 @@ if TYPE_CHECKING:
     )
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
     from sglang.srt.debug_utils.comparator.output_types import (
+        ComparisonErrorRecord,
+        ComparisonNonTensorRecord,
+        ComparisonSkipRecord,
+        ComparisonTensorRecord,
         ConfigRecord,
         ErrorLog,
         InfoLog,
         LogRecord,
-        ComparisonNonTensorRecord,
-        ComparisonSkipRecord,
         SummaryRecord,
-        ComparisonTensorRecord,
         _OutputRecord,
         _TableRecord,
     )
@@ -127,6 +128,28 @@ def _format_skip_rich_body(
     )
 
 
+# ── ComparisonErrorRecord ────────────────────────────────────────────
+
+
+def _format_error_body(record: ComparisonErrorRecord) -> str:
+    prefix: str = record._format_location_prefix()
+    return (
+        f"{prefix}Error: {record.name} ({record.exception_type})\n"
+        f"{record.traceback_str}"
+    )
+
+
+def _format_error_rich_body(
+    record: ComparisonErrorRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
+    prefix: str = record._format_location_prefix_rich()
+    name: str = escape(record.name)
+    header: str = f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)})[/]"
+    if verbosity == "minimal":
+        return header
+    return header + f"\n[dim]{escape(record.traceback_str)}[/]"
+
+
 # ── _TableRecord ─────────────────────────────────────────────────────
 
 
@@ -216,10 +239,13 @@ def _format_non_tensor_rich_body(
 
 
 def _format_summary_body(record: SummaryRecord) -> str:
-    return (
+    text: str = (
         f"Summary: {record.passed} passed, {record.failed} failed, "
         f"{record.skipped} skipped (total {record.total})"
     )
+    if record.errored > 0:
+        text += f", {record.errored} errored"
+    return text
 
 
 def _format_summary_rich_body(
@@ -231,6 +257,8 @@ def _format_summary_rich_body(
         f"[yellow]{record.skipped} skipped[/] │ "
         f"{record.total} total"
     )
+    if record.errored > 0:
+        text += f" │ [bold red]{record.errored} errored[/]"
     return Panel(text, title="SUMMARY", border_style="bold")
 
 

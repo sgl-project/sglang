@@ -13,6 +13,8 @@ from sglang.srt.debug_utils.comparator.output_formatter import (  # noqa: F401 â
 from sglang.srt.debug_utils.comparator.output_formatter import (
     _format_config_body,
     _format_config_rich_body,
+    _format_error_body,
+    _format_error_rich_body,
     _format_log_body,
     _format_non_tensor_body,
     _format_non_tensor_rich_body,
@@ -164,6 +166,23 @@ class ComparisonSkipRecord(_BaseComparisonRecord):
         return _format_skip_rich_body(self, verbosity=verbosity)
 
 
+class ComparisonErrorRecord(_BaseComparisonRecord):
+    type: Literal["comparison_error"] = "comparison_error"
+    name: str
+    exception_type: str
+    traceback_str: str
+
+    @property
+    def category(self) -> str:
+        return "errored"
+
+    def _format_body(self) -> str:
+        return _format_error_body(self)
+
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_error_rich_body(self, verbosity=verbosity)
+
+
 class _TableRecord(_OutputRecord):
     label: str
     rows: list[dict[str, Any]]
@@ -243,13 +262,15 @@ class SummaryRecord(_OutputRecord):
     passed: int
     failed: int
     skipped: int
+    errored: int = 0
 
     @model_validator(mode="after")
     def _validate_totals(self) -> "SummaryRecord":
-        expected: int = self.passed + self.failed + self.skipped
+        expected: int = self.passed + self.failed + self.skipped + self.errored
         if self.total != expected:
             raise ValueError(
-                f"total={self.total} != passed({self.passed}) + failed({self.failed}) + skipped({self.skipped}) = {expected}"
+                f"total={self.total} != passed({self.passed}) + failed({self.failed}) "
+                f"+ skipped({self.skipped}) + errored({self.errored}) = {expected}"
             )
         return self
 
@@ -273,6 +294,7 @@ AnyRecord = Annotated[
         RankInfoRecord,
         InputIdsRecord,
         ComparisonSkipRecord,
+        ComparisonErrorRecord,
         ComparisonTensorRecord,
         ComparisonNonTensorRecord,
         SummaryRecord,
