@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import polars as pl
+import rich.table
 
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -39,23 +40,6 @@ def emit_display_records(
 
 def _render_polars_as_text(df: pl.DataFrame, *, title: Optional[str] = None) -> str:
     from rich.console import Console
-
-    table = _build_rich_table(df, title=title)
-
-    buf = StringIO()
-    Console(file=buf, force_terminal=False, width=200).print(table)
-    return buf.getvalue().rstrip("\n")
-
-
-def _render_polars_as_rich_table(
-    df: pl.DataFrame, *, title: Optional[str] = None
-) -> "Table":
-    return _build_rich_table(df, title=title)
-
-
-def _build_rich_table(
-    df: pl.DataFrame, *, title: Optional[str] = None
-) -> "Table":
     from rich.table import Table
 
     table = Table(title=title)
@@ -64,6 +48,21 @@ def _build_rich_table(
     for row in df.iter_rows():
         table.add_row(*[str(v) for v in row])
 
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, width=200).print(table)
+    return buf.getvalue().rstrip("\n")
+
+
+def _render_polars_as_rich_table(
+    df: pl.DataFrame, *, title: Optional[str] = None
+) -> "rich.table.Table":
+    from rich.table import Table
+
+    table = Table(title=title)
+    for col in df.columns:
+        table.add_column(col)
+    for row in df.iter_rows():
+        table.add_row(*[str(v) for v in row])
     return table
 
 
