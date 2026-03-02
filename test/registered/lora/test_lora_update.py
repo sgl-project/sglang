@@ -34,7 +34,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=487, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(
+    est_time=487,
+    suite="stage-b-test-large-1-gpu",
+    disabled="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 removed from HuggingFace",
+)
 
 PROMPTS = [
     "SGL is a",
