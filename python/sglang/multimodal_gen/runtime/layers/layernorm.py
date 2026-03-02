@@ -288,7 +288,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
     Fused kernel that combines:
     1. residual_out = residual + gate * x
     2. normed = layernorm(residual_out) or rmsnorm(residual_out)
-    3. out = normed * (1 + scale) + shift
+    3. out = normed * (scale_constant + scale) + shift
     compute_dtype is always fp32 for higher precision.
     """
 
@@ -301,10 +301,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        scale_constant: float = 1.0,
     ):
         super().__init__()
         self.eps = eps
         self.dtype = dtype
+        self.scale_constant = scale_constant
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -322,13 +324,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             return self.forward_native(residual, x, gate, shift, scale)
 
         from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
@@ -339,6 +335,10 @@ class _ScaleResidualNormScaleShift(CustomOp):
             raise ValueError(
                 f"Only gate value of 1 is supported for int type, but got {gate}"
             )
+
+        if self.scale_constant != 1.0:
+            # CuTe DSL kernel currently only supports scale_constant=1.0
+            return self.forward_native(residual, x, gate, shift, scale)
 
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
@@ -384,7 +384,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         else:
             raise ValueError(f"Gate type {type(gate)} not supported")
         normalized = self.norm(residual_output)
-        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        modulated = fuse_scale_shift_kernel(
+            normalized, scale, shift, scale_constant=self.scale_constant
+        )
         return modulated, residual_output
 
 
@@ -400,7 +402,7 @@ class _NormScaleShift(CustomOp):
     """
     Fused kernel that combines:
     1. normed = layernorm(x) or rmsnorm(x)
-    2. out = normed * (1 + scale) + shift
+    2. out = normed * (scale_constant + scale) + shift
     compute_dtype is always fp32 for higher precision.
     """
 
@@ -413,9 +415,11 @@ class _NormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        scale_constant: float = 1.0,
     ):
         super().__init__()
         self.eps = eps
+        self.scale_constant = scale_constant
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -428,18 +432,16 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             return self.forward_native(x, shift, scale)
 
         from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_norm_scale_shift,
         )
+
+        if self.scale_constant != 1.0:
+            # CuTe DSL kernel currently only supports scale_constant=1.0
+            return self.forward_native(x, shift, scale)
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -460,7 +462,9 @@ class _NormScaleShift(CustomOp):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         normalized = self.norm(x)
-        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        modulated = fuse_scale_shift_kernel(
+            normalized, scale, shift, scale_constant=self.scale_constant
+        )
         return modulated.to(x.dtype)
 
 

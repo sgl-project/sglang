@@ -8,7 +8,11 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    RMSNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -210,6 +214,7 @@ class ZImageAttention(nn.Module):
             causal=False,
         )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -225,16 +230,25 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=-1,
             )
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
+            # Reshape and keep contiguous for better memory layout
+            q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim).contiguous()
+            k = k.view(
+                *k.shape[:-1], self.local_num_kv_heads, self.head_dim
+            ).contiguous()
+            v = v.view(
+                *v.shape[:-1], self.local_num_kv_heads, self.head_dim
+            ).contiguous()
         else:
             q, _ = self.to_q(hidden_states)
             k, _ = self.to_k(hidden_states)
             v, _ = self.to_v(hidden_states)
-        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
+            q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim).contiguous()
+            k = k.view(
+                *k.shape[:-1], self.local_num_kv_heads, self.head_dim
+            ).contiguous()
+            v = v.view(
+                *v.shape[:-1], self.local_num_kv_heads, self.head_dim
+            ).contiguous()
 
         if self.qk_norm:
             q, k = apply_qk_norm(
@@ -248,11 +262,20 @@ class ZImageAttention(nn.Module):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if _is_cuda and q.shape == k.shape:
+            if (
+                _is_cuda
+                and q.shape == k.shape
+                and q.is_contiguous()
+                and k.is_contiguous()
+            ):
                 cos_sin_cache = torch.cat(
                     [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
+                        cos.to(
+                            dtype=torch.float32, memory_format=torch.contiguous_format
+                        ),
+                        sin.to(
+                            dtype=torch.float32, memory_format=torch.contiguous_format
+                        ),
                     ],
                     dim=-1,
                 )
@@ -264,7 +287,7 @@ class ZImageAttention(nn.Module):
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
 
         hidden_states = self.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
+        hidden_states = hidden_states.flatten(2, 3)
 
         hidden_states, _ = self.to_out[0](hidden_states)
 
@@ -328,8 +351,19 @@ class ZImageTransformerBlock(nn.Module):
         else:
             self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        # Pre-norms: fused version for modulation path, plain RMSNorm for no-modulation path
+        if modulation:
+            # Fused norm+scale: out = norm(x) * (0 + scale) + shift = norm(x) * scale
+            self.attention_norm_fused = RMSNormScaleShift(
+                dim, eps=norm_eps, scale_constant=0.0
+            )
+            self.ffn_norm_fused = RMSNormScaleShift(
+                dim, eps=norm_eps, scale_constant=0.0
+            )
+            self.register_buffer("zero_shift", torch.zeros(1, 1, dim), recurse=False)
+        else:
+            self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
+            self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
 
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -351,24 +385,27 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            # Clone chunk outputs to avoid CUDAGraph tensor overwrite issues
+            gate_msa = gate_msa.clone().tanh()
+            gate_mlp = gate_mlp.clone().tanh()
+            scale_msa = scale_msa.clone()
+            scale_mlp = scale_mlp.clone()
 
-            # Attention block
+            # Attention block: fused norm(x) * scale_msa (scale_constant=0 means norm*scale+shift)
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                self.attention_norm_fused(x, self.zero_shift, scale_msa),
                 freqs_cis=freqs_cis,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
-            # FFN block
+            # FFN block: fused norm(x) * scale_mlp
             x = x + gate_mlp * self.ffn_norm2(
                 self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
+                    self.ffn_norm_fused(x, self.zero_shift, scale_mlp),
                 )
             )
         else:
-            # Attention block
+            # Attention block (no modulation, use plain RMSNorm)
             attn_out = self.attention(
                 self.attention_norm1(x),
                 freqs_cis=freqs_cis,

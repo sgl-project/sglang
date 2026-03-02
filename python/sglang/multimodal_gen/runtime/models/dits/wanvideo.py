@@ -486,13 +486,18 @@ class WanTransformerBlock(nn.Module):
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
-        # Apply rotary embeddings
+        # Apply rotary embeddings with optimized path
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if (
+            _is_cuda
+            and query.shape == key.shape
+            and query.is_contiguous()
+            and key.is_contiguous()
+        ):
             cos_sin_cache = torch.cat(
                 [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
+                    cos.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+                    sin.to(dtype=torch.float32, memory_format=torch.contiguous_format),
                 ],
                 dim=-1,
             )
@@ -500,9 +505,8 @@ class WanTransformerBlock(nn.Module):
                 query, key, cos_sin_cache, is_neox=False
             )
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query = _apply_rotary_emb(query, cos, sin, is_neox_style=False)
+            key = _apply_rotary_emb(key, cos, sin, is_neox_style=False)
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -681,13 +685,18 @@ class WanTransformerBlock_VSA(nn.Module):
             2, (self.num_attention_heads, -1)
         )
 
-        # Apply rotary embeddings
+        # Apply rotary embeddings with optimized path
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if (
+            _is_cuda
+            and query.shape == key.shape
+            and query.is_contiguous()
+            and key.is_contiguous()
+        ):
             cos_sin_cache = torch.cat(
                 [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
+                    cos.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+                    sin.to(dtype=torch.float32, memory_format=torch.contiguous_format),
                 ],
                 dim=-1,
             )
@@ -695,9 +704,8 @@ class WanTransformerBlock_VSA(nn.Module):
                 query, key, cos_sin_cache, is_neox=False
             )
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query = _apply_rotary_emb(query, cos, sin, is_neox_style=False)
+            key = _apply_rotary_emb(key, cos, sin, is_neox_style=False)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
