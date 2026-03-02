@@ -32,11 +32,11 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     TensorComparisonRecord,
 )
-from sglang.srt.debug_utils.comparator.report_sink import report_sink
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
 from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
+from sglang.srt.debug_utils.comparator.report_sink import report_sink
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     auto_descend_dir,
