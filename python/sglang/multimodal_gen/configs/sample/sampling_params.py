@@ -866,7 +866,7 @@ class SamplingParams:
             type=str,
             default=SamplingParams.upscaling_model_path,
             help="Local .pth file or HuggingFace repo ID for Real-ESRGAN weights "
-            "(default: ai-forever/Real-ESRGAN with realesr-animevideov3.pth).",
+            "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth).",
         )
         parser.add_argument(
             "--upscaling-scale",

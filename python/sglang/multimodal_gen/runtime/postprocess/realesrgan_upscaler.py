@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 
 # Default HuggingFace repo and filename for Real-ESRGAN weights
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
-_DEFAULT_REALESRGAN_FILENAME = "realesr-animevideov3.pth"
+_DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
@@ -398,7 +398,7 @@ def upscale_frames(
         frames:         List of uint8 HWC numpy frames.
         model_path:     Local .pth file or HuggingFace repo ID.
                         None → default ``ai-forever/Real-ESRGAN`` with
-                        ``realesr-animevideov3.pth``.
+                        ``RealESRGAN_x4.pth``.
         scale:          Upscaling factor (2 or 4).
         half_precision: Use fp16 inference (faster on supported GPUs).
 
