@@ -49,7 +49,7 @@ gh run list --repo sgl-project/sglang --workflow="pr-test.yml" --event schedule 
 gh run view {RUN_ID} --repo sgl-project/sglang --json jobs --jq '.jobs[] | select(.conclusion == "failure") | {name, conclusion, databaseId}'
 
 # Get the failure details
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -B 5 -A 30 "AssertionError\|FAIL\|Error\|{TEST_NAME}"
+gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E -B 5 -A 30 "AssertionError|FAIL|Error|{TEST_NAME}"
 ```
 
 2. **Record the failure signature:**
@@ -94,7 +94,7 @@ git log --oneline {LAST_PASS_SHA}..{FIRST_FAIL_SHA} -- {relevant_paths}
 gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E "Runner name|Machine name" | head -5
 
 # Get GPU/driver info
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -i "NVIDIA-SMI\|Driver Version\|CUDA Version" | head -5
+gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -i -E "NVIDIA-SMI|Driver Version|CUDA Version" | head -5
 
 # Get package versions
 gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E "sgl.kernel.*==|flashinfer.*==" | head -5
@@ -136,9 +136,9 @@ ssh {SSH_TARGET} "docker exec {CONTAINER} pip show sgl-kernel sglang flashinfer-
 ```bash
 # Try fetching latest main
 ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /path/to/sglang && git fetch origin main && git checkout origin/main'"
-# Or download tarball if git auth fails
-ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'curl -L https://github.com/sgl-project/sglang/archive/refs/heads/main.tar.gz -o /tmp/sglang-main.tar.gz && cd /tmp && tar xzf sglang-main.tar.gz'"
-# Reinstall
+# Or download and install from tarball if git auth fails
+ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /tmp && curl -L https://github.com/sgl-project/sglang/archive/refs/heads/main.tar.gz | tar xz && cd sglang-main && pip install -e \"python[all]\"'"
+# Reinstall (after git fetch)
 ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /path/to/sglang && pip install -e \"python[all]\"'"
 # Install test dependencies if needed
 ssh {SSH_TARGET} "docker exec {CONTAINER} pip install peft rouge-score"
