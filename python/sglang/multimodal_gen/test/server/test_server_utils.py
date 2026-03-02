@@ -37,6 +37,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
+    get_video_frame_count,
     is_image_url,
     prepare_perf_log,
     validate_image,
@@ -647,7 +648,7 @@ def get_generate_fn(
     model_path: str,
     modality: str,
     sampling_params: DiffusionSamplingParams,
-) -> Callable[[str, Client], str]:
+) -> Callable[[str, Client], tuple[str, bytes]]:
     """Return appropriate generation function for the case."""
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
     output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
@@ -663,6 +664,7 @@ def get_generate_fn(
         seconds: int | None = None,
         input_reference: Any | None = None,
         extra_body: dict[Any] | None = None,
+        expected_frame_count: int | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -717,7 +719,7 @@ def get_generate_fn(
                     f"{case_id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
-                return video_id
+                return (video_id, b"")
 
             if is_amd:
                 logger.warning(
@@ -746,6 +748,13 @@ def get_generate_fn(
             tmp_path, expected_filename, expected_width, expected_height
         )
 
+        if expected_frame_count is not None:
+            actual_count = get_video_frame_count(tmp_path)
+            assert actual_count == expected_frame_count, (
+                f"{case_id}: frame count mismatch after interpolation — "
+                f"expected {expected_frame_count}, got {actual_count}"
+            )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -755,14 +764,14 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return video_id
+        return (video_id, content)
 
     video_seconds = sampling_params.seconds or 4
 
-    def generate_image(case_id, client) -> str:
+    def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
         req_output_format = None  # Not specified in current request
@@ -813,12 +822,12 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_image_edit(case_id, client) -> str:
-        """TI2I: Text + Image ? Image edit."""
+    def generate_image_edit(case_id, client) -> tuple[str, bytes]:
+        """TI2I: Text + Image -> Image edit."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         image_paths = sampling_params.image_path
 
@@ -832,7 +841,7 @@ def get_generate_fn(
             else:
                 new_image_paths.append(Path(image_path))
                 if not image_path.exists():
-                    pytest.skip(f"{id}: file missing: {image_path}")
+                    pytest.skip(f"{case_id}: file missing: {image_path}")
 
         image_paths = new_image_paths
 
@@ -896,12 +905,12 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_image_edit_url(case_id, client) -> str:
+    def generate_image_edit_url(case_id, client) -> tuple[str, bytes]:
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
         # Handle both single URL and list of URLs
         image_urls = sampling_params.image_path
         if not isinstance(image_urls, list):
@@ -911,7 +920,7 @@ def get_generate_fn(
         for url in image_urls:
             if not is_image_url(url):
                 pytest.skip(
-                    f"{id}: image_path must be a URL for URL direct test: {url}"
+                    f"{case_id}: image_path must be a URL for URL direct test: {url}"
                 )
 
         # Request parameters that affect output format
@@ -965,17 +974,31 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_video(case_id, client) -> str:
+    def generate_video(case_id, client) -> tuple[str, bytes]:
         """T2V: Text ? Video."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
 
         # Build extra_body for optional features
         extra_body = {}
         if sampling_params.enable_teacache:
             extra_body["enable_teacache"] = True
+        if sampling_params.num_frames:
+            extra_body["num_frames"] = sampling_params.num_frames
+        if sampling_params.enable_frame_interpolation:
+            extra_body["enable_frame_interpolation"] = True
+            extra_body["frame_interpolation_exp"] = (
+                sampling_params.frame_interpolation_exp
+            )
+
+        # Compute expected output frame count for validation
+        expected_frame_count = None
+        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+            n = sampling_params.num_frames
+            exp = sampling_params.frame_interpolation_exp
+            expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
             client,
@@ -985,19 +1008,20 @@ def get_generate_fn(
             size=output_size,
             seconds=video_seconds,
             extra_body=extra_body if extra_body else None,
+            expected_frame_count=expected_frame_count,
         )
 
-    def generate_image_to_video(case_id, client) -> str:
-        """I2V: Image ? Video (optional prompt)."""
+    def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """I2V: Image -> Video (optional prompt)."""
         if not sampling_params.image_path:
-            pytest.skip(f"{id}: no input image configured")
+            pytest.skip(f"{case_id}: no input image configured")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
         extra_body = {}
@@ -1016,9 +1040,9 @@ def get_generate_fn(
                 extra_body=extra_body if extra_body else None,
             )
 
-    def generate_text_url_image_to_video(case_id, client) -> str:
+    def generate_text_url_image_to_video(case_id, client) -> tuple[str, bytes]:
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         # Build extra_body for optional features
         extra_body = {"reference_url": sampling_params.image_path}
@@ -1039,17 +1063,17 @@ def get_generate_fn(
             },
         )
 
-    def generate_text_image_to_video(case_id, client) -> str:
-        """TI2V: Text + Image ? Video."""
+    def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """TI2V: Text + Image -> Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
         extra_body = {}

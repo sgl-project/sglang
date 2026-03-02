@@ -167,10 +167,6 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
-  # Install tvm-ffi for JIT kernel support (QK-norm, etc.)
-  echo "Installing tvm-ffi for JIT kernel support..."
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache git+https://github.com/apache/tvm-ffi.git || echo "tvm-ffi installation failed, JIT kernels will use fallback"
-
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
 

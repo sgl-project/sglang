@@ -9,10 +9,6 @@ from sglang.srt.debug_utils.comparator.output_types import AnyWarning
 class WarningSink:
     def __init__(self) -> None:
         self._stack: list[list[AnyWarning]] = []
-        self._output_format: str = "text"
-
-    def set_output_format(self, output_format: str) -> None:
-        self._output_format = output_format
 
     @contextmanager
     def context(self) -> Generator[list[AnyWarning], None, None]:
@@ -30,13 +26,10 @@ class WarningSink:
         else:
             from sglang.srt.debug_utils.comparator.output_types import (
                 WarningRecord,
-                print_record,
+                report_sink,
             )
 
-            print_record(
-                WarningRecord(warnings=[warning]),
-                output_format=self._output_format,
-            )
+            report_sink.add(WarningRecord(warnings=[warning]))
 
 
 warning_sink = WarningSink()
