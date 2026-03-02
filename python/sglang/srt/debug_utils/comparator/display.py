@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import polars as pl
 import rich.table

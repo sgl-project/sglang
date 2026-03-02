@@ -287,6 +287,7 @@ class SummaryRecord(_OutputRecord):
     def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return _format_summary_rich_body(self, verbosity=verbosity)
 
+
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"
 
