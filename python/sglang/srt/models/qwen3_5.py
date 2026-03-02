@@ -68,6 +68,32 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
+# Utils - weight loading
+def _reshuffle_q_proj_weight_for_gated_attn(
+    weight: torch.Tensor, num_heads: int, head_dim: int
+) -> torch.Tensor:
+    """Reshuffle q_proj weight from checkpoint layout [head0_q, head0_gate, head1_q, head1_gate, ...]
+    to [all_q, all_gate] so forward can use a simple split instead of view+chunk.
+    Weight shape: [num_heads * head_dim * 2, in_features].
+    """
+    # weight rows: 0..head_dim-1 = head0_q, head_dim..2*head_dim-1 = head0_gate, ...
+    q_parts = torch.cat(
+        [
+            weight[2 * h * head_dim : 2 * h * head_dim + head_dim]
+            for h in range(num_heads)
+        ],
+        dim=0,
+    )
+    gate_parts = torch.cat(
+        [
+            weight[2 * h * head_dim + head_dim : 2 * (h + 1) * head_dim]
+            for h in range(num_heads)
+        ],
+        dim=0,
+    )
+    return torch.cat([q_parts, gate_parts], dim=0)
+
+
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
@@ -580,14 +606,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            q, gate, k, v = qkv.split(
+                [self.q_size, self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -816,6 +837,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
+                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
+                    num_heads = self.config.num_attention_heads
+                    head_dim = getattr(
+                        self.config, "head_dim", None
+                    ) or self.config.hidden_size // num_heads
+                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
+                        loaded_weight, num_heads, head_dim
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -946,6 +975,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
+                    num_heads = self.config.num_attention_heads
+                    head_dim = getattr(
+                        self.config, "head_dim", None
+                    ) or self.config.hidden_size // num_heads
+                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
+                        loaded_weight, num_heads, head_dim
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1096,6 +1133,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
+                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
+                    text_config = getattr(self.config, "text_config", self.config)
+                    num_heads = text_config.num_attention_heads
+                    head_dim = getattr(
+                        text_config, "head_dim", None
+                    ) or text_config.hidden_size // num_heads
+                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
+                        loaded_weight, num_heads, head_dim
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1252,6 +1298,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
+                    text_config = getattr(self.config, "text_config", self.config)
+                    num_heads = text_config.num_attention_heads
+                    head_dim = getattr(
+                        text_config, "head_dim", None
+                    ) or text_config.hidden_size // num_heads
+                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
+                        loaded_weight, num_heads, head_dim
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
