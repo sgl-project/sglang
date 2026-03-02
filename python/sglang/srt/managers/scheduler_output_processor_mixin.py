@@ -729,7 +729,7 @@ class SchedulerOutputProcessorMixin:
                 Some of input logprob operation should only happen at the last
                 prefill (e.g., computing input token logprobs).
         """
-        assert output.input_token_logprobs is not None or num_input_logprobs == 1
+        assert output.input_token_logprobs is not None
         if req.input_token_logprobs is None:
             req.input_token_logprobs = []
         if req.temp_input_top_logprobs_val is None:
@@ -748,6 +748,7 @@ class SchedulerOutputProcessorMixin:
                 assert req.input_token_logprobs_val is not None
             return
 
+        # Important for the performance.
         assert isinstance(output.input_token_logprobs, tuple)
         input_token_logprobs: Tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[
