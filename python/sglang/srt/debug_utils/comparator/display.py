@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from io import StringIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import polars as pl
+
+if TYPE_CHECKING:
+    from rich.table import Table
 
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -53,9 +56,7 @@ def _render_polars_as_rich_table(
     return _build_rich_table(df, title=title)
 
 
-def _build_rich_table(
-    df: pl.DataFrame, *, title: Optional[str] = None
-) -> "Table":
+def _build_rich_table(df: pl.DataFrame, *, title: Optional[str] = None) -> "Table":
     from rich.table import Table
 
     table = Table(title=title)

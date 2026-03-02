@@ -163,9 +163,7 @@ def _format_tensor_comparison_rich_body(
         format_comparison_rich,
     )
 
-    return record._format_location_prefix_rich() + format_comparison_rich(
-        record=record
-    )
+    return record._format_location_prefix_rich() + format_comparison_rich(record=record)
 
 
 # ── NonTensorComparisonRecord ────────────────────────────────────────

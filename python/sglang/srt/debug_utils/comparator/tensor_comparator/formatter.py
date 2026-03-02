@@ -254,16 +254,12 @@ def _format_comparison_normal(*, record: TensorComparisonRecord) -> str:
     # Bundle section
     if record.raw_bundle_info is not None:
         lines.append("   [dim]Bundle[/]")
-        lines.extend(
-            _format_bundle_section(bundle_info=record.raw_bundle_info)
-        )
+        lines.extend(_format_bundle_section(bundle_info=record.raw_bundle_info))
 
     # Plan section
     if record.traced_plan is not None:
         lines.append("   [dim]Plan[/]")
-        lines.extend(
-            _format_plan_section_rich(traced_plan=record.traced_plan)
-        )
+        lines.extend(_format_plan_section_rich(traced_plan=record.traced_plan))
 
     # Aligned section
     lines.append("   [dim]Aligned[/]")
@@ -274,9 +270,7 @@ def _format_comparison_normal(*, record: TensorComparisonRecord) -> str:
 
     # Stats section
     lines.append("   [dim]Stats[/]")
-    lines.extend(
-        _format_stats_rich(baseline=baseline.stats, target=target.stats)
-    )
+    lines.extend(_format_stats_rich(baseline=baseline.stats, target=target.stats))
 
     # Abs diff percentiles (show when failed)
     if not passed and record.diff is not None and record.diff.abs_diff_percentiles:
