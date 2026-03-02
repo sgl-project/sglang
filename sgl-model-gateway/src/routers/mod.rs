@@ -176,6 +176,16 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
     }
 
+    /// Route native classify requests (SGLang native /classify for reward models)
+    async fn route_classify_native(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &GenerateRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Native classify not implemented").into_response()
+    }
+
     /// Route classification requests (OpenAI-compatible /v1/classify)
     async fn route_classify(
         &self,

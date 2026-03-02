@@ -248,6 +248,18 @@ async fn v1_embeddings(
         .await
 }
 
+async fn classify(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<GenerateRequest>,
+) -> Response {
+    let model_id = body.model.as_deref();
+    state
+        .router
+        .route_classify_native(Some(&headers), &body, model_id)
+        .await
+}
+
 async fn v1_classify(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -559,6 +571,7 @@ pub fn build_app(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
+        .route("/classify", post(classify))
         .route("/v1/classify", post(v1_classify))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
