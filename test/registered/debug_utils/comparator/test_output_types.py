@@ -6,7 +6,8 @@ from registered.debug_utils.comparator.testing_helpers import make_diff as _make
 from registered.debug_utils.comparator.testing_helpers import (
     make_tensor_info as _make_tensor_info,
 )
-from rich.console import Console
+from rich.console import Console, Group
+from rich.panel import Panel
 
 from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
@@ -121,6 +122,23 @@ class TestConfigRecord:
         record: ConfigRecord = ConfigRecord(config={"a": 1, "b": "two"})
         assert record._format_body() == "Config: {'a': 1, 'b': 'two'}"
 
+    def test_format_rich_body(self) -> None:
+        record: ConfigRecord = ConfigRecord(config={"threshold": 0.001, "mode": "fast"})
+        body = record._format_rich_body()
+
+        assert isinstance(body, Panel)
+        rendered: str = _render_rich(body)
+        assert rendered == (
+            "╭───────────────────────────────────────────────── Comparator Config "
+            "──────────────────────────────────────────────────╮\n"
+            "│   threshold : 0.001"
+            "                                                                                                  │\n"
+            "│   mode : fast"
+            "                                                                                                        │\n"
+            "╰──────────────────────────────────────────────────────────────────────"
+            "────────────────────────────────────────────────╯"
+        )
+
     def test_to_text_with_errors(self) -> None:
         record: ConfigRecord = ConfigRecord(
             config={"x": 1},
@@ -151,6 +169,14 @@ class TestSkipComparisonRecord:
             location=RecordLocation(step=3),
         )
         assert record._format_body() == "Skip: layer.weight (step=3) (scalar)"
+
+    def test_format_rich_body(self) -> None:
+        record: SkipComparisonRecord = SkipComparisonRecord(
+            name="attn.qkv",
+            reason="no baseline",
+        )
+        body: str = record._format_rich_body()
+        assert body == "[dim]⊘ attn.qkv ── skipped (no baseline)[/]"
 
     def test_category_skipped(self) -> None:
         record: SkipComparisonRecord = SkipComparisonRecord(
@@ -196,6 +222,32 @@ class TestNonTensorComparisonRecord:
         )
         assert record._format_body() == (
             "NonTensor: config.lr\n"
+            "  baseline = 0.001 (float)\n"
+            "  target   = 0.01 (float)"
+        )
+
+    def test_format_rich_body_equal(self) -> None:
+        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+            name="config.lr",
+            baseline_value="0.001",
+            target_value="0.001",
+            baseline_type="float",
+            target_type="float",
+            values_equal=True,
+        )
+        assert record._format_rich_body() == ("═ config.lr = 0.001 (float) [green]✓[/]")
+
+    def test_format_rich_body_not_equal(self) -> None:
+        record: NonTensorComparisonRecord = NonTensorComparisonRecord(
+            name="config.lr",
+            baseline_value="0.001",
+            target_value="0.01",
+            baseline_type="float",
+            target_type="float",
+            values_equal=False,
+        )
+        assert record._format_rich_body() == (
+            "═ [bold red]config.lr[/]\n"
             "  baseline = 0.001 (float)\n"
             "  target   = 0.01 (float)"
         )
@@ -248,6 +300,26 @@ class TestSummaryRecord:
         )
         assert record._format_body() == (
             "Summary: 7 passed, 2 failed, 1 skipped (total 10)"
+        )
+
+    def test_format_rich_body(self) -> None:
+        record: SummaryRecord = SummaryRecord(
+            total=10,
+            passed=7,
+            failed=2,
+            skipped=1,
+        )
+        body = record._format_rich_body()
+        assert isinstance(body, Panel)
+
+        rendered: str = _render_rich(body)
+        assert rendered == (
+            "╭────────────────────────────────────────────────────── SUMMARY "
+            "───────────────────────────────────────────────────────╮\n"
+            "│ 7 passed │ 2 failed │ 1 skipped │ 10 total"
+            "                                                                           │\n"
+            "╰──────────────────────────────────────────────────────────────────────"
+            "────────────────────────────────────────────────╯"
         )
 
     def test_validation_error(self) -> None:
@@ -567,7 +639,7 @@ class TestFormatAlignerPlan:
 
 
 # ---------------------------------------------------------------------------
-# _OutputRecord log attachment (to_text)
+# _OutputRecord log attachment (to_text / to_rich)
 # ---------------------------------------------------------------------------
 
 
@@ -605,6 +677,27 @@ class TestOutputRecordLogAttachment:
         text: str = record.to_text()
 
         assert text == "Config: {'a': 1}\n  ✗ err1\n  ℹ note1"
+
+    def test_to_rich_string_body(self) -> None:
+        record: SkipComparisonRecord = SkipComparisonRecord(
+            name="x",
+            reason="r",
+            errors=[ErrorLog(category="e", message="oops")],
+        )
+        body = record.to_rich()
+
+        assert isinstance(body, str)
+        assert body == "[dim]⊘ x ── skipped (r)[/]\n  [red]✗ oops[/]"
+
+    def test_to_rich_group_body(self) -> None:
+        record: ConfigRecord = ConfigRecord(
+            config={"a": 1},
+            errors=[ErrorLog(category="e", message="oops")],
+        )
+        body = record.to_rich()
+
+        # Panel body + log block → Group
+        assert isinstance(body, Group)
 
 
 if __name__ == "__main__":

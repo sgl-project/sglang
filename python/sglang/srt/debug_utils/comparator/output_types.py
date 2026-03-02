@@ -3,15 +3,10 @@ from __future__ import annotations
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 
-import polars as pl
 from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
 from rich.console import RenderableType
 from rich.markup import escape
 
-from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
-    format_comparison,
-    format_replicated_checks,
-)
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
@@ -21,7 +16,6 @@ from sglang.srt.debug_utils.comparator.utils import Pair, _StrictBase
 if TYPE_CHECKING:
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
         TracedAlignerPlan,
-        TracedSubPlan,
     )
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
     from sglang.srt.debug_utils.comparator.report_sink import Verbosity
@@ -89,19 +83,45 @@ class _OutputRecord(_StrictBase):
     @abstractmethod
     def _format_body(self) -> str: ...
 
-    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+    def _format_rich_body(self) -> RenderableType:
         return self._format_body()
 
-    def to_rich(self, verbosity: Verbosity = "normal") -> RenderableType:
-        return self._format_body()
+    def to_rich(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _render_record_rich,
+        )
+
+        return _render_record_rich(self)
 
     def to_text(self) -> str:
-        body = self._format_body()
-        if self.errors:
-            body += "\n" + "\n".join(f"  ✗ {e.to_text()}" for e in self.errors)
-        if self.infos:
-            body += "\n" + "\n".join(f"  ℹ {i.to_text()}" for i in self.infos)
-        return body
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _render_record_text,
+        )
+
+        return _render_record_text(self)
+
+
+class RecordLocation(_StrictBase):
+    step: Optional[int] = None
+
+
+class _BaseComparisonRecord(_OutputRecord):
+    location: RecordLocation = Field(default_factory=RecordLocation)
+
+    def _format_location_prefix(self) -> str:
+        if self.location.step is not None:
+            return f"[step={self.location.step}] "
+        return ""
+
+    def _format_location_prefix_rich(self) -> str:
+        if self.location.step is not None:
+            return escape(f"[step={self.location.step}]") + " "
+        return ""
+
+    def _format_location_suffix(self) -> str:
+        if self.location.step is not None:
+            return f" (step={self.location.step})"
+        return ""
 
 
 class RecordLocation(_StrictBase):
@@ -132,7 +152,18 @@ class ConfigRecord(_OutputRecord):
     config: dict[str, Any]
 
     def _format_body(self) -> str:
-        return f"Config: {self.config}"
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_config_body,
+        )
+
+        return _format_config_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_config_rich_body,
+        )
+
+        return _format_config_rich_body(self)
 
 
 class SkipComparisonRecord(_BaseComparisonRecord):
@@ -147,7 +178,18 @@ class SkipComparisonRecord(_BaseComparisonRecord):
         return "skipped"
 
     def _format_body(self) -> str:
-        return f"Skip: {self.name}{self._format_location_suffix()} ({self.reason})"
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_skip_body,
+        )
+
+        return _format_skip_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_skip_rich_body,
+        )
+
+        return _format_skip_rich_body(self)
 
 
 class _TableRecord(_OutputRecord):
@@ -158,11 +200,18 @@ class _TableRecord(_OutputRecord):
     def _table_title(self) -> str: ...
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.display import _render_polars_as_text
-
-        return _render_polars_as_text(
-            pl.DataFrame(self.rows), title=self._table_title()
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_table_body,
         )
+
+        return _format_table_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_table_rich_body,
+        )
+
+        return _format_table_rich_body(self)
 
 
 class RankInfoRecord(_TableRecord):
@@ -196,12 +245,18 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def _format_body(self) -> str:
-        body: str = self._format_location_prefix() + format_comparison(self)
-        if self.replicated_checks:
-            body += "\n" + format_replicated_checks(self.replicated_checks)
-        if self.traced_plan is not None:
-            body += "\n" + _format_aligner_plan(self.traced_plan)
-        return body
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_tensor_comparison_body,
+        )
+
+        return _format_tensor_comparison_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_tensor_comparison_rich_body,
+        )
+
+        return _format_tensor_comparison_rich_body(self)
 
 
 class NonTensorComparisonRecord(_BaseComparisonRecord):
@@ -220,14 +275,18 @@ class NonTensorComparisonRecord(_BaseComparisonRecord):
         return "passed" if self.values_equal else "failed"
 
     def _format_body(self) -> str:
-        suffix: str = self._format_location_suffix()
-        if self.values_equal:
-            return f"NonTensor: {self.name}{suffix} = {self.baseline_value} ({self.baseline_type}) [equal]"
-        return (
-            f"NonTensor: {self.name}{suffix}\n"
-            f"  baseline = {self.baseline_value} ({self.baseline_type})\n"
-            f"  target   = {self.target_value} ({self.target_type})"
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_non_tensor_body,
         )
+
+        return _format_non_tensor_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_non_tensor_rich_body,
+        )
+
+        return _format_non_tensor_rich_body(self)
 
 
 class SummaryRecord(_OutputRecord):
@@ -247,74 +306,38 @@ class SummaryRecord(_OutputRecord):
         return self
 
     def _format_body(self) -> str:
-        return (
-            f"Summary: {self.passed} passed, {self.failed} failed, "
-            f"{self.skipped} skipped (total {self.total})"
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_summary_body,
         )
+
+        return _format_summary_body(self)
+
+    def _format_rich_body(self) -> RenderableType:
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_summary_rich_body,
+        )
+
+        return _format_summary_rich_body(self)
 
 
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"
 
     def _format_body(self) -> str:
-        return ""
+        from sglang.srt.debug_utils.comparator.output_formatter import (
+            _format_log_body,
+        )
+
+        return _format_log_body(self)
 
 
+# Re-export _format_aligner_plan for backward compatibility (used by tests)
 def _format_aligner_plan(traced_plan: TracedAlignerPlan) -> str:
-    lines: list[str] = ["Aligner Plan:"]
+    from sglang.srt.debug_utils.comparator.output_formatter import (
+        _format_aligner_plan as _impl,
+    )
 
-    for side_label, traced_side in [
-        ("baseline", traced_plan.per_side.x),
-        ("target", traced_plan.per_side.y),
-    ]:
-        if not traced_side.step_plans:
-            lines.append(f"  {side_label}: (no steps)")
-            continue
-
-        step_summaries: list[str] = []
-        for traced_step in traced_side.step_plans:
-            sub_strs: list[str] = [
-                _format_sub_plan_text(traced_sub)
-                for traced_sub in traced_step.sub_plans
-            ]
-            summary: str = ", ".join(sub_strs) if sub_strs else "passthrough"
-            step_summaries.append(f"step={traced_step.step}: {summary}")
-        lines.append(f"  {side_label}: [{'; '.join(step_summaries)}]")
-
-    lines.extend(_format_cross_side_plan_text(traced_plan.plan))
-    return "\n".join(lines)
-
-
-def _format_sub_plan_text(traced_sub: TracedSubPlan) -> str:
-    sub_desc: str = f"{traced_sub.plan.type}"
-
-    if traced_sub.snapshot is not None:
-        snap = traced_sub.snapshot
-        in_count: int = len(snap.input_shapes)
-        out_count: int = len(snap.output_shapes)
-        in_shape: str = str(snap.input_shapes[0]) if snap.input_shapes else "?"
-        out_shape: str = str(snap.output_shapes[0]) if snap.output_shapes else "?"
-        sub_desc += f" {in_count}x{in_shape} -> {out_count}x{out_shape}"
-
-    return sub_desc
-
-
-def _format_cross_side_plan_text(plan: AlignerPlan) -> list[str]:
-    lines: list[str] = []
-
-    if plan.token_aligner_plan is not None:
-        num_tokens: int = len(plan.token_aligner_plan.locators.x.steps)
-        lines.append(f"  token_aligner: {num_tokens} tokens aligned")
-
-    if plan.axis_aligner_plan is not None:
-        parts: list[str] = []
-        if plan.axis_aligner_plan.pattern.x:
-            parts.append(f"x: {plan.axis_aligner_plan.pattern.x}")
-        if plan.axis_aligner_plan.pattern.y:
-            parts.append(f"y: {plan.axis_aligner_plan.pattern.y}")
-        lines.append(f"  axis_aligner: {', '.join(parts)}")
-
-    return lines
+    return _impl(traced_plan)
 
 
 AnyRecord = Annotated[
