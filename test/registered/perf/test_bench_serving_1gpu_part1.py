@@ -141,6 +141,9 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
+    @unittest.skip(
+        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 removed from HuggingFace"
+    )
     def test_lora_online_latency(self):
         if is_in_amd_ci():
             pass
@@ -156,6 +159,9 @@ class TestBenchServing1GPUPart1(CustomTestCase):
             self.assertLess(res["median_e2e_latency_ms"], 2400)
             self.assertLess(res["median_ttft_ms"], 58)
 
+    @unittest.skip(
+        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 removed from HuggingFace"
+    )
     def test_lora_online_latency_with_concurrent_adapter_updates(self):
         if is_in_amd_ci():
             pass
