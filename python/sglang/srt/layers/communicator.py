@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -74,6 +75,7 @@ _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -98,6 +100,20 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
+    )
+
+
+def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
+    n = input_tensor.shape[-1]
+    total_bytes = input_tensor.numel() * input_tensor.element_size()
+    return (
+        _use_aiter
+        and total_bytes > 0
+        and n <= 16384
+        and total_bytes < 8 * 1024 * 8192
+        and get_tensor_model_parallel_world_size() != 6
+        and not is_dp_attention_enabled()
+        and get_global_server_args().enable_aiter_allreduce_fusion
     )
 
 
@@ -175,14 +191,14 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_nsa):
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
-            and _is_cuda
+            and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_nsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and not get_global_server_args().enable_piecewise_cuda_graph
+            and get_global_server_args().disable_piecewise_cuda_graph
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -430,11 +446,20 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                hidden_states, residual = (
-                    self.input_layernorm.forward_with_allreduce_fusion(
+                if (
+                    apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    hidden_states, residual = (
+                        self.input_layernorm.forward_with_allreduce_fusion(
+                            hidden_states, residual
+                        )
+                    )
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
-                )
             else:
                 if residual is None:
                     residual = hidden_states
@@ -601,7 +626,15 @@ class LayerCommunicator:
         )
 
         return (
-            apply_flashinfer_allreduce_fusion(batch_size)
+            (
+                apply_flashinfer_allreduce_fusion(batch_size)
+                or (
+                    _use_aiter
+                    and batch_size > 0
+                    and get_tensor_model_parallel_world_size() != 6
+                    and get_global_server_args().enable_aiter_allreduce_fusion
+                )
+            )
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)
         )
@@ -662,6 +695,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if _use_ag_after_qlora:
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
@@ -807,13 +842,17 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
-                layernorm, "forward_with_allreduce_fusion"
-            ):
+            handled = False
+            if (
+                apply_aiter_all_reduce_fusion(hidden_states)
+                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
-            else:
+                handled = True
+
+            if not handled:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
