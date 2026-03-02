@@ -37,7 +37,8 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
       std::swap(mem_node_id_st, mem_node_id_ed);
     }
 
-    bitmask* mask = numa_parse_nodestring((std::to_string(mem_node_id_st) + "-" + std::to_string(mem_node_id_ed)).c_str());
+    bitmask* mask =
+        numa_parse_nodestring((std::to_string(mem_node_id_st) + "-" + std::to_string(mem_node_id_ed)).c_str());
     bitmask* src_mask = numa_get_membind();
 
     int pid = getpid();
