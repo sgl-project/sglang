@@ -728,7 +728,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
                     padding_size,  # Avoid circular import
                 )
-                align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+
+                align_aiter = (
+                    lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+                )
                 if (intermediate_size_per_partition) % padding_size:
                     w2_processed = align_aiter(intermediate_size_per_partition)
                     w13_processed = w2_processed * 2

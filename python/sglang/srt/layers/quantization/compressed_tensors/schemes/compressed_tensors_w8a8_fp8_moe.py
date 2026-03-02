@@ -126,9 +126,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
                 padding_size,  # Avoid circular import
             )
-            align_k = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+
+            align_aiter = (
+                lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+            )
             if w2_processed % padding_size:
-                w2_processed = align_k(w2_processed)
+                w2_processed = align_aiter(w2_processed)
                 # up proj + gate fusion : 2x
                 w13_processed = w2_processed * 2
 
