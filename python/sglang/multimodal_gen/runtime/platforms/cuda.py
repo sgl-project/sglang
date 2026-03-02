@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     Platform,
     PlatformEnum,
 )
+from sglang.multimodal_gen.runtime.utils.accel_capabilities import (
+    has_flash_attn_runtime,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import import_pynvml
 
@@ -348,26 +351,32 @@ class CudaPlatformBase(Platform):
         # FlashAttn is valid for the model, checking if the package is
         # installed.
         if target_backend == AttentionBackendEnum.FA:
-            try:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
-                    FlashAttentionBackend,
-                )
-
-                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
-                    logger.info(
-                        "Cannot use FlashAttention backend for head size %d.",
-                        head_size,
-                    )
-                    target_backend = AttentionBackendEnum.TORCH_SDPA
-            except ImportError:
+            if not has_flash_attn_runtime():
                 logger.info(
-                    "Cannot use FlashAttention backend because the "
-                    "flash_attn package is not found. "
-                    "Make sure that flash_attn was built and installed "
-                    "(on by default)."
+                    "Cannot use FlashAttention backend because sgl_kernel.flash_attn is unavailable."
                 )
                 target_backend = AttentionBackendEnum.TORCH_SDPA
+            else:
+                try:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                        FlashAttentionBackend,
+                    )
+
+                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                    if head_size not in supported_sizes:
+                        logger.info(
+                            "Cannot use FlashAttention backend for head size %d.",
+                            head_size,
+                        )
+                        target_backend = AttentionBackendEnum.TORCH_SDPA
+                except ImportError:
+                    logger.info(
+                        "Cannot use FlashAttention backend because the "
+                        "flash_attn package is not found. "
+                        "Make sure that flash_attn was built and installed "
+                        "(on by default)."
+                    )
+                    target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")

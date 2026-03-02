@@ -62,7 +62,7 @@ runtime_common = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop",
+  "uvloop ; sys_platform != 'win32'",
   "xgrammar==0.1.27",
   "smg-grpc-proto>=0.3.3",
   "grpcio>=1.78.0",

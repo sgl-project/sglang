@@ -568,11 +568,13 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
         Determine the dtype to use for model loading.
         """
-        dtype = (
-            torch.bfloat16
-            if torch.get_device_module().is_bf16_supported()
-            else torch.float16
-        )
+        is_bf16_supported = False
+        try:
+            is_bf16_supported = bool(torch.get_device_module().is_bf16_supported())
+        except Exception:
+            is_bf16_supported = False
+
+        dtype = torch.bfloat16 if is_bf16_supported else torch.float16
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
             dit_precision = server_args.pipeline_config.dit_precision

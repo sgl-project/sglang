@@ -71,6 +71,11 @@ def build_pipeline(
             backend=server_args.backend,
             model_id=server_args.model_id,
         )
+        if model_info is None:
+            raise ValueError(
+                "No native SGLang pipeline could be resolved for this model/backend combination. "
+                "Use --backend auto to allow diffusers fallback, or --backend diffusers explicitly."
+            )
         pipeline_cls = model_info.pipeline_cls
         logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
 
