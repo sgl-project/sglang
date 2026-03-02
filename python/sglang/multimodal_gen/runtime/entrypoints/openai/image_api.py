@@ -88,9 +88,11 @@ def _build_image_response_kwargs(
                 ImageResponseData(
                     url=url,
                     revised_prompt=prompt,
-                    file_path=os.path.abspath(save_file_path_list[0])
-                    if is_persistent
-                    else None,
+                    file_path=(
+                        os.path.abspath(save_file_path_list[0])
+                        if is_persistent
+                        else None
+                    ),
                 )
             ],
         }
@@ -172,9 +174,7 @@ async def generations(
             result,
             b64_list=b64_list,
             cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content"
-            if is_persistent
-            else None,
+            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
             is_persistent=is_persistent,
         )
 
@@ -224,16 +224,12 @@ async def edits(
         uploads_dir = stack.enter_context(
             temp_dir_if_disabled(server_args.input_save_path)
         )
-        output_dir = stack.enter_context(
-            temp_dir_if_disabled(server_args.output_path)
-        )
+        output_dir = stack.enter_context(temp_dir_if_disabled(server_args.output_path))
 
         input_paths = []
         try:
             for idx, img in enumerate(image_list):
-                filename = (
-                    img.filename if hasattr(img, "filename") else f"image_{idx}"
-                )
+                filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
                 input_path = await save_image_to_path(
                     img,
                     os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
@@ -291,9 +287,7 @@ async def edits(
             {
                 "id": request_id,
                 "created_at": int(time.time()),
-                "file_path": None
-                if cloud_url or not is_persistent
-                else save_file_path,
+                "file_path": None if cloud_url or not is_persistent else save_file_path,
                 "url": cloud_url,
                 "input_image_paths": input_paths if is_input_persistent else None,
                 "num_input_images": len(input_paths),
@@ -308,9 +302,7 @@ async def edits(
             result,
             b64_list=b64_list,
             cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content"
-            if is_persistent
-            else None,
+            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
             is_persistent=is_persistent,
         )
 

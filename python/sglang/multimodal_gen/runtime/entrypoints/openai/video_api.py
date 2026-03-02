@@ -135,9 +135,7 @@ async def _dispatch_job_async(
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
         persistent_path = (
-            save_file_path
-            if not cloud_url and output_persistent
-            else None
+            save_file_path if not cloud_url and output_persistent else None
         )
         update_fields = {
             "status": "completed",
