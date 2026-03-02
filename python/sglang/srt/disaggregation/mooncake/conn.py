@@ -1135,6 +1135,9 @@ class MooncakeKVSender(CommonKVSender):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
+        logger.debug(
+            f"MooncakeKVSender send with num_kv_indices: {self.num_kv_indices} and curr_idx: {self.curr_idx}"
+        )
 
         if self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:

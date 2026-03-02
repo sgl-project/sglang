@@ -401,6 +401,9 @@ class CommonKVSender(BaseKVSender):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        logger.debug(
+            f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
+        )
 
     def send(
         self,
