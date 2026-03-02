@@ -31,10 +31,10 @@ from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
-    ErrorLog,
     ComparisonNonTensorRecord,
     ComparisonSkipRecord,
     ComparisonTensorRecord,
+    ErrorLog,
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (

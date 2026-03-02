@@ -34,15 +34,15 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonNonTensorRecord,
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
     ErrorLog,
     InfoLog,
     LogRecord,
-    ComparisonNonTensorRecord,
     RecordLocation,
-    ComparisonSkipRecord,
     SummaryRecord,
-    ComparisonTensorRecord,
     _format_aligner_plan,
     _split_logs,
 )

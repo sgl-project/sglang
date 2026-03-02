@@ -4,14 +4,14 @@ import sys
 import pytest
 
 from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonSkipRecord,
+    ComparisonTensorRecord,
     ConfigRecord,
     ErrorLog,
     InfoLog,
     LogRecord,
     ReplicatedCheckResult,
-    ComparisonSkipRecord,
     SummaryRecord,
-    ComparisonTensorRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (

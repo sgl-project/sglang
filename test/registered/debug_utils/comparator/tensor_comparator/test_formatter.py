@@ -34,9 +34,9 @@ from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayou
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
+    ComparisonTensorRecord,
     ReplicatedCheckResult,
     ShapeSnapshot,
-    ComparisonTensorRecord,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     _format_abs_diff_percentiles_rich,

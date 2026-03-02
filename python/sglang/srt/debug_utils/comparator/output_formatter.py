@@ -144,7 +144,9 @@ def _format_error_rich_body(
 ) -> RenderableType:
     prefix: str = record._format_location_prefix_rich()
     name: str = escape(record.name)
-    header: str = f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)})[/]"
+    header: str = (
+        f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)})[/]"
+    )
     if verbosity == "minimal":
         return header
     return header + f"\n[dim]{escape(record.traceback_str)}[/]"
