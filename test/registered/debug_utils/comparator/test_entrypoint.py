@@ -3498,10 +3498,12 @@ class TestEntrypointDpFilter:
             diff_threshold=1e-3,
         )
 
-        with pytest.raises(
-            AssertionError, match="Expected exactly 1 non-empty dp_rank"
-        ):
-            _run_and_parse(argv, capsys)
+        records, exit_code = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert errors[0].exception_type == "AssertionError"
+        assert "Expected exactly 1 non-empty dp_rank" in errors[0].traceback_str
+        assert exit_code == 1
 
 
 class TestEntrypointDpGroupAlias:
