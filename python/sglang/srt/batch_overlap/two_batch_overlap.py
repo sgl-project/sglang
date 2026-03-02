@@ -79,7 +79,7 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
+    if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
