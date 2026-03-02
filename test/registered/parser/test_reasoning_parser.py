@@ -848,9 +848,7 @@ class TestKimiK2ReasoningDetector(CustomTestCase):
         r2 = detector.parse_streaming_increment("thinking...")
         self.assertEqual(r2.reasoning_text, "thinking...")
 
-        r3 = detector.parse_streaming_increment(
-            "<|tool_calls_section_begin|>tool data"
-        )
+        r3 = detector.parse_streaming_increment("<|tool_calls_section_begin|>tool data")
         self.assertEqual(r3.reasoning_text, "")
         self.assertEqual(r3.normal_text, "<|tool_calls_section_begin|>tool data")
         self.assertFalse(detector._in_reasoning)
@@ -927,7 +925,9 @@ class TestKimiK2ReasoningDetector(CustomTestCase):
         )
         reasoning_text, remaining_text, tool_calls = self._run_pipeline_non_stream(text)
         self.assertIn("read the file", reasoning_text)
-        self.assertEqual(len(tool_calls), 1, "Tool calls should be parsed even without </think>")
+        self.assertEqual(
+            len(tool_calls), 1, "Tool calls should be parsed even without </think>"
+        )
         self.assertEqual(tool_calls[0].name, "ReadFile")
         self.assertEqual(tool_calls[0].parameters, '{"path": "/tmp/test.ts"}')
 
@@ -957,7 +957,11 @@ class TestKimiK2ReasoningDetector(CustomTestCase):
         ]
         reasoning_text, normal_text, tool_calls = self._run_pipeline_streaming(chunks)
         self.assertIn("read the file", reasoning_text)
-        self.assertEqual(len(tool_calls), 1, "Tool calls should be parsed even without </think> in streaming")
+        self.assertEqual(
+            len(tool_calls),
+            1,
+            "Tool calls should be parsed even without </think> in streaming",
+        )
         self.assertEqual(tool_calls[0]["name"], "ReadFile")
 
     def test_streaming_tool_token_split_across_chunks(self):
