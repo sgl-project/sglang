@@ -38,8 +38,12 @@ class PickParams(_FrozenBase):
     op: Literal["pick"] = "pick"
 
 
+class ReduceSumParams(_FrozenBase):
+    op: Literal["reduce_sum"] = "reduce_sum"
+
+
 UnsharderParams = Annotated[
-    Union[ConcatParams, CpThdConcatParams, PickParams],
+    Union[ConcatParams, CpThdConcatParams, PickParams, ReduceSumParams],
     Field(discriminator="op"),
 ]
 
