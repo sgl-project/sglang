@@ -45,6 +45,8 @@ def _expand_flag(
     idx: int = argv.index(flag)
     name: str = argv[idx + 1]
     if name not in mapping:
-        raise ValueError(f"Unknown value for {flag}: {name}. Available: {list(mapping.keys())}")
+        raise ValueError(
+            f"Unknown value for {flag}: {name}. Available: {list(mapping.keys())}"
+        )
 
     return argv[:idx] + mapping[name] + argv[idx + 2 :]
