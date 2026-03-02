@@ -756,6 +756,7 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
+        logger.debug(f"MooncakeKVSender sync_status_to_decode_endpoint with remote: {remote}, dst_port: {dst_port}, room: {room}, status: {status}, prefill_rank: {prefill_rank}")
         self._connect(
             format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
         ).send_multipart(
@@ -967,6 +968,7 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
+                        logger.debug(f"MooncakeKVSender decode thread received response from prefill rank {prefill_rank} for room {bootstrap_room}, arrived_response_num: {arrived_response_num}, expected_response_num: {expected_response_num}")
                         if arrived_response_num == expected_response_num:
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
@@ -1136,7 +1138,7 @@ class MooncakeKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
         logger.debug(
-            f"MooncakeKVSender send with num_kv_indices: {self.num_kv_indices} and curr_idx: {self.curr_idx}"
+            f"MooncakeKVSender send with kv_indices: {kv_indices} and curr_idx: {self.curr_idx}"
         )
 
         if self.kv_mgr.is_dummy_cp_rank:
