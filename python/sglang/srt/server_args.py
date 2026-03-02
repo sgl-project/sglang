@@ -1124,11 +1124,14 @@ class ServerArgs:
         if self.disable_cuda_graph_padding:
             capture_bs = list(range(1, self.torch_compile_max_bs + 1))
         else:
-            capture_bs = (
-                list(range(1, 17))
-                + list(range(18, 31, 2))
-                + list(range(32, 81, 4))
-                + list(range(84, self.torch_compile_max_bs + 1, 8))
+            capture_bs = sorted(
+                set().union(
+                    range(1, 17),
+                    range(18, 31, 2),
+                    range(32, 81, 4),
+                    range(84, self.torch_compile_max_bs + 1, 8),
+                    {self.torch_compile_max_bs},
+                )
             )
         capture_bs = [bs for bs in capture_bs if bs <= self.torch_compile_max_bs]
 
