@@ -75,7 +75,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-OPT_PREBUILT_BATCH = envs.SGLANG_ENABLE_OPT_PREBUILT_BATCH.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -1038,64 +1037,30 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
-    def _merge_into_running(self: Scheduler, batch: ScheduleBatch):
-        if batch.is_empty():
-            return
-        if self.running_batch.is_empty():
-            self.running_batch = batch
-        else:
-            # merge running_batch with prefill batch
-            self.running_batch.merge_batch(batch)
-
-    def _finalize_running(self: Scheduler):
-        if self.running_batch.is_empty():
-            return None
-        self.running_batch = self.update_running_batch(self.running_batch)
-        return None if self.running_batch.is_empty() else self.running_batch
-
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        """Create fake completed prefill if possible and merge with running batch"""
-        ret: Optional[ScheduleBatch] = None
-        if OPT_PREBUILT_BATCH:
-            # Optimized the decode processing and prebuilt processing flow.
-            # The decode stage is significantly affected by prebuilt processing under large batch sizes.
-            # The specific optimization logic is as follows:
-            # when encountering prebuilt data, perform output processing first,
-            # and then add it to the running_batch,
-            # eliminating the idle processing logic caused by prebuilt data.
-            new_prebuilt_batch = self.get_new_prebuilt_batch()
-            if new_prebuilt_batch:
-                # chunked prefill doesn't happen in decode instance.
-                assert self.chunked_req is None
-                self.process_batch_result_prebuilt(new_prebuilt_batch)
-                # Filter finished batches.
-                new_prebuilt_batch.filter_batch()
-                self._merge_into_running(new_prebuilt_batch)
+        """Process prebuilt batch and schedule the next decode batch."""
+        # Process pending prebuilt batch: output processing + filter + merge
+        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        if new_prebuilt_batch:
+            assert self.chunked_req is None
+            self.process_batch_result_prebuilt(new_prebuilt_batch)
+            new_prebuilt_batch.filter_batch()
+            if not new_prebuilt_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = new_prebuilt_batch
+                else:
+                    self.running_batch.merge_batch(new_prebuilt_batch)
+
+        # Schedule decode batch
+        if self.running_batch.is_empty():
+            ret = None
         else:
-            # Merge the prefill batch into the running batch
-            last_batch = self.last_batch
-            if last_batch and last_batch.forward_mode.is_prebuilt():
-                # chunked prefill doesn't happen in decode instance.
-                assert self.chunked_req is None
-                # Filter finished batches.
-                last_batch.filter_batch()
-                self._merge_into_running(last_batch)
+            self.running_batch = self.update_running_batch(self.running_batch)
+            ret = self.running_batch if not self.running_batch.is_empty() else None
 
-            new_prebuilt_batch = self.get_new_prebuilt_batch()
-            if new_prebuilt_batch:
-                ret = new_prebuilt_batch
-
-        if ret is None:
-            ret = self._finalize_running()
-
-        # 1. decode + None -> decode + idle
-        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
-        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
-        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
         ret = self.maybe_prepare_mlp_sync_batch(ret)
-
         if ret:
             set_schedule_time_batch(ret)
         return ret

@@ -125,6 +125,22 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertLess(result["mean_tpot_ms"], 20)
         self.assertEqual(result["completed"], 1000)
 
+    def test_bench_serving_large_batch(self):
+        args = get_benchmark_args(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=2000,
+            random_input_len=512,
+            random_output_len=512,
+            request_rate=float("inf"),
+            max_concurrency=512,
+        )
+        result = run_benchmark(args)
+
+        self.assertLess(result["mean_tpot_ms"], 25)
+        self.assertEqual(result["completed"], 2000)
+
 
 @unittest.skip(
     "Skip this test until new testing logic in mini-lb has been updated in docker image."
