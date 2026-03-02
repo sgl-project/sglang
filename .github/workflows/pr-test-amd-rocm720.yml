@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ''
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       ref:

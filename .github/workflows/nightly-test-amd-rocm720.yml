@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: ''
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
