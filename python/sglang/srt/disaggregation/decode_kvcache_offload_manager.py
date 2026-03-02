@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -191,6 +192,18 @@ class DecodeKVCacheOffloadManager:
 
         # Free the incremental part of the request
         self.token_to_kv_pool_allocator.free(kv_indices)
+
+        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
+        # Without spec v2, start_p == end_p so this is a no-op.
+        start_p, end_p = req.pop_overallocated_kv_cache()
+        if self.page_size > 1:
+            start_p = ceil_align(start_p, self.page_size)
+        if start_p < end_p:
+            overalloc_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_p:end_p
+            ]
+            self.token_to_kv_pool_allocator.free(overalloc_indices)
+
         self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
 

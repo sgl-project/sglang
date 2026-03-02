@@ -114,6 +114,9 @@ diffusion = [
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 tracing = [
