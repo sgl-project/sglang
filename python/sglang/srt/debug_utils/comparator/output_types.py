@@ -7,6 +7,26 @@ from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_valida
 from rich.console import RenderableType
 from rich.markup import escape
 
+from sglang.srt.debug_utils.comparator.output_formatter import (  # noqa: F401 — re-export
+    _format_aligner_plan as _format_aligner_plan,
+)
+from sglang.srt.debug_utils.comparator.output_formatter import (
+    _format_config_body,
+    _format_config_rich_body,
+    _format_log_body,
+    _format_non_tensor_body,
+    _format_non_tensor_rich_body,
+    _format_skip_body,
+    _format_skip_rich_body,
+    _format_summary_body,
+    _format_summary_rich_body,
+    _format_table_body,
+    _format_table_rich_body,
+    _format_tensor_comparison_body,
+    _format_tensor_comparison_rich_body,
+    _render_record_rich,
+    _render_record_text,
+)
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
@@ -17,7 +37,6 @@ if TYPE_CHECKING:
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
         TracedAlignerPlan,
     )
-    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
     from sglang.srt.debug_utils.comparator.report_sink import Verbosity
 
 
@@ -83,45 +102,14 @@ class _OutputRecord(_StrictBase):
     @abstractmethod
     def _format_body(self) -> str: ...
 
-    def _format_rich_body(self) -> RenderableType:
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
         return self._format_body()
 
-    def to_rich(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _render_record_rich,
-        )
-
-        return _render_record_rich(self)
+    def to_rich(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _render_record_rich(self, verbosity=verbosity)
 
     def to_text(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _render_record_text,
-        )
-
         return _render_record_text(self)
-
-
-class RecordLocation(_StrictBase):
-    step: Optional[int] = None
-
-
-class _BaseComparisonRecord(_OutputRecord):
-    location: RecordLocation = Field(default_factory=RecordLocation)
-
-    def _format_location_prefix(self) -> str:
-        if self.location.step is not None:
-            return f"[step={self.location.step}] "
-        return ""
-
-    def _format_location_prefix_rich(self) -> str:
-        if self.location.step is not None:
-            return escape(f"[step={self.location.step}]") + " "
-        return ""
-
-    def _format_location_suffix(self) -> str:
-        if self.location.step is not None:
-            return f" (step={self.location.step})"
-        return ""
 
 
 class RecordLocation(_StrictBase):
@@ -152,18 +140,10 @@ class ConfigRecord(_OutputRecord):
     config: dict[str, Any]
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_config_body,
-        )
-
         return _format_config_body(self)
 
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_config_rich_body,
-        )
-
-        return _format_config_rich_body(self)
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_config_rich_body(self, verbosity=verbosity)
 
 
 class SkipComparisonRecord(_BaseComparisonRecord):
@@ -178,18 +158,10 @@ class SkipComparisonRecord(_BaseComparisonRecord):
         return "skipped"
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_skip_body,
-        )
-
         return _format_skip_body(self)
 
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_skip_rich_body,
-        )
-
-        return _format_skip_rich_body(self)
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_skip_rich_body(self, verbosity=verbosity)
 
 
 class _TableRecord(_OutputRecord):
@@ -200,9 +172,10 @@ class _TableRecord(_OutputRecord):
     def _table_title(self) -> str: ...
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_table_body,
-        )
+        return _format_table_body(self)
+
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_table_rich_body(self, verbosity=verbosity)
 
         return _format_table_body(self)
 
@@ -245,18 +218,10 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_tensor_comparison_body,
-        )
-
         return _format_tensor_comparison_body(self)
 
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_tensor_comparison_rich_body,
-        )
-
-        return _format_tensor_comparison_rich_body(self)
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_tensor_comparison_rich_body(self, verbosity=verbosity)
 
 
 class NonTensorComparisonRecord(_BaseComparisonRecord):
@@ -275,9 +240,10 @@ class NonTensorComparisonRecord(_BaseComparisonRecord):
         return "passed" if self.values_equal else "failed"
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_non_tensor_body,
-        )
+        return _format_non_tensor_body(self)
+
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_non_tensor_rich_body(self, verbosity=verbosity)
 
         return _format_non_tensor_body(self)
 
@@ -306,38 +272,18 @@ class SummaryRecord(_OutputRecord):
         return self
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_summary_body,
-        )
-
         return _format_summary_body(self)
 
-    def _format_rich_body(self) -> RenderableType:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_summary_rich_body,
-        )
+    def _format_rich_body(self, verbosity: Verbosity = "normal") -> RenderableType:
+        return _format_summary_rich_body(self, verbosity=verbosity)
 
-        return _format_summary_rich_body(self)
-
+        return _format_summary_body(self)
 
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"
 
     def _format_body(self) -> str:
-        from sglang.srt.debug_utils.comparator.output_formatter import (
-            _format_log_body,
-        )
-
         return _format_log_body(self)
-
-
-# Re-export _format_aligner_plan for backward compatibility (used by tests)
-def _format_aligner_plan(traced_plan: TracedAlignerPlan) -> str:
-    from sglang.srt.debug_utils.comparator.output_formatter import (
-        _format_aligner_plan as _impl,
-    )
-
-    return _impl(traced_plan)
 
 
 AnyRecord = Annotated[

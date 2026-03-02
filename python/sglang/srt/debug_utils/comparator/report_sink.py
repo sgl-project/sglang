@@ -80,7 +80,7 @@ class ReportSink:
             print(record.model_dump_json())
         else:
             console: Console = self._get_console()
-            console.print(record.to_rich())
+            console.print(record.to_rich(verbosity=self._verbosity))
             console.print()  # blank line between records
 
 

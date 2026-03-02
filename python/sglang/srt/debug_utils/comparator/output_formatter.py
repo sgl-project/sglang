@@ -6,7 +6,7 @@ from rendering / formatting logic.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from rich.console import Group
 from rich.markup import escape
@@ -38,12 +38,16 @@ if TYPE_CHECKING:
         _TableRecord,
     )
 
+Verbosity = Literal["minimal", "normal", "verbose"]
+
 
 # ── Record-level rendering (body + logs) ─────────────────────────────
 
 
-def _render_record_rich(record: _OutputRecord) -> RenderableType:
-    body: RenderableType = record._format_rich_body()
+def _render_record_rich(
+    record: _OutputRecord, *, verbosity: Verbosity = "normal"
+) -> RenderableType:
+    body: RenderableType = record._format_rich_body(verbosity=verbosity)
 
     log_lines: list[str] = _format_log_lines_rich(
         errors=record.errors, infos=record.infos
@@ -100,7 +104,9 @@ def _format_config_body(record: ConfigRecord) -> str:
     return f"Config: {record.config}"
 
 
-def _format_config_rich_body(record: ConfigRecord) -> RenderableType:
+def _format_config_rich_body(
+    record: ConfigRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
     lines: list[str] = [f"  [bold]{k}[/] : {v}" for k, v in record.config.items()]
     return Panel("\n".join(lines), title="Comparator Config", border_style="cyan")
 
@@ -112,7 +118,9 @@ def _format_skip_body(record: SkipComparisonRecord) -> str:
     return f"Skip: {record.name}{record._format_location_suffix()} ({record.reason})"
 
 
-def _format_skip_rich_body(record: SkipComparisonRecord) -> RenderableType:
+def _format_skip_rich_body(
+    record: SkipComparisonRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
     suffix: str = record._format_location_suffix()
     return (
         f"[dim]⊘ {escape(record.name)}{suffix} ── skipped ({escape(record.reason)})[/]"
@@ -132,7 +140,9 @@ def _format_table_body(record: _TableRecord) -> str:
     )
 
 
-def _format_table_rich_body(record: _TableRecord) -> RenderableType:
+def _format_table_rich_body(
+    record: _TableRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
     import polars as pl
 
     from sglang.srt.debug_utils.comparator.display import (
@@ -157,13 +167,15 @@ def _format_tensor_comparison_body(record: TensorComparisonRecord) -> str:
 
 
 def _format_tensor_comparison_rich_body(
-    record: TensorComparisonRecord,
+    record: TensorComparisonRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
         format_comparison_rich,
     )
 
-    return record._format_location_prefix_rich() + format_comparison_rich(record=record)
+    return record._format_location_prefix_rich() + format_comparison_rich(
+        record=record, verbosity=verbosity
+    )
 
 
 # ── NonTensorComparisonRecord ────────────────────────────────────────
@@ -181,7 +193,7 @@ def _format_non_tensor_body(record: NonTensorComparisonRecord) -> str:
 
 
 def _format_non_tensor_rich_body(
-    record: NonTensorComparisonRecord,
+    record: NonTensorComparisonRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
     name: str = escape(record.name)
@@ -210,7 +222,9 @@ def _format_summary_body(record: SummaryRecord) -> str:
     )
 
 
-def _format_summary_rich_body(record: SummaryRecord) -> RenderableType:
+def _format_summary_rich_body(
+    record: SummaryRecord, verbosity: Verbosity = "normal"
+) -> RenderableType:
     text: str = (
         f"[bold green]{record.passed} passed[/] │ "
         f"[bold red]{record.failed} failed[/] │ "

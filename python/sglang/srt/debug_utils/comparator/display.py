@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import polars as pl
+import rich.table
 
 if TYPE_CHECKING:
     from rich.table import Table
@@ -65,6 +66,19 @@ def _build_rich_table(df: pl.DataFrame, *, title: Optional[str] = None) -> "Tabl
     for row in df.iter_rows():
         table.add_row(*[str(v) for v in row])
 
+    return table
+
+
+def _render_polars_as_rich_table(
+    df: pl.DataFrame, *, title: Optional[str] = None
+) -> "rich.table.Table":
+    from rich.table import Table
+
+    table = Table(title=title)
+    for col in df.columns:
+        table.add_column(col)
+    for row in df.iter_rows():
+        table.add_row(*[str(v) for v in row])
     return table
 
 
