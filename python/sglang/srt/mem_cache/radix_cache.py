@@ -124,6 +124,10 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
+        self.pin_expiry: float = (
+            0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
+        )
+        self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 

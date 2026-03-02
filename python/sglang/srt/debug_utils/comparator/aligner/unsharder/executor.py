@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     UnsharderParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
     resolve_dim_by_name,
 )
@@ -96,29 +96,49 @@ def _verify_replicated_group(
     group_index: int,
 ) -> list[ReplicatedCheckResult]:
     baseline: torch.Tensor = ordered_tensors[0].rename(None).float()
-    checks: list[ReplicatedCheckResult] = []
 
-    for i in range(1, len(ordered_tensors)):
-        other: torch.Tensor = ordered_tensors[i].rename(None).float()
+    return [
+        _check_replicated_pair(
+            baseline=baseline,
+            other=ordered_tensors[i],
+            axis=axis,
+            group_index=group_index,
+            compared_index=i,
+        )
+        for i in range(1, len(ordered_tensors))
+    ]
+
+
+def _check_replicated_pair(
+    *,
+    baseline: torch.Tensor,
+    other: torch.Tensor,
+    axis: ParallelAxis,
+    group_index: int,
+    compared_index: int,
+) -> ReplicatedCheckResult:
+    other_float: torch.Tensor = other.rename(None).float()
+
+    if baseline.shape != other_float.shape:
+        passed = False
+        diff_info = None
+    else:
         diff_info = compute_diff(
             x_baseline=baseline,
-            x_target=other,
+            x_target=other_float,
             diff_threshold=_REPLICATED_ATOL,
         )
-        passed: bool = diff_info.max_abs_diff <= _REPLICATED_ATOL
-        checks.append(
-            ReplicatedCheckResult(
-                axis=axis.value,
-                group_index=group_index,
-                compared_index=i,
-                baseline_index=0,
-                passed=passed,
-                atol=_REPLICATED_ATOL,
-                diff=diff_info,
-            )
-        )
+        passed = diff_info.max_abs_diff <= _REPLICATED_ATOL
 
-    return checks
+    return ReplicatedCheckResult(
+        axis=axis.value,
+        group_index=group_index,
+        compared_index=compared_index,
+        baseline_index=0,
+        passed=passed,
+        atol=_REPLICATED_ATOL,
+        diff=diff_info,
+    )
 
 
 def _thd_concat(

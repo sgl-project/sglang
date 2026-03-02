@@ -2,8 +2,11 @@
 import base64
 import os
 import re
+import shutil
+import tempfile
 import time
-from typing import Any, List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Generator, List, Optional, Union
 
 import httpx
 from fastapi import UploadFile
@@ -45,6 +48,23 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+@contextmanager
+def temp_dir_if_disabled(
+    configured_path: str | None,
+) -> Generator[str, None, None]:
+    """Yield *configured_path* when it is set, otherwise create a temporary
+    directory that is automatically removed when the context exits."""
+    if configured_path is not None:
+        os.makedirs(configured_path, exist_ok=True)
+        yield configured_path
+    else:
+        tmp = tempfile.mkdtemp(prefix="sglang_")
+        try:
+            yield tmp
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:

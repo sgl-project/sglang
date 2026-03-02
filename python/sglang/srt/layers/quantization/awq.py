@@ -65,7 +65,14 @@ if _is_cuda:
         awq_marlin_moe_repack,
         awq_marlin_repack,
     )
+    from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
+    awq_dequantize = register_custom_op_from_extern(
+        awq_dequantize,
+        fake_impl=lambda qweight, scales, qzeros: qweight.new_empty(
+            qweight.shape[:-1] + (qweight.shape[-1] * 8,), dtype=scales.dtype
+        ),
+    )
 
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
@@ -951,18 +958,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
 # Register fake implementations for torch.compile support
 if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::awq_dequantize")
-    def _(
-        qweight,
-        scales,
-        qzeros,
-        ch_axis,
-        group_size,
-        num_bits,
-    ):
-        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
-        return qweight.new_empty(out_shape, dtype=scales.dtype)
 
     @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
     def _(b_q_weight, size_k, size_n, num_bits):

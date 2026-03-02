@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     SGLangSeqId,
     TokenAlignerStepAux,
 )
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)
@@ -218,19 +218,19 @@ class TestInferCpShardedDims:
     """Tests for infer_cp_sharded_dims on each plugin."""
 
     def test_megatron_infer_1d(self) -> None:
-        """Megatron 1D → 't(cp:zigzag)'."""
+        """Megatron 1D → 't[cp:zigzag]'."""
         result: str = _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
-        assert result == "t(cp:zigzag)"
+        assert result == "t[cp:zigzag]"
 
     def test_megatron_infer_2d(self) -> None:
-        """Megatron 2D → 'b s(cp:zigzag)'."""
+        """Megatron 2D → 'b s[cp:zigzag]'."""
         result: str = _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
-        assert result == "b s(cp:zigzag)"
+        assert result == "b s[cp:zigzag]"
 
     def test_sglang_infer_1d(self) -> None:
-        """SGLang 1D → 't(cp:zigzag)'."""
+        """SGLang 1D → 't[cp:zigzag]'."""
         result: str = _sglang_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
-        assert result == "t(cp:zigzag)"
+        assert result == "t[cp:zigzag]"
 
     def test_megatron_infer_3d_raises(self) -> None:
         """Megatron 3D raises ValueError."""
