@@ -110,7 +110,9 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        self.enable_cp_all_ranks_transfer = envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
+        self.enable_cp_all_ranks_transfer = (
+            envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
+        )
 
         # bind zmq socket
         context = zmq.Context()
@@ -506,7 +508,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            if self.kv_mgr.is_mla_backend and not self.kv_mgr.enable_cp_all_ranks_transfer:
+            if (
+                self.kv_mgr.is_mla_backend
+                and not self.kv_mgr.enable_cp_all_ranks_transfer
+            ):
                 # MLA + CP: only retrieve from prefill CP rank 0 when not using all ranks
                 self.target_cp_ranks = self.target_cp_ranks[:1]
                 self.required_prefill_response_num *= 1
