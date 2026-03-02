@@ -15,11 +15,13 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 
 def test_split_logs_mixed_list() -> None:
     """_split_logs correctly partitions a mixed list of ErrorLog and InfoLog."""
-    errors, infos = _split_logs([
-        ErrorLog(category="a", message="err"),
-        InfoLog(category="b", message="info"),
-        ErrorLog(category="c", message="err2"),
-    ])
+    errors, infos = _split_logs(
+        [
+            ErrorLog(category="a", message="err"),
+            InfoLog(category="b", message="info"),
+            ErrorLog(category="c", message="err2"),
+        ]
+    )
     assert len(errors) == 2
     assert len(infos) == 1
     assert errors[0].message == "err"

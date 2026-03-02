@@ -128,7 +128,6 @@ def run(args: argparse.Namespace) -> int:
             print(f"Report: {report_path}", file=sys.stderr)
 
 
-
 def _resolve_report_path(args: argparse.Namespace) -> Optional[Path]:
     if args.report_path is not None:
         return Path(args.report_path) if args.report_path else None

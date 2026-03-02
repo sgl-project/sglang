@@ -2104,8 +2104,7 @@ class TestEntrypointAlignment:
             i
             for lr in log_records
             for i in lr.infos
-            if isinstance(i, InfoLog)
-            and i.category == "layout_detection_fallback"
+            if isinstance(i, InfoLog) and i.category == "layout_detection_fallback"
         ]
         assert len(layout_infos) == 1
 
