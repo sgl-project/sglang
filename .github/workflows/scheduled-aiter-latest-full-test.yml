@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: 'all'
+      continue_on_error:
+        description: 'Continue running other workflows even if one fails'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: scheduled-aiter-latest-full-test-${{ github.run_id }}
@@ -85,6 +90,7 @@ jobs:
     with:
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-nightly-amd-rocm720:
     if: needs.resolve-aiter.outputs.run_nightly_amd_rocm720 == 'true'
@@ -94,6 +100,7 @@ jobs:
     with:
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd:
     if: needs.resolve-aiter.outputs.run_pr_test_amd == 'true'
@@ -103,6 +110,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
     if: needs.resolve-aiter.outputs.run_pr_test_amd_rocm720 == 'true'
@@ -112,6 +120,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   check-all-jobs:
     if: always()
