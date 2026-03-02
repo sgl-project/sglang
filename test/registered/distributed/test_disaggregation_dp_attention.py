@@ -126,20 +126,21 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 1000)
 
     def test_bench_serving_large_batch(self):
+        num_prompts = 4096
         args = get_benchmark_args(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             dataset_name="random",
             tokenizer=self.model,
-            num_prompts=2000,
+            num_prompts=num_prompts,
             random_input_len=512,
             random_output_len=512,
             request_rate=float("inf"),
-            max_concurrency=512,
+            max_concurrency=num_prompts,
         )
         result = run_benchmark(args)
 
-        self.assertLess(result["mean_tpot_ms"], 25)
-        self.assertEqual(result["completed"], 2000)
+        self.assertEqual(result["completed"], num_prompts)
+        self.assertGreater(result["output_throughput"], 17000)
 
 
 @unittest.skip(
