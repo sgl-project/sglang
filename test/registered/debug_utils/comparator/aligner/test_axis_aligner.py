@@ -9,8 +9,8 @@ from sglang.srt.debug_utils.comparator.aligner.axis_aligner import (
     compute_axis_aligner_plan,
     execute_axis_aligner_plan,
 )
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
 from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)
@@ -37,7 +37,7 @@ class TestComputeAxisAlignerPlan:
         assert result.pattern.y is None
 
     def test_name_mismatch_returns_none_with_warning(self) -> None:
-        with warning_sink.context() as warnings:
+        with log_sink.context() as warnings:
             result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
                 Pair(x="t h d", y="t h e")
             )

@@ -9,8 +9,8 @@ from sglang.srt.debug_utils.comparator.dims import (
     _SingletonDimUtil,
     parse_dims,
 )
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
 from sglang.srt.debug_utils.comparator.utils import Pair, _FrozenBase
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 
 # --- types ---
 
@@ -70,10 +70,10 @@ def _resolve_target_order(
     if set(x_names) != set(y_names):
         # Local import to avoid circular dependency:
         # output_types -> aligner/entrypoint/types -> axis_aligner -> output_types
-        from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
+        from sglang.srt.debug_utils.comparator.output_types import ErrorLog
 
-        warning_sink.add(
-            GeneralWarning(
+        log_sink.add(
+            ErrorLog(
                 category="axis_aligner_dim_mismatch",
                 message=(
                     f"AxisAligner: dim name sets differ (x={x_names}, y={y_names}), "

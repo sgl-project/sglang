@@ -233,6 +233,12 @@ def resolve_dim_by_name(tensor: torch.Tensor, name: str) -> int:
 
 
 def apply_dim_names(tensor: torch.Tensor, dim_names: list[str]) -> torch.Tensor:
+    if tensor.ndim != len(dim_names):
+        raise ValueError(
+            f"dims metadata mismatch: tensor has {tensor.ndim} dims (shape {list(tensor.shape)}) "
+            f"but dims string specifies {len(dim_names)} names {dim_names}. "
+            f"Please fix the dims string in the dumper.dump() call to match the actual tensor shape."
+        )
     return tensor.refine_names(*dim_names)
 
 

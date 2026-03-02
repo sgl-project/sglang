@@ -12,8 +12,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     TokenAlignerStepAux,
 )
 from sglang.srt.debug_utils.comparator.dims import TokenLayout
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
+from sglang.srt.debug_utils.comparator.output_types import InfoLog
 
 # ── plugin ABC ─────────────────────────────────────────────────────
 
@@ -227,8 +227,8 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
             if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
                 return TokenLayout.BS
 
-        warning_sink.add(
-            GeneralWarning(
+        log_sink.add(
+            InfoLog(
                 category="layout_detection_fallback",
                 message=(
                     "Megatron layout detection: no qkv_format or 2D input_ids found, "

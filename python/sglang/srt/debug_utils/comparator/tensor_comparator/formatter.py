@@ -66,12 +66,20 @@ def format_replicated_checks(checks: list[ReplicatedCheckResult]) -> str:
 
     for check in checks:
         marker: str = "✅" if check.passed else "❌"
+
+        if check.diff is not None:
+            detail: str = (
+                f"rel_diff={check.diff.rel_diff:.6e} "
+                f"max_abs_diff={check.diff.max_abs_diff:.6e} "
+                f"mean_abs_diff={check.diff.mean_abs_diff:.6e}"
+            )
+        else:
+            detail = "n/a diff"
+
         lines.append(
             f"  {marker} axis={check.axis} group={check.group_index} "
             f"idx={check.compared_index} vs {check.baseline_index}: "
-            f"rel_diff={check.diff.rel_diff:.6e} "
-            f"max_abs_diff={check.diff.max_abs_diff:.6e} "
-            f"mean_abs_diff={check.diff.mean_abs_diff:.6e}"
+            f"{detail}"
         )
 
     return "\n".join(lines)

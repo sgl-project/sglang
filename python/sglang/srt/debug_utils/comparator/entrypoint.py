@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
@@ -38,7 +37,7 @@ from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
 from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
-from sglang.srt.debug_utils.comparator.utils import Pair
+from sglang.srt.debug_utils.comparator.utils import Pair, compute_exit_code
 from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 _DEFAULT_SKIP_KEYS: set[str] = {"dump_index", "filename"}
@@ -112,36 +111,21 @@ def run(args: argparse.Namespace) -> int:
             compute_per_token=visualize_per_token is not None,
             meta_overrider=meta_overrider,
         )
-        summary, skipped_names = _consume_comparison_records(
+        summary, skipped_names, failed_names = _consume_comparison_records(
             comparison_records=comparison_records,
             visualize_per_token=visualize_per_token,
         )
-        return _compute_exit_code(
+        return compute_exit_code(
             summary,
-            allow_skip_pattern=args.allow_skip_pattern,
+            allow_skipped_pattern=args.allow_skipped_pattern,
             skipped_names=skipped_names,
+            allow_failed_pattern=args.allow_failed_pattern,
+            failed_names=failed_names,
         )
     finally:
         report_sink.close()
         if report_path is not None:
             print(f"Report: {report_path}", file=sys.stderr)
-
-
-def _compute_exit_code(
-    summary: SummaryRecord,
-    *,
-    allow_skip_pattern: str,
-    skipped_names: list[str],
-) -> int:
-    if summary.failed > 0:
-        return 1
-
-    pattern: re.Pattern[str] = re.compile(allow_skip_pattern)
-    forbidden: list[str] = [n for n in skipped_names if not pattern.fullmatch(n)]
-    if forbidden:
-        return 1
-
-    return 0
 
 
 def _resolve_report_path(args: argparse.Namespace) -> Optional[Path]:
@@ -261,16 +245,19 @@ def _consume_comparison_records(
         Union[TensorComparisonRecord, SkipComparisonRecord, NonTensorComparisonRecord]
     ],
     visualize_per_token: Optional[Path] = None,
-) -> tuple[SummaryRecord, list[str]]:
+) -> tuple[SummaryRecord, list[str], list[str]]:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
     collected_comparisons: list[TensorComparisonRecord] = []
     skipped_names: list[str] = []
+    failed_names: list[str] = []
 
     for record in comparison_records:
         counts[record.category] += 1
         report_sink.add(record)
         if isinstance(record, SkipComparisonRecord) and record.category == "skipped":
             skipped_names.append(record.name)
+        if record.category == "failed":
+            failed_names.append(record.name)
         if visualize_per_token is not None and isinstance(
             record, TensorComparisonRecord
         ):
@@ -285,7 +272,7 @@ def _consume_comparison_records(
             output_path=visualize_per_token,
         )
 
-    return summary, skipped_names
+    return summary, skipped_names, failed_names
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -299,7 +286,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--end-step", type=int, default=1000000)
     parser.add_argument("--diff-threshold", type=float, default=1e-3)
     parser.add_argument(
-        "--filter", type=str, default=None, help="Regex to filter filenames"
+        "--filter", type=str, default=None, help="Regex to filter filenames (include)"
     )
     parser.add_argument(
         "--output-format",
@@ -383,11 +370,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Path to YAML override config file (dims overrides, etc.)",
     )
     parser.add_argument(
-        "--allow-skip-pattern",
+        "--allow-skipped-pattern",
         type=str,
         default=".*",
         help="Regex pattern for tensor names allowed to be skipped. "
         "Default '.*' allows all skips. Use '^$' to forbid all skips.",
+    )
+    parser.add_argument(
+        "--allow-failed-pattern",
+        type=str,
+        default=None,
+        help="Regex pattern for tensor names allowed to fail without affecting exit code. "
+        "Default None (all failures affect exit code).",
     )
 
     # Report output

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import functools
-from typing import Callable, Generic, Optional, Tuple, TypeVar
+import re
+from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -86,3 +87,34 @@ def calc_per_token_rel_diff(
         sim = 2 * (x * y) / (denominator + 1e-10)
 
     return (1 - sim).float()
+
+
+if TYPE_CHECKING:
+    from sglang.srt.debug_utils.comparator.output_types import SummaryRecord
+
+
+def compute_exit_code(
+    summary: SummaryRecord,
+    *,
+    allow_skipped_pattern: str,
+    skipped_names: list[str],
+    allow_failed_pattern: Optional[str],
+    failed_names: list[str],
+) -> int:
+    if summary.passed == 0:
+        return 1
+
+    if not _is_all_match_pattern(pattern=allow_failed_pattern, strings=failed_names):
+        return 1
+
+    if not _is_all_match_pattern(pattern=allow_skipped_pattern, strings=skipped_names):
+        return 1
+
+    return 0
+
+
+def _is_all_match_pattern(*, pattern: Optional[str], strings: list[str]) -> bool:
+    if pattern is None:
+        return len(strings) == 0
+    compiled: re.Pattern[str] = re.compile(pattern)
+    return all(compiled.fullmatch(s) for s in strings)

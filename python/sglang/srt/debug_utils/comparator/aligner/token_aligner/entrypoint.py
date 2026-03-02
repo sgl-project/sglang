@@ -25,9 +25,9 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     TokenAlignerPlan,
     TokenAlignerSeqsInfo,
 )
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
+from sglang.srt.debug_utils.comparator.output_types import InfoLog
 from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 
 _NONE_THD: Pair[Optional[dict[int, list[int]]]] = Pair(x=None, y=None)
 
@@ -66,8 +66,8 @@ def compute_maybe_token_aligner_result(
         )
     elif token_aligner_mode == "smart":
         if not (has_aux_tensors(dfs.x) and has_aux_tensors(dfs.y)):
-            warning_sink.add(
-                GeneralWarning(
+            log_sink.add(
+                InfoLog(
                     category="aux_tensors_missing",
                     message="Aux tensors missing, skipping token alignment",
                 )
@@ -102,8 +102,8 @@ def _build_smart_result(
     )
 
     if baseline_aux is None or target_aux is None:
-        warning_sink.add(
-            GeneralWarning(
+        log_sink.add(
+            InfoLog(
                 category="framework_detection_failed",
                 message="Framework detection failed, skipping token alignment",
             )

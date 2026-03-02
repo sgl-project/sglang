@@ -241,6 +241,14 @@ class TestApplyDimNames:
         named: torch.Tensor = apply_dim_names(tensor, ["x", "y"])
         assert torch.equal(strip_dim_names(named), tensor)
 
+    def test_ndim_mismatch_gives_clear_error(self) -> None:
+        tensor: torch.Tensor = torch.randn(10, 1, 128)
+        with pytest.raises(
+            ValueError,
+            match=r"dims metadata mismatch.*3 dims.*shape \[10, 1, 128\].*2 names \['t', 'num_experts'\].*fix the dims string",
+        ):
+            apply_dim_names(tensor, ["t", "num_experts"])
+
 
 class TestStripDimNames:
     def test_strip(self) -> None:

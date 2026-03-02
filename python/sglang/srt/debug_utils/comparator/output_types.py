@@ -24,8 +24,7 @@ if TYPE_CHECKING:
     )
 
 
-class GeneralWarning(_StrictBase):
-    kind: Literal["general"] = "general"
+class BaseLog(_StrictBase):
     category: str
     message: str
 
@@ -33,9 +32,21 @@ class GeneralWarning(_StrictBase):
         return self.message
 
 
-# Type alias — currently only GeneralWarning exists.
-# When adding new warning types, convert back to Union + Discriminator("kind").
-AnyWarning = GeneralWarning
+class ErrorLog(BaseLog):
+    kind: Literal["error"] = "error"
+
+
+class InfoLog(BaseLog):
+    kind: Literal["info"] = "info"
+
+
+AnyLog = Annotated[Union[ErrorLog, InfoLog], Discriminator("kind")]
+
+
+def _split_logs(logs: list[BaseLog]) -> tuple[list[ErrorLog], list[InfoLog]]:
+    errors: list[ErrorLog] = [log for log in logs if isinstance(log, ErrorLog)]
+    infos: list[InfoLog] = [log for log in logs if isinstance(log, InfoLog)]
+    return errors, infos
 
 
 class ReplicatedCheckResult(_StrictBase):
@@ -45,19 +56,22 @@ class ReplicatedCheckResult(_StrictBase):
     baseline_index: int
     passed: bool
     atol: float
-    diff: DiffInfo
+    diff: Optional[DiffInfo] = None
 
 
 class _OutputRecord(_StrictBase):
-    warnings: list[AnyWarning] = Field(default_factory=list)
+    errors: list[ErrorLog] = Field(default_factory=list)
+    infos: list[InfoLog] = Field(default_factory=list)
 
     @abstractmethod
     def _format_body(self) -> str: ...
 
     def to_text(self) -> str:
         body = self._format_body()
-        if self.warnings:
-            body += "\n" + "\n".join(f"  ⚠ {w.to_text()}" for w in self.warnings)
+        if self.errors:
+            body += "\n" + "\n".join(f"  ✗ {e.to_text()}" for e in self.errors)
+        if self.infos:
+            body += "\n" + "\n".join(f"  ℹ {i.to_text()}" for i in self.infos)
         return body
 
 
@@ -99,7 +113,7 @@ class SkipComparisonRecord(_BaseComparisonRecord):
 
     @property
     def category(self) -> str:
-        if self.warnings:
+        if self.errors:
             return "failed"
         return "skipped"
 
@@ -145,7 +159,7 @@ class TensorComparisonRecord(TensorComparisonInfo, _BaseComparisonRecord):
 
     @property
     def category(self) -> str:
-        if self.warnings:
+        if self.errors:
             return "failed"
         if any(not check.passed for check in self.replicated_checks):
             return "failed"
@@ -171,7 +185,7 @@ class NonTensorComparisonRecord(_BaseComparisonRecord):
 
     @property
     def category(self) -> str:
-        if self.warnings:
+        if self.errors:
             return "failed"
         return "passed" if self.values_equal else "failed"
 
@@ -209,8 +223,8 @@ class SummaryRecord(_OutputRecord):
         )
 
 
-class WarningRecord(_OutputRecord):
-    type: Literal["warning"] = "warning"
+class LogRecord(_OutputRecord):
+    type: Literal["log"] = "log"
 
     def _format_body(self) -> str:
         return ""
@@ -260,7 +274,7 @@ AnyRecord = Annotated[
         TensorComparisonRecord,
         NonTensorComparisonRecord,
         SummaryRecord,
-        WarningRecord,
+        LogRecord,
     ],
     Discriminator("type"),
 ]
