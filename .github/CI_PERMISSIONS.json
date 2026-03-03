@@ -804,6 +804,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "Prozac614": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "pyc96": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -840,6 +847,13 @@
         "can_rerun_stage": true
     },
     "rkooo567": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
+    "RubiaCx": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 60,
