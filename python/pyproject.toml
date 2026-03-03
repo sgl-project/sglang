@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.3 ; sys_platform == 'linux'", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.3 ; sys_platform == 'linux'",
+  "flashinfer_python==0.6.4 ; sys_platform == 'linux'", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.4 ; sys_platform == 'linux'",
   "gguf",
   "hf_transfer",
   "huggingface_hub",

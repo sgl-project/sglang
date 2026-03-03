@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import time
 from typing import Any, Dict, Optional
 
@@ -99,14 +101,15 @@ def _video_job_from_sampling(
     }
 
 
-async def _save_first_input_image(image_sources, request_id: str) -> str | None:
+async def _save_first_input_image(
+    image_sources, request_id: str, uploads_dir: str
+) -> str | None:
     """Save the first input image from a list of sources and return its path."""
     image_list = merge_image_input_list(image_sources)
     if not image_list:
         return None
     image = image_list[0]
 
-    uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
@@ -114,7 +117,13 @@ async def _save_first_input_image(image_sources, request_id: str) -> str | None:
     return await save_image_to_path(image, target_path)
 
 
-async def _dispatch_job_async(job_id: str, batch: Req) -> None:
+async def _dispatch_job_async(
+    job_id: str,
+    batch: Req,
+    *,
+    temp_dirs: list[str] | None = None,
+    output_persistent: bool = True,
+) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
@@ -125,12 +134,15 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
+        persistent_path = (
+            save_file_path if not cloud_url and output_persistent else None
+        )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
             "url": cloud_url,
-            "file_path": save_file_path if not cloud_url else None,
+            "file_path": persistent_path,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -141,6 +153,9 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
+    finally:
+        for td in temp_dirs or []:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 # TODO: support image to video generation
@@ -176,6 +191,22 @@ async def create_video(
     server_args = get_global_server_args()
     task_type = server_args.pipeline_config.task_type
 
+    # Resolve input upload directory (may be a temp dir when saving is disabled)
+    temp_dirs: list[str] = []
+    if server_args.input_save_path is not None:
+        uploads_dir = server_args.input_save_path
+        os.makedirs(uploads_dir, exist_ok=True)
+    else:
+        uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+        temp_dirs.append(uploads_dir)
+
+    # Resolve output directory
+    effective_output_path = server_args.output_path
+    output_persistent = True
+    if "multipart/form-data" not in content_type:
+        # JSON body may carry a per-request output_path; checked after parsing below
+        pass
+
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
@@ -187,7 +218,9 @@ async def create_video(
                 detail="input_reference or reference_url is required for image-to-video generation",
             )
         try:
-            input_path = await _save_first_input_image(image_sources, request_id)
+            input_path = await _save_first_input_image(
+                image_sources, request_id, uploads_dir
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Failed to process image source: {str(e)}"
@@ -258,7 +291,7 @@ async def create_video(
             if payload.get("reference_url"):
                 try:
                     input_path = await _save_first_input_image(
-                        payload.get("reference_url"), request_id
+                        payload.get("reference_url"), request_id, uploads_dir
                     )
                 except Exception as e:
                     raise HTTPException(
@@ -269,6 +302,17 @@ async def create_video(
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+
+    # Resolve per-request output_path override
+    effective_output_path = req.output_path or server_args.output_path
+    if effective_output_path is None:
+        output_tmp = tempfile.mkdtemp(prefix="sglang_output_")
+        temp_dirs.append(output_tmp)
+        effective_output_path = output_tmp
+        output_persistent = False
+
+    # Inject resolved output_path so _build_video_sampling_params picks it up
+    req.output_path = effective_output_path
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
@@ -289,7 +333,14 @@ async def create_video(
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(_dispatch_job_async(request_id, batch))
+    asyncio.create_task(
+        _dispatch_job_async(
+            request_id,
+            batch,
+            temp_dirs=temp_dirs or None,
+            output_persistent=output_persistent,
+        )
+    )
     return VideoResponse(**job)
 
 
