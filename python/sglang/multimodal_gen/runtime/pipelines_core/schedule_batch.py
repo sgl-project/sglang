@@ -247,11 +247,9 @@ class Req:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
 
-        return (
-            os.path.join(self.output_path, output_file_name)
-            if output_file_name
-            else None
-        )
+        if self.output_path is None or not output_file_name:
+            return None
+        return os.path.join(self.output_path, output_file_name)
 
     def set_as_warmup(self):
         self.is_warmup = True

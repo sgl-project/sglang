@@ -67,6 +67,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
@@ -219,14 +220,16 @@ class Engine(EngineBase):
             if routed_dp_rank is None:
                 routed_dp_rank = data_parallel_rank
 
-        if self.server_args.enable_dp_attention:
-            if routed_dp_rank is None:
-                logger.debug("routed_dp_rank not provided, using default dispatch")
-            elif routed_dp_rank < 0:
-                raise ValueError("routed_dp_rank must be non-negative")
-            elif routed_dp_rank >= self.server_args.dp_size:
+        if routed_dp_rank is not None:
+            dp_size = self.server_args.dp_size
+            if dp_size <= 1 and routed_dp_rank == 0:
+                logger.warning(
+                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+                return None
+            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
                 raise ValueError(
-                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
@@ -769,7 +772,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
@@ -794,8 +797,9 @@ class Engine(EngineBase):
             item_first: If True, prepend items to query. Otherwise append items to query.
 
         Returns:
-            List of dictionaries mapping token IDs to their probabilities for each item.
-            Each dictionary in the list corresponds to one item input.
+            ScoreResult with:
+                scores: List of lists containing probabilities for each item and each label token
+                prompt_tokens: The number of prompt tokens processed.
 
         Raises:
             ValueError: If query is not provided, or if items is not provided,
@@ -819,7 +823,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> ScoreResult:
         """
         Asynchronous version of score method.
 
@@ -879,7 +883,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.3",
+                "0.6.4",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
