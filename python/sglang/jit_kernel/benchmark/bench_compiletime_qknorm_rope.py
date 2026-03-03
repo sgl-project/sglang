@@ -19,14 +19,19 @@ BASE_CFLAGS = ["--use_fast_math"]
 
 CASES = [
     # (label, extra_cflags)
-    ("OLD  – 6 instantiations (no template specialisation)",
-     []),
-    ("NEW  – 1 instantiation  (head_dim=64,  neox=False)",
-     ["-DJIT_HEAD_DIM=64",  "-DJIT_INTERLEAVE=1"]),
-    ("NEW  – 1 instantiation  (head_dim=128, neox=True)",
-     ["-DJIT_HEAD_DIM=128", "-DJIT_INTERLEAVE=0"]),
-    ("NEW  – 1 instantiation  (head_dim=256, neox=True)",
-     ["-DJIT_HEAD_DIM=256", "-DJIT_INTERLEAVE=0"]),
+    ("OLD  – 6 instantiations (no template specialisation)", []),
+    (
+        "NEW  – 1 instantiation  (head_dim=64,  neox=False)",
+        ["-DJIT_HEAD_DIM=64", "-DJIT_INTERLEAVE=1"],
+    ),
+    (
+        "NEW  – 1 instantiation  (head_dim=128, neox=True)",
+        ["-DJIT_HEAD_DIM=128", "-DJIT_INTERLEAVE=0"],
+    ),
+    (
+        "NEW  – 1 instantiation  (head_dim=256, neox=True)",
+        ["-DJIT_HEAD_DIM=256", "-DJIT_INTERLEAVE=0"],
+    ),
 ]
 
 
