@@ -46,6 +46,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -926,8 +927,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, etc.)
-        if is_hip() or is_npu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
+        if is_hip() or is_npu() or is_cpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
