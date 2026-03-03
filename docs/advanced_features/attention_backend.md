@@ -77,7 +77,7 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ {32, 64}.
 
-### GDN Backends
+### GDN Attention Backends
 
 GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, used in hybrid models that alternate GDN linear attention layers with standard full attention layers. GDN is **not** selected via `--attention-backend`; it is automatically activated when the model architecture requires it (e.g., Qwen 3.5, Qwen 3 Next, Jet Nemotron, Jet VLM).
 
@@ -86,6 +86,7 @@ The GDN linear attention layers have their own kernel backends, selected via `--
 | **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
 |--------------------------|------------|----------------------|-----------------------------------|
 | **Triton (CUDA)**        | ✅         | ✅                   | ✅                                |
+| **Triton (AMD/ROCm)**    | ✅         | ✅                   | ✅                                |
 | **Triton (NPU)**         | ✅         | ✅                   | ❌                                |
 | **Triton (CPU)**         | ✅         | ✅                   | ❌                                |
 | **CuTe DSL (CUDA only)**| ✅         | ❌                   | ❌                                |
