@@ -25,12 +25,22 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
-    get_default_distributed_backend,
     get_mooncake_transfer_engine,
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
+
+try:
+    from sglang.srt.distributed.parallel_state import get_default_distributed_backend
+except ImportError:
+
+    def get_default_distributed_backend(device: str) -> str:
+        return {"cuda": "nccl", "xpu": "xccl", "hpu": "hccl", "npu": "hccl"}.get(
+            device, "gloo"
+        )
+
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
@@ -262,23 +272,11 @@ class MMEncoder:
                 EmbeddingCacheController,
             )
 
-            hidden_dim = self.model_config.hidden_size
-            vision_cfg = getattr(self.model_config.hf_config, "vision_config", None)
-            if vision_cfg is not None:
-                out_hs = getattr(vision_cfg, "out_hidden_size", None)
-                if out_hs is not None:
-                    deepstack_idxs = getattr(
-                        vision_cfg, "deepstack_visual_indexes", None
-                    )
-                    if isinstance(deepstack_idxs, (list, tuple)) and deepstack_idxs:
-                        hidden_dim = out_hs * (1 + len(deepstack_idxs))
-                    else:
-                        hidden_dim = out_hs
-
+            hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
-                hidden_dim=hidden_dim,
+                hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
             )
@@ -298,6 +296,45 @@ class MMEncoder:
             self.embedding_to_send = dict()
 
         logger.info(f"rank {rank} init finish ")
+
+    def _infer_embedding_dims(self) -> dict:
+        """Infer per-modality embedding dimensions from hf_config at init time."""
+        default = self.model_config.hidden_size
+        hf_cfg = self.model_config.hf_config
+        thinker_cfg = getattr(hf_cfg, "thinker_config", None)
+        dims = {
+            Modality.IMAGE: default,
+            Modality.VIDEO: default,
+            Modality.AUDIO: default,
+        }
+
+        vision_cfg = getattr(thinker_cfg, "vision_config", None) or getattr(
+            hf_cfg, "vision_config", None
+        )
+        if vision_cfg is not None:
+            out_hs = getattr(vision_cfg, "out_hidden_size", None)
+            if out_hs is not None:
+                ds = getattr(vision_cfg, "deepstack_visual_indexes", None)
+                vis_dim = (
+                    out_hs * (1 + len(ds))
+                    if isinstance(ds, (list, tuple)) and ds
+                    else out_hs
+                )
+                dims[Modality.IMAGE] = vis_dim
+                dims[Modality.VIDEO] = vis_dim
+
+        audio_cfg = getattr(thinker_cfg, "audio_config", None) or getattr(
+            hf_cfg, "audio_config", None
+        )
+        if audio_cfg is not None:
+            for attr in ("output_dim", "d_model"):
+                val = getattr(audio_cfg, attr, None)
+                if val and int(val) > 0:
+                    dims[Modality.AUDIO] = int(val)
+                    break
+
+        logger.info(f"Global cache embedding dims: {dims}")
+        return dims
 
     def _build_vision_config(self, mm_process_config):
         """
@@ -629,7 +666,7 @@ class MMEncoder:
     ) -> torch.Tensor:
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         grid_thw = _get_mm_grid_dim(mm_inputs, modality)
-        mm_feature = _get_mm_feature(mm_inputs, modality)
+        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
@@ -675,7 +712,7 @@ class MMEncoder:
                 hit_tokens = [
                     self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
                 ]
-                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
+                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens, modality)
 
                 try:
 
