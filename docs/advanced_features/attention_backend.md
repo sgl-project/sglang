@@ -228,6 +228,25 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
+- TRTLLM MHA (Optimized for Blackwell Architecture, e.g., B200)
+```bash
+python3 -m sglang.launch_server \
+  --tp 4 \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
+  --attention-backend trtllm_mha \
+  --trust-remote-code
+```
+
+- TRTLLM MHA (XQA backend) (Optimized for SM90 and SM120, e.g., H20, H200, 5090)
+Note that TRTLLM XQA backend only works well for pagesize 64.
+```bash
+python3 -m sglang.launch_server \
+  --tp 4 \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
+  --decode-attention-backend trtllm_mha \
+  --trust-remote-code
+```
+
 - FlashAttention 4 (MHA & MLA)
 ```bash
 # FA4 for both prefill and decode on SM90/SM100
