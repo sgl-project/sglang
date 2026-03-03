@@ -50,6 +50,10 @@ logger = init_logger(__name__)
 
 globally_suppress_loggers()
 
+# Tracks mesh output file paths from generate_mesh for later correctness validation.
+# Keyed by case_id, cleaned up after use.
+MESH_OUTPUT_PATHS: dict[str, str] = {}
+
 
 def download_image_from_url(url: str) -> Path:
     """Download an image from a URL to a temporary file.
@@ -637,10 +641,99 @@ class VideoPerformanceValidator(PerformanceValidator):
             )
 
 
+class MeshValidator(PerformanceValidator):
+    """Validator for 3D mesh generation. Inherits perf validation from PerformanceValidator."""
+
+    pass
+
+
+HUNYUAN3D_REFERENCE_URL = (
+    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
+    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+)
+
+
+def _download_reference_mesh(url: str) -> Path:
+    """Download a reference mesh from URL, caching in temp dir."""
+    import hashlib
+
+    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_path = Path(tempfile.gettempdir()) / cache_name
+    if cache_path.exists():
+        logger.info(f"Using cached reference mesh: {cache_path}")
+        return cache_path
+
+    logger.info(f"Downloading reference mesh from: {url}")
+    with urlopen(url, timeout=60) as resp:
+        cache_path.write_bytes(resp.read())
+    logger.info(f"Reference mesh cached at: {cache_path}")
+    return cache_path
+
+
+def validate_mesh_correctness(
+    generated_mesh_path: str,
+    reference_url: str = HUNYUAN3D_REFERENCE_URL,
+    num_sample_points: int = 4096,
+    cd_threshold_ratio: float = 0.01,
+    random_seed: int = 42,
+):
+    """Validate mesh geometric similarity against a reference via Chamfer Distance.
+
+    Downloads the reference mesh from a URL (cached), samples point clouds from
+    both meshes, and asserts Chamfer Distance is within threshold.
+    """
+    import numpy as np
+
+    try:
+        import trimesh
+    except ImportError:
+        pytest.fail("trimesh is required for mesh validation: pip install trimesh")
+
+    from scipy.spatial import cKDTree
+
+    # Load generated mesh
+    generated_mesh = trimesh.load(generated_mesh_path)
+    if isinstance(generated_mesh, trimesh.Scene):
+        generated_mesh = generated_mesh.dump(concatenate=True)
+
+    # Download and load reference mesh
+    ref_path = _download_reference_mesh(reference_url)
+    reference_mesh = trimesh.load(str(ref_path))
+    if isinstance(reference_mesh, trimesh.Scene):
+        reference_mesh = reference_mesh.dump(concatenate=True)
+
+    # Bounding box diagonal for threshold normalization
+    ref_bbox = reference_mesh.bounding_box.bounds
+    bbox_diagonal = float(np.linalg.norm(ref_bbox[1] - ref_bbox[0]))
+    cd_threshold = cd_threshold_ratio * bbox_diagonal
+
+    # Sample point clouds
+    np.random.seed(random_seed)
+    gen_points = np.array(
+        generated_mesh.sample(num_sample_points, return_index=True)[0]
+    )
+    ref_points = np.array(
+        reference_mesh.sample(num_sample_points, return_index=True)[0]
+    )
+
+    # Bidirectional Chamfer Distance
+    tree1 = cKDTree(gen_points)
+    tree2 = cKDTree(ref_points)
+    forward_cd = float(np.mean(tree2.query(gen_points)[0] ** 2))
+    backward_cd = float(np.mean(tree1.query(ref_points)[0] ** 2))
+    total_cd = forward_cd + backward_cd
+
+    assert total_cd <= cd_threshold, (
+        f"Chamfer Distance check failed: total_cd={total_cd:.6f}, "
+        f"threshold={cd_threshold:.6f} ({cd_threshold_ratio * 100:.2f}% of bbox diagonal {bbox_diagonal:.4f})"
+    )
+
+
 # Registry of validators by name
 VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
+    "mesh": MeshValidator,
 }
 
 
@@ -1095,7 +1188,103 @@ def get_generate_fn(
                 },
             )
 
-    if modality == "video":
+    def generate_mesh(case_id, client) -> tuple[str, bytes]:
+        """I2M: Image to Mesh generation using async /v1/meshes API."""
+        import requests as http_requests
+
+        if not sampling_params.image_path:
+            pytest.skip(f"{case_id}: no input image configured for mesh generation")
+
+        image_path = sampling_params.image_path
+        if isinstance(image_path, str) and is_image_url(image_path):
+            image_path = download_image_from_url(image_path)
+        elif isinstance(image_path, Path):
+            if not image_path.exists():
+                pytest.skip(f"{case_id}: image file missing: {image_path}")
+        else:
+            image_path = Path(str(image_path))
+            if not image_path.exists():
+                pytest.skip(f"{case_id}: image file missing: {image_path}")
+
+        base_url = str(client.base_url).rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+
+        create_url = f"{base_url}/v1/meshes"
+
+        with open(str(image_path), "rb") as img_file:
+            files = {"image": (Path(str(image_path)).name, img_file, "image/png")}
+            data = {
+                "prompt": "generate 3d mesh",
+                "model": model_path,
+                "seed": "0",
+                "guidance_scale": "5.0",
+                "num_inference_steps": "50",
+            }
+
+            logger.info(f"[Mesh Gen] Sending request to {create_url}")
+
+            try:
+                response = http_requests.post(
+                    create_url, files=files, data=data, timeout=60
+                )
+            except Exception as e:
+                pytest.fail(f"{case_id}: mesh creation request failed: {e}")
+
+        if response.status_code != 200:
+            pytest.fail(f"{case_id}: mesh creation failed: {response.text}")
+
+        job = response.json()
+        mesh_id = job.get("id")
+        if not mesh_id:
+            pytest.fail(f"{case_id}: no mesh id in response: {job}")
+
+        poll_url = f"{base_url}/v1/meshes/{mesh_id}"
+        poll_interval = 5
+        max_wait = 1200
+        elapsed = 0
+
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            try:
+                poll_resp = http_requests.get(poll_url, timeout=30)
+            except Exception as e:
+                logger.warning(f"[Mesh Gen] Poll failed: {e}")
+                continue
+
+            if poll_resp.status_code != 200:
+                continue
+
+            status_data = poll_resp.json()
+            status = status_data.get("status", "")
+
+            if status == "completed":
+                content_url = f"{base_url}/v1/meshes/{mesh_id}/content"
+                try:
+                    content_resp = http_requests.get(content_url, timeout=60)
+                except Exception as e:
+                    pytest.fail(f"{case_id}: mesh download failed: {e}")
+
+                if content_resp.status_code != 200:
+                    pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
+
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
+                temp_path.write_bytes(content_resp.content)
+                MESH_OUTPUT_PATHS[case_id] = str(temp_path)
+
+                logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
+                return (mesh_id, b"")
+            elif status == "failed":
+                error = status_data.get("error", {})
+                pytest.fail(f"{case_id}: mesh generation failed: {error}")
+
+        pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
+
+    if modality == "3d":
+        fn = generate_mesh
+    elif modality == "video":
         if sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video

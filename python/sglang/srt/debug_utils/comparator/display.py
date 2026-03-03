@@ -10,11 +10,11 @@ import polars as pl
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
     RankInfoRecord,
-    report_sink,
 )
+from sglang.srt.debug_utils.comparator.report_sink import report_sink
 from sglang.srt.debug_utils.dump_loader import LOAD_FAILED, ValueWithMeta
 
-_PARALLEL_INFO_KEYS: list[str] = ["sglang_parallel_info", "megatron_parallel_info"]
+PARALLEL_INFO_KEYS: list[str] = ["sglang_parallel_info", "megatron_parallel_info"]
 
 
 def emit_display_records(
@@ -68,7 +68,7 @@ def _collect_rank_info(
         meta: dict[str, Any] = ValueWithMeta.load(dump_dir / row["filename"]).meta
 
         row_data: dict[str, Any] = {"rank": row["rank"]}
-        for key in _PARALLEL_INFO_KEYS:
+        for key in PARALLEL_INFO_KEYS:
             _extract_parallel_info(row_data=row_data, info=meta.get(key, {}))
         table_rows.append(row_data)
 
