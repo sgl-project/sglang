@@ -134,6 +134,12 @@ class BenchArgs:
             help="Path to dataset (prompts file or image directory)",
         )
         parser.add_argument(
+            "--task-name",
+            type=str,
+            default="unknown",
+            help="Task name for benchmark identification",
+        )
+        parser.add_argument(
             "--num-prompts",
             type=int,
             default=10,
