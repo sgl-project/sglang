@@ -29,7 +29,11 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-register_cuda_ci(est_time=116, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(
+    est_time=116,
+    suite="stage-b-test-large-2-gpu",
+    disabled="Disabled due to CI machines transition from H100 to H200, which exposes some potential bugs.",
+)
 register_amd_ci(
     est_time=116,
     suite="stage-b-test-large-2-gpu-amd",

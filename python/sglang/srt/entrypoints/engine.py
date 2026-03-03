@@ -492,12 +492,18 @@ class Engine(EngineBase):
         self,
         capacity_of_str_len: int,
         session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
     ) -> str:
         """Open a session for multi-turn conversation with shared context.
 
         Args:
             capacity_of_str_len: Maximum string length capacity for the session.
             session_id: Optional session ID. If not provided, a UUID will be generated.
+            streaming: Use low-overhead path for realtime streaming (append-only mode).
+            timeout: If set, the session is automatically closed after being inactive
+                for this many seconds. Inactivity is measured from session open or the
+                most recent request submission.
 
         Returns:
             The session ID (either the provided one or a newly generated UUID).
@@ -505,6 +511,8 @@ class Engine(EngineBase):
         obj = OpenSessionReqInput(
             capacity_of_str_len=capacity_of_str_len,
             session_id=session_id,
+            streaming=streaming,
+            timeout=timeout,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.open_session(obj, None)
@@ -871,7 +879,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.3",
+                "0.6.4",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
