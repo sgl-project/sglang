@@ -1,4 +1,4 @@
-name: Scheduled Full AMD Test (AITER Latest)
+name: AMD AITER Scout
 
 on:
   schedule:
@@ -23,7 +23,7 @@ on:
         default: true
 
 concurrency:
-  group: scheduled-aiter-latest-full-test-${{ github.run_id }}
+  group: amd-aiter-scout-${{ github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -88,6 +88,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
+      ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -98,6 +99,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     secrets: inherit
     with:
+      ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -134,7 +136,7 @@ jobs:
     steps:
       - name: Summary
         run: |
-          echo "## Scheduled Full AMD Test (AITER Latest) Results" >> $GITHUB_STEP_SUMMARY
+          echo "## AMD AITER Scout Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
