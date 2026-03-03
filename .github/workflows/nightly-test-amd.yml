@@ -43,11 +43,13 @@ on:
           - 'nightly-8-gpu-deepseek-v32-mtp'
           - 'nightly-8-gpu-kimi-k25'
           - 'nightly-8-gpu-qwen3-235b'
+          - 'nightly-8-gpu-qwen35'
           - 'nightly-8-gpu-glm5'
           - 'nightly-8-gpu-minimax-m25'
           # MI35x jobs
           - 'nightly-test-1-gpu-mi35x'
           - 'nightly-8-gpu-mi35x-qwen3-235b-mxfp4'
+          - 'nightly-8-gpu-mi35x-qwen35'
           - 'nightly-8-gpu-mi35x-kimi-k25'
           - 'nightly-8-gpu-mi35x-glm5'
           - 'nightly-8-gpu-mi35x-minimax-m25'
@@ -555,6 +557,38 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # 8-GPU Qwen 3.5 (Accuracy)
+  nightly-8-gpu-qwen35:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-qwen35')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+
+      - name: Accuracy Test (8-GPU Qwen 3.5)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-qwen35 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   nightly-8-gpu-glm5:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-glm5')
     runs-on: linux-mi325-8gpu-sglang
@@ -984,6 +1018,39 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # MI35x 8-GPU Qwen 3.5 (Accuracy)
+  nightly-8-gpu-mi35x-qwen35:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-qwen35')
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+
+      - name: Accuracy Test MI35x (8-GPU Qwen 3.5)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   nightly-8-gpu-mi35x-glm5:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-glm5')
     runs-on: linux-mi35x-gpu-8
@@ -1104,6 +1171,7 @@ jobs:
       - nightly-8-gpu-deepseek-v32-mtp
       - nightly-8-gpu-kimi-k25
       - nightly-8-gpu-qwen3-235b
+      - nightly-8-gpu-qwen35
       - nightly-8-gpu-glm5
       - nightly-8-gpu-minimax-m25
       # MI35x jobs
@@ -1116,6 +1184,7 @@ jobs:
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
       - nightly-8-gpu-mi35x-kimi-k25
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
+      - nightly-8-gpu-mi35x-qwen35
       - nightly-8-gpu-mi35x-glm5
       - nightly-8-gpu-mi35x-minimax-m25
       # MI35x perf jobs excluded from check - perf failures don't block CI
