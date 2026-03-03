@@ -103,6 +103,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         close, validating that spec v2 computes logprobs correctly.
         """
         top_k = 5
+        probe_token_ids = [1, 2, 10, 100, 1000]
         prompt = "The capital of France is"
 
         gen_res = requests.post(
@@ -116,12 +117,14 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
                 },
                 "return_logprob": True,
                 "top_logprobs_num": top_k,
+                "token_ids_logprob": probe_token_ids,
                 "logprob_start_len": 0,
             },
         ).json()
 
         decode_logprobs = gen_res["meta_info"]["output_token_logprobs"]
         decode_top_logprobs = gen_res["meta_info"]["output_top_logprobs"]
+        decode_tid_logprobs = gen_res["meta_info"]["output_token_ids_logprobs"]
         input_token_ids = [t[1] for t in gen_res["meta_info"]["input_token_logprobs"]]
         output_token_ids = [t[1] for t in decode_logprobs]
         num_prompt_tokens = gen_res["meta_info"]["prompt_tokens"]
@@ -136,6 +139,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
                 },
                 "return_logprob": True,
                 "top_logprobs_num": top_k,
+                "token_ids_logprob": probe_token_ids,
                 "logprob_start_len": 0,
             },
         ).json()
@@ -146,9 +150,13 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         score_top_logprobs = score_res["meta_info"]["input_top_logprobs"][
             num_prompt_tokens:
         ]
+        score_tid_logprobs = score_res["meta_info"]["input_token_ids_logprobs"][
+            num_prompt_tokens:
+        ]
 
         self.assertEqual(len(decode_logprobs), len(score_logprobs))
 
+        # Check per-token logprobs
         decode_vals = np.array([t[0] for t in decode_logprobs])
         score_vals = np.array([t[0] for t in score_logprobs])
         max_diff = np.max(np.abs(decode_vals - score_vals))
@@ -157,6 +165,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         print(f"score_vals[-5:]={score_vals[-5:]}")
         self.assertLess(max_diff, 0.255)
 
+        # Check top-k logprobs
         for pos in range(len(decode_logprobs)):
             dec_top = {t[1]: t[0] for t in decode_top_logprobs[pos]}
             scr_top = {t[1]: t[0] for t in score_top_logprobs[pos]}
@@ -164,6 +173,15 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             self.assertGreater(len(common_ids), 0)
             for tid in common_ids:
                 self.assertAlmostEqual(dec_top[tid], scr_top[tid], delta=0.255)
+
+        # Check token_ids_logprob
+        self.assertEqual(len(decode_tid_logprobs), len(score_tid_logprobs))
+        for pos in range(len(decode_tid_logprobs)):
+            dec_tid = {t[1]: t[0] for t in decode_tid_logprobs[pos]}
+            scr_tid = {t[1]: t[0] for t in score_tid_logprobs[pos]}
+            self.assertEqual(set(dec_tid.keys()), set(scr_tid.keys()))
+            for tid in dec_tid:
+                self.assertAlmostEqual(dec_tid[tid], scr_tid[tid], delta=0.255)
 
 
 class TestEagleServerPage(TestEagleServerBase):
