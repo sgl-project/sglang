@@ -351,6 +351,12 @@ def fused_experts_impl(
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
+    elif hidden_states.shape[1] == w1.shape[2]:
+        # Some ROCm FP8 MoE checkpoints load unpadded expert weights even when
+        # SGLANG_MOE_PADDING is enabled globally. In that case the runtime
+        # shape already matches the true hidden size and subtracting
+        # `padding_size` would reject a valid layout.
+        padded_size = 0
 
     # Check constraints.
     if use_int4_w4a16:

@@ -3,11 +3,14 @@
 import pytest
 import torch
 
+from sglang.srt.layers.quantization import fp8_kernel
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = getattr(fp8_kernel, "_use_aiter", False)
+_has_vllm = getattr(fp8_kernel, "_has_vllm", False)
 _is_fp8_fnuz = is_fp8_fnuz()
 fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 
@@ -141,6 +144,14 @@ if _is_cuda or _is_hip:
         torch.testing.assert_close(
             scale_per_token[:original_rows], scale_per_token_without_padding
         )
+        if _is_hip:
+            assert scale_per_token.shape[0] == padding_size
+            assert torch.isfinite(scale_per_token).all()
+            if not _use_aiter and not _has_vllm:
+                # The native HIP fallback explicitly fills padded rows.
+                assert torch.all(y_dynamic[original_rows:] == 0.0)
+                assert torch.all(y_static[original_rows:] == 0.0)
+                assert torch.all(y_per_token[original_rows:] == 0.0)
 
 
 if __name__ == "__main__":
