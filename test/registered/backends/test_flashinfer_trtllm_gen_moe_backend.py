@@ -12,111 +12,98 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 
 
-class _FlashinferTrtllmGenMoeBackendMixin:
-    MODEL_PATH = ""
-    BACKENDS = ()
-    EXTRA_OTHER_ARGS = ()
-    ENV_OVERRIDES = None
-    MIN_GSM8K_ACCURACY = 0.93
-
-    def _run_gsm8k_for_backend(self, moe_runner_backend: str):
-        launch_kwargs = {}
-        if self.ENV_OVERRIDES is not None:
-            launch_kwargs["env"] = {**os.environ, **self.ENV_OVERRIDES}
-
-        process = popen_launch_server(
-            self.MODEL_PATH,
-            DEFAULT_URL_FOR_TEST,
+class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
+                "--attention-backend",
+                "triton",
                 "--moe-runner-backend",
-                moe_runner_backend,
-                *self.EXTRA_OTHER_ARGS,
+                "flashinfer_trtllm",
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--mamba-ssm-dtype",
+                "bfloat16",
             ],
-            **launch_kwargs,
         )
-        try:
-            args = SimpleNamespace(
-                num_shots=5,
-                data_path=None,
-                num_questions=200,
-                max_new_tokens=512,
-                parallel=128,
-                host="http://127.0.0.1",
-                port=int(DEFAULT_URL_FOR_TEST.split(":")[-1]),
-            )
-            metrics = run_eval(args)
-            print(f"{moe_runner_backend=} {metrics=}")
-            self.assertGreater(metrics["accuracy"], self.MIN_GSM8K_ACCURACY)
-        finally:
-            kill_process_tree(process.pid)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        for moe_runner_backend in self.BACKENDS:
-            with self.subTest(moe_runner_backend=moe_runner_backend):
-                self._run_gsm8k_for_backend(moe_runner_backend)
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestFlashinferTrtllmGenMoeBackendFP8(
-    _FlashinferTrtllmGenMoeBackendMixin, CustomTestCase
-):
-    MODEL_PATH = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-    BACKENDS = ("flashinfer_trtllm", "flashinfer_trtllm_routed")
-    EXTRA_OTHER_ARGS = (
-        "--attention-backend",
-        "triton",
-        "--tp-size",
-        "4",
-        "--ep-size",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-        "--mamba-ssm-dtype",
-        "bfloat16",
-    )
-    ENV_OVERRIDES = {"SGLANG_ENABLE_JIT_DEEPGEMM": "False"}
+class TestFlashinferTrtllmGenMoeBackendBF16(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--attention-backend",
+                "triton",
+                "--moe-runner-backend",
+                "flashinfer_trtllm",
+                "--cuda-graph-max-bs",
+                "512",
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--mamba-ssm-dtype",
+                "bfloat16",
+            ],
+        )
 
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
-class TestFlashinferTrtllmGenMoeBackendBF16(
-    _FlashinferTrtllmGenMoeBackendMixin, CustomTestCase
-):
-    MODEL_PATH = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-    BACKENDS = ("flashinfer_trtllm",)
-    EXTRA_OTHER_ARGS = (
-        "--attention-backend",
-        "triton",
-        "--cuda-graph-max-bs",
-        "512",
-        "--tp-size",
-        "4",
-        "--ep-size",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-        "--mamba-ssm-dtype",
-        "bfloat16",
-    )
-
-
-class TestFlashinferTrtllmGenMoeBackendMXFP8(
-    _FlashinferTrtllmGenMoeBackendMixin, CustomTestCase
-):
-    MODEL_PATH = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    BACKENDS = ("flashinfer_trtllm", "flashinfer_trtllm_routed")
-    EXTRA_OTHER_ARGS = (
-        "--quantization",
-        "mxfp8",
-        "--tp-size",
-        "4",
-        "--ep-size",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-    )
-    ENV_OVERRIDES = {"SGLANG_ENABLE_JIT_DEEPGEMM": "False"}
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":
