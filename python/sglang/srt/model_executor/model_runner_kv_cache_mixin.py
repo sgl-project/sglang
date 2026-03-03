@@ -519,7 +519,16 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
+                    full_attention_layer_ids=(
+                        [0]
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i in self.mambaish_config.full_attention_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ]
+                    ),
+                    layer_num=len(self.mambaish_config.full_attention_layer_ids),
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,

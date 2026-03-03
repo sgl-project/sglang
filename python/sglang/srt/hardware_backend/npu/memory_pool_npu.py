@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 import torch_npu
@@ -26,6 +26,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: str,
+        full_attention_layer_ids: List[int],
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
@@ -33,6 +34,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         enable_kv_cache_copy: bool = False,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.full_attention_layer_id_mapping = {
+            id: i for i, id in enumerate(full_attention_layer_ids)
+        }
         super().__init__(
             size=size,
             page_size=page_size,
@@ -109,6 +113,13 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def _transfer_full_attention_id(self, layer_id: int):
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"{layer_id=} not in full attention layers: {self.full_attention_layer_id_mapping.keys()}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -123,6 +134,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        layer_id = self._transfer_full_attention_id(layer_id)
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -163,6 +175,17 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 slot_indices=loc,
             )
 
+    def get_kv_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return super().get_kv_buffer(layer_id)
+
+    def get_key_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return super().get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return super().get_value_buffer(layer_id)
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
 
