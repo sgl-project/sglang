@@ -108,18 +108,10 @@ def serve(args, extra_argv):
             execute_serve_cmd(parsed_args, remaining_argv)
         else:
             # Logic for Standard Language Models
-            from sglang.cli.config import ServerConfig
             from sglang.launch_server import run_server
             from sglang.srt.server_args import prepare_server_args
 
-            # Add a dummy argument for the program name, expected by prepare_server_args
-            # as it typically processes sys.argv
             server_args = prepare_server_args(dispatch_argv)
-            server_config = ServerConfig(
-                model_path=server_args.model_path,
-                port=server_args.port,
-                host=server_args.host,
-            )
 
             run_server(server_args)
     finally:
