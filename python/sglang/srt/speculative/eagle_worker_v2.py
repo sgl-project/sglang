@@ -465,6 +465,7 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -473,6 +474,7 @@ class EagleDraftWorker(BaseDraftWorker):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            mm_input_embeds: VLM image embeddings from target forward, needed by MTP draft heads.
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
@@ -498,6 +500,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         # Update spec_info for the next draft step
@@ -668,6 +672,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         model_worker_batch,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
+                        mm_input_embeds=batch_output.logits_output.mm_input_embeds,
                     )
                 )
                 return batch_output

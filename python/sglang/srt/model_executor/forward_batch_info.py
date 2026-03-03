@@ -714,6 +714,36 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                             mm_input, self.seq_lens_cpu[batch_idx]
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
+            elif self.forward_mode.is_draft_extend_v2():
+                # Draft tokens are always text; compute sequential mrope positions.
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_prefix_len = batch.extend_prefix_lens[batch_idx]
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
+                    mrope_positions = torch.tensor(
+                        [
+                            list(
+                                range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            )
+                        ]
+                        * 3,
+                        dtype=torch.int64,
+                    )
+                else:
+                    # VLM: shift positions by mrope_position_delta (same as decode).
+                    delta = mm_input.mrope_position_delta.flatten()
+                    positions = torch.arange(
+                        extend_prefix_len,
+                        extend_prefix_len + extend_seq_len,
+                        dtype=torch.int64,
+                    )
+                    mrope_positions = (positions + delta).unsqueeze(0).repeat(3, 1)
+                mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
             [pos for pos in mrope_positions_list],
