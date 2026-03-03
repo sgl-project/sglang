@@ -753,8 +753,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                     f"[Expert Balancedness] "
                     f"forward_pass_id={forward_pass_id} "
                     f"balancedness={utilization_rate_cpu:.03f} "
+                    f"{''.join(f'avg{size}={value:.03f} ' for size, value in self._history.mean().items())}"
                     f"cross_node_ratio={cross_node_ratio:.03f} "
-                    f"{''.join(f'avg{size}={value:.03f} ' for size, value in self._history.mean().items())} "
                     f"tokens={gpu_physical_count_sum}"
                 )
 
