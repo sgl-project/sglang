@@ -251,11 +251,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -298,8 +300,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # The caller passes them via **kwargs from the dispatcher.
         a_raw = kwargs.get("a_raw")
         b_raw = kwargs.get("b_raw")
-        A_log = kwargs.get("A_log")
-        dt_bias = kwargs.get("dt_bias")
 
         if a_raw is None or b_raw is None or A_log is None or dt_bias is None:
             raise RuntimeError(

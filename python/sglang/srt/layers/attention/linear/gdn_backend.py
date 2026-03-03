@@ -387,8 +387,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Pass raw pre-gating values for FlashInfer MTP kernel
                 a_raw=a,
                 b_raw=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
