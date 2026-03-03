@@ -685,6 +685,7 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "all_extend_in_batch",
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",

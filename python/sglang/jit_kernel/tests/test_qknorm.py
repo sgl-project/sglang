@@ -90,4 +90,4 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])

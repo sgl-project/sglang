@@ -26,7 +26,6 @@ def start_disagg_service(
         bootstrap_server = kv_bootstrap_server_class(
             host=server_args.host,
             port=server_args.disaggregation_bootstrap_port,
-            dp_size=server_args.dp_size,
         )
         is_create_store = (
             server_args.node_rank == 0 and transfer_backend == TransferBackend.ASCEND
