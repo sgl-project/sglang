@@ -405,8 +405,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
-
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
+        # fused_qkvzba_split_reshape_cat will report error when BS large than 65536 on NPU
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu and (not _is_npu or is_cuda_graph):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
