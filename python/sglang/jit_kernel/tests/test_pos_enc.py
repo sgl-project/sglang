@@ -371,10 +371,10 @@ def test_correctness(
     ],
 )
 def test_performance(
-    head_size,
-    rotary_dim,
-    max_position_embeddings,
-    base,
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: int,
     is_neox_style,
     dtype,
     device,
@@ -483,3 +483,7 @@ def test_performance(
         print(f"Speedup (SGL/JIT): {speedup:.2f}x")
 
     assert jit_time >= 0 and sgl_time >= 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
