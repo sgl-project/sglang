@@ -122,7 +122,6 @@ def get_top_logprobs(
     )
 
 
-# FIXME: remove sync in spec v2
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[Optional[List[int]]],
