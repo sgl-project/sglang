@@ -1,9 +1,3 @@
-#pragma once
-#include <sgl_kernel/utils.cuh>
-
-#include <cstddef>
-#include <cstdint>
-
 /// \file vec.cuh
 /// \brief Aligned vector types for coalesced global memory access.
 ///
@@ -11,6 +5,12 @@
 /// aligned struct so that the compiler emits wide (vectorized) load/store
 /// instructions (e.g. `LDG.128`). The maximum supported vector width is
 /// 256 bits (32 bytes), matching CUDA's widest vector load.
+
+#pragma once
+#include <sgl_kernel/utils.cuh>
+
+#include <cstddef>
+#include <cstdint>
 
 namespace device {
 

@@ -291,7 +291,7 @@ and its key APIs.
 
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
-| `vec.cuh` | `device` | `AlignedVector<T, N>` — vectorized load/store (up to 256-bit) |
+| `vec.cuh` | `device` | `AlignedVector<T, N>` — vectorized load/store (up to 128-bit; 256-bit requires Blackwell GPUs) |
 | `tile.cuh` | `device::tile` | `Memory<T>` — cooperative tiled memory I/O (thread/warp/CTA) |
 
 ### Parallel Primitives

@@ -1,10 +1,10 @@
+/// \file cta.cuh
+/// \brief CTA (Cooperative Thread Array / thread-block) level primitives.
+
 #pragma once
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
-
-/// \file cta.cuh
-/// \brief CTA (Cooperative Thread Array / thread-block) level primitives.
 
 namespace device::cta {
 

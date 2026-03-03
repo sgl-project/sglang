@@ -1,3 +1,14 @@
+/// \file tensor.h
+/// \brief Tensor validation and symbolic matching utilities.
+///
+/// Provides the `TensorMatcher` fluent API for validating tensor shapes,
+/// strides, dtypes, and devices at kernel entry points, along with
+/// `SymbolicSize`, `SymbolicDType`, and `SymbolicDevice` for capturing
+/// and cross-checking tensor metadata across multiple tensors.
+///
+/// See the "Tensor Checking" section in the JIT kernel dev guide for
+/// usage examples.
+
 #pragma once
 #include <sgl_kernel/utils.h>
 
@@ -23,17 +34,6 @@
 #ifdef __CUDACC__
 #include <sgl_kernel/utils.cuh>
 #endif
-
-/// \file tensor.h
-/// \brief Tensor validation and symbolic matching utilities.
-///
-/// Provides the `TensorMatcher` fluent API for validating tensor shapes,
-/// strides, dtypes, and devices at kernel entry points, along with
-/// `SymbolicSize`, `SymbolicDType`, and `SymbolicDevice` for capturing
-/// and cross-checking tensor metadata across multiple tensors.
-///
-/// See the "Tensor Checking" section in the JIT kernel dev guide for
-/// usage examples.
 
 namespace host {
 

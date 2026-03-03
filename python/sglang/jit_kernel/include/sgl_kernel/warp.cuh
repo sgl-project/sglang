@@ -1,8 +1,8 @@
-#pragma once
-#include <sgl_kernel/math.cuh>
-
 /// \file warp.cuh
 /// \brief Warp-level reduction primitives using `__shfl_xor_sync`.
+
+#pragma once
+#include <sgl_kernel/math.cuh>
 
 namespace device::warp {
 

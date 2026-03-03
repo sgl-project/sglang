@@ -1,8 +1,8 @@
-#pragma once
-#include <sgl_kernel/utils.cuh>
-
 /// \file atomic.cuh
 /// \brief Device-side atomic operations.
+
+#pragma once
+#include <sgl_kernel/utils.cuh>
 
 namespace device::atomic {
 

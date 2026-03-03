@@ -1,22 +1,22 @@
+/// \file tile.cuh
+/// \brief Tiled memory access helpers for coalesced global memory I/O.
+///
+/// `tile::Memory<T>` represents a contiguous memory region where multiple
+/// threads cooperatively load/store elements. The three factory methods
+/// determine the thread group:
+/// - `thread()` – single thread (no tiling).
+/// - `warp()`   – all threads in a warp cooperate.
+/// - `cta()`    – all threads in the CTA cooperate.
+
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
 
-/// \file tile.cuh
-/// \brief Tiled memory access helpers for coalesced global memory I/O.
-///
-/// `tile::Memory<T>` distributes a contiguous array of `T` elements across
-/// threads so that each thread loads/stores one element per tile. The three
-/// factory methods determine the thread group:
-/// - `thread()` – single thread (no tiling).
-/// - `warp()`   – all threads in a warp cooperate.
-/// - `cta()`    – all threads in the CTA cooperate.
-
 namespace device::tile {
 
 /**
- * \brief Cooperative tiled memory accessor.
+ * \brief Represents a contiguous memory region for cooperative tiled access.
  *
  * Each instance is parameterized by an element type `T` and bound to a
  * specific thread id (`tid`) within a group of `tsize` threads.

@@ -1,3 +1,18 @@
+/// \file utils.cuh
+/// \brief Core CUDA/device utilities: type aliases, PDL helpers,
+///        typed pointer access, kernel launch wrapper, and error checking.
+///
+/// This header is included (directly or transitively) by nearly every
+/// JIT kernel. It provides:
+/// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, …).
+/// - `SGL_DEVICE` macro (forced-inline device function qualifier).
+/// - `kWarpThreads` constant (32).
+/// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
+/// - Typed `load_as` / `store_as` for void-pointer access.
+/// - `pointer::offset` for safe void-pointer arithmetic.
+/// - `host::LaunchKernel` — kernel launcher with optional PDL.
+/// - `host::RuntimeDeviceCheck` — CUDA error checking.
+
 #pragma once
 
 #include <sgl_kernel/utils.h>
@@ -30,21 +45,6 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
 #endif
-
-/// \file utils.cuh
-/// \brief Core CUDA/device utilities: type aliases, PDL helpers,
-///        typed pointer access, kernel launch wrapper, and error checking.
-///
-/// This header is included (directly or transitively) by nearly every
-/// JIT kernel. It provides:
-/// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, …).
-/// - `SGL_DEVICE` macro (forced-inline device function qualifier).
-/// - `kWarpThreads` constant (32).
-/// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
-/// - Typed `load_as` / `store_as` for void-pointer access.
-/// - `pointer::offset` for safe void-pointer arithmetic.
-/// - `host::LaunchKernel` — kernel launcher with optional PDL.
-/// - `host::RuntimeDeviceCheck` — CUDA error checking.
 
 #ifndef USE_ROCM
 using fp32_t = float;

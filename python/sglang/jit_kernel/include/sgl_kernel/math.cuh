@@ -1,14 +1,14 @@
-#pragma once
-#include <sgl_kernel/type.cuh>
-
-#include <cmath>
-
 /// \file math.cuh
 /// \brief Device-side math helper functions and constants.
 ///
 /// Provides type-generic wrappers around CUDA math intrinsics by
 /// dispatching through `dtype_trait<T>`. All functions are forced-inline
 /// device functions.
+
+#pragma once
+#include <sgl_kernel/type.cuh>
+
+#include <cmath>
 
 namespace device::math {
 

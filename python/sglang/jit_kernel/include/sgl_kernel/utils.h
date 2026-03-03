@@ -1,3 +1,15 @@
+/// \file utils.h
+/// \brief Host-side C++ utilities used by JIT kernel wrappers.
+///
+/// Provides:
+/// - `DebugInfo` — wraps `std::source_location` for error reporting.
+/// - `RuntimeCheck` — runtime assertion with formatted error messages.
+/// - `Panic` — unconditional abort with formatted error messages.
+/// - `pointer::offset` — safe void-pointer arithmetic (host side).
+/// - `div_ceil` — integer ceiling division.
+/// - `dtype_bytes` — byte width of a `DLDataType`.
+/// - `irange` — Python-style integer range for range-for loops.
+
 #pragma once
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
@@ -41,18 +53,6 @@
 #include <ranges>
 #include <sstream>
 #include <utility>
-
-/// \file utils.h
-/// \brief Host-side C++ utilities used by JIT kernel wrappers.
-///
-/// Provides:
-/// - `DebugInfo` — wraps `std::source_location` for error reporting.
-/// - `RuntimeCheck` — runtime assertion with formatted error messages.
-/// - `Panic` — unconditional abort with formatted error messages.
-/// - `pointer::offset` — safe void-pointer arithmetic (host side).
-/// - `div_ceil` — integer ceiling division.
-/// - `dtype_bytes` — byte width of a `DLDataType`.
-/// - `irange` — Python-style integer range for range-for loops.
 
 namespace host {
 

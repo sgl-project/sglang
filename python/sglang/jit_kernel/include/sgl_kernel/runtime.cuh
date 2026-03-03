@@ -1,3 +1,9 @@
+/// \file runtime.cuh
+/// \brief Host-side CUDA runtime query helpers.
+///
+/// Thin wrappers around CUDA occupancy and device-property APIs with
+/// automatic error checking via `RuntimeDeviceCheck`.
+
 #pragma once
 
 #include <sgl_kernel/utils.cuh>
@@ -5,12 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
-
-/// \file runtime.cuh
-/// \brief Host-side CUDA runtime query helpers.
-///
-/// Thin wrappers around CUDA occupancy and device-property APIs with
-/// automatic error checking via `RuntimeDeviceCheck`.
 
 namespace host::runtime {
 
