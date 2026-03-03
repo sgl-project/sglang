@@ -193,6 +193,10 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or is_deepseek_nsa(self.hf_text_config)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -661,7 +665,10 @@ class ModelConfig:
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
             # Identify modelopt quantization
-            if "quant_method" not in quant_cfg:
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
                 parsed_cfg = self._parse_modelopt_quant_config(
                     {"quantization": quant_cfg}
                 )
@@ -1274,6 +1281,14 @@ multimodal_model_archs = [
     "KimiK25ForConditionalGeneration",
 ]
 
+piecewise_cuda_graph_disabled_model_archs = [
+    "DeepseekV32ForCausalLM",
+    "Qwen3NextForCausalLM",
+    "GlmMoeDsaForCausalLM",
+    "BailingMoeV2_5ForCausalLM",
+    "LLaDAModelLM",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1327,6 +1342,13 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         return False
     else:
         return True
+
+
+def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+    return any(
+        arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
