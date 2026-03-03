@@ -1157,7 +1157,7 @@ class MooncakeKVSender(CommonKVSender):
             f"MooncakeKVSender send with kv_indices: {kv_indices=} and index_slice: {index_slice} and curr_idx: {self.curr_idx} and is_last_chunk: {is_last_chunk}"
         )
 
-        # Special handling for cp transfer
+        # Special handling for cp
         if self.kv_mgr.enable_cp_all_ranks_transfer:
             total_pages = len(kv_indices)
             cp_rank = self.kv_mgr.attn_cp_rank
@@ -1171,23 +1171,25 @@ class MooncakeKVSender(CommonKVSender):
             )
 
             if rank_page_indices.size == 0:
-                return
+                kv_indices = kv_indices[:0]
+                index_slice = slice(index_slice.start, index_slice.start)
+            else:
+                mask = np.isin(kv_indices, rank_page_indices)
+                if not mask.any():
+                    kv_indices = kv_indices[:0]
+                    index_slice = slice(index_slice.start, index_slice.start)
+                else:
+                    first_pos = int(mask.argmax())
+                    last_pos = len(mask) - int(mask[::-1].argmax())
 
-            mask = np.isin(kv_indices, rank_page_indices)
-            if not mask.any():
-                # Skip this chunk for this CP rank
-                logger.debug(f"Skip this chunk for this CP rank: {kv_indices=}")
-                return
-
-            first_pos = int(mask.argmax())
-            last_pos = len(mask) - int(mask[::-1].argmax())
-
-            kv_indices = kv_indices[first_pos:last_pos]
-            index_slice = slice(
-                index_slice.start + first_pos,
-                index_slice.start + last_pos,
+                    kv_indices = kv_indices[first_pos:last_pos]
+                    index_slice = slice(
+                        index_slice.start + first_pos,
+                        index_slice.start + last_pos,
+                    )
+            logger.debug(
+                f"After filter for this CP rank: {kv_indices=}, {index_slice=}"
             )
-            logger.debug(f"After filter for this CP rank: {kv_indices=}")
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
                 return
