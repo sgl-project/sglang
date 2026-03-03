@@ -459,8 +459,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
-            hasattr(self.qkv_a_proj.quant_method, "quant_config")
-            and self.qkv_a_proj.quant_method.quant_config.get_name() == "modelslim"
+            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+            and self.qkv_a_proj.quant_method.quantization_config.get_name()
+            == "modelslim"
         )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
