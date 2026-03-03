@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -91,6 +93,35 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             metrics["accuracy"], 0.23
         )  # 0.3333 for 60 questions; 0.234 for 1319 questions
         assert self.process.poll() is None
+
+    def test_openai_completion_logprobs(self):
+        max_tokens = 8
+        response = requests.post(
+            self.base_url + "/v1/completions",
+            json={
+                "model": self.model,
+                "prompt": "The capital city of France is",
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "logprobs": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200, msg=response.text)
+
+        response_json = response.json()
+        self.assertIn("choices", response_json)
+        self.assertGreater(len(response_json["choices"]), 0)
+
+        logprobs = response_json["choices"][0]["logprobs"]
+        self.assertEqual(len(logprobs["token_logprobs"]), len(logprobs["tokens"]))
+        self.assertEqual(len(logprobs["top_logprobs"]), len(logprobs["tokens"]))
+        self.assertGreater(len(logprobs["token_logprobs"]), 0)
+
+        usage = response_json.get("usage")
+        if usage is not None:
+            self.assertEqual(
+                len(logprobs["token_logprobs"]), usage["completion_tokens"]
+            )
 
 
 class TestEagleServerPage(TestEagleServerBase):

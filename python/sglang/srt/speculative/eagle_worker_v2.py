@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.utils.logprob import get_top_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -498,6 +499,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        # Spec v2 logprobs are computed in verify(); draft prefill should not
+        # request logits-processor logprobs
+        forward_batch.return_logprob = False
         logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         # Update spec_info for the next draft step
@@ -533,6 +537,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
+        # Keep logprob computation in verify(); draft-extend is KV maintenance
+        forward_batch.return_logprob = False
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -784,6 +790,44 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+        if batch.return_logprob:
+            accepted_indices = accept_index[accept_index != -1].to(torch.int64)
+            accepted_logits = logits_output.next_token_logits[accepted_indices]
+            if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+                logprobs = torch.nn.functional.log_softmax(accepted_logits, dim=-1)
+            else:
+                temperatures = batch.sampling_info.temperatures[
+                    accepted_indices // verify_input.draft_token_num
+                ]
+                logprobs = torch.nn.functional.log_softmax(
+                    accepted_logits / temperatures, dim=-1
+                )
+
+            accepted_token_ids = predict[accepted_indices].to(torch.int64)
+            logits_output.next_token_logprobs = logprobs[
+                torch.arange(
+                    accepted_token_ids.shape[0], device=accepted_token_ids.device
+                ),
+                accepted_token_ids,
+            ]
+
+            if any(x > 0 for x in batch.top_logprobs_nums):
+                top_logprobs_nums_repeat_interleaved = [
+                    num
+                    for num, num_tokens in zip(
+                        batch.top_logprobs_nums,
+                        accept_length.tolist(),
+                        strict=True,
+                    )
+                    for _ in range(num_tokens)
+                ]
+                (
+                    logits_output.next_token_top_logprobs_val,
+                    logits_output.next_token_top_logprobs_idx,
+                ) = get_top_logprobs(logprobs, top_logprobs_nums_repeat_interleaved)
+            else:
+                logits_output.next_token_top_logprobs_val = None
+                logits_output.next_token_top_logprobs_idx = None
         new_seq_lens = batch.seq_lens + accept_length
 
         # Update mamba state for hybrid GDN models after verification

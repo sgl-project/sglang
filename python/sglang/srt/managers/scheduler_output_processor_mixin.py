@@ -407,6 +407,8 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        next_token_logprobs = None
+        spec_v2_logprob_pt = 0
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
@@ -414,6 +416,12 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            if (
+                batch.return_logprob
+                and logits_output is not None
+                and logits_output.next_token_logprobs is not None
+            ):
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -429,6 +437,12 @@ class SchedulerOutputProcessorMixin:
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
+            if batch.is_spec_v2 and next_token_logprobs is not None:
+                spec_v2_start = spec_v2_logprob_pt
+                spec_v2_logprob_pt += len(next_token_id)
+                spec_v2_end = spec_v2_logprob_pt
+            else:
+                spec_v2_start = spec_v2_end = None
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
@@ -489,6 +503,30 @@ class SchedulerOutputProcessorMixin:
                     )
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
+                    )
+            elif (
+                req.return_logprob
+                and batch.is_spec_v2
+                and spec_v2_start is not None
+                and spec_v2_end is not None
+            ):
+                req.output_token_logprobs_val.extend(
+                    next_token_logprobs[spec_v2_start:spec_v2_end]
+                )
+                req.output_token_logprobs_idx.extend(next_token_id)
+                if (
+                    req.top_logprobs_num > 0
+                    and logits_output.next_token_top_logprobs_val is not None
+                ):
+                    req.output_top_logprobs_val.extend(
+                        logits_output.next_token_top_logprobs_val[
+                            spec_v2_start:spec_v2_end
+                        ]
+                    )
+                    req.output_top_logprobs_idx.extend(
+                        logits_output.next_token_top_logprobs_idx[
+                            spec_v2_start:spec_v2_end
+                        ]
                     )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
