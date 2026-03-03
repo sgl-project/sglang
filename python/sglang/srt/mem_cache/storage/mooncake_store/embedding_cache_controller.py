@@ -152,7 +152,10 @@ class EmbeddingCacheController:
         """Issues ONE batch GET for all missing images in the request."""
         dim = self.hidden_dims.get(modality) if modality is not None else None
         if not dim:
-            dim = next(iter(self.hidden_dims.values()), 1024)
+            logger.warning(
+                f"Req {req_id}: Unknown dim for modality={modality}, skipping prefetch (will fallback to ViT)."
+            )
+            return
         keys, ptrs, sizes = [], [], []
 
         with self.lock:
