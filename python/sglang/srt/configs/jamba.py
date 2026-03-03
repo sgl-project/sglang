@@ -222,7 +222,10 @@ class JambaConfig(PretrainedConfig):
 
     def _get_layer_ffn_type(self, layer_idx: int) -> str:
         """Determine if layer uses MoE or dense MLP."""
-        if (layer_idx - self.expert_layer_offset) % self.expert_layer_period == 0:
+        if (
+            self.num_experts > 1
+            and (layer_idx - self.expert_layer_offset) % self.expert_layer_period == 0
+        ):
             return MOE
         return MLP
 

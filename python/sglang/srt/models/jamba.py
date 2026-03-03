@@ -372,8 +372,9 @@ class JambaMambaMixer1(nn.Module):
         num_prefill_tokens = num_tokens - num_decodes
 
         # 1. Input projection
+        # HF convention: first half = x (main branch), second half = z (gate)
         projected, _ = self.in_proj(hidden_states)
-        z, x = projected.chunk(2, dim=-1)
+        x, z = projected.chunk(2, dim=-1)
 
         # Split by prefill/decode
         x_p, x_d = x[:num_prefill_tokens], x[num_prefill_tokens:]
@@ -898,9 +899,19 @@ class JambaForCausalLM(nn.Module):
             ) and not self.pp_group.is_last_rank:
                 continue
 
+            # Map HF router weight name to SGLang gate param name
+            if "feed_forward.router." in name:
+                name = name.replace("feed_forward.router.", "feed_forward.gate.")
+
             # Handle stacked params (QKV, gate_up)
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+                # Skip expert weights here - they are handled by
+                # expert_params_mapping below. Without this guard,
+                # "gate_proj" in "experts.0.gate_proj" would match and
+                # corrupt the name to "experts.0.gate_up_proj".
+                if "feed_forward.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
