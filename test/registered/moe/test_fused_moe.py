@@ -1,9 +1,11 @@
 import unittest
+from unittest import mock
 
 import torch
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.fused_moe_triton import fused_moe as fused_moe_module
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -238,6 +240,70 @@ class TestFusedMOE(CustomTestCase):
                                             )
                                             empty_gpu_cache()
                                         pbar.update(1)
+
+    @unittest.skipUnless(_is_hip, "ROCm-only regression test")
+    def test_fp8_unpadded_weights_with_global_moe_padding(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+        m, n, k, e, topk = 16, 64, 256, 8, 2
+        dtype = torch.bfloat16
+        rtol, atol = self.get_tolerance(dtype)
+
+        a = self.create_random_gpu_tensor((m, k), dtype)
+        w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype).to(
+            torch.float8_e4m3fn
+        )
+        w2 = self.create_random_gpu_tensor((e, k, n), dtype).to(torch.float8_e4m3fn)
+        score = self.create_random_gpu_tensor((m, e), dtype)
+        w1_scale = self.create_random_gpu_tensor(e, torch.float32)
+        w2_scale = self.create_random_gpu_tensor(e, torch.float32)
+        a1_scale = self.create_random_gpu_tensor(1, torch.float32)
+        a2_scale = self.create_random_gpu_tensor(1, torch.float32)
+
+        if _is_fp8_fnuz:
+            w1, w1_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w1,
+                weight_scale=w1_scale,
+                input_scale=a1_scale,
+            )
+            w2, w2_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w2,
+                weight_scale=w2_scale,
+                input_scale=a2_scale,
+            )
+
+        topk_output = select_experts(
+            hidden_states=a,
+            router_logits=score,
+            topk_config=TopKConfig(top_k=topk, renormalize=False),
+        )
+
+        torch_output = self.torch_naive_moe(
+            a,
+            w1,
+            w2,
+            score,
+            topk,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+        )
+
+        with mock.patch.object(fused_moe_module, "padding_size", 128):
+            sglang_output = fused_moe(
+                a,
+                w1,
+                w2,
+                topk_output,
+                use_fp8_w8a8=True,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+            )
+
+        torch.testing.assert_close(sglang_output, torch_output, rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":

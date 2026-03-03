@@ -1541,6 +1541,23 @@ Raises:
 """
 if _is_hip:
 
+    def _copy_with_optional_row_padding(
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        pad_value: float = 0.0,
+    ) -> None:
+        if dst.shape == src.shape:
+            dst.copy_(src)
+            return
+
+        assert dst.ndim == src.ndim == 2
+        assert dst.shape[0] >= src.shape[0] and dst.shape[1] == src.shape[1], (
+            f"Unexpected padded copy shapes: dst={tuple(dst.shape)}, src={tuple(src.shape)}"
+        )
+        dst[: src.shape[0]].copy_(src)
+        if dst.shape[0] > src.shape[0]:
+            dst[src.shape[0] :].fill_(pad_value)
+
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
         M, N = input.shape
@@ -1549,10 +1566,10 @@ if _is_hip:
         absmax = input.abs().max(dim=1, keepdim=True).values
         absmax = torch.clamp(absmax, min=eps)
         scale_val = absmax / fp8_max
-        scale.copy_(scale_val)
+        _copy_with_optional_row_padding(scale, scale_val, pad_value=1.0)
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        _copy_with_optional_row_padding(output, output_data, pad_value=0.0)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
@@ -1564,13 +1581,13 @@ if _is_hip:
         scale.view(-1).copy_(scale_val.view(-1))
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        _copy_with_optional_row_padding(output, output_data, pad_value=0.0)
 
     def _native_static_quant_fp8(output, input, scale):
         """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        _copy_with_optional_row_padding(output, output_data, pad_value=0.0)
 
     def scaled_fp8_quant(
         input: torch.Tensor,
