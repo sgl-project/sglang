@@ -99,11 +99,6 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
 ```
 
-```{tip}
-CuTe DSL only supports decode. To use CuTe DSL for decode while keeping Triton for prefill, set `--linear-attn-decode-backend cutedsl`. Do **not** set `--linear-attn-backend cutedsl` directly, as this will fail during prefill.
-```
-
-
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
 ```{warning}
@@ -298,46 +293,6 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend torch_native
-```
-
-- GDN Models (e.g., Qwen 3.5)
-
-GDN is automatically activated for hybrid GDN models. The `--attention-backend` flag controls the **full-attention layers**, while `--linear-attn-backend` controls the **GDN linear attention layers**.
-
-```bash
-# Default: auto-select full-attention backend, Triton GDN kernel
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B \
-  --tp 8 \
-  --trust-remote-code
-
-# Use CuTe DSL for GDN decode (CUDA only, Triton still used for prefill)
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B \
-  --tp 8 \
-  --trust-remote-code \
-  --linear-attn-decode-backend cutedsl
-
-# Blackwell: must specify a supported full-attention backend
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B \
-  --tp 8 \
-  --attention-backend triton \
-  --trust-remote-code
-
-# AMD (ROCm): use triton for both full attention and GDN layers
-SGLANG_USE_AITER=1 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B \
-  --tp 8 \
-  --attention-backend triton \
-  --trust-remote-code
-
-# NPU (Ascend): use ascend for full attention layers
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B \
-  --tp 8 \
-  --attention-backend ascend \
-  --trust-remote-code
 ```
 
 ## Steps to add a new attention backend
