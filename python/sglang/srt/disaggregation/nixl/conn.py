@@ -1066,7 +1066,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_aux_data_ptrs,
                         packed_state_data_ptrs,
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
+                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]

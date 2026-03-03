@@ -6,7 +6,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
@@ -80,6 +80,19 @@ class TestNormalizeParallelInfo:
             }
         }
         assert normalize_parallel_info(meta) == {}
+
+    def test_recompute_pseudo_from_top_level_meta(self) -> None:
+        """recompute_pseudo_rank/size at top-level meta is extracted alongside TP."""
+        meta = {
+            "recompute_pseudo_rank": 1,
+            "recompute_pseudo_size": 2,
+            "sglang_parallel_info": {"tp_rank": 0, "tp_size": 2},
+        }
+        result = normalize_parallel_info(meta)
+        assert result == {
+            ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2),
+            ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+        }
 
 
 if __name__ == "__main__":
