@@ -128,7 +128,7 @@ class CommonKVManager(BaseKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER is True, all CP ranks
-            # participate in KV transfer (page-split); otherwise only rank 0 sends.
+            # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_cp_all_ranks_transfer
                 and self.attn_cp_size > 1
@@ -502,7 +502,7 @@ class CommonKVReceiver(BaseKVReceiver):
             f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to 1",
         )
         if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
-            # This means that the prefill cp size is 1, so we only need to retrieve from the prefill cp rank
+            # This means that the prefill cp size is 1
             assert self.prefill_info.attn_cp_size == 1, (
                 f"When prefill cp size is 1, attn cp size should be 1, but got {self.kv_mgr.attn_cp_size}",
             )

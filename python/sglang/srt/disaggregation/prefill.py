@@ -738,5 +738,4 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-
         req.disagg_kv_sender.send(page_indices, state_indices)
