@@ -485,11 +485,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
-            if dp_size <= 1:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} is not supported because dp_size={dp_size}"
+            if dp_size <= 1 and obj.routed_dp_rank == 0:
+                logger.warning(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
-            if obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
