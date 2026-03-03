@@ -471,9 +471,17 @@ class CommonKVReceiver(BaseKVReceiver):
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
-            if self.kv_mgr.is_mla_backend:
+
+            if self.kv_mgr.is_mla_backend and (
+                len(self.kv_mgr.kv_args.draft_kv_data_ptrs) == 0
+                or self.kv_mgr.is_draft_mla_backend
+            ):
+                # 1.MLA target model with non-draft
+                # 2.MLA target model with MLA draft
                 self.required_prefill_response_num = 1
             else:
+                # 1.non-MLA models
+                # 2.MLA target and MHA draft models
                 self.required_prefill_response_num = (
                     self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
                 )
@@ -567,10 +575,10 @@ class CommonKVReceiver(BaseKVReceiver):
                             else:
                                 bootstrap_info["is_send_target"] = True
 
-                                logger.debug(
-                                    f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
-                                )
-                                bootstrap_infos.append(bootstrap_info)
+                            logger.debug(
+                                f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
+                            )
+                            bootstrap_infos.append(bootstrap_info)
                         else:
                             self.kv_mgr.record_failure(
                                 self.bootstrap_room,
