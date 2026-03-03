@@ -54,6 +54,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    JambaConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
@@ -105,6 +106,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetVLMConfig,
     KimiK25Config,
     Step3p5Config,
+    JambaConfig,
 ]
 
 _CONFIG_REGISTRY = {
@@ -113,7 +115,9 @@ _CONFIG_REGISTRY = {
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
+        # For configs that override built-in transformers configs (like JambaConfig),
+        # we need to force registration with exist_ok=True
+        AutoConfig.register(name, cls, exist_ok=True)
 
 
 def download_from_hf(

@@ -274,6 +274,7 @@ class JambaMambaMixer1(nn.Module):
         self.use_conv_bias = config.mamba_conv_bias
         self.use_bias = config.mamba_proj_bias
         self.layer_idx = layer_idx
+        self.rms_norm_eps = config.rms_norm_eps
 
         # Intermediate size after TP sharding
         self.intermediate_size_tp = self.intermediate_size // self.tp_size
@@ -281,9 +282,9 @@ class JambaMambaMixer1(nn.Module):
         # Input projection: x -> (z, x_proj) where x_proj -> (x, B, C)
         # z is the gate, x goes through conv and SSM
         # Total output: 2 * intermediate_size (for z and x_proj)
-        self.in_proj = ColumnParallelLinear(
+        self.in_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            self.intermediate_size * 2,
+            [self.intermediate_size, self.intermediate_size],
             bias=self.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
@@ -316,6 +317,11 @@ class JambaMambaMixer1(nn.Module):
             self.dt_rank + 2 * self.state_size,
             bias=False,
         )
+
+        # Layer norms for dt, B, C (critical for Jamba - prevents NaN)
+        self.dt_layernorm = RMSNorm(self.dt_rank, eps=self.rms_norm_eps)
+        self.b_layernorm = RMSNorm(self.state_size, eps=self.rms_norm_eps)
+        self.c_layernorm = RMSNorm(self.state_size, eps=self.rms_norm_eps)
 
         # A parameter (stored as log, converted to negative exp during forward)
         # Shape: (intermediate_size,) - not TP sharded, we shard during forward
@@ -401,6 +407,11 @@ class JambaMambaMixer1(nn.Module):
             x_dbc = self.x_proj(x_conv)
             dt, B, C = x_dbc.split([self.dt_rank, self.state_size, self.state_size], dim=-1)
 
+            # Apply layer norms (critical for numerical stability)
+            dt = self.dt_layernorm(dt)
+            B = self.b_layernorm(B)
+            C = self.c_layernorm(C)
+
             # dt projection
             dt, _ = self.dt_proj(dt)
 
@@ -420,29 +431,33 @@ class JambaMambaMixer1(nn.Module):
             for i, (x_i, dt_i, B_i, C_i, z_i) in enumerate(
                 zip(x_batched, dt_batched, B_batched, C_batched, z_batched)
             ):
-                # Add batch dim
-                x_i = x_i.unsqueeze(0)  # (1, L, D)
-                dt_i = dt_i.unsqueeze(0)
-                B_i = B_i.unsqueeze(0)
-                C_i = C_i.unsqueeze(0)
-                z_i = z_i.unsqueeze(0)
+                # Store original dtype for output conversion
+                dtype_in = x_i.dtype
 
-                # Selective scan
+                # Add batch dim: (L, D) -> (1, L, D), convert to float32 for numerical stability
+                x_i = x_i.unsqueeze(0).float()
+                dt_i = dt_i.unsqueeze(0).float()
+                B_i = B_i.unsqueeze(0).float()
+                C_i = C_i.unsqueeze(0).float()
+                z_i = z_i.unsqueeze(0).float()
+
+                # Selective scan (mamba1_selective_scan handles transposition internally)
                 y_i, final_state = mamba1_selective_scan(
                     x_i,
                     dt_i,
                     A,
                     B_i,
                     C_i,
-                    D=self.D,
+                    D=self.D.float(),
                     z=z_i,
                     delta_softplus=True,
                     return_last_state=True,
                 )
 
-                # Update SSM state
+                # Update SSM state (keep as float32 for numerical precision)
                 ssm_state[state_indices_p[i]] = final_state.squeeze(0)
-                outputs_p.append(y_i.squeeze(0))
+                # Convert output back: (1, L, D) -> (L, D) and cast to original dtype
+                outputs_p.append(y_i.squeeze(0).to(dtype_in))
 
             output[:num_prefill_tokens] = torch.cat(outputs_p, dim=0)
 
@@ -466,13 +481,18 @@ class JambaMambaMixer1(nn.Module):
             x_dbc = self.x_proj(x_conv)
             dt, B, C = x_dbc.split([self.dt_rank, self.state_size, self.state_size], dim=-1)
 
+            # Apply layer norms (critical for numerical stability)
+            dt = self.dt_layernorm(dt)
+            B = self.b_layernorm(B)
+            C = self.c_layernorm(C)
+
             # dt projection
             dt, _ = self.dt_proj(dt)
 
             # Get A
             A = -torch.exp(self.A_log.float())
 
-            # Selective state update for decode
+            # Selective state update for decode (using Mamba1-specific kernel)
             y_d = mamba1_selective_state_update(
                 ssm_state,
                 x_conv,
@@ -480,7 +500,7 @@ class JambaMambaMixer1(nn.Module):
                 A,
                 B,
                 C,
-                D=self.D,
+                D=self.D.float(),
                 z=z_d,
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,

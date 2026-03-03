@@ -372,13 +372,20 @@ def selective_state_update(
             z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
-    if out.dim() == 2:
-        out = out.unsqueeze(1)
-    if out.dim() == 3:
-        out = out.unsqueeze(1)
 
+    # Get dimensions after normalization
     _, nheads, dim, dstate = state.shape
-    batch, T, _, _ = x.shape
+    batch = x.shape[0]
+    T = x.shape[1]
+
+    # Create output tensor if not provided
+    if out is None:
+        out = torch.empty((batch, T, nheads, dim), dtype=x.dtype, device=x.device)
+    else:
+        if out.dim() == 2:
+            out = out.unsqueeze(1)
+        if out.dim() == 3:
+            out = out.unsqueeze(1)
 
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
@@ -463,7 +470,7 @@ def selective_state_update(
             dt.stride(1),
             dt.stride(2),
             dt.stride(3),
-            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
+            *((dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else (0, 0)),
             A.stride(0),
             A.stride(1),
             A.stride(2),
@@ -475,7 +482,7 @@ def selective_state_update(
             C.stride(1),
             C.stride(2),
             C.stride(3),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
+            *((D.stride(0), D.stride(1)) if D is not None else (0, 0)),
             z_strides[0],
             z_strides[1],
             z_strides[2],
@@ -492,3 +499,13 @@ def selective_state_update(
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
         )
+
+    # Squeeze output back to original dimensions if needed
+    # For Mamba1 decode: (batch, 1, 1, dim) -> (batch, dim)
+    # For Mamba2 decode: (batch, 1, nheads, dim) -> (batch, nheads, dim)
+    if T == 1:
+        out = out.squeeze(1)  # Remove T dimension
+    if nheads == 1:
+        out = out.squeeze(1)  # Remove nheads dimension for Mamba1
+
+    return out

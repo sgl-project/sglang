@@ -232,7 +232,8 @@ def mamba1_selective_state_update(
         pad_slot_id: padding slot ID to skip
         out: (batch, dim) - optional preallocated output tensor
     """
-    batch, dim, dstate = state.shape
+    _, dim, dstate = state.shape
+    batch = x.shape[0]
     assert x.shape == (batch, dim)
     assert dt.shape == (batch, dim)
     assert A.shape == (dim, dstate)
@@ -360,7 +361,8 @@ def mamba1_selective_scan_ref(
     ys = []
     for i in range(seqlen):
         x = deltaA[:, i] * x + deltaB_u[:, i]
-        y = torch.einsum("bdn,bn->bd", x, C[:, i])
+        # Cast C to same dtype as x for einsum
+        y = torch.einsum("bdn,bn->bd", x, C[:, i].to(x.dtype))
         ys.append(y)
 
     y = torch.stack(ys, dim=1)  # (B, L, D)
