@@ -66,7 +66,8 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
                 )
             )
 
-        mm_items[0].audio_feature_lens = output_lengths
+        if mm_items:
+            mm_items[0].audio_feature_lens = output_lengths
 
         return {
             "mm_items": mm_items,

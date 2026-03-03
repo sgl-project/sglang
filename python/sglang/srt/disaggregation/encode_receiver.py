@@ -92,14 +92,10 @@ class EmbeddingData:
             error_msg=self.error_msg,
             error_code=self.error_code,
         )
-        for key in dir(self):
-            if (
-                key.startswith("_")
-                or key == "embedding"
-                or callable(getattr(self, key, None))
-            ):
+        for key, value in self.__dict__.items():
+            if key.startswith("_") or key == "embedding":
                 continue
-            setattr(new_data, key, getattr(self, key, None))
+            setattr(new_data, key, value)
         return new_data
 
 
@@ -203,8 +199,6 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape=embedding_data.shape,
             **extra,
         )
-        if embedding_data.modality == Modality.VIDEO:
-            mm_data._set_video_meta_for_part(embedding_data.part_idx, extra)
         mm_data.send_time = embedding_data.send_time
         return mm_data
 
@@ -233,13 +227,16 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
-        for attr in _VIDEO_META_ATTRS:
-            lst = getattr(self, attr, None)
-            if not lst:
-                continue
-            valid = [a for a in lst if a is not None]
-            if valid:
-                kwargs[attr] = list(itertools.chain(*valid))
+        # video_timestamps: list-of-lists per part → flatten into single list
+        vts = [a for a in self.video_timestamps if a is not None]
+        if vts:
+            kwargs["video_timestamps"] = list(itertools.chain.from_iterable(vts))
+        # second_per_grid_ts: tensor per part → concatenate into single tensor
+        sps = [a for a in self.second_per_grid_ts if a is not None]
+        if sps:
+            kwargs["second_per_grid_ts"] = (
+                torch.cat(sps) if isinstance(sps[0], torch.Tensor) else sps
+            )
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
@@ -500,7 +497,6 @@ class MMReceiverHTTP(MMReceiverBase):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
-        self.encode_idx = list(range(len(self.encode_urls)))
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
@@ -769,9 +765,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 part_req_id = create_part_req_id(req_id, part_idx)
                 encode_requests.append(
                     {
-                        "encoder_idx": self.encode_idx[
-                            idx
-                        ],  # use shuffle-idx to load-balance
+                        "encoder_idx": idx,
                         "mm_items": [
                             mm_item.get("url")
                             for mm_item in mm_data_modality[

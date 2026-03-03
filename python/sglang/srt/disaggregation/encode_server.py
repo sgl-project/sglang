@@ -407,12 +407,20 @@ class MMEncoder:
 
         try:
             # Note: AutoProcessor is used for audio processor
-            self.audio_processor = AutoProcessor.from_pretrained(
+            _audio_proc = AutoProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 use_fast=not server_args.disable_fast_image_processor,
             )
+            if not hasattr(_audio_proc, "feature_extractor"):
+                logger.warning(
+                    "Loaded AutoProcessor has no feature_extractor attribute, "
+                    "audio processing will be unavailable."
+                )
+                self.audio_processor = None
+            else:
+                self.audio_processor = _audio_proc
         except Exception as e:
             logger.warning(f"Failed to load audio processor: {e}")
             self.audio_processor = None
