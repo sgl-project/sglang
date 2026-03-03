@@ -2,12 +2,14 @@ import glob
 import json
 import os
 import re
+import subprocess
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import requests
+from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -17,8 +19,8 @@ logger = init_logger(__name__)
 @dataclass
 class RequestFuncInput:
     prompt: str
-    api_url: str
-    model: str
+    api_url: str = ""
+    model: str = ""
     width: Optional[int] = None
     height: Optional[int] = None
     num_frames: Optional[int] = None
@@ -38,12 +40,12 @@ class RequestFuncOutput:
     peak_memory_mb: float = 0.0
 
 
-def is_dir_not_empty(path):
+def is_dir_not_empty(path: str) -> bool:
     return os.path.isdir(path) and bool(os.listdir(path))
 
 
 class BaseDataset(ABC):
-    def __init__(self, args, api_url: str, model: str):
+    def __init__(self, args, api_url: str = "", model: str = ""):
         self.args = args
         self.api_url = api_url
         self.model = model
@@ -54,20 +56,11 @@ class BaseDataset(ABC):
         pass
 
     @abstractmethod
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> RequestFuncInput:
         pass
 
-    @abstractmethod
-    def get_batch(self, indices: List[int]) -> List[Dict[str, Any]]:
-        pass
-
-    @abstractmethod
-    def get_request(self, idx: int) -> RequestFuncInput:
-        pass
-
-    @abstractmethod
     def get_requests(self) -> List[RequestFuncInput]:
-        pass
+        return [self[i] for i in range(len(self))]
 
 
 class VBenchDataset(BaseDataset):
@@ -147,7 +140,6 @@ class VBenchDataset(BaseDataset):
             os.chmod(script_path, 0o755)
 
             logger.info("Executing download_data.sh (this may take a while)...")
-            import subprocess
 
             result = subprocess.run(
                 ["bash", script_path],
@@ -208,7 +200,6 @@ class VBenchDataset(BaseDataset):
             files.extend(glob.glob(os.path.join(path, ext)))
             files.extend(glob.glob(os.path.join(path, ext.upper())))
 
-            # Also check in data/origin subdirectory
             origin_dir = os.path.join(path, "data", "origin")
             if os.path.exists(origin_dir):
                 files.extend(glob.glob(os.path.join(origin_dir, ext)))
@@ -225,29 +216,21 @@ class VBenchDataset(BaseDataset):
 
         dummy_image = os.path.join(self.cache_dir, "dummy_image.jpg")
         if not os.path.exists(dummy_image):
-            try:
-                from PIL import Image
-
-                os.makedirs(self.cache_dir, exist_ok=True)
-                img = Image.new("RGB", (100, 100), color="red")
-                img.save(dummy_image)
-                logger.info(f"Created dummy image at {dummy_image}")
-            except ImportError:
-                logger.info("PIL not installed, cannot create dummy image.")
-                return []
+            os.makedirs(self.cache_dir, exist_ok=True)
+            img = Image.new("RGB", (100, 100), color="red")
+            img.save(dummy_image)
+            logger.info(f"Created dummy image at {dummy_image}")
 
         return [{"prompt": "A moving cat", "image_path": dummy_image}] * 10
 
     def _load_i2v_data(self) -> List[Dict[str, Any]]:
         """Load I2V data from VBench I2V dataset or user-provided path."""
         path = self.args.dataset_path
-        # Auto-download if no path provided
         if not path:
             path = self._auto_download_i2v_dataset()
             if not path:
                 return self._resize_data(self._create_dummy_data())
 
-        # Try to load from i2v-bench-info.json
         info_json_candidates = [
             os.path.join(path, "data", "i2v-bench-info.json"),
             path if path.endswith(".json") else None,
@@ -260,13 +243,11 @@ class VBenchDataset(BaseDataset):
                 except Exception as e:
                     logger.info(f"Failed to load {json_path}: {e}")
 
-        # Fallback: scan directory for images
         if os.path.isdir(path):
             data = self._scan_directory_for_images(path)
             if data:
                 return self._resize_data(data)
 
-        # Last resort: dummy data
         return self._resize_data(self._create_dummy_data())
 
     def _resize_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -283,19 +264,8 @@ class VBenchDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return self.items[idx]
-
-    def get_batch(self, indices: List[int]) -> List[Dict[str, Any]]:
-        return [self[i] for i in indices]
-
-    def get_request(self, idx: int) -> RequestFuncInput:
-        item = self[idx]
-        assert (
-            len(self.api_url) > 0
-        ), "API URL must be provided for generating requests."
-        assert len(self.model) > 0, "Model must be provided for generating requests."
-
+    def __getitem__(self, idx: int) -> RequestFuncInput:
+        item = self.items[idx]
         return RequestFuncInput(
             prompt=item.get("prompt", ""),
             api_url=self.api_url,
@@ -307,43 +277,22 @@ class VBenchDataset(BaseDataset):
             image_paths=[item["image_path"]] if "image_path" in item else None,
         )
 
-    def get_requests(self) -> List[RequestFuncInput]:
-        return [self.get_request(i) for i in range(len(self))]
-
 
 class RandomDataset(BaseDataset):
     def __init__(self, args, api_url: str = "", model: str = ""):
-        self.args = args
-        self.api_url = api_url
-        self.model = model
+        super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts or 100
 
     def __len__(self) -> int:
         return self.num_prompts
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return {
-            "prompt": f"Random prompt {idx} for benchmarking diffusion models",
-            "width": self.args.width,
-            "height": self.args.height,
-            "num_frames": self.args.num_frames,
-            "fps": self.args.fps,
-        }
-
-    def get_batch(self, indices: List[int]) -> List[Dict[str, Any]]:
-        return [self[i] for i in indices]
-
-    def get_request(self, idx: int) -> RequestFuncInput:
-        assert (
-            len(self.api_url) > 0
-        ), "API URL must be provided for generating requests."
-        assert len(self.model) > 0, "Model must be provided for generating requests."
-
+    def __getitem__(self, idx: int) -> RequestFuncInput:
         return RequestFuncInput(
+            prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            **self[idx],
+            width=self.args.width,
+            height=self.args.height,
+            num_frames=self.args.num_frames,
+            fps=self.args.fps,
         )
-
-    def get_requests(self) -> List[RequestFuncInput]:
-        return [self.get_request(i) for i in range(len(self))]
