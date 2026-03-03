@@ -424,6 +424,12 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
 }
 
+DEEPEP_SUITES = {
+    "stage-c-test-8-gpu-h20",
+    "stage-c-test-deepep-4-gpu",
+    "stage-c-test-deepep-8-gpu-h200",
+}
+
 
 def resolve_test_file(file_part):
     """
@@ -465,7 +471,7 @@ def detect_cuda_suite(file_path_from_test):
     """
     Read a test file and extract the suite from register_cuda_ci(suite="...").
 
-    Returns (suite_name, runner_label, error_message).
+    Returns (suite_name, runner_label, use_deepep, error_message).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -478,6 +484,7 @@ def detect_cuda_suite(file_path_from_test):
         return (
             None,
             None,
+            False,
             (
                 f"No `register_cuda_ci()` found in `{full_path}`.\n\n"
                 f"This file may not be a registered CUDA CI test."
@@ -491,12 +498,14 @@ def detect_cuda_suite(file_path_from_test):
         return (
             suite,
             None,
+            False,
             (
                 f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
                 f"Known suites: {known}"
             ),
         )
-    return suite, runner, None
+    use_deepep = suite in DEEPEP_SUITES
+    return suite, runner, use_deepep, None
 
 
 def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
@@ -541,7 +550,7 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
         return False
 
     # Detect suite and runner
-    suite, runner_label, err = detect_cuda_suite(resolved_path)
+    suite, runner_label, use_deepep, err = detect_cuda_suite(resolved_path)
     if err:
         comment.create_reaction("confused")
         pr.create_issue_comment(f"❌ {err}")
@@ -554,7 +563,7 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
 
     print(
         f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={suite}, runner={runner_label}, command='{test_command}'"
+        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, command='{test_command}'"
     )
 
     try:
@@ -583,12 +592,14 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
                 "test_command": test_command,
                 "runner_label": runner_label,
                 "pr_head_sha": pr_head_sha,
+                "use_deepep": str(use_deepep).lower(),
             }
         else:
             ref = pr.head.ref
             inputs = {
                 "test_command": test_command,
                 "runner_label": runner_label,
+                "use_deepep": str(use_deepep).lower(),
             }
 
         dispatch_time = time.time()
