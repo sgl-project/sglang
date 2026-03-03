@@ -19,6 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 class PixtralProcessor(BaseMultimodalProcessor):
     models = [PixtralVisionModel, PixtralForConditionalGeneration]
+    gpu_image_decode = False  # Pixtral processes loaded image as PIL image explicitly
 
     PAD_TOKEN = "<pad>"
     DEFAULT_IMAGE_TOKEN = "[IMG]"
