@@ -111,7 +111,7 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         self.enable_all_cp_ranks_for_transfer = (
-            envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
+            envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
 
         # bind zmq socket
@@ -127,7 +127,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # When SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER is True, all CP ranks
+            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
