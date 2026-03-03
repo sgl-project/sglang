@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -711,10 +711,32 @@ class CommunicateSimpleFn:
 
     @staticmethod
     def _scattered_to_tp_attn_full(
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(hidden_states, tuple):
+            gathered_hidden_states = []
+            for local_hidden_states in hidden_states:
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    output = torch.empty(
+                        (
+                            local_hidden_states.shape[0] * context.attn_tp_size,
+                            *local_hidden_states.shape[1:],
+                        ),
+                        dtype=local_hidden_states.dtype,
+                        device=local_hidden_states.device,
+                    )
+                attn_tp_all_gather_into_tensor(
+                    output,
+                    local_hidden_states,
+                )
+                gathered_hidden_states.append(output)
+            return tuple(gathered_hidden_states)
+
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,

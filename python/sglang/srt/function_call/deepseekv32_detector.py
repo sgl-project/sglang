@@ -158,9 +158,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if partial_match.group(2) == "true":
                     parameters[param_name] = param_value.strip()
                 else:
-                    parameters[param_name] = _partial_json_loads(
-                        param_value, Allow.ALL
-                    )[0]
+                    try:
+                        parameters[param_name] = _partial_json_loads(
+                            param_value, Allow.ALL
+                        )[0]
+                    except json.JSONDecodeError:
+                        parameters[param_name] = param_value.strip()
 
         return parameters
 
