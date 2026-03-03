@@ -59,26 +59,14 @@ __global__ void per_token_quant_fp8_kernel(const DType* __restrict__ input,
     AlignedVector<DType, kVecSize> in_vec;
     in_vec.load(token_input, i);
 
-    fp8_e4m3_t out_arr[kVecSize];
+    AlignedVector<fp8_e4m3_t, kVecSize> out_vec;
 #pragma unroll
     for (int j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(in_vec[j]) * scale_inv;
       val = math::max(math::min(val, math::FP8_E4M3_MAX), -math::FP8_E4M3_MAX);
-      out_arr[j] = static_cast<fp8_e4m3_t>(val);
+      out_vec[j] = static_cast<fp8_e4m3_t>(val);
     }
-
-    if constexpr (kVecSize == 16) {
-      *reinterpret_cast<uint4*>(token_output + i * kVecSize) = *reinterpret_cast<uint4*>(out_arr);
-    } else if constexpr (kVecSize == 8) {
-      *reinterpret_cast<uint2*>(token_output + i * kVecSize) = *reinterpret_cast<uint2*>(out_arr);
-    } else if constexpr (kVecSize == 4) {
-      *reinterpret_cast<unsigned int*>(token_output + i * kVecSize) = *reinterpret_cast<unsigned int*>(out_arr);
-    } else {
-#pragma unroll
-      for (int k = 0; k < kVecSize; ++k) {
-        token_output[i * kVecSize + k] = out_arr[k];
-      }
-    }
+    out_vec.store(token_output, i);
   }
 }
 
@@ -114,44 +102,25 @@ void per_token_quant_fp8(tvm::ffi::TensorView input,
   constexpr int kBlockSize = 256;
   constexpr int kMaxVecSize = 32 / sizeof(DType);
 
-  if (hidden_dim % kMaxVecSize == 0) {
-    constexpr int kVecSize = kMaxVecSize;
+  const auto* input_ptr = static_cast<const DType*>(input.data_ptr());
+  auto* output_q_ptr = static_cast<fp8_e4m3_t*>(output_q.data_ptr());
+  auto* output_s_ptr = static_cast<float*>(output_s.data_ptr());
+
+  auto launch = [&](auto kernel) {
     LaunchKernel(num_tokens, kBlockSize, device.unwrap())(
-        per_token_quant_fp8_kernel<DType, kVecSize>,
-        static_cast<const DType*>(input.data_ptr()),
-        static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-        static_cast<float*>(output_s.data_ptr()),
-        hidden_dim,
-        num_tokens);
+        kernel, input_ptr, output_q_ptr, output_s_ptr, hidden_dim, num_tokens);
+  };
+
+  if (hidden_dim % kMaxVecSize == 0) {
+    launch(per_token_quant_fp8_kernel<DType, kMaxVecSize>);
   } else if constexpr (kMaxVecSize > 8) {
     if (hidden_dim % 8 == 0) {
-      constexpr int kVecSize = 8;
-      LaunchKernel(num_tokens, kBlockSize, device.unwrap())(
-          per_token_quant_fp8_kernel<DType, kVecSize>,
-          static_cast<const DType*>(input.data_ptr()),
-          static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-          static_cast<float*>(output_s.data_ptr()),
-          hidden_dim,
-          num_tokens);
+      launch(per_token_quant_fp8_kernel<DType, 8>);
     } else {
-      constexpr int kVecSize = 4;
-      LaunchKernel(num_tokens, kBlockSize, device.unwrap())(
-          per_token_quant_fp8_kernel<DType, kVecSize>,
-          static_cast<const DType*>(input.data_ptr()),
-          static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-          static_cast<float*>(output_s.data_ptr()),
-          hidden_dim,
-          num_tokens);
+      launch(per_token_quant_fp8_kernel<DType, 4>);
     }
   } else {
-    constexpr int kVecSize = 4;
-    LaunchKernel(num_tokens, kBlockSize, device.unwrap())(
-        per_token_quant_fp8_kernel<DType, kVecSize>,
-        static_cast<const DType*>(input.data_ptr()),
-        static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-        static_cast<float*>(output_s.data_ptr()),
-        hidden_dim,
-        num_tokens);
+    launch(per_token_quant_fp8_kernel<DType, 4>);
   }
 }
 
