@@ -1,0 +1,60 @@
+name: Rerun UT
+run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0}', inputs.pr_head_sha) || '[rerun-ut]' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_command:
+        description: "Test command to run (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
+        required: true
+        type: string
+      runner_label:
+        description: "Runner label (e.g. '1-gpu-runner', '1-gpu-5090', '4-gpu-h100')"
+        required: true
+        type: string
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-ut on fork PRs)"
+        required: false
+        type: string
+        default: ""
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun-ut-cuda:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+    env:
+      RUNNER_LABELS: ${{ inputs.runner_label }}
+      IS_BLACKWELL: ${{ inputs.runner_label == '1-gpu-5090' && '1' || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          cd test/
+          python3 ${{ inputs.test_command }}
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
