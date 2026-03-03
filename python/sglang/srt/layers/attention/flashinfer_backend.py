@@ -243,7 +243,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
-            if model_runner.server_args.enable_piecewise_cuda_graph:
+            if not model_runner.server_args.disable_piecewise_cuda_graph:
                 logger.warning(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
                     "due to TMA descriptor initialization issues on B200. "
@@ -812,7 +812,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:

@@ -11,7 +11,6 @@ import os
 import signal
 import sys
 import threading
-import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -19,6 +18,7 @@ import grpc
 import zmq
 import zmq.asyncio
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -28,6 +28,11 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+)
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    calibrate_time_diff,
+    real_time,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
@@ -138,15 +143,8 @@ class GrpcReqState:
     obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
 
     # Metrics (same as TokenizerManager's ReqState)
-    created_time: float
-    finished_time: float = 0.0
-    first_token_time: float = 0.0
-    last_time: float = 0.0
+    time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
-
-    # perf_counter equivalents for accurate time calculations
-    finished_time_perf: float = 0.0
-    first_token_time_perf: float = 0.0
 
     # Streaming state
     stream_finished: bool = False
@@ -209,11 +207,14 @@ class GrpcRequestManager:
         self.is_pause_cond = asyncio.Condition()
 
         # Metrics
-        self.last_receive_tstamp = time.time()
+        self.last_receive_tstamp = real_time()
 
         # Crash dump for debugging
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
+
+        # disaggregation mode
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
 
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
@@ -365,29 +366,15 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        # Create and register request state
-        # TODO: support log_request
-        state = GrpcReqState(
-            request_id=request_id,
-            grpc_context=grpc_context,
-            out_queue=asyncio.Queue(),
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=time.time(),
-        )
-
-        # Track session if needed
-        if hasattr(obj, "session_params") and obj.session_params:
-            state.session_id = obj.session_params.session_id
-            state.is_session_request = True
-
-        self.rid_to_state[request_id] = state
+        self._req_stats_init(obj, grpc_context)
+        state = self.rid_to_state[request_id]
         self.record_request_for_crash_dump(obj)
 
         try:
             # Send to scheduler - let exceptions bubble up to grpc_server.py
+            state.time_stats.set_api_server_dispatch_time()
             await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
 
             is_stream = getattr(obj, "stream", False)
 
@@ -436,26 +423,17 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        # Create request state
-        state = GrpcReqState(
-            request_id=request_id,
-            grpc_context=None,
-            out_queue=asyncio.Queue(),
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=time.time(),
-        )
-
-        # Register state
-        self.rid_to_state[request_id] = state
+        self._req_stats_init(obj)
+        state = self.rid_to_state[request_id]
 
         # Create future for result
         future = asyncio.Future()
 
         # Send to scheduler
         try:
+            state.time_stats.set_api_server_dispatch_time()
             await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
         except Exception as e:
             del self.rid_to_state[request_id]
             future.set_exception(e)
@@ -515,7 +493,7 @@ class GrpcRequestManager:
             try:
                 # Receive from scheduler
                 recv_obj = await self.recv_from_scheduler.recv_pyobj()
-                self.last_receive_tstamp = time.time()
+                self.last_receive_tstamp = real_time()
 
                 # Check for pause (optimized: check flag before acquiring lock)
                 if self.is_pause:
@@ -612,8 +590,6 @@ class GrpcRequestManager:
         # Collect all queue.put() tasks for parallel execution
         put_tasks = []
         cleanup_tasks = []
-        now = time.time()
-        now_perf_counter = time.perf_counter()
 
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -628,10 +604,10 @@ class GrpcRequestManager:
                 continue
 
             # Update metrics
-            if state.first_token_time == 0.0:
-                state.first_token_time = now
-                state.first_token_time_perf = now_perf_counter
-            state.last_time = now
+            if state.time_stats.first_token_time == 0.0:
+                state.time_stats.set_first_token_time()
+            else:
+                state.time_stats.set_last_time()
 
             # Extract output for this request
             output_data = {
@@ -659,12 +635,14 @@ class GrpcRequestManager:
             }
 
             # Accumulate logprobs (following tokenizer_manager pattern)
-            if state.obj.return_logprob:
+            # Use getattr for safe access - not all request types have return_logprob
+            # (e.g., TokenizedEmbeddingReqInput)
+            if getattr(state.obj, "return_logprob", False):
                 self._convert_logprob_style(state, batch_out, i)
 
             # Send input logprobs based if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and state.obj.logprob_start_len >= 0
                 and state.input_token_logprobs_val
             ):
@@ -688,7 +666,7 @@ class GrpcRequestManager:
 
             # Send output logprobs if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and batch_out.output_token_logprobs_val
                 and i < len(batch_out.output_token_logprobs_val)
             ):
@@ -728,8 +706,7 @@ class GrpcRequestManager:
             # Handle completion
             if output_data["finished"]:
                 state.finished = True
-                state.finished_time = now
-                state.finished_time_perf = now_perf_counter
+                state.time_stats.set_finished_time()
                 state.stream_finished = True
                 state.event.set()
 
@@ -772,8 +749,7 @@ class GrpcRequestManager:
 
             # Mark as finished
             state.finished = True
-            state.finished_time = time.time()
-            state.finished_time_perf = time.perf_counter()
+            state.time_stats.set_finished_time()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
@@ -805,8 +781,7 @@ class GrpcRequestManager:
 
         # Mark as finished
         state.finished = True
-        state.finished_time = time.time()
-        state.finished_time_perf = time.perf_counter()
+        state.time_stats.set_finished_time()
         state.event.set()
 
     async def _handle_abort_req(self, recv_obj: AbortReq):
@@ -883,7 +858,7 @@ class GrpcRequestManager:
         if len(self.crash_dump_request_list) < 100:
             self.crash_dump_request_list.append(
                 {
-                    "time": time.time(),
+                    "time": real_time(),
                     "request_id": getattr(obj, "rid", "unknown"),
                     "type": type(obj).__name__,
                 }
@@ -1001,6 +976,34 @@ class GrpcRequestManager:
         """Watchdog to handle SIGTERM gracefully, matching TokenizerManager pattern."""
         while not self.gracefully_exit:
             await asyncio.sleep(1.0)
+
+    def _req_stats_init(
+        self,
+        obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        grpc_context: Optional[grpc.ServicerContext] = None,
+    ):
+        calibrate_time_diff()
+        # Create and register request state
+        # TODO: support log_request
+        # TODO: support request tracing
+        time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        state = GrpcReqState(
+            request_id=obj.rid,
+            grpc_context=grpc_context,
+            out_queue=asyncio.Queue(),
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=time_stats,
+        )
+
+        # Track session if needed
+        if hasattr(obj, "session_params") and obj.session_params:
+            state.session_id = obj.session_params.session_id
+            state.is_session_request = True
+
+        self.rid_to_state[obj.rid] = state
+        time_stats.set_created_time()
 
 
 async def print_exception_wrapper(func):

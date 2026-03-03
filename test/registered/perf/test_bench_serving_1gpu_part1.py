@@ -241,14 +241,14 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--lora-paths",
-                "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                "nvidia/llama-3.1-nemoguard-8b-topic-control",
                 "--max-lora-rank",
                 "256",
             ],
             dataset_name="random",
             random_input_len=256,
             random_output_len=256,
-            lora_name=["Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"],
+            lora_name=["nvidia/llama-3.1-nemoguard-8b-topic-control"],
             background_task=background_task,
         )
 

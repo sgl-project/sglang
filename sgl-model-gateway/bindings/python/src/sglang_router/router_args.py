@@ -18,6 +18,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -359,6 +360,11 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}test-external-dp-routing",
+            action="store_true",
+            help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
