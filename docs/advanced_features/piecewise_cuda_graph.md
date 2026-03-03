@@ -124,23 +124,13 @@ model.forward wrapper
 
 ### Piecewise cuda graph runner
 
-`PiecewiseCudaGraphRunner` orchestrates the full lifecycle: initialization, warmup, capture, and runtime replay.
+`PiecewiseCudaGraphRunner` orchestrates the full lifecycle through three phases:
 
-**Initialization** allocates static input buffers (`PrefillInputBuffers`) and sets up a global shared memory pool for all CUDA graph captures.
+- **Compile** — Warms up JIT kernels with a dummy forward pass, then wraps the model with `torch.compile`, triggering Dynamo tracing to split the FX graph and create `CUDAPiecewiseBackend` instances for each subgraph piece.
 
-**Warmup** has two phases:
-- **Pre-JIT warmup**: A single forward pass before `torch.compile` is installed, to warm up JIT-compiled kernels.
-- **Post-compile warmup**: `install_torch_compiled()` wraps the model with `torch.compile`. The first `warmup_compile()` call triggers Dynamo tracing, which invokes `SGLangBackend` once to split the graph and create `CUDAPiecewiseBackend` instances. Subsequent calls for other capture sizes reuse the already-compiled stitching graph (`split_gm`) — `SGLangBackend.__call__()` is guarded to run only once. During this phase, `is_in_pcg_torch_compile()` returns True, so backends execute compiled code but do not capture CUDA graphs.
+- **Capture** — Iterates over capture sizes in reverse order (largest first). For each size, runs the forward pass twice (one warmup, one CUDA graph capture).
 
-**Capture** iterates capture sizes in reverse order (largest first). For each size, the forward pass runs twice: once for per-piece kernel warmup, once for actual CUDA graph capture. Each `CUDAPiecewiseBackend` records its subgraph into a `torch.cuda.CUDAGraph` object and converts its output to a weak reference.
-
-**Replay** at runtime:
-- `can_run()` checks: token count ≤ max, no pre-computed input embeddings, and logprob constraints.
-- `replay_prepare()` uses binary search (`bisect_left`) to find the smallest captured size ≥ actual token count, copies inputs into static buffers, and zero-pads unused positions.
-- `model.forward()` dispatches through the stitching graph, replaying each piece's CUDA graph.
-- The runner normalizes outputs according to the actual token count:
-  - **Token generation** (`LogitsProcessorOutput`): logits and hidden states are sliced back to `raw_num_tokens`.
-  - **Embedding models** (`EmbeddingPoolerOutput`): returned as-is.
+- **Replay** — At runtime, finds the smallest captured size >= actual token count via binary search, copies inputs into static buffers with zero-padding, replays the captured CUDA graphs, and slices outputs back to the actual token count.
 
 ### Memory optimization
 
