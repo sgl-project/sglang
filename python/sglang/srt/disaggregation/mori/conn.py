@@ -996,7 +996,7 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
         packed_state_descs = _pack_mem_desc_list(self.kv_mgr.state_mem_descs)
         gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
-        decode_tp_size = str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii")
+        decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
 

@@ -324,6 +324,4 @@ def test_moe_wna16_marlin_gemm(
 
 
 if __name__ == "__main__":
-    import subprocess
-
-    subprocess.call(["pytest", "--tb=short", "-v", str(__file__)])
+    pytest.main([__file__, "-v", "-s"])
