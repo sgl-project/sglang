@@ -77,6 +77,32 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ {32, 64}.
 
+### GDN Backends
+
+GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, used in hybrid models that alternate GDN linear attention layers with standard full attention layers. GDN is **not** selected via `--attention-backend`; it is automatically activated when the model architecture requires it (e.g., Qwen 3.5, Qwen 3 Next, Jet Nemotron, Jet VLM).
+
+The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
+
+| **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
+|--------------------------|------------|----------------------|-----------------------------------|
+| **Triton (CUDA)**        | ✅         | ✅                   | ✅                                |
+| **Triton (NPU)**         | ✅         | ✅                   | ❌                                |
+| **Triton (CPU)**         | ✅         | ✅                   | ❌                                |
+| **CuTe DSL (CUDA only)**| ✅         | ❌                   | ❌                                |
+
+```{important}
+GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
+- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, or `fa4` only.
+- **NPU (Ascend)**: `ascend` only.
+- **AMD (ROCm)**: `triton` recommended.
+- **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
+```
+
+```{tip}
+CuTe DSL only supports decode. To use CuTe DSL for decode while keeping Triton for prefill, set `--linear-attn-decode-backend cutedsl`. Do **not** set `--linear-attn-backend cutedsl` directly, as this will fail during prefill.
+```
+
+
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
 ```{warning}
@@ -273,10 +299,54 @@ python3 -m sglang.launch_server \
   --attention-backend torch_native
 ```
 
+- GDN Models (e.g., Qwen 3.5)
+
+GDN is automatically activated for hybrid GDN models. The `--attention-backend` flag controls the **full-attention layers**, while `--linear-attn-backend` controls the **GDN linear attention layers**.
+
+```bash
+# Default: auto-select full-attention backend, Triton GDN kernel
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --trust-remote-code
+
+# Use CuTe DSL for GDN decode (CUDA only, Triton still used for prefill)
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --trust-remote-code \
+  --linear-attn-decode-backend cutedsl
+
+# Blackwell: must specify a supported full-attention backend
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --attention-backend triton \
+  --trust-remote-code
+
+# AMD (ROCm): use triton for both full attention and GDN layers
+SGLANG_USE_AITER=1 python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --attention-backend triton \
+  --trust-remote-code
+
+# NPU (Ascend): use ascend for full attention layers
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --attention-backend ascend \
+  --trust-remote-code
+```
+
 ## Steps to add a new attention backend
 To add a new attention backend, you can learn from the existing backends
 (`python/sglang/srt/layers/attention/triton_backend.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`)
 and follow the steps below.
+
+```{note}
+Linear attention kernel backends (GDN, KDA) follow a different pattern. They implement `LinearAttnKernelBase` in `python/sglang/srt/layers/attention/linear/kernels/` and are dispatched by `GDNKernelDispatcher` / `KDAKernelDispatcher` rather than registered via `@register_attention_backend`.
+```
 
 1. Run without cuda graph. Support the two forward functions
     - forward_extend
