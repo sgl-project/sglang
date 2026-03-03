@@ -287,10 +287,11 @@ def alloc_extend_kernel(
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
     )
-    num_blocks = (max_num_extend_tokens + 4095) // 4096
+    BLOCK_EXTEND = tl.constexpr(4096)
+    num_blocks = (max_num_extend_tokens + BLOCK_EXTEND - 1) // BLOCK_EXTEND
     for block_id in range(num_blocks):
-        offset_in_block = tl.arange(0, 4096)
-        offset = block_id * 4096 + offset_in_block
+        offset_in_block = tl.arange(0, BLOCK_EXTEND)
+        offset = block_id * BLOCK_EXTEND + offset_in_block
         mask = offset < num_part2
         page_start = tl.load(
             free_page_ptr + new_page_start_loc + offset // page_size,
