@@ -34,7 +34,7 @@ ${PIP_INSTALL} memfabric-hybrid==1.0.5
 ### Install PyTorch and PTA
 PYTORCH_VERSION="2.8.0"
 TORCHVISION_VERSION="0.23.0"
-${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu
+${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu
 PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
 ${PIP_INSTALL} ${PTA_URL}
 
