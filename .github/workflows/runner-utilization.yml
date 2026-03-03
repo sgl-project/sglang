@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/runner-utilization.yml'
-      - 'scripts/ci/runner_utilization_report.py'
+      - 'scripts/ci/utils/runner_utilization_report.py'
   workflow_dispatch:
     inputs:
       hours:
@@ -37,7 +37,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/ci/runner_utilization_report.py \
+          python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
             --hours ${{ inputs.hours || '24' }} \
             ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}

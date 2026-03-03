@@ -37,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run weekly 8-GPU H200 tests
         timeout-minutes: 120

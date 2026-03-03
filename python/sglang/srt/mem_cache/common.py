@@ -235,8 +235,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
-    # Check if this is a hybrid allocator
-    if hasattr(allocator, "full_available_size"):
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
@@ -297,11 +296,11 @@ def alloc_paged_token_slots_extend(
 
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
-    num_reqs: int,
-    reqs: list[Req] | None,
+    reqs: list[Req],
     tree_cache: BasePrefixCache | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
+    num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
         factor = (
@@ -314,9 +313,7 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
-    else:
-        req_pool_indices = req_to_token_pool.alloc(num_reqs)
+    req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
         raise RuntimeError(
@@ -342,7 +339,6 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
@@ -353,7 +349,7 @@ def alloc_for_extend(
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
@@ -467,13 +463,26 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
-
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
             tree_cache.supports_mamba()
-        ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
+        ), "Only MambaRadixCache allow freeing before alloc"
+        # TODO (csy, hanming): clean up this early allocation logic
+        if req.mamba_pool_idx is not None:
+            tree_cache.req_to_token_pool.mamba_pool.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+        return
+
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
+    # transfer KV ownership to the SessionSlot, so we skip the remaining
+    # cleanup (overalloc free + pool slot free). This means over-allocated
+    # tokens from speculative decoding are NOT freed between turns.
+    if req.req_pool_idx is None:
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -490,29 +499,21 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
-    if start_p >= end_p:
-        return
+    if start_p < end_p:
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_p:end_p
+        ]
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    # If the prefix cache doesn't manage mamba states, we must free them here.
+    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+        not tree_cache.supports_mamba()
+    ):
+        assert (
+            req.mamba_pool_idx is not None
+        ), "mamba state is freed while the tree cache does not manage mamba states"
+        tree_cache.req_to_token_pool.free_mamba_cache(req)
+    tree_cache.req_to_token_pool.free(req)
 
-    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-        start_p:end_p
-    ]
-    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
-
-def available_and_evictable_str(tree_cache) -> str:
-    token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-        full_available_size = token_to_kv_pool_allocator.full_available_size()
-        swa_available_size = token_to_kv_pool_allocator.swa_available_size()
-        full_evictable_size = tree_cache.full_evictable_size()
-        swa_evictable_size = tree_cache.swa_evictable_size()
-        return (
-            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
-            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
-        )
-    else:
-        available_size = token_to_kv_pool_allocator.available_size()
-        evictable_size = tree_cache.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()

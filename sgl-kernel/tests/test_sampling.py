@@ -1,5 +1,6 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/93e1a2634e22355b0856246b032b285ad1d1da6b/tests/test_sampling.py
 
+import flashinfer.sampling
 import pytest
 import sgl_kernel
 import torch
@@ -16,10 +17,10 @@ def test_top_k_top_p_sampling_from_probs_logits_top_k_first_alignment(
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
     generator_logits = torch.Generator("cuda:0")
     generator_probs = generator_logits.clone_state()
-    samples = sgl_kernel.sampling.top_k_top_p_sampling_from_logits(
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, k, p, filter_apply_order="top_k_first", generator=generator_logits
     )
-    samples_ref = sgl_kernel.sampling.top_k_top_p_sampling_from_probs(
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1),
         k,
         p,
@@ -40,10 +41,10 @@ def test_top_k_top_p_sampling_from_probs_logits_joint_alignment(
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
     generator_logits = torch.Generator("cuda:0")
     generator_probs = generator_logits.clone_state()
-    samples = sgl_kernel.sampling.top_k_top_p_sampling_from_logits(
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, k, p, filter_apply_order="joint", generator=generator_logits
     )
-    samples_ref = sgl_kernel.sampling.top_k_top_p_sampling_from_probs(
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1),
         k,
         p,
@@ -83,7 +84,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
     num_trails = 1000
     for _ in range(num_trails):
-        samples = sgl_kernel.top_k_top_p_sampling_from_probs(
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             normalized_prob,
             top_k_tensor,
             top_p_tensor,
@@ -167,7 +168,7 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 
     num_trails = 1000
     for _ in range(num_trails):
-        samples = sgl_kernel.min_p_sampling_from_probs(
+        samples = flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
             min_p_tensor,
         )

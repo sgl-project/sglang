@@ -28,7 +28,7 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
-third_party = Path("third_party")
+third_party = Path(os.environ.get("SGLANG_MUSA_THIRD_PARTY_DIR", "build/_deps"))
 arch = platform.machine().lower()
 
 
@@ -160,7 +160,7 @@ class _CustomBuildExt(BuildExtension):
     @staticmethod
     def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
         """Clone a git repository and checkout a specific tag/commit."""
-        repo_path.parent.mkdir(exist_ok=True)
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
         if not repo_path.exists():
             clone_cmd = ["git", "clone"]
             if git_shallow:
@@ -173,8 +173,10 @@ class _CustomBuildExt(BuildExtension):
             subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
 
     def run(self):
-        if os.environ.get("SKIP_THIRD_PARTY", "0") == "1":
-            print("Skipping third-party repositories cloning (SKIP_THIRD_PARTY=1)")
+        if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":
+            print(
+                "Skipping third-party repositories cloning (SGLANG_MUSA_SKIP_THIRD_PARTY=1)"
+            )
         else:
             print("Cloning third-party repositories...")
             self._clone_and_checkout(

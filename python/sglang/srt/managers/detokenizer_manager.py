@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
 import pybase64
@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
-from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -93,6 +93,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init dispatcher
         self.init_request_dispatcher()
+
+    @staticmethod
+    def is_health_check_request(rid: Optional[str]) -> bool:
+        return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -232,7 +236,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                self.decode_status[rid] = s
+                if not self.is_health_check_request(rid):
+                    # for health check requests, we do not store the decode status
+                    self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
@@ -290,17 +296,26 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Incremental decoding
         output_strs = []
         for i in range(bs):
-            try:
-                s = self.decode_status[recv_obj.rids[i]]
-            except KeyError:
-                raise RuntimeError(
-                    f"Decode status not found for request {recv_obj.rids[i]}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+            rid = recv_obj.rids[i]
+            if self.is_health_check_request(rid):
+                s = DecodeStatus(
+                    decoded_text=recv_obj.decoded_texts[i],
+                    decode_ids=recv_obj.decode_ids[i],
+                    surr_offset=0,
+                    read_offset=recv_obj.read_offsets[i],
                 )
+            else:
+                try:
+                    s = self.decode_status[rid]
+                except KeyError:
+                    raise RuntimeError(
+                        f"Decode status not found for request {rid}. "
+                        "It may be due to the request being evicted from the decode status due to memory pressure. "
+                        "Please increase the maximum number of requests by setting "
+                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                        f"The current value is {DETOKENIZER_MAX_STATES}. "
+                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
@@ -312,7 +327,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 else:
                     new_text = find_printable_text(new_text)
             else:
-                del self.decode_status[recv_obj.rids[i]]
+                if rid in self.decode_status:
+                    del self.decode_status[rid]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
@@ -359,8 +375,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
+            cached_tokens_details=recv_obj.cached_tokens_details,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_accepted_tokens=recv_obj.spec_accepted_tokens,
+            spec_acceptance_histogram=recv_obj.spec_acceptance_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -382,11 +400,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
-            queue_time=recv_obj.queue_time,
-            forward_entry_time=recv_obj.forward_entry_time,
-            prefill_launch_delay=recv_obj.prefill_launch_delay,
-            prefill_launch_latency=recv_obj.prefill_launch_latency,
-            prefill_finished_ts=recv_obj.prefill_finished_ts,
+            dp_ranks=recv_obj.dp_ranks,
+            time_stats=recv_obj.time_stats,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

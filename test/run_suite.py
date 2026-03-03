@@ -21,29 +21,35 @@ PER_COMMIT_SUITES = {
     HWBackend.AMD: [
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-nondeterministic",
         "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-8-gpu-35x-disaggregation-amd",
+        "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
-        "stage-b-test-small-1-gpu-performance-amd",
-        "stage-b-test-large-1-gpu-performance-amd",
-        "stage-b-test-large-2-gpu-performance-amd",
-        "stage-b-test-small-1-gpu-accuracy-amd",
-        "stage-b-test-large-2-gpu-accuracy-amd",
+        "stage-c-test-aiter-fusion-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
-        "stage-b-test-small-1-gpu-performance",
-        "stage-b-test-small-1-gpu-accuracy",
         "stage-b-test-large-1-gpu",
-        "stage-b-test-large-1-gpu-performance",
         "stage-b-test-large-2-gpu",
-        "stage-b-test-large-2-gpu-performance",
-        "stage-c-test-large-4-gpu",
-        "stage-b-test-4-gpu-b200",
-        "stage-c-test-large-4-gpu-b200",
+        "stage-c-test-4-gpu-h100",
+        "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-gb200",
+        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-8-gpu-h20",
+        "stage-c-test-8-gpu-h200",
+        "stage-c-test-8-gpu-b200",
+        "stage-c-test-deepep-8-gpu-h200",
     ],
-    HWBackend.NPU: [],
+    HWBackend.NPU: [
+        "stage-a-test-1",
+        "stage-b-test-1-npu-a2",
+        "stage-b-test-2-npu-a2",
+        "stage-b-test-4-npu-a3",
+        "stage-b-test-16-npu-a3",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -68,6 +74,8 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.AMD: [
         "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
@@ -78,6 +86,7 @@ NIGHTLY_SUITES = {
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
+        "nightly-8-npu-a3",
         "nightly-16-npu-a3",
     ],
 }
@@ -115,8 +124,10 @@ def auto_partition(files: List[CIRegistry], rank, size):
     if not files or size <= 0:
         return []
 
-    # Sort files by estimated_time in descending order (LPT heuristic)
-    sorted_files = sorted(files, key=lambda f: f.est_time, reverse=True)
+    # Sort files by estimated_time in descending order (LPT heuristic).
+    # Use filename as tie-breaker to ensure deterministic partitioning
+    # regardless of glob ordering.
+    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
 
     partitions = [[] for _ in range(size)]
     partition_sums = [0.0] * size
@@ -179,7 +190,11 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # All tests (per-commit and nightly) are now in registered/
-    files = glob.glob("registered/**/*.py", recursive=True)
+    files = [
+        f
+        for f in glob.glob("registered/**/*.py", recursive=True)
+        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+    ]
     # Strict: all registered files must have proper registration
     sanity_check = True
 
