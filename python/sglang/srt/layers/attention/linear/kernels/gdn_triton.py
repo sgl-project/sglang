@@ -7,9 +7,6 @@ from sglang.srt.utils import is_cpu, is_npu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.srt.layers.attention.fla.fused_recurrent import (
-        fused_recurrent_gated_delta_rule_update,
-    )
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -98,34 +95,32 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        intermediate_states_buffer: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_recurrent_gated_delta_rule_update(
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
+            a=a,
+            b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
             use_qk_l2norm_in_kernel=True,
-            disable_state_update=True,
-            intermediate_states_buffer=intermediate_states_buffer,
-            intermediate_state_indices=intermediate_state_indices,
-            cache_steps=cache_steps,
-            retrieve_parent_token=retrieve_parent_token,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=False,
         )
