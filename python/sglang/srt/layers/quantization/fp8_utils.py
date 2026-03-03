@@ -181,8 +181,8 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
-    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+    from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
     from sglang.srt.utils.custom_op import register_custom_op
@@ -210,6 +210,62 @@ if is_blackwell_supported() and is_flashinfer_available():
             weight_scale,
             out_dtype=out_dtype,
             backend="trtllm",
+        )
+
+    # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
+    # flashinfer's JIT compilation path (filesystem checks/cubin loader).
+    def _fake_flashinfer_mxfp8_quantize(
+        input: torch.Tensor,
+        _is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fake mode only needs dtypes and output rank to propagate compile graph.
+        # The scale tensor shape is not consumed before the following fake mm op.
+        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
+        q_input = input.new_empty(
+            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
+        )
+        scale = input.new_empty((1,), dtype=torch.uint8)
+        return q_input, scale
+
+    @register_custom_op(
+        op_name="flashinfer_mxfp8_quantize",
+        mutates_args=[],
+        fake_impl=_fake_flashinfer_mxfp8_quantize,
+    )
+    def flashinfer_mxfp8_quantize(
+        input: torch.Tensor,
+        is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _raw_flashinfer_mxfp8_quantize(
+            input,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            alignment=alignment,
+        )
+
+    @register_custom_op(
+        op_name="flashinfer_mm_mxfp8",
+        mutates_args=[],
+        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, backend="auto": (
+            q_input.new_empty((q_input.shape[0], weight_t.shape[1]), dtype=out_dtype)
+        ),
+    )
+    def flashinfer_mm_mxfp8(
+        q_input: torch.Tensor,
+        weight_t: torch.Tensor,
+        x_scale_u8: torch.Tensor,
+        weight_scale_t: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str = "auto",
+    ) -> torch.Tensor:
+        return _raw_flashinfer_mm_mxfp8(
+            q_input,
+            weight_t,
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=out_dtype,
+            backend=backend,
         )
 
 
@@ -791,14 +847,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8."""
-    if not (is_blackwell_supported() and is_flashinfer_available()):
-        raise RuntimeError(
-            "MXFP8 FlashInfer GEMM requested, but flashinfer.mm_mxfp8 is unavailable."
-        )
-
-    if not (_is_cuda and is_sm100_supported()):
-        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
-
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
