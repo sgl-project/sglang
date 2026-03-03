@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -393,6 +394,73 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
     return original_levels
 
 
+def _should_suppress_torch_logs() -> bool:
+    """Return False if the user explicitly opted into torch compile verbosity."""
+    if os.environ.get("TORCH_LOGS"):
+        return False
+    if get_log_level() <= logging.DEBUG:
+        return False
+    return True
+
+
+@contextmanager
+def suppress_torch_compile_noise():
+    """Suppress noisy output from the first torch.compile forward pass.
+
+    Combines three layers of suppression:
+    1. Logger-level: silence torch._dynamo / torch._inductor / torch._functorch
+    2. warnings.filterwarnings: suppress Dynamo/Inductor UserWarnings
+    3. fd-level stdout *and* stderr redirect: catch bare ``print()`` calls
+       from inductor (e.g. ``final peak_memory=...`` on stdout) and
+       ``sys.stderr.write()`` from autotune (``Autotune Choices Stats`` on
+       stderr)
+
+    Respects user opt-in: if ``TORCH_LOGS`` is set or log level is DEBUG,
+    this context manager is a no-op.
+    """
+    if not _should_suppress_torch_logs():
+        yield
+        return
+
+    torch_logger_names = [
+        "torch._dynamo",
+        "torch._inductor",
+        "torch._functorch",
+    ]
+    saved_levels = suppress_loggers(torch_logger_names, level=logging.ERROR)
+
+    saved_filters = warnings.filters[:]
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\._dynamo.*")
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, module=r"torch\._inductor.*"
+    )
+
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    stdout_dup = os.dup(stdout_fd)
+    stderr_dup = os.dup(stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(devnull_fd, stdout_fd)
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(stdout_dup, stdout_fd)
+        os.dup2(stderr_dup, stderr_fd)
+        os.close(stdout_dup)
+        os.close(stderr_dup)
+        os.close(devnull_fd)
+
+        warnings.filters[:] = saved_filters
+
+        for name, level in saved_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
 def globally_suppress_loggers():
     # globally suppress some obsessive loggers
     target_names = [
@@ -404,6 +472,15 @@ def globally_suppress_loggers():
         "filelock",
         "urllib3",
     ]
+
+    if _should_suppress_torch_logs():
+        target_names.extend(
+            [
+                "torch._dynamo",
+                "torch._inductor",
+                "torch._functorch",
+            ]
+        )
 
     for name in target_names:
         logging.getLogger(name).setLevel(logging.ERROR)
