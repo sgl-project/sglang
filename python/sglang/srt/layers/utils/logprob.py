@@ -68,11 +68,13 @@ def get_top_logprobs_raw(
     top_logprobs_nums: List[int],
     stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+    delay_cpu_copy: bool = False,
 ):
     max_k = max(top_logprobs_nums)
     values, indices = logprobs.topk(max_k, dim=-1)
-    values = values.tolist()
-    indices = indices.tolist()
+    if not delay_cpu_copy:
+        values = values.tolist()
+        indices = indices.tolist()
 
     top_logprobs_val = []
     top_logprobs_idx = []
@@ -110,10 +112,17 @@ def get_top_logprobs_prefill(
 def get_top_logprobs(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
+    delay_cpu_copy: bool = False,
 ):
-    return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage=LogprobStage.DECODE)
+    return get_top_logprobs_raw(
+        logprobs,
+        top_logprobs_nums,
+        stage=LogprobStage.DECODE,
+        delay_cpu_copy=delay_cpu_copy,
+    )
 
 
+# FIXME: remove sync in spec v2
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[Optional[List[int]]],
@@ -128,7 +137,8 @@ def get_token_ids_logprobs_raw(
                 vals.append([])
                 idxs.append([])
             else:
-                vals.append(logprobs[i, token_ids].tolist())
+                row = logprobs[i, token_ids]
+                vals.append(row if delay_cpu_copy else row.tolist())
                 idxs.append(token_ids)
     else:  # prefill
         pt = 0
@@ -158,9 +168,12 @@ def get_token_ids_logprobs_prefill(
     )
 
 
-def get_token_ids_logprobs(logprobs, token_ids_logprobs):
+def get_token_ids_logprobs(logprobs, token_ids_logprobs, delay_cpu_copy=False):
     return get_token_ids_logprobs_raw(
-        logprobs, token_ids_logprobs, stage=LogprobStage.DECODE
+        logprobs,
+        token_ids_logprobs,
+        stage=LogprobStage.DECODE,
+        delay_cpu_copy=delay_cpu_copy,
     )
 
 
