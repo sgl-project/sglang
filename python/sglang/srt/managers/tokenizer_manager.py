@@ -485,7 +485,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         self._req_stats_init(obj, request)
         if self.server_args.language_only:
-            self._handle_epd_disaggregation_encode_request(obj)
+            await self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -936,6 +936,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                mm_metadata=obj.mm_metadata,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2260,16 +2261,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     )
                 time_stats.set_created_time(created_time)
 
-    def _handle_epd_disaggregation_encode_request(
+    async def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""
         if (
             isinstance(obj, GenerateReqInput)
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ("zmq_to_scheduler", "mooncake_to_scheduler")
             and obj.contains_mm_input()
         ):
             self.mm_receiver.send_encode_request(obj)
+            if (
+                self.server_args.encoder_transfer_backend == "mooncake_to_scheduler"
+                and obj.need_wait_for_image
+            ):
+                error = await self.mm_receiver.wait_mm_metadata(obj)
+                if error:
+                    raise ValueError(f"Encoder failed: {error}")
 
     def convert_to_span_attrs(
         self,

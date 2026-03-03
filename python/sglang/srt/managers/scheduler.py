@@ -980,10 +980,12 @@ class Scheduler(
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ("zmq_to_scheduler", "mooncake_to_scheduler")
         ):
             self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
+                dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 pp_rank=self.pp_rank,
                 tp_rank=self.tp_rank,
@@ -1314,7 +1316,8 @@ class Scheduler(
         if (
             self.pp_rank == 0
             and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ("zmq_to_scheduler", "mooncake_to_scheduler")
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
@@ -1471,9 +1474,10 @@ class Scheduler(
             # For session requests, keep mm_inputs for the next request
             if req.session:
                 continue
-            # For non-session requests, clear features and mm_inputs
+            # For non-session requests, clear features, precomputed embeddings, and mm_inputs
             for item in mm_inputs.mm_items:
                 item.feature = None
+                item.precomputed_embeddings = None
             req.multimodal_inputs = None
 
     def handle_generate_request(

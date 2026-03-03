@@ -870,11 +870,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             or (
                 self.server_args.encoder_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
+                and self.server_args.encoder_transfer_backend
+                in ("mooncake", "mooncake_to_scheduler")
             )
             or (
                 self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
+                and self.server_args.encoder_transfer_backend
+                in ("mooncake", "mooncake_to_scheduler")
             )
             or (
                 self.server_args.enable_elastic_expert_backup
