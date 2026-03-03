@@ -1,10 +1,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
+#include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 #ifndef USE_ROCM
+#include <dlfcn.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
@@ -743,48 +747,195 @@ inline void transfer_kv_page_first_direct_impl(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+
+  auto fallback_to_page_copy = [&]() {
+    if constexpr (IsLf2Pf) {
+      const bool is_mla = dst_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size];
+        const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[j + num_layers],
+                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                s_index,
+                0,
+                page_size);
+          }
+        }
+      }
+    } else {
+      const bool is_mla = src_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
+        const int64_t d_index = dst_indices_ptr[i * page_size];
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+                dst_ptrs[j + num_layers],
+                0,
+                d_index,
+                page_size);
+          }
+        }
+      }
+    }
+  };
+
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_page_copy();
+  return;
+
+#else
+  // Driver capability gate: only use cudaMemcpyBatchAsync on CUDA 12.8+ drivers.
+  int driver_version = 0;
+  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
+  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
+  using CudaMemcpyBatchAsyncFn =
+      cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
+  }();
+  if (cuda_memcpy_batch_async == nullptr) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  size_t num_copies = 0;
+  std::vector<void*> batch_srcs;
+  std::vector<void*> batch_dsts;
+  std::vector<size_t> batch_sizes;
+  std::vector<size_t> attrs_idxs(1, 0);
+  cudaMemcpyAttributes attrs{};
+  const int device_id = at::cuda::current_device();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
+    batch_srcs.push_back(src);
+    batch_dsts.push_back(dst);
+    batch_sizes.push_back(size_bytes);
+  };
 
   if constexpr (IsLf2Pf) {
     const bool is_mla = dst_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
 
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t dst_stride1 = dst_ptrs[0].stride(1);
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t elem_size = dst_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    attrs.srcLocHint.id = device_id;
+    attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.id = 0;
+    attrs.flags = 0;
+
+    num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>() / page_size;
+      auto s_index = src_indices_ptr[i * page_size];
+      auto d_index = dst_indices_ptr[i * page_size] / page_size;
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
+                          (start_layer_id + j) * dst_stride1 * elem_size;
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[j + num_layers],
-              dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
-              s_index,
-              0,
-              page_size);
+          const char* src_v_ptr =
+              static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
+                            (start_layer_id + j) * dst_stride1 * elem_size;
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
+
   } else {
     const bool is_mla = src_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
 
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t src_stride1 = src_ptrs[0].stride(1);
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t elem_size = src_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    attrs.srcLocHint.id = 0;
+    attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs.dstLocHint.id = device_id;
+    attrs.flags = 0;
+
+    num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>() / page_size;
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+      auto s_index = src_indices_ptr[i * page_size] / page_size;
+      auto d_index = dst_indices_ptr[i * page_size];
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
+                                (start_layer_id + j) * src_stride1 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
-              dst_ptrs[j + num_layers],
-              0,
-              d_index,
-              page_size);
+          const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
+                                  (start_layer_id + j) * src_stride1 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
   }
+
+  TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
+  if (num_copies > 0) {
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    cudaError_t err = cuda_memcpy_batch_async(
+        batch_dsts.data(),
+        batch_srcs.data(),
+        batch_sizes.data(),
+        num_copies,
+        &attrs,
+        attrs_idxs.data(),
+        1,
+        &fail_idx,
+        stream);
+    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+      fallback_to_page_copy();
+      return;
+    }
+    if (err != cudaSuccess) {
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+    }
+  }
+#endif
 }
 
 void transfer_kv_per_layer_direct_pf_lf(

@@ -247,11 +247,9 @@ class Req:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
 
-        return (
-            os.path.join(self.output_path, output_file_name)
-            if output_file_name
-            else None
-        )
+        if self.output_path is None or not output_file_name:
+            return None
+        return os.path.join(self.output_path, output_file_name)
 
     def set_as_warmup(self):
         self.is_warmup = True
@@ -282,7 +280,7 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
-        if self.is_warmup:
+        if self.is_warmup or self.suppress_logs:
             return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
@@ -300,8 +298,8 @@ class Req:
             self.negative_prompt, key_hint="negative_prompt"
         )
 
-        # log non-sensitive parameters at info level
-        info_str = f"""Sampling params:
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
@@ -319,16 +317,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-
-        # log full prompts at debug level only (for debugging purposes)
-        debug_str = f"""Full prompts:
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-        """
-
-        if not self.suppress_logs:
-            logger.info(info_str)
-            logger.debug(debug_str)
+        logger.debug(debug_str)
 
 
 @dataclass

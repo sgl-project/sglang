@@ -44,7 +44,7 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback
+from sglang.utils import get_exception_traceback, normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -377,7 +377,7 @@ def call_select_guidance(context, choices, model=None):
 
 def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
         "--backend",
@@ -426,7 +426,7 @@ def auto_config_device() -> str:
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument(
@@ -450,7 +450,7 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        backend = RuntimeEndpoint(normalize_base_url(args.host, args.port))
     elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
@@ -459,14 +459,15 @@ def select_sglang_backend(args: argparse.Namespace):
 
 
 def _get_call_generate(args: argparse.Namespace):
+    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_lightllm, url=f"{base_url}/generate")
     elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_vllm, url=f"{base_url}/generate")
     elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
     elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_outlines, url=f"{base_url}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -479,10 +480,11 @@ def _get_call_generate(args: argparse.Namespace):
 
 
 def _get_call_select(args: argparse.Namespace):
+    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_select_lightllm, url=f"{base_url}/generate")
     elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_select_vllm, url=f"{base_url}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -877,18 +879,22 @@ def popen_launch_server(
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
-        command = "sglang.launch_pd_server"
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_pd_server",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+        ]
     else:
-        command = "sglang.launch_server"
-
-    command = [
-        "python3",
-        "-m",
-        command,
-        "--model-path",
-        model,
-        *[str(x) for x in other_args],
-    ]
+        command = [
+            "sglang",
+            "serve",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+        ]
 
     if pd_separated or use_mixed_pd_engine:
         command.extend(["--lb-host", host, "--lb-port", port])
@@ -1306,7 +1312,7 @@ def run_score_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except:
+                except Exception:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1374,17 +1380,9 @@ def run_embeddings_benchmark(
 
     async def _run_benchmark():
 
-        # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        tokenizer = get_tokenizer(model)
-
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
-            # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
-            # Verify it's a single token
-            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
             text = special_token * num_tokens
             return text
 
@@ -1404,7 +1402,7 @@ def run_embeddings_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except:
+                except Exception:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1820,7 +1818,7 @@ def run_mulit_request_test(
                     },
                 },
             )
-            ret = response.json()
+            response.json()
 
         with ThreadPoolExecutor(2) as executor:
             list(executor.map(run_one, list(range(4))))

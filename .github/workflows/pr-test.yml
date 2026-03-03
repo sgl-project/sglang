@@ -132,6 +132,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
               - "python/pyproject.toml"
               - ".github/workflows/pr-test.yml"

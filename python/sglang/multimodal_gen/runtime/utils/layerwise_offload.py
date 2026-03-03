@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -40,11 +41,13 @@ class LayerwiseOffloadManager:
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-        self.enabled = bool(enabled and torch.cuda.is_available())
+        self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
-        self.device = torch.device("cuda", torch.cuda.current_device())
-        self.copy_stream = torch.cuda.Stream()
+        self.device = torch.device(
+            current_platform.device_type, torch.get_device_module().current_device()
+        )
+        self.copy_stream = torch.get_device_module().Stream()
 
         self._layer_name_re = re.compile(
             rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
@@ -58,8 +61,8 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
-        # layer_idx -> torch.cuda.Event for fine-grained sync, to make sure the weight is resident in pre-hook
-        self._prefetch_events: Dict[int, torch.cuda.Event] = {}
+        # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
+        self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -144,7 +147,7 @@ class LayerwiseOffloadManager:
         for i in range(self.prefetch_size):
             self.prefetch_layer(i, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
     def get_target_with_name(self, name: str) -> torch.Tensor:
         """get the target model weight/buffer to be replaced"""
@@ -167,11 +170,11 @@ class LayerwiseOffloadManager:
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-        self.copy_stream.wait_stream(torch.cuda.current_stream())
+        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
-        with torch.cuda.stream(self.copy_stream):
+        with torch.get_device_module().stream(self.copy_stream):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
@@ -180,7 +183,7 @@ class LayerwiseOffloadManager:
                 gpu_buffers[dtype] = gpu_buffer
 
         # record the prefetch event of this layer
-        event = torch.cuda.Event()
+        event = torch.get_device_module().Event()
         event.record(self.copy_stream)
         self._prefetch_events[layer_idx] = event
 
@@ -226,7 +229,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx)
@@ -237,7 +240,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
@@ -252,7 +255,7 @@ class LayerwiseOffloadManager:
             return
 
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
@@ -271,7 +274,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
@@ -368,7 +371,9 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self.prepare_for_next_req(non_blocking=False)
                 if i in self._prefetch_events:
-                    torch.cuda.current_stream().wait_event(self._prefetch_events[i])
+                    torch.get_device_module().current_stream().wait_event(
+                        self._prefetch_events[i]
+                    )
 
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
                 if i % self.prefetch_size == 0:

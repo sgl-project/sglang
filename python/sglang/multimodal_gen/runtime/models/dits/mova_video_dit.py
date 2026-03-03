@@ -447,7 +447,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
-        seperated_timestep = config.seperated_timestep
+        separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
         require_clip_embedding = config.require_clip_embedding
         fuse_vae_embedding_in_latents = config.fuse_vae_embedding_in_latents
@@ -455,7 +455,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.dim = dim
         self.freq_dim = freq_dim
         self.patch_size = patch_size
-        self.seperated_timestep = seperated_timestep
+        self.separated_timestep = separated_timestep
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
