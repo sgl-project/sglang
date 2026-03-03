@@ -79,7 +79,10 @@ diffusion = [
     "opencv-python==4.10.0.84",
     "remote-pdb",
     "cache-dit==1.2.1",
-    "addict"
+    "addict",
+    "scikit-image==0.25.2",
+    "trimesh>=4.0.0",
+    "xatlas",
 ]
 
 tracing = [

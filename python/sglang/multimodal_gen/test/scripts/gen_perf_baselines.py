@@ -117,7 +117,7 @@ def _run_case(case: DiffusionTestCase) -> dict:
             modality=case.server_args.modality,
             sampling_params=sp,
         )
-        rid = gen(case.id, client)
+        rid, _ = gen(case.id, client)
         rec = wait_for_req_perf_record(
             rid,
             ctx.perf_log_path,
