@@ -1,7 +1,7 @@
 from typing import Optional
 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
 
 _PARALLEL_INFO_KEYS = ("sglang_parallel_info", "megatron_parallel_info")
 
