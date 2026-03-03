@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import is_sm100_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -241,7 +242,9 @@ class MambaPool:
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
-
+        # Force disable CUTEDSL_GDN_DECODE_TRANSPOSE if SM100 is not supported
+        if not is_sm100_supported():
+            envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.set(False)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool

@@ -4,6 +4,9 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl_transpose import (
+    CuteDSLGDNTransposeKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -57,6 +60,7 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        cutedsl_transpose_kernel = CuteDSLGDNTransposeKernel()
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
@@ -68,6 +72,11 @@ class GDNKernelDispatcher:
             )
 
             self.decode_kernel = CuteDSLGDNKernel()
+        elif decode_backend.is_cutedsl_transpose():
+            if not is_cuda():
+                raise ValueError("CuTe DSL backend requires CUDA")
+
+            self.decode_kernel = cutedsl_transpose_kernel
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -78,10 +87,23 @@ class GDNKernelDispatcher:
                 "CuTe DSL backend only supports decode, not prefill. "
                 "Use --linear-attn-prefill-backend triton instead."
             )
+        elif prefill_backend.is_cutedsl_transpose():
+            if not is_cuda():
+                raise ValueError("CuTe DSL backend requires CUDA")
+
+            self.extend_kernel = cutedsl_transpose_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        self.verify_kernel = triton_kernel
+        if decode_backend.is_triton():
+            self.verify_kernel = triton_kernel
+        elif decode_backend.is_cutedsl_transpose():
+            if not is_cuda():
+                raise ValueError("CuTe DSL backend requires CUDA")
+
+            self.verify_kernel = cutedsl_transpose_kernel
+        else:
+            raise ValueError(f"Unsupported GDN verify backend: {decode_backend}")
 
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "

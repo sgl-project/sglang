@@ -15,12 +15,16 @@ logger = logging.getLogger(__name__)
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
     CUTEDSL = "cutedsl"
+    CUTEDSL_TRANSPOSE = "cutedsl_transpose"
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL
+
+    def is_cutedsl_transpose(self):
+        return self == LinearAttnKernelBackend.CUTEDSL_TRANSPOSE
 
 
 LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
