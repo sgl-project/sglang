@@ -13,7 +13,10 @@ import os
 import time
 from typing import Any, List, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -227,6 +230,19 @@ class DiffGenerator:
                             )
                         continue
 
+                    if req.data_type == DataType.MESH:
+                        for output_idx, sample in enumerate(
+                            output_batch.output_file_paths
+                        ):
+                            results.append(
+                                GenerationResult(
+                                    **common,
+                                    prompt_index=output_idx,
+                                    output_file_path=sample,
+                                )
+                            )
+                        continue
+
                     samples_out: list[Any] = []
                     audios_out: list[Any] = []
                     frames_out: list[Any] = []
@@ -243,6 +259,10 @@ class DiffGenerator:
                         audios_out=audios_out,
                         frames_out=frames_out,
                         output_compression=req.output_compression,
+                        enable_frame_interpolation=req.enable_frame_interpolation,
+                        frame_interpolation_exp=req.frame_interpolation_exp,
+                        frame_interpolation_scale=req.frame_interpolation_scale,
+                        frame_interpolation_model_path=req.frame_interpolation_model_path,
                     )
 
                     for idx in range(len(samples_out)):
