@@ -110,7 +110,7 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        self.enable_cp_all_ranks_transfer = (
+        self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
         )
 
@@ -130,7 +130,7 @@ class CommonKVManager(BaseKVManager):
             # When SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
-                not self.enable_cp_all_ranks_transfer
+                not self.enable_all_cp_ranks_for_transfer
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -511,7 +511,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            if not self.kv_mgr.enable_cp_all_ranks_transfer:
+            if not self.kv_mgr.enable_all_cp_ranks_for_transfer:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
                 self.target_cp_ranks = self.target_cp_ranks[:1]
                 self.required_prefill_response_num *= 1

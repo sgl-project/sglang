@@ -1149,7 +1149,7 @@ class MooncakeKVSender(CommonKVSender):
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
         # Special handling for cp
-        if self.kv_mgr.enable_cp_all_ranks_transfer:
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
             total_pages = len(kv_indices)
             cp_rank = self.kv_mgr.attn_cp_rank
             cp_size = self.kv_mgr.attn_cp_size
