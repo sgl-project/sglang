@@ -225,6 +225,11 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
+            if (
+                "Gemma2ForSequenceClassification"
+                in model_runner.model_config.hf_config.architectures
+            ):
+                self.use_native_sdpa = True
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -821,10 +826,13 @@ class AscendAttnBackend(AttentionBackend):
 
                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
+                # Model skywork-reward-gemma2-2-27B also suffers from precision anomalies, thus the torch native backend becomes beneficial approach.
                 if (
                     layer.qk_head_dim <= 128
                     and causal
                     and forward_batch.encoder_lens is None
+                    and layer.logit_cap == 0
+                    and not getattr(self, "use_native_sdpa", False)
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -889,6 +897,8 @@ class AscendAttnBackend(AttentionBackend):
                         scaling=layer.scaling,
                         enable_gqa=use_gqa,
                         causal=causal,
+                        logit_cap=layer.logit_cap,
+                        logit_capping_method=layer.logit_capping_method,
                     )
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
@@ -1015,7 +1025,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer.layer_id
                 )
                 kv_cache = torch.cat([k_cache, v_cache], dim=-1)
-                attn_output = self.native_attn._run_sdpa_forward_extend(
+                attn_output = self.native_attn.run_sdpa_forward_extend(
                     q,
                     attn_output,
                     kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -1518,7 +1528,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None:
+            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
@@ -1578,6 +1588,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     enable_gqa=use_gqa,
                     causal=False,
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:

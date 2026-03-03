@@ -6,6 +6,9 @@ import sys
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
 
 
 def run_server(server_args):
@@ -26,6 +29,16 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    import warnings
+
+    warnings.warn(
+        "'python -m sglang.launch_server' is still supported, but "
+        "'sglang serve' is the recommended entrypoint.\n"
+        "  Example: sglang serve --model-path <model> [options]",
+        UserWarning,
+        stacklevel=1,
+    )
+
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

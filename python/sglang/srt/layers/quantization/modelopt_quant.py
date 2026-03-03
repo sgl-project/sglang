@@ -5,6 +5,7 @@ import logging
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
@@ -48,6 +49,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -295,6 +297,11 @@ class ModelOptQuantConfig(QuantizationConfig):
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
+            # Check if MoE layer should be excluded from quantization
+            # (e.g., MTP layers that have no quantization scales in checkpoint)
+            if self.is_layer_excluded(prefix):
+                # Falls back to default unquantized MoE
+                return None
             return Moe(self)
         return None
 
@@ -320,6 +327,54 @@ class ModelOptQuantConfig(QuantizationConfig):
                     expanded.append(name.removeprefix("language_model."))
             # Preserve order, drop duplicates.
             self.exclude_modules = list(dict.fromkeys(expanded))
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        """Check if a layer should be excluded from quantization.
+
+        Handles:
+        - Exact matches (e.g., "lm_head" matching prefix "lm_head")
+        - Glob-style wildcards (e.g., "mtp*" matching "mtp_layers")
+        - Part-by-part matching (split prefix on "." and check each part)
+        - language_model. prefix stripping for vision-language models
+        - Fused module patterns (e.g., "q_a_proj" in "fused_qkv_a_proj_with_mqa")
+        """
+        if not self.exclude_modules:
+            return False
+
+        # Build prefix variants: some models wrap layers under "language_model."
+        prefixes_to_check = [prefix]
+        if prefix.startswith("language_model."):
+            prefixes_to_check.append(prefix.removeprefix("language_model."))
+
+        # Fused module patterns: the exclude list may reference a sub-component
+        # (e.g., "q_a_proj") that is fused into a combined parameter name
+        # (e.g., "fused_qkv_a_proj_with_mqa"). We check if the last segment of
+        # the exclude pattern is a substring of the last segment of the prefix.
+        fused_patterns = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
+
+        for pattern in self.exclude_modules:
+            # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*")
+            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+
+            for pfx in prefixes_to_check:
+                if re.fullmatch(regex_str, pfx):
+                    return True
+                # Part-by-part check: handles wildcards like "mtp*" matching
+                pfx_parts = pfx.split(".")
+                for part in pfx_parts:
+                    if re.fullmatch(regex_str, part):
+                        return True
+
+            # Check fused patterns: if the last segment of the exclude pattern
+            # is a known fused component, check if it appears in the prefix's
+            # last segment (handles fused_qkv_a_proj_with_mqa containing q_a_proj)
+            pattern_tail = pattern.rsplit(".", maxsplit=1)[-1]
+            if pattern_tail in fused_patterns:
+                for pfx in prefixes_to_check:
+                    if pattern_tail in pfx.rsplit(".", maxsplit=1)[-1]:
+                        return True
+
+        return False
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -376,19 +431,19 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             # Flat format (config.json quantization_config)
-            # For kv_cache, check if kv_cache_scheme exists and extract algo
+            # Derive kv_cache quant from kv_cache_scheme dict
             kv_cache_scheme = config.get("kv_cache_scheme")
-            if (
-                kv_cache_scheme
-                and kv_cache_scheme.get("type") == "float"
-                and kv_cache_scheme.get("num_bits") == 8
-            ):
-                kv_cache_quant_method = "FP8"
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_method = "FP8"
 
             # Map 'ignore' field to 'exclude_modules'
             exclude_modules = config.get("ignore")
         else:
-            # Fall back to nested format (hf_quant_config.json - legacy format)
+            # Fall back to nested format (hf_quant_config.json - will be deprecated)
             try:
                 quantization_section = cls.get_from_keys(config, ["quantization"])
                 quant_method = quantization_section.get("quant_algo")
@@ -415,18 +470,6 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
-        )
-
-    def is_layer_excluded(self, prefix: str) -> bool:
-        if len(self.exclude_modules) == 0:
-            return False
-        return any(
-            module in prefix
-            or (
-                prefix.startswith("language_model.")
-                and module in prefix.removeprefix("language_model.")
-            )
-            for module in self.exclude_modules
         )
 
     def get_quant_method(
@@ -461,6 +504,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         input_size_per_partition: int,
         output_partition_sizes: List[int],
+        input_size: Optional[int],
+        output_size: Optional[int],
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
@@ -958,30 +1003,26 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             # Flat format (config.json quantization_config)
-            # Note: FP4 models in config.json format may not have all the detailed fields
-            # that are present in hf_quant_config.json, so we need to handle defaults
-            kv_cache_quant_algo = config.get("kv_cache_quant_algo")
-            if not kv_cache_quant_algo:
-                # For config.json format, derive from kv_cache_scheme if available
-                kv_cache_scheme = config.get("kv_cache_scheme")
-                if isinstance(kv_cache_scheme, dict):
-                    if (
-                        kv_cache_scheme.get("type") == "float"
-                        and kv_cache_scheme.get("num_bits") == 8
-                    ):
-                        kv_cache_quant_algo = "FP8"
-                    else:
-                        kv_cache_quant_algo = "auto"
-                elif isinstance(kv_cache_scheme, str):
-                    scheme_name = kv_cache_scheme.strip().upper()
-                    if scheme_name in ("FP8", "FLOAT8"):
-                        kv_cache_quant_algo = "FP8"
-                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
-                        kv_cache_quant_algo = "NVFP4"
-                    else:
-                        kv_cache_quant_algo = "auto"
+            # Derive kv_cache_quant_algo from kv_cache_scheme dict
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
                 else:
                     kv_cache_quant_algo = "auto"
+            elif isinstance(kv_cache_scheme, str):
+                scheme_name = kv_cache_scheme.strip().upper()
+                if scheme_name in ("FP8", "FLOAT8"):
+                    kv_cache_quant_algo = "FP8"
+                elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                    kv_cache_quant_algo = "NVFP4"
+                else:
+                    kv_cache_quant_algo = "auto"
+            else:
+                kv_cache_quant_algo = "auto"
 
             group_size = config.get("group_size")
             # If group_size is not at top level, try to extract from config_groups
@@ -1035,27 +1076,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             exclude_modules,
             config.get("packed_modules_mapping"),
         )
-
-    def is_layer_excluded(self, prefix: str):
-        import regex as re
-
-        fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
-        prefix_split = prefix.split(".")
-        for pattern in self.exclude_modules:
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-            pattern_split = pattern.split(".")
-            if re.fullmatch(regex_str, prefix):
-                return True
-            elif (
-                pattern_split[-1] in fused_patterns
-                and pattern_split[-1] in prefix_split[-1]
-            ):
-                # Check if the last part of the excluded pattern is contained in the last part of the prefix
-                # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
-                # e.g., model.layers.{i}.self_attn.{fused_weight_name}
-                assert len(prefix_split) == 5 and len(pattern_split) == 5
-                return True
-        return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         return self._get_quant_method(
@@ -1161,13 +1181,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
-        layer.input_scale = Parameter(input_scale_2, requires_grad=False)
-        layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
-        layer.alpha = Parameter(
-            layer.input_scale * layer.weight_scale_2, requires_grad=False
+
+        # Keep per-shard scales intact for hot reload; derive scalar params below.
+        copy_or_rebind_param(
+            layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
         )
-        layer.input_scale_inv = Parameter(
-            (1 / input_scale_2).to(torch.float32), requires_grad=False
+        copy_or_rebind_param(
+            layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
 
         # Store original output size before any padding
@@ -1219,15 +1239,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
-            layer.weight = Parameter(weight, requires_grad=False)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
+            copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
         weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
         layer.weights_padding_cols = weights_padding_cols
-        layer.weight = Parameter(weight, requires_grad=False)
+        copy_or_rebind_param(layer, "weight", weight)
 
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
@@ -1251,7 +1271,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale_ndim == 2
             else padded_scales.reshape(B, M_padded, K_padded)
         )
-        layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+        copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
 
     def apply(
         self,
@@ -1477,18 +1497,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
-            if not torch.allclose(
-                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
-            ):
-                logger.warning_once(
-                    "w1_weight_scale_2 must match w3_weight_scale_2. "
-                    "Accuracy may be affected."
-                )
+            if layer.w13_weight_scale_2.dim() == 1:
+                # Some checkpoints store a shared scale for w1/w3.
+                w13_weight_scale_2 = layer.w13_weight_scale_2
+            else:
+                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                    layer.w13_weight_scale_2[:, 0],
+                    layer.w13_weight_scale_2[:, 1],
+                ):
+                    logger.warning_once(
+                        "w1_weight_scale_2 must match w3_weight_scale_2. "
+                        "Accuracy may be affected."
+                    )
 
-            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+                w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-        layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
 
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
@@ -1530,19 +1554,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
         # Create shared parameters
-        layer.g1_alphas = Parameter(
+        copy_or_rebind_param(
+            layer,
+            "g1_alphas",
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
-            requires_grad=False,
         )
-        layer.g2_alphas = Parameter(
+        copy_or_rebind_param(
+            layer,
+            "g2_alphas",
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
-            requires_grad=False,
         )
-        layer.w13_input_scale_quant = Parameter(
-            (1 / w13_input_scale).to(torch.float32), requires_grad=False
+        copy_or_rebind_param(
+            layer,
+            "w13_input_scale_quant",
+            (1 / w13_input_scale).to(torch.float32),
         )
-        layer.w2_input_scale_quant = Parameter(
-            (1 / w2_input_scale).to(torch.float32), requires_grad=False
+        copy_or_rebind_param(
+            layer,
+            "w2_input_scale_quant",
+            (1 / w2_input_scale).to(torch.float32),
         )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
@@ -1602,8 +1632,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            del layer.w13_weight_scale
-            layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
+            copy_or_rebind_param(
+                layer, "w13_blockscale_swizzled", w13_blockscale_swizzled
+            )
 
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
@@ -1615,46 +1646,56 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "but padding is also implemented for gated activations"
                 )
 
-                layer.w13_weight = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight",
                     torch.nn.functional.pad(
                         w13_weight, (0, 0, 0, intermediate_size_pad)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_weight = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w2_weight",
                     torch.nn.functional.pad(
                         layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_weight_scale = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w2_weight_scale",
                     torch.nn.functional.pad(
                         layer.w2_weight_scale, (0, intermediate_size_pad // 16)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_blockscale_swizzled = Parameter(
-                    swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-                )
-
-            layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            del layer.w2_weight_scale
-            layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
+            copy_or_rebind_param(
+                layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
+            )
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
-            # Set up CUTLASS MoE parameters
+            # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)
             device = layer.w13_weight.device
-            layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
-                device,
-                num_experts=layer.num_experts,  # global num experts
-                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
-                hidden_size=layer.w13_weight.shape[2] * 2,
-            )  # k
+            inter_size = layer.w2_weight.shape[2] * 2
+            hidden_size = layer.w13_weight.shape[2] * 2
+            existing_params = getattr(layer, "cutlass_moe_params", None)
+            if (
+                existing_params is None
+                or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
+                or existing_params.num_experts != layer.num_experts
+                or existing_params.intermediate_size_per_partition != inter_size
+                or existing_params.hidden_size != hidden_size
+                or existing_params.device != device
+            ):
+                layer.cutlass_moe_params = CutlassMoEParams(
+                    CutlassMoEType.BlockscaledFP4,
+                    device,
+                    num_experts=layer.num_experts,  # global num experts
+                    intermediate_size_per_partition=inter_size,  # n
+                    hidden_size=hidden_size,
+                )  # k
 
     @property
     def load_up_proj_weight_first(self) -> bool:

@@ -2,13 +2,11 @@
 
 use async_trait::async_trait;
 use tracing::info;
-
-use crate::{
-    core::steps::workflow_data::WorkerRegistrationData,
-    workflow::{
-        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
-    },
+use wfaas::{
+    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
+
+use crate::core::steps::workflow_data::WorkerRegistrationData;
 
 /// Unified step to activate workers by marking them as healthy.
 ///
