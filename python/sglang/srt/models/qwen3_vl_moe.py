@@ -355,6 +355,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        self.visual.patch_embed.copy_conv3d_weight_to_linear()
+
         # TODO mimic deepseek
         # Lazy initialization of expert weights cache to avoid slowing down load_weights
         # if not hasattr(self, "routed_experts_weights_of_layer"):
