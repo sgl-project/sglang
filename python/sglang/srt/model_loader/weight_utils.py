@@ -65,6 +65,11 @@ try:
 except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
+try:
+    import instanttensor
+except ImportError as e:
+    instanttensor = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -789,6 +794,35 @@ def fastsafetensors_weights_iterator(
                 pass
         finally:
             loader.close()
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """
+    Iterate over the weights in the model instanttensor files
+    using instanttensor library to accelerate loading via GPU Direct Storage (if available).
+    """
+    if instanttensor is None:
+        raise ImportError(
+            "Please install instanttensor via `pip install instanttensor`"
+        )
+    pg = None
+    world_size = 1
+    rank = 0
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+        world_size = torch.distributed.get_world_size(pg)
+        rank = torch.distributed.get_rank(pg)
+
+    device = torch.device(f"cuda:{rank}")
+    process_group = pg if world_size > 1 else None
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        for name, tensor in f.tensors():
+            yield name, tensor
 
 
 def multi_thread_safetensors_weights_iterator(
