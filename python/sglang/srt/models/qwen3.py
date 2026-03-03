@@ -250,11 +250,18 @@ class Qwen3DecoderLayer(nn.Module):
             if get_global_server_args().rl_on_policy_target is not None
             else {}
         )
+
+        if _is_npu:
+            norm_kwargs_input = {**norm_kwargs, "linear_func": self.self_attn.qkv_proj}
+            norm_kwargs_post = {**norm_kwargs, "linear_func": self.mlp.gate_up_proj}
+        else:
+            norm_kwargs_input = norm_kwargs_post = norm_kwargs
+
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs_input
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs_post
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

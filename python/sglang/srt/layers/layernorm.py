@@ -97,6 +97,7 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        linear_func: Optional = None,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -114,6 +115,8 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+
+        self.linear_func = linear_func
 
     def forward_cuda(
         self,
@@ -157,9 +160,19 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
-            )
+            if self.linear_func is not None:
+                out, _, residual_out = torch.ops.npu.npu_add_rms_norm_quant(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.linear_func.aclnn_input_scale,
+                    self.linear_func.aclnn_input_offset,
+                    epsilon=self.variance_epsilon,
+                )
+            else:
+                out, _, residual_out = torch_npu.npu_add_rms_norm(
+                    residual, x, self.weight.data, self.variance_epsilon
+                )
             return out, residual_out
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 

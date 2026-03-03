@@ -737,10 +737,14 @@ class CommunicateSimpleFn:
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
-        )
+        if hidden_states.dtype == torch.bfloat16:
+            hidden_states, local_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+        else:
+            local_hidden_states = hidden_states
+            hidden_states = torch.empty_like(get_local_dp_buffer(), dtype=torch.int8)
         attn_tp_all_gather_into_tensor(
             hidden_states,
             local_hidden_states,

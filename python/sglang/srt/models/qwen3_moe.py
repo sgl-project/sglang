@@ -743,7 +743,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        norm_kwargs = (
+            dict(
+                linear_func=self.self_attn.qkv_proj,
+            )
+            if _is_npu
+            else {}
+        )
+
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
