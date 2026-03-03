@@ -758,6 +758,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         # When enable_cp_all_ranks_transfer is on, all CP ranks send their page range;
         # otherwise only rank 0 sends and sends all pages.
+        # When total_pages < cp_size (e.g. 1 page, 8 CP ranks), only some ranks get pages;
+        # others get empty page_indices for this chunk.
         enable_cp_all_ranks_transfer = (
             envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
         )

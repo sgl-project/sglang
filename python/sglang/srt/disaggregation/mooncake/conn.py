@@ -780,7 +780,12 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                # Unique id per prefill sender so decode's response set size matches expected_response_num.
+                prefill_unique_rank = (
+                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                    + self.pp_rank * self.attn_cp_size
+                    + self.attn_cp_rank
+                )
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -796,7 +801,7 @@ class MooncakeKVManager(CommonKVManager):
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
-                                    local_rank,
+                                    prefill_unique_rank,
                                 )
                                 break
 
@@ -858,7 +863,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req.dst_port,
                                 req.room,
                                 KVPoll.Failed,
-                                local_rank,
+                                prefill_unique_rank,
                             )
                             break
 
@@ -889,7 +894,7 @@ class MooncakeKVManager(CommonKVManager):
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status, local_rank
+                                        endpoint, dst_port, room, status, prefill_unique_rank
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -1134,11 +1139,12 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        logger.debug(f"MooncakeKVSender send with kv_indices: {kv_indices} and curr_idx: {self.curr_idx}")
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
         logger.debug(
-            f"MooncakeKVSender send with kv_indices: {kv_indices} and curr_idx: {self.curr_idx}"
+            f"MooncakeKVSender send with index_slice: {index_slice} and curr_idx: {self.curr_idx}"
         )
 
         if self.kv_mgr.is_dummy_cp_rank:
