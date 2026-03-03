@@ -5,6 +5,7 @@
 # Adapted from transformers: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/clip/modeling_clip.py
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
+
 from collections.abc import Iterable
 from typing import Optional
 
