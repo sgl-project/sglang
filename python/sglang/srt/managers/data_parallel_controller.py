@@ -495,6 +495,14 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
+            # Validate dp_rank range to prevent IndexError and service crash
+            if not (0 <= req.routed_dp_rank < len(self.workers)):
+                logger.warning(
+                    f"Invalid routed_dp_rank={req.routed_dp_rank}, "
+                    f"valid range is [0, {len(self.workers) - 1}]. "
+                    f"Falling back to load balancing."
+                )
+                return False
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
