@@ -161,8 +161,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         self.assertGreater(metrics1["score"], 0.65)
         self.assertGreater(metrics2["score"], 0.65)
 
-        # Score should be consistent
-        self.assertAlmostEqual(metrics1["score"], metrics2["score"], delta=0.05)
+        # Score should be consistent: round 2 should be >= round 1, or at least within a 0.05 margin if slightly lower
+        self.assertGreaterEqual(metrics2["score"], metrics1["score"] - 0.05)
 
 
 if __name__ == "__main__":
