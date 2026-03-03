@@ -4,6 +4,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
@@ -35,11 +36,39 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 
+FP8_ALIGNMENT = 16
+
 strategy_to_parameter_type = {
     QuantizationStrategy.BLOCK: BlockQuantScaleParameter,
     QuantizationStrategy.CHANNEL: ChannelQuantScaleParameter,
     QuantizationStrategy.TENSOR: PerTensorScaleParameter,
 }
+
+
+def _pad_weight_for_fp8(
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+):
+    """
+    Pad weight (out_dim, in_dim) so both dims are divisible by FP8_ALIGNMENT.
+
+    Returns:
+        weight_t: padded and transposed weight
+        weight_scale: padded scale if needed
+        orig_output_dim: original N dimension (for output slice)
+    """
+    orig_out, orig_in = weight.shape
+    pad_in = (-orig_in) % FP8_ALIGNMENT
+    pad_out = (-orig_out) % FP8_ALIGNMENT
+
+    if pad_in > 0 or pad_out > 0:
+        weight = F.pad(weight, (0, pad_in, 0, pad_out))
+        if weight_scale is not None and pad_out > 0:
+            if weight_scale.dim() == 2 and weight_scale.shape[0] == orig_out:
+                weight_scale = F.pad(
+                    weight_scale, (0, 0, 0, pad_out), value=1.0  # 0*scale=0 for padded rows
+                )
+    return weight.t(), weight_scale, orig_out
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
@@ -155,8 +184,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+
+            weight_t, max_w_scale, orig_out = _pad_weight_for_fp8(weight, max_w_scale)
+            layer.weight = Parameter(weight_t, requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.register_buffer("_orig_output_dim", torch.tensor(orig_out, dtype=torch.int))
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
@@ -175,17 +207,26 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # keep the weight as (N, K)
+                # aiter kernel handles non-16-aligned shapes internally; weight/scale not padded.
+                # Output dimension unchanged; register for uniform output slicing logic.
+                orig_out = weight.shape[0]
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
+                    shuffle_weight(weight, (FP8_ALIGNMENT, FP8_ALIGNMENT)),
+                    requires_grad=False,
                 )
+                layer.register_buffer("_orig_output_dim", torch.tensor(orig_out, dtype=torch.int))
             else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+                weight_t, weight_scale, orig_out = _pad_weight_for_fp8(
+                    weight, weight_scale
+                )
+                layer.weight = Parameter(weight_t, requires_grad=False)
+                layer.register_buffer("_orig_output_dim", torch.tensor(orig_out, dtype=torch.int))
 
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         elif self.strategy == QuantizationStrategy.BLOCK:
+            # Block kernel uses its own layout; no padding applied (assumes block-aligned dims)
             assert self.is_static_input_scheme is False
             weight = layer.weight
             weight_scale = layer.weight_scale
@@ -194,8 +235,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight, weight_scale=weight_scale
                 )
-            layer.weight = Parameter(weight.data, requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+            layer.weight = Parameter(weight.detach(), requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale.detach(), requires_grad=False)
+            layer.register_buffer("_orig_output_dim", torch.tensor(-1, dtype=torch.int))
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -223,7 +265,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
-            return apply_fp8_ptpc_linear(
+            output = apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -233,7 +275,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 compressed_tensor_quant=True,
             )
         else:
-            return apply_fp8_linear(
+            expected_in = layer.weight.shape[0]
+            pad = expected_in - x.shape[-1]
+            if pad < 0:
+                raise RuntimeError(
+                    f"Input dim {x.shape[-1]} larger than padded weight dim {expected_in}"
+                )
+            if pad > 0:
+                x = F.pad(x, (0, pad))
+            output = apply_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -242,3 +292,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
             )
+
+        n = layer._orig_output_dim.item() if hasattr(layer, "_orig_output_dim") else -1
+        if n >= 0:
+            output = output[..., :n]
+        return output
