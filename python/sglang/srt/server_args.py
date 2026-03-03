@@ -2282,7 +2282,7 @@ class ServerArgs:
                     "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "flashinfer_trtllm"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
