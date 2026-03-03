@@ -232,10 +232,6 @@ compile_commands.json
 # VSCode
 .vscode
 
-# Cursor
-.cursor/
-.remotedebug/
-
 1
 
 # Autoenv
