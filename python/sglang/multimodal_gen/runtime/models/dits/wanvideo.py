@@ -174,27 +174,20 @@ class WanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
-            is_cross_attention=is_cross_attention,
+            skip_sequence_parallel=is_cross_attention,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
 
 class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
-        super().__init__(
-            *args,
-            **kwargs,
-            is_cross_attention=True,
-        )
+        super().__init__(*args, **kwargs, is_cross_attention=True)
 
     def forward(self, x, context, context_lens):
         r"""

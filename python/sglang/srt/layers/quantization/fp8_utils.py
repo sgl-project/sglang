@@ -181,7 +181,35 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer.gemm import gemm_fp8_nt_groupwise
+    from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    # Wrap gemm_fp8_nt_groupwise as a custom op so torch.compile does not trace
+    # into flashinfer's JIT compilation code (pathlib/cubin_loader ops).
+    @register_custom_op(
+        op_name="flashinfer_gemm_fp8_nt_groupwise",
+        mutates_args=[],
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+            q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=out_dtype)
+        ),
+    )
+    def gemm_fp8_nt_groupwise(
+        q_input: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return _raw_gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            backend="trtllm",
+        )
+
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
@@ -350,7 +378,6 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         x_scale,
         weight_scale,
         out_dtype=input_2d.dtype,
-        backend="trtllm",
     )
 
     if bias is not None:
