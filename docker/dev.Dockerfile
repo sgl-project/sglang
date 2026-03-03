@@ -1,6 +1,6 @@
 # Dev Dockerfile - builds on top of existing sglang base image
 # For faster iteration during development
-ARG BASE_IMAGE=lmsysorg/sglang:latest
+ARG BASE_IMAGE=harbor.xa.xshixun.com:7443/hanfeigeng/lmsysorg/sglang:kv-cache-logging-dev-otel-0.8
 FROM ${BASE_IMAGE}
 
 # Copy local sglang source (with your changes)

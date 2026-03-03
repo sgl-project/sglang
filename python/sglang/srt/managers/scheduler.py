@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -167,7 +168,7 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.managers.session_controller import Session
+from sglang.srt.managers.session_controller import Session, SessionReqNode
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -1425,6 +1426,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        auto_created_session_id = None
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1495,6 +1497,21 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+            
+            # Auto-create session if session_params is provided but id is None
+            if (
+                recv_req.session_params is not None
+                and recv_req.session_params.id is None
+            ):
+                auto_created_session_id = uuid.uuid4().hex
+                self.sessions[auto_created_session_id] = Session(
+                    capacity_of_str_len=0,
+                    session_id=auto_created_session_id
+                )
+                req.session_id = auto_created_session_id
+                self.sessions[auto_created_session_id].req_nodes[req.rid] = SessionReqNode(req)
+                # Add session_id to customized_info so it's returned in the response
+                req.customized_info = {"session_id": auto_created_session_id}
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]

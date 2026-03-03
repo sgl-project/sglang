@@ -143,6 +143,7 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
+    semantic_event: Optional[str] = None
 
 
 # Type definitions for multimodal input data
@@ -615,6 +616,16 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
     def __getitem__(self, i):
+        # Handle session_params - extract i-th element from list fields
+        session_params = self.session_params
+        if isinstance(session_params, dict):
+            session_params = {
+                k: (v[i] if isinstance(v, list) else v)
+                for k, v in session_params.items()
+            }
+        elif isinstance(session_params, list):
+            session_params = session_params[i] if i < len(session_params) else None
+
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -640,7 +651,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ),
             return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
-            session_params=self.session_params,
+            session_params=session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(

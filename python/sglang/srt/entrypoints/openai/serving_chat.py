@@ -302,6 +302,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
+            session_params=request.session_params,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
@@ -973,13 +974,18 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        # Build metadata
+        metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+        if "session_id" in ret[0]["meta_info"]:
+            metadata["session_id"] = ret[0]["meta_info"]["session_id"]
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
         )
 
     def _process_logprobs_tokens(

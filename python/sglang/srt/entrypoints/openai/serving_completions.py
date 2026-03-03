@@ -122,6 +122,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
+            session_params=request.session_params,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -477,13 +478,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ret, n_choices=request.n, enable_cache_report=cache_report
         )
 
+        # Build metadata
+        metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+        if "session_id" in ret[0]["meta_info"]:
+            metadata["session_id"] = ret[0]["meta_info"]["session_id"]
+
         return CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
             created=created,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

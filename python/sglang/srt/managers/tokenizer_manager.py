@@ -911,8 +911,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            # Handle session_params which can be a dict or a list of dicts
+            session_params_data = obj.session_params
+            if isinstance(session_params_data, list):
+                session_params_data = session_params_data[0] if session_params_data else None
+            
+            # Ensure all fields are scalar values, not lists
+            if session_params_data:
+                for key in ['id', 'rid', 'offset', 'replace', 'drop_previous_output', 'semantic_event']:
+                    if key in session_params_data and isinstance(session_params_data[key], list):
+                        session_params_data[key] = session_params_data[key][0] if session_params_data[key] else None
+            
             session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
+                SessionParams(**session_params_data) if session_params_data else None
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
