@@ -65,7 +65,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -75,7 +74,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.server_args import ServerArgs
 
-CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -1036,39 +1035,27 @@ class SchedulerDisaggregationDecodeMixin:
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        """Create fake completed prefill if possible and merge with running batch"""
-        # Merge the prefill batch into the running batch
-        last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_prebuilt():
-            # chunked prefill doesn't happen in decode instance.
-            assert self.chunked_req is None
-            # Filter finished batches.
-            last_batch.filter_batch()
-            if not last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = last_batch
-                else:
-                    # merge running_batch with prefill batch
-                    self.running_batch.merge_batch(last_batch)
-
+        """Process prebuilt batch and schedule the next decode batch."""
+        # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
-
-        ret: Optional[ScheduleBatch] = None
         if new_prebuilt_batch:
-            ret = new_prebuilt_batch
+            assert self.chunked_req is None
+            self.process_batch_result_prebuilt(new_prebuilt_batch)
+            new_prebuilt_batch.filter_batch()
+            if not new_prebuilt_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = new_prebuilt_batch
+                else:
+                    self.running_batch.merge_batch(new_prebuilt_batch)
+
+        # Schedule decode batch
+        if self.running_batch.is_empty():
+            ret = None
         else:
-            if self.running_batch.is_empty():
-                ret = None
-            else:
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+            self.running_batch = self.update_running_batch(self.running_batch)
+            ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        # 1. decode + None -> decode + idle
-        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
-        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
-        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
         ret = self.maybe_prepare_mlp_sync_batch(ret)
-
         if ret:
             set_schedule_time_batch(ret)
         return ret
