@@ -13,6 +13,7 @@ class EplbAlgorithm(Enum):
     deepseek_vec = auto()
     deepseek_vec_hierarchical = auto()
     elasticity_aware = auto()
+    topology_aware = auto()
     # TODO may have more algorithm later
 
 
@@ -32,6 +33,17 @@ def rebalance_experts(
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
             enable_hierarchical=algorithm == EplbAlgorithm.deepseek_hierarchical,
+        )
+
+    if algorithm == EplbAlgorithm.topology_aware:
+        return deepseek.rebalance_experts(
+            weight=tokens_per_expert.sum(dim=0),
+            num_replicas=num_physical_experts,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+            num_gpus=num_physical_experts // num_local_physical_experts,
+            enable_hierarchical=True,
+            topology_aware=True,
         )
 
     if algorithm in [
@@ -74,7 +86,10 @@ def compute_algorithm(
         return EplbAlgorithm[raw_algorithm]
 
     # TODO test on real scenarios and know which ones perform better
+    # For multi-node deployments, prefer topology_aware for better RDMA reduction
     if (num_groups is not None) and (num_groups % num_nodes == 0):
+        if num_nodes > 1:
+            return EplbAlgorithm.topology_aware
         return EplbAlgorithm.deepseek_hierarchical
     else:
         return EplbAlgorithm.deepseek
