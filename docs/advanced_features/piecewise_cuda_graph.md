@@ -99,7 +99,48 @@ For wrapping external library functions (e.g., FlashInfer kernels), use `registe
 ## How it works
 ### Torch compile backend
 
+PCG uses `torch.compile` with a custom backend (`SGLangBackend`) to split and compile the model's forward pass. The flow is:
+
+```
+model.forward wrapper
+→ torch.compile(..., backend=SGLangBackend)
+→ FX graph
+→ split_graph() at registered split ops
+→ split_gm (top-level graph that chains the pieces)
+→ replace capturable submodules with CUDAPiecewiseBackend
+→ runtime dispatch: eager split ops + per-piece capture/replay
+```
+
+- **Install**: `install_torch_compiled()` replaces `model.forward` with a wrapper function. When `is_in_piecewise_cuda_graph()` returns True, the wrapper dispatches to the compiled callable; otherwise it falls back to the original forward. The first invocation through this path triggers Dynamo tracing and graph compilation — CUDA graph replay only happens after the capture phase completes.
+
+- **Split**: When `torch.compile` traces the model, `SGLangBackend` receives the FX graph and calls `split_graph()`. Ops listed in `CompilationConfig.split_ops` are treated as split points, so the graph is cut at each one. These split-op submodules are left to run eagerly at runtime, while the surrounding submodules are compiled and wrapped by `CUDAPiecewiseBackend`. The result is a top-level "stitching graph" (`split_gm`) with children such as `submod_0`, `submod_1`, … interleaving capturable subgraphs and eager split-op submodules.
+
+- **Replace**: `PiecewiseCompileInterpreter` iterates over each capturable submodule in `split_gm`, compiles it for general (dynamic) shapes, and replaces it in-place with a `CUDAPiecewiseBackend` instance. Split-op submodules (e.g., attention, all-reduce) are left as-is and run eagerly at runtime.
+
+- **Dispatch**: At runtime, calling `split_gm` executes the stitching graph, which calls each submodule in order. Split-op submodules run eagerly. Each `CUDAPiecewiseBackend` submodule goes through three phases:
+  - **Compile warmup** — runs the general-shape compiled path.
+  - **Capture** — for each capture size, runs one warmup pass then records a CUDA graph.
+  - **Steady-state replay** — replays the captured CUDA graph for each forward pass.
+
 ### Piecewise cuda graph runner
+
+`PiecewiseCudaGraphRunner` orchestrates the full lifecycle: initialization, warmup, capture, and runtime replay.
+
+**Initialization** allocates static input buffers (`PrefillInputBuffers`) and sets up a global shared memory pool for all CUDA graph captures.
+
+**Warmup** has two phases:
+- **Pre-JIT warmup**: A single forward pass before `torch.compile` is installed, to warm up JIT-compiled kernels.
+- **Post-compile warmup**: `install_torch_compiled()` wraps the model with `torch.compile`. The first `warmup_compile()` call triggers Dynamo tracing, which invokes `SGLangBackend` once to split the graph and create `CUDAPiecewiseBackend` instances. Subsequent calls for other capture sizes reuse the already-compiled stitching graph (`split_gm`) — `SGLangBackend.__call__()` is guarded to run only once. During this phase, `is_in_pcg_torch_compile()` returns True, so backends execute compiled code but do not capture CUDA graphs.
+
+**Capture** iterates capture sizes in reverse order (largest first). For each size, the forward pass runs twice: once for per-piece kernel warmup, once for actual CUDA graph capture. Each `CUDAPiecewiseBackend` records its subgraph into a `torch.cuda.CUDAGraph` object and converts its output to a weak reference.
+
+**Replay** at runtime:
+- `can_run()` checks: token count ≤ max, no pre-computed input embeddings, and logprob constraints.
+- `replay_prepare()` uses binary search (`bisect_left`) to find the smallest captured size ≥ actual token count, copies inputs into static buffers, and zero-pads unused positions.
+- `model.forward()` dispatches through the stitching graph, replaying each piece's CUDA graph.
+- The runner normalizes outputs according to the actual token count:
+  - **Token generation** (`LogitsProcessorOutput`): logits and hidden states are sliced back to `raw_num_tokens`.
+  - **Embedding models** (`EmbeddingPoolerOutput`): returned as-is.
 
 ### Memory optimization
 
@@ -110,7 +151,20 @@ The torch memory allocator overhead is trivial thanks to several optimizations: 
 The main memory overhead comes from non-torch memory — the CUDA graph objects themselves require GPU memory to store the recorded kernel launch parameters and internal state. This overhead scales with the number of captured sizes, which is why `piecewise_cuda_graph_max_tokens` is capped conservatively by default.
 
 ### Shape configuration
+Piecewise CUDA graph pre-captures graphs for a set of token counts. At runtime, the actual token count is rounded up to the nearest captured size (via binary search), and the corresponding graph is replayed. If the token count exceeds the largest captured size, the runtime falls back to the normal (non-graph) forward path.
 
+The default capture schedule is auto-generated with increasing granularity:
+
+| Token range | Step size |
+|-------------|-----------|
+| 4 – 32      | 4         |
+| 48 – 256    | 16        |
+| 288 – 512   | 32        |
+| 576 – 1024  | 64        |
+| 1280 – 4096 | 256       |
+| 4096+       | 512       |
+
+For the auto-generated schedule, sizes are capped at `--piecewise-cuda-graph-max-tokens`. The default cap is `chunked_prefill_size` for non-MLA models and `2048` for MLA backend models. If `--max-total-tokens` is set, the cap is further limited to not exceed it. Additionally, Llama-2 models are auto-capped at 4096 tokens as a temporary workaround.
 
 ## Compatibility
 
