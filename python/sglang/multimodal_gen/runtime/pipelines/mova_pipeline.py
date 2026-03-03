@@ -11,10 +11,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     ImageVAEEncodingStage,
     InputValidationStage,
-    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
     MOVADecodingStage,
@@ -62,53 +60,41 @@ class MOVAPipeline(ComposedPipelineBase):
             )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
-        )
-        self.add_stage(
-            stage_name="prompt_encoding_stage",
-            stage=TextEncodingStage(
-                text_encoders=[self.get_module("text_encoder")],
-                tokenizers=[self.get_module("tokenizer")],
-            ),
-        )
-        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
         if getattr(self.get_module("video_dit"), "require_vae_embedding", True):
-            self.add_stage(
-                stage_name="image_latent_preparation_stage",
-                stage=ImageVAEEncodingStage(vae=self.get_module("video_vae")),
-            )
+            self.add_stage(ImageVAEEncodingStage(vae=self.get_module("video_vae")))
         self.add_stage(
-            stage_name="mova_latent_preparation_stage",
-            stage=MOVALatentPreparationStage(
+            MOVALatentPreparationStage(
                 audio_vae=self.get_module("audio_vae"),
                 require_vae_embedding=getattr(
                     self.get_module("video_dit"), "require_vae_embedding", True
                 ),
             ),
+            "mova_latent_preparation_stage",
         )
         self.add_stage(
-            stage_name="mova_timestep_preparation_stage",
-            stage=MOVATimestepPreparationStage(
+            MOVATimestepPreparationStage(
                 scheduler=self.get_module("scheduler"),
             ),
+            "mova_timestep_preparation_stage",
         )
         self.add_stage(
-            stage_name="mova_denoising_stage",
-            stage=MOVADenoisingStage(
+            MOVADenoisingStage(
                 video_dit=self.get_module("video_dit"),
                 video_dit_2=self.get_module("video_dit_2"),
                 audio_dit=self.get_module("audio_dit"),
                 dual_tower_bridge=self.get_module("dual_tower_bridge"),
                 scheduler=self.get_module("scheduler"),
             ),
+            "mova_denoising_stage",
         )
         self.add_stage(
-            stage_name="mova_decoding_stage",
-            stage=MOVADecodingStage(
+            MOVADecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
             ),
+            "mova_decoding_stage",
         )
 
 
