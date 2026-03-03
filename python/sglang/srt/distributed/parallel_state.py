@@ -69,6 +69,24 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 
+def get_torch_distributed_pg_options(group_name=None):
+    if not _is_npu:
+        return None
+
+    # Only create HCCL options for default group or MoE-related groups
+    if group_name is not None and "moe" not in group_name:
+        return None
+
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    hccl_buffer_size = int(
+        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
+    )
+    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    return options
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.get_device_module().Stream
@@ -274,8 +292,9 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
+                pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks, backend=torch_distributed_backend, pg_options=pg_options
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -625,6 +644,58 @@ class GroupCoordinator:
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        # Prefer communicator-native fused API when provided.
+        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                # Fall back to custom_fused_ar_rms path below.
+                pass
+
+        if not hasattr(ca_comm, "custom_fused_ar_rms"):
+            return None
+
+        # 1-stage policy for fused AR+RMSNorm:
+        # 1) Explicit env override wins.
+        # 2) Deterministic inference forces 1-stage for reproducibility.
+        # 3) Otherwise follow AITER's heuristic (small payloads only).
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
+
+        fused_outputs = ca_comm.custom_fused_ar_rms(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
+        return fused_outputs
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
@@ -1526,6 +1597,20 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
+_DEVICE_TO_DISTRIBUTED_BACKEND = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl",
+    "musa": "mccl",
+}
+
+
+def get_default_distributed_backend(device: str) -> str:
+    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1563,6 +1648,8 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
+        pg_options = get_torch_distributed_pg_options()
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1570,6 +1657,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            pg_options=pg_options,
         )
 
     # set the local rank

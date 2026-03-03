@@ -7,8 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -33,7 +32,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     format_tcp_address,
@@ -194,16 +196,8 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.bootstrap_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
-            )
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.waiting_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
-            )
-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
-            self.addr_to_rooms_tracker = defaultdict(set)
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
 
@@ -874,6 +868,19 @@ class MoriKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -1005,7 +1012,7 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
         packed_state_descs = _pack_mem_desc_list(self.kv_mgr.state_mem_descs)
         gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
-        decode_tp_size = str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii")
+        decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
 
