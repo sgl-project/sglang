@@ -1096,21 +1096,18 @@ def _embed_mm_inputs_with_split(
         token_starts.append(cumulative)
         cumulative += sl
 
-    total_tokens = input_ids.shape[0]
-    hidden_size = input_embedding.embedding_dim
-    device = input_ids.device
-    dtype = input_embedding.weight.dtype
-    input_embeds = torch.empty(total_tokens, hidden_size, device=device, dtype=dtype)
+    vocab_size = input_embedding.num_embeddings
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
     other_info = {}
 
     input_deepstack_embeds = None
     if use_deepstack and multimodal_model is not None:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
         input_deepstack_embeds = torch.zeros(
-            total_tokens,
-            hidden_size * num_deepstack_embeddings,
-            device=device,
-            dtype=dtype,
+            input_ids.shape[0],
+            input_embedding.embedding_dim * num_deepstack_embeddings,
+            device=input_ids.device,
+            dtype=input_embedding.weight.dtype,
         )
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
