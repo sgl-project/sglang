@@ -220,16 +220,14 @@ class Engine(EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            if self.server_args.dp_size == 1:
-                logger.warning(
-                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size=1"
-                )
-                return None
-            if routed_dp_rank < 0:
-                raise ValueError("routed_dp_rank must be non-negative")
-            if routed_dp_rank >= self.server_args.dp_size:
+            dp_size = self.server_args.dp_size
+            if dp_size <= 1:
                 raise ValueError(
-                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} is not supported because dp_size={dp_size}"
+                )
+            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+                raise ValueError(
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
