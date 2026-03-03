@@ -111,8 +111,6 @@ def serve(args, extra_argv):
             from sglang.launch_server import run_server
             from sglang.srt.server_args import prepare_server_args
 
-            # Add a dummy argument for the program name, expected by prepare_server_args
-            # as it typically processes sys.argv
             server_args = prepare_server_args(dispatch_argv)
 
             run_server(server_args)
