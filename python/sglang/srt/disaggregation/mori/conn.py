@@ -32,7 +32,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    page_indices_to_cp_rank_page_indices,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     format_tcp_address,
@@ -865,7 +868,40 @@ class MoriKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.is_dummy_cp_rank:
+        # Special handling for cp
+        if self.kv_mgr.enable_cp_all_ranks_transfer:
+            total_pages = len(kv_indices)
+            cp_rank = self.kv_mgr.attn_cp_rank
+            cp_size = self.kv_mgr.attn_cp_size
+
+            rank_page_indices = page_indices_to_cp_rank_page_indices(
+                page_indices=kv_indices,
+                total_pages=total_pages,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+            if rank_page_indices.size == 0:
+                kv_indices = kv_indices[:0]
+                index_slice = slice(index_slice.start, index_slice.start)
+            else:
+                mask = np.isin(kv_indices, rank_page_indices)
+                if not mask.any():
+                    kv_indices = kv_indices[:0]
+                    index_slice = slice(index_slice.start, index_slice.start)
+                else:
+                    first_pos = int(mask.argmax())
+                    last_pos = len(mask) - int(mask[::-1].argmax())
+
+                    kv_indices = kv_indices[first_pos:last_pos]
+                    index_slice = slice(
+                        index_slice.start + first_pos,
+                        index_slice.start + last_pos,
+                    )
+            logger.debug(
+                f"After filter for this CP rank: {kv_indices=}, {index_slice=}"
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last:
                 return
             else:
