@@ -82,6 +82,47 @@ rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.t
 pip install -e "python[all_musa]"
 ```
 
+## Platform-Specific: Windows (NVIDIA CUDA)
+
+Native Windows support uses the `sglang` backend with `torch_sdpa` attention.
+
+Note:
+- Flash Attention (`fa`) is not supported on the native Windows CUDA path.
+- Use the Windows-specific dependency profile (`pyproject_other.toml`) for now.
+
+```powershell
+# From repo root
+py -3.10 -m venv .venv-win
+.\.venv-win\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip setuptools wheel
+
+# Use the Windows dependency profile
+Remove-Item -Force python/pyproject.toml
+Copy-Item python/pyproject_other.toml python/pyproject.toml
+
+# Install Windows extras
+pip install -e "python[all_windows]"
+```
+
+Quick test:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-klein-4B \
+  --backend sglang \
+  --attention-backend torch_sdpa \
+  --num-gpus 1 \
+  --text-encoder-cpu-offload \
+  --dit-cpu-offload \
+  --vae-cpu-offload \
+  --pin-cpu-memory \
+  --prompt "a cinematic portrait of a robot engineer in a workshop" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 4 \
+```
+
 ## Platform-Specific: Ascend NPU
 
 For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend_npu.md).
