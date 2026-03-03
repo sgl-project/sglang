@@ -78,7 +78,6 @@ class UlyssesAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
-    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
@@ -157,7 +156,6 @@ class UlyssesAttention(nn.Module):
 class UlyssesAttention_VSA(UlyssesAttention):
     """Distributed attention layer with VSA support."""
 
-    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
@@ -305,8 +303,17 @@ class USPAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        skip_sequence_parallel: bool = False,
         **extra_impl_args,
     ) -> None:
+        """
+        Args:
+            skip_sequence_parallel:
+              when KV is replicated across all SP ranks (e.g. cross-attention to
+              text/image encoder outputs), the full USP pipeline is redundant:
+              each rank's local Q shard can attend directly to the locally-held
+              full KV without any collective communication.
+        """
         super().__init__()
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
@@ -338,6 +345,8 @@ class USPAttention(nn.Module):
         self.causal = causal
         self.dropout_p = dropout_rate
 
+        self.skip_sequence_parallel = skip_sequence_parallel
+
     def forward(
         self,
         q: torch.Tensor,
@@ -353,13 +362,16 @@ class USPAttention(nn.Module):
             q, k, v: [B, S_local, H, D]
 
         Note: Replicated tensors are not supported in this implementation.
+        When skip_sequence_parallel=True (set at construction time), all SP
+        communication is bypassed — use this for cross-attention where KV
+        content is replicated across ranks (distinct from replicated_k/v args).
         """
         assert (
             replicated_q is None and replicated_k is None and replicated_v is None
         ), "USPAttention does not support replicated_qkv."
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-        if get_sequence_parallel_world_size() == 1:
+        if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
