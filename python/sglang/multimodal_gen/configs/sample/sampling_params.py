@@ -14,12 +14,15 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean
+from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def _json_safe(obj: Any):
@@ -66,12 +69,14 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    MESH = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
-        else:
+        if self == DataType.VIDEO:
             return "mp4"
+        return "glb"
 
 
 @dataclass
@@ -170,7 +175,7 @@ class SamplingParams:
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp"]
+            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
         ):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -352,18 +357,36 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
+        expand_path_fields(self)
+
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
+        if self.guidance_scale is None:
+            try:
+                from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+                    Hunyuan3D2PipelineConfig,
+                )
+
+                if isinstance(pipeline_config, Hunyuan3D2PipelineConfig):
+                    self.guidance_scale = pipeline_config.guidance_scale
+                else:
+                    self.guidance_scale = 1.0
+            except ImportError:
+                self.guidance_scale = 1.0
+
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
-        if self.output_path is None and server_args.output_path is not None:
-            self.output_path = server_args.output_path
-            logger.debug(
-                f"Overriding output_path with server configuration: {self.output_path}"
-            )
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -489,15 +512,18 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         backend = kwargs.pop("backend", None)
-        model_info = get_model_info(model_path, backend=backend)
+        model_id = kwargs.pop("model_id", None)
+        model_info = get_model_info(model_path, backend=backend, model_id=model_id)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
-    def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
+    def from_user_sampling_params_args(
+        model_path: str, server_args: "ServerArgs", *args, **kwargs
+    ):
         try:
             sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend
+                model_path, backend=server_args.backend, model_id=server_args.model_id
             )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
@@ -875,6 +901,8 @@ class SamplingParams:
         return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
+        if self.output_path is None:
+            return None
         return os.path.join(self.output_path, self.output_file_name)
 
     def _merge_with_user_params(self, user_params: "SamplingParams"):

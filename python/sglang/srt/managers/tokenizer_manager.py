@@ -482,6 +482,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        self._validate_rid(obj)
 
         self._req_stats_init(obj, request)
         if self.server_args.language_only:
@@ -736,6 +737,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    def _validate_rid(self, obj: Union[GenerateReqInput, EmbeddingReqInput]) -> None:
+        """Validate the request ID (rid) uniqueness."""
+        rid = obj.rid
+        if rid is None:
+            return
+        ids = rid if isinstance(rid, list) else [rid]
+        if len(ids) != len(set(ids)):
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {ids}"
+            )
+
+        for i in ids:
+            if i in self.rid_to_state:
+                raise ValueError(f"Duplicate request ID detected: {i}")
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
