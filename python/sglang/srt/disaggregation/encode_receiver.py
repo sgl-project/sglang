@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -211,24 +211,13 @@ class MultiModalEmbeddingData(EmbeddingData):
     def __repr__(self):
         return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
 
-    def get_embedding_offsets(self):
-        embedding_offsets = {}
-        global_offset = 0
-        for i in range(self.num_parts):
-            modality = self.modality_list[i]
-            embedding_len = self.embedding_shape_list[i][0]
-            if modality not in embedding_offsets:
-                embedding_offsets[modality] = []
-            embedding_range = (global_offset, global_offset + embedding_len)
-            embedding_offsets[modality].append(embedding_range)
-            global_offset += embedding_len
-        return embedding_offsets
-
     def get_embedding(self, is_concat=False):
         if is_concat:
-            return torch.concat(
-                [e.cuda() for e in self.embedding_list if e is not None]
-            )
+            groups = defaultdict(list)
+            for i, e in enumerate(self.embedding_list):
+                if e is not None:
+                    groups[self.modality_list[i]].append(e.cuda())
+            return {mod: torch.concat(tensors) for mod, tensors in groups.items()}
         return self.embedding_list
 
     @property
@@ -449,11 +438,9 @@ class WaitingImageRequest:
                 self.recv_embedding_data.add(recv_obj)
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        recv_embedding_offsets = self.recv_embedding_data.get_embedding_offsets()
         mm_inputs = self.mm_processor.get_mm_data(
             self.recv_req.input_text,
             recv_embedding,
-            recv_embedding_offsets,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
@@ -1000,11 +987,9 @@ class MMReceiverHTTP(MMReceiverBase):
 
         recv_socket.close()
 
-        recv_embedding_offsets = recv_embedding_data.get_embedding_offsets()
         mm_inputs = mm_processor.get_mm_data(
             prompt,
             recv_embedding,
-            recv_embedding_offsets,
             **recv_embedding_data.get_mm_extra_meta(),
         )
         return mm_inputs

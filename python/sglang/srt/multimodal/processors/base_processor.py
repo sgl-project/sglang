@@ -321,66 +321,7 @@ class BaseMultimodalProcessor(ABC):
 
         return input_ids, offsets, modality_list
 
-    @staticmethod
-    def update_embedding_index(
-        embedding_offsets, modality, embedding_index_dict, cur_num_tokens
-    ):
-        """
-        Update embedding index for a modality when using range-based embedding_offsets.
-
-        Args:
-            embedding_offsets: Dict mapping modality to list of (start, end) tuples
-            modality: Current modality
-            embedding_index_dict: Dict tracking current (start_idx, end_idx) for each modality
-            cur_num_tokens: Number of tokens needed for current item
-
-        Returns:
-            Updated (start_idx, end_idx) tuple for the modality
-        """
-        if embedding_index_dict.get(modality, None) is None:
-            embedding_index_dict[modality] = (0, 0)
-        start_idx, end_idx = embedding_index_dict.get(modality)
-
-        # Judge whether the current range is within the specific modality embedding range
-        range_start, range_end = embedding_offsets[modality][0]
-        if end_idx >= range_start and end_idx + cur_num_tokens <= range_end:
-            # Current range is within the specific modality embedding range
-            embedding_index_dict[modality] = (end_idx, end_idx + cur_num_tokens)
-        elif end_idx < range_start:
-            # Current range is before the specific modality embedding range
-            assert (
-                range_start + cur_num_tokens <= range_end
-            ), f"Range [{range_start}, {range_end}) too small for {cur_num_tokens} tokens"
-            embedding_index_dict[modality] = (range_start, range_start + cur_num_tokens)
-        elif end_idx + cur_num_tokens > range_end:
-            # Current range is after the specific modality embedding range
-            # Continue to the next range
-            embedding_offsets[modality].pop(0)
-            if not embedding_offsets[modality]:
-                raise ValueError(
-                    f"No more embedding offset available for modality {modality}"
-                )
-            embedding_start_idx, embedding_end_idx = embedding_offsets[modality][0]
-            assert (
-                embedding_start_idx >= end_idx
-            ), f"Next range start {embedding_start_idx} < current end {end_idx}"
-            assert (
-                embedding_start_idx + cur_num_tokens <= embedding_end_idx
-            ), f"Next range [{embedding_start_idx}, {embedding_end_idx}) too small for {cur_num_tokens} tokens"
-            embedding_index_dict[modality] = (
-                embedding_start_idx,
-                embedding_start_idx + cur_num_tokens,
-            )
-        else:
-            raise ValueError(
-                f"Invalid embedding range for modality {modality}: "
-                f"current [{start_idx}, {end_idx}), need {cur_num_tokens} tokens, "
-                f"available range [{range_start}, {range_end})"
-            )
-
-        return embedding_index_dict[modality]
-
-    def get_mm_data(self, prompt, embeddings, embedding_offsets, **kwargs):
+    def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
@@ -394,14 +335,15 @@ class BaseMultimodalProcessor(ABC):
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
         mm_items = []
-        embedding_index_by_modality = {}
+        consumed_per_modality = {}
 
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
-            start_idx, end_idx = self.update_embedding_index(
-                embedding_offsets, modality, embedding_index_by_modality, num_tokens
-            )
-            embedding_slice = embeddings[start_idx:end_idx]
+            embedding_start = consumed_per_modality.get(modality, 0)
+            embedding_slice = embeddings[modality][
+                embedding_start : embedding_start + num_tokens
+            ]
+            consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,

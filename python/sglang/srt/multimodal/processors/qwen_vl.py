@@ -366,7 +366,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         return input_ids, offsets, modality_list
 
-    def get_mm_data(self, prompt, embeddings, embedding_offsets, **kwargs):
+    def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
@@ -412,7 +412,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
             use_audio_in_video=False,
-            audio_seq_lens=(
+            audio_seqlens=(
                 audio_feature_lens if self.model_type == "qwen3_omni_moe" else None
             ),
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),
@@ -427,17 +427,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         mrope_positions = mrope_positions.squeeze(1)
 
         mm_items = []
-        embedding_index_by_modality = {}
+        consumed_per_modality = {}
 
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
-            start_idx, end_idx = self.update_embedding_index(
-                embedding_offsets, modality, embedding_index_by_modality, num_tokens
-            )
-            logger.info(
-                f"Get embedding slice for {modality} from {start_idx} to {end_idx}"
-            )
-            embedding_slice = embeddings[start_idx:end_idx]
+            embedding_start = consumed_per_modality.get(modality, 0)
+            embedding_slice = embeddings[modality][
+                embedding_start : embedding_start + num_tokens
+            ]
+            consumed_per_modality[modality] = embedding_start + num_tokens
+            logger.info(f"Get embedding slice for {modality}, num_tokens={num_tokens}")
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
