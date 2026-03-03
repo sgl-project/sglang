@@ -145,7 +145,7 @@ class TokenizerManagerMultiItemMixin:
         if not input_logprobs:
             raise RuntimeError(
                 f"input_token_ids_logprobs is empty for multi-item scoring request {request_id}. "
-                "This indicates token_ids_logprobs were not computed properly for Mutil Item Scoring."
+                "This indicates token_ids_logprobs were not computed properly for Multi-Item Scoring."
             )
 
         scores = []

@@ -52,7 +52,6 @@ class OpenAIServingScore(OpenAIServingBase):
                 request=raw_request,
             )
 
-            # Create response with just the scores, without usage info
             response = ScoringResponse(
                 scores=result.scores,
                 model=request.model,
