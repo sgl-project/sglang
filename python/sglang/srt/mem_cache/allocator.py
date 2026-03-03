@@ -280,22 +280,27 @@ def alloc_extend_kernel(
     if pre_len + num_part1 == seq_len:
         return
 
-    # Part 2: fill the new full pages
+    # Part 2: fill the new full pages. Use blocked loop (tl.arange(0, BLOCK_EXTEND))
+    # instead of tl.arange(0, max_num_extend_tokens): Triton does not handle very
+    # large arange well; block size 4096 avoids the bottleneck.
     num_part2 = (
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
     )
-
-    offset_many_page = tl.arange(0, max_num_extend_tokens)
-    page_start = tl.load(
-        free_page_ptr + new_page_start_loc + offset_many_page // page_size,
-        mask=offset_many_page < num_part2,
-    )
-    tl.store(
-        out_indices + output_start_loc + num_part1 + offset_many_page,
-        page_start * page_size + offset_many_page % page_size,
-        mask=offset_many_page < num_part2,
-    )
+    num_blocks = (max_num_extend_tokens + 4095) // 4096
+    for block_id in range(num_blocks):
+        offset_in_block = tl.arange(0, 4096)
+        offset = block_id * 4096 + offset_in_block
+        mask = offset < num_part2
+        page_start = tl.load(
+            free_page_ptr + new_page_start_loc + offset // page_size,
+            mask=mask,
+        )
+        tl.store(
+            out_indices + output_start_loc + num_part1 + offset,
+            page_start * page_size + offset % page_size,
+            mask=mask,
+        )
     if pre_len + num_part1 + num_part2 == seq_len:
         return
 
