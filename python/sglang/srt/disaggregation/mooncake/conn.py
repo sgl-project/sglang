@@ -28,7 +28,10 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    page_indices_to_cp_rank_page_indices,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -756,7 +759,9 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        logger.debug(f"MooncakeKVSender sync_status_to_decode_endpoint with remote: {remote}, dst_port: {dst_port}, room: {room}, status: {status}, prefill_rank: {prefill_rank}")
+        logger.debug(
+            f"MooncakeKVSender sync_status_to_decode_endpoint with remote: {remote}, dst_port: {dst_port}, room: {room}, status: {status}, prefill_rank: {prefill_rank}"
+        )
         self._connect(
             format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
         ).send_multipart(
@@ -894,7 +899,11 @@ class MooncakeKVManager(CommonKVManager):
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status, prefill_unique_rank
+                                        endpoint,
+                                        dst_port,
+                                        room,
+                                        status,
+                                        prefill_unique_rank,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -973,7 +982,9 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.debug(f"MooncakeKVSender decode thread received response from prefill rank {prefill_rank} for room {bootstrap_room}, arrived_response_num: {arrived_response_num}, expected_response_num: {expected_response_num}")
+                        logger.debug(
+                            f"MooncakeKVSender decode thread received response from prefill rank {prefill_rank} for room {bootstrap_room}, arrived_response_num: {arrived_response_num}, expected_response_num: {expected_response_num}"
+                        )
                         if arrived_response_num == expected_response_num:
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
@@ -1139,15 +1150,45 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
-        logger.debug(f"MooncakeKVSender send with kv_indices: {kv_indices} and curr_idx: {self.curr_idx}")
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
         logger.debug(
-            f"MooncakeKVSender send with index_slice: {index_slice} and curr_idx: {self.curr_idx}"
+            f"MooncakeKVSender send with kv_indices: {kv_indices=} and index_slice: {index_slice} and curr_idx: {self.curr_idx} and is_last_chunk: {is_last_chunk}"
         )
 
-        if self.kv_mgr.is_dummy_cp_rank:
+        # Special handling for cp transfer
+        if self.kv_mgr.enable_cp_all_ranks_transfer:
+            total_pages = len(kv_indices)
+            cp_rank = self.kv_mgr.attn_cp_rank
+            cp_size = self.kv_mgr.attn_cp_size
+
+            rank_page_indices = page_indices_to_cp_rank_page_indices(
+                page_indices=kv_indices,
+                total_pages=total_pages,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+            if rank_page_indices.size == 0:
+                return
+
+            mask = np.isin(kv_indices, rank_page_indices)
+            if not mask.any():
+                # Skip this chunk for this CP rank
+                logger.debug(f"Skip this chunk for this CP rank: {kv_indices=}")
+                return
+
+            first_pos = int(mask.argmax())
+            last_pos = len(mask) - int(mask[::-1].argmax())
+
+            kv_indices = kv_indices[first_pos:last_pos]
+            index_slice = slice(
+                index_slice.start + first_pos,
+                index_slice.start + last_pos,
+            )
+            logger.debug(f"After filter for this CP rank: {kv_indices=}")
+        elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
                 return
             else:

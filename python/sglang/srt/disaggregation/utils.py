@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, overload
+from typing import TYPE_CHECKING, Literal, Optional, Type, overload
 
 import numpy as np
 import torch
@@ -424,28 +424,6 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
 
-def get_cp_rank_page_range(
-    total_pages: int,
-    cp_rank: int,
-    cp_size: int,
-) -> Tuple[int, int]:
-    """
-    Even split of total_pages across cp_size ranks by contiguous page ranges.
-    Pages are numbered [0, total_pages) here.
-    Each rank gets a contiguous [start_page, end_page) slice in this local space.
-    When not divisible: first (total_pages % cp_size) ranks get one extra page.
-
-    Returns:
-        (start_page, end_page) for this cp_rank, end_page exclusive.
-    """
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-    start_page = cp_rank * base + min(cp_rank, rem)
-    n_pages = base + (1 if cp_rank < rem else 0)
-    end_page = start_page + n_pages
-    return (start_page, end_page)
-
-
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -458,10 +436,9 @@ def page_indices_to_cp_rank_page_indices(
 
     For a single request, its pages occupy a contiguous global range
     [first_page, first_page + total_pages). We first compute the local
-    split [0, total_pages) across cp_size ranks (same rule as
-    get_cp_rank_page_range), then shift that local range by first_page
-    back into the global page id space and take the intersection with
-    page_indices.
+    split [0, total_pages) across cp_size ranks, then shift that local
+    range by first_page back into the global page id space and take
+    the intersection with page_indices.
 
     Returns:
         Subset of page_indices that fall in this rank's global
