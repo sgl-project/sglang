@@ -763,6 +763,7 @@ class SchedulerDisaggregationPrefillMixin:
         enable_cp_all_ranks_transfer = (
             envs.SGLANG_DISAGGREGATION_CP_ALL_RANKS_TRANSFER.get()
         )
+        logger.debug(f"before page_indices_to_cp_rank_page_indices: {page_indices=}")
         if enable_cp_all_ranks_transfer and self.attn_cp_size > 1:
             total_pages = kv_to_page_num(len(req.origin_input_ids), page_size)
             page_indices = page_indices_to_cp_rank_page_indices(
@@ -771,5 +772,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.attn_cp_rank,
                 self.attn_cp_size,
             )
+        logger.debug(f"after page_indices_to_cp_rank_page_indices: {page_indices=}")
 
         req.disagg_kv_sender.send(page_indices, state_indices)

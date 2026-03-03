@@ -431,7 +431,8 @@ def get_cp_rank_page_range(
 ) -> Tuple[int, int]:
     """
     Even split of total_pages across cp_size ranks by contiguous page ranges.
-    Each rank has full KV cache; we assign each a contiguous [start_page, end_page) to send.
+    Pages are numbered [0, total_pages) here.
+    Each rank gets a contiguous [start_page, end_page) slice in this local space.
     When not divisible: first (total_pages % cp_size) ranks get one extra page.
 
     Returns:
@@ -452,26 +453,41 @@ def page_indices_to_cp_rank_page_indices(
     cp_size: int,
 ) -> np.ndarray:
     """
-    Filter page_indices to those belonging to the given CP rank.
-    Page range is split evenly across cp_size ranks; when total_pages is not
-    divisible by cp_size, the first (total_pages % cp_size) ranks get one extra page.
+    Filter page_indices (which are *global* page ids in the KV pool) to those
+    belonging to the given CP rank for this request.
+
+    For a single request, its pages occupy a contiguous global range
+    [first_page, first_page + total_pages). We first compute the local
+    split [0, total_pages) across cp_size ranks (same rule as
+    get_cp_rank_page_range), then shift that local range by first_page
+    back into the global page id space and take the intersection with
+    page_indices.
 
     Returns:
-        Subset of page_indices that fall in this rank's [start_page, end_page).
+        Subset of page_indices that fall in this rank's global
+        [start_page, end_page) slice for the given CP rank.
     """
     if cp_size <= 1:
         return page_indices
 
+    if page_indices.size == 0:
+        return np.asarray(page_indices)
+
+    first_page = int(page_indices.min())
     base = total_pages // cp_size
     rem = total_pages % cp_size
 
     if rem == 0:
-        start_page = cp_rank * base
-        end_page = start_page + base
+        local_start = cp_rank * base
+        local_end = local_start + base
     else:
-        start_page = cp_rank * base + min(cp_rank, rem)
+        local_start = cp_rank * base + min(cp_rank, rem)
         n_pages = base + (1 if cp_rank < rem else 0)
-        end_page = start_page + n_pages
+        local_end = local_start + n_pages
+
+    # Map back to global page ids.
+    start_page = first_page + local_start
+    end_page = first_page + local_end
 
     mask = (page_indices >= start_page) & (page_indices < end_page)
     return np.asarray(page_indices)[mask]
