@@ -1,25 +1,28 @@
 import os
+import shutil
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
 # Registering the test for CUDA CI with appropriate parameters
-register_cuda_ci(est_time=400, suite="stage-b-test-large-2-gpu")
+# Increasing estimated time since we run evaluation twice
+register_cuda_ci(est_time=600, suite="stage-b-test-large-2-gpu")
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
-    Test class for verifying KV cache offloading on the decode side in a 
+    Test class for verifying KV cache offloading on the decode side in a
     prefill-decode disaggregation setup.
     """
 
@@ -27,22 +30,26 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     def setUpClass(cls):
         # Set environment variable to make offloading more frequent for testing purposes
         cls.old_stride = os.environ.get("SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE")
-        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = "/tmp/hicache"
+        cls.hicache_dir = "/tmp/hicache_test"
+        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
         os.environ["SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE"] = "16"
 
+        # Ensure a clean cache directory
+        if os.path.exists(cls.hicache_dir):
+            shutil.rmtree(cls.hicache_dir)
+        os.makedirs(cls.hicache_dir, exist_ok=True)
+
         super().setUpClass()
-        # Using a small model for faster test execution and reduced memory footprint
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non-blocking start of prefill and decode servers
         cls.start_prefill()
         cls.start_decode()
 
         # Wait for both servers to be ready before proceeding
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.wait_server_ready(cls.prefill_url + "/health")
+        cls.wait_server_ready(cls.decode_url + "/health")
 
-        # Launch the load balancer
         cls.launch_lb()
 
     @classmethod
@@ -54,6 +61,12 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         else:
             os.environ.pop("SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE", None)
 
+        os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
+
+        # Clean up the cache directory
+        if os.path.exists(cls.hicache_dir):
+            shutil.rmtree(cls.hicache_dir)
+
     @classmethod
     def start_prefill(cls):
         prefill_args = [
@@ -64,6 +77,11 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "1",
             "--page-size",
             "16",
+            "--enable-hierarchical-cache",
+            "--hicache-storage-backend",
+            "file",
+            "--hicache-ratio",
+            "2",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -101,24 +119,50 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_gsm8k(self):
+    def test_mmlu_double_eval(self):
         """
-        Run a few-shot GSM8K evaluation to ensure end-to-end correctness 
-        while offloading logic is active.
+        Run two rounds of MMLU evaluation:
+        1. First round: Decode node offloads KV cache back to disk (HiCache).
+        2. Restart All Nodes to clear memory cache.
+        3. Second round: Prefill node loads KV cache from disk (HiCache).
+        Verify that both rounds produce consistent scores.
         """
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=20,
-            max_new_tokens=512,
-            parallel=16,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.30)
+        metrics1 = run_eval(args)
+
+        # Ensure all offloads are committed to disk
+        import time
+
+        time.sleep(10)
+
+        kill_process_tree(self.process_prefill.pid)
+        kill_process_tree(self.process_decode.pid)
+        kill_process_tree(self.process_lb.pid)
+        self.process_prefill.wait()
+        self.process_decode.wait()
+        self.process_lb.wait()
+
+        self.start_prefill()
+        self.start_decode()
+        self.launch_lb()
+        self.wait_server_ready(self.prefill_url + "/health")
+        self.wait_server_ready(self.decode_url + "/health")
+
+        metrics2 = run_eval(args)
+
+        # Assert score is above a minimum threshold for both rounds
+        self.assertGreater(metrics1["score"], 0.65)
+        self.assertGreater(metrics2["score"], 0.65)
+
+        # Score should be consistent
+        self.assertAlmostEqual(metrics1["score"], metrics2["score"], delta=0.05)
 
 
 if __name__ == "__main__":
