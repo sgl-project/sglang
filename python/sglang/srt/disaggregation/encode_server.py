@@ -262,10 +262,23 @@ class MMEncoder:
                 EmbeddingCacheController,
             )
 
+            hidden_dim = self.model_config.hidden_size
+            vision_cfg = getattr(self.model_config.hf_config, "vision_config", None)
+            if vision_cfg is not None:
+                out_hs = getattr(vision_cfg, "out_hidden_size", None)
+                if out_hs is not None:
+                    deepstack_idxs = getattr(
+                        vision_cfg, "deepstack_visual_indexes", None
+                    )
+                    if isinstance(deepstack_idxs, (list, tuple)) and deepstack_idxs:
+                        hidden_dim = out_hs * (1 + len(deepstack_idxs))
+                    else:
+                        hidden_dim = out_hs
+
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
-                hidden_dim=self.model_config.hidden_size,
+                hidden_dim=hidden_dim,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
             )
@@ -527,7 +540,7 @@ class MMEncoder:
             return self._get_feat_extract_output_lengths(input_length)
         else:
             merge_size = getattr(self.image_processor, "merge_size", 2)
-            return self.get_num_patches(grid) // (merge_size**2)
+            return self.get_num_patches(grid, modality) // (merge_size**2)
 
     def slice_embedding(
         self, mm_embedding: torch.Tensor, grid_thw: List, modality: Modality
@@ -573,7 +586,7 @@ class MMEncoder:
         offsets = [0]
         curr = 0
         for g in grid_thw:
-            curr += self.get_num_patches(g)
+            curr += self.get_num_patches(g, modality)
             offsets.append(curr)
 
         for idx in indices:
