@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     offloader,
 )
 
@@ -180,7 +181,35 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer.gemm import gemm_fp8_nt_groupwise
+    from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    # Wrap gemm_fp8_nt_groupwise as a custom op so torch.compile does not trace
+    # into flashinfer's JIT compilation code (pathlib/cubin_loader ops).
+    @register_custom_op(
+        op_name="flashinfer_gemm_fp8_nt_groupwise",
+        mutates_args=[],
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+            q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=out_dtype)
+        ),
+    )
+    def gemm_fp8_nt_groupwise(
+        q_input: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return _raw_gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            backend="trtllm",
+        )
+
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
@@ -349,7 +378,6 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         x_scale,
         weight_scale,
         out_dtype=input_2d.dtype,
-        backend="trtllm",
     )
 
     if bias is not None:
@@ -670,8 +698,8 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and is_sm100_supported()):
-        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+    if not (_is_cuda and (is_sm100_supported() or is_sm120_supported())):
+        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100/SM120).")
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -722,6 +750,7 @@ def triton_mxfp8_blockscaled_linear(
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
     b_scale_packed = _pack_mxfp8_scales(weight_scale)
 
+    num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
     output = mxfp8_block_scaled_matmul_triton(
         q_input,
         a_scale_packed,
@@ -731,6 +760,7 @@ def triton_mxfp8_blockscaled_linear(
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
+        num_stages=num_stages,
     )
     output = output[:m, :]
     if bias is not None:
