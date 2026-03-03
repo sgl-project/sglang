@@ -127,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PinPrefixReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -851,6 +852,25 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
+
+
+@app.api_route("/hicache/pin_prefix", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pin_prefix(obj: PinPrefixReqInput):
+    """Pin a prefix by token_ids to resist eviction."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.pin_prefix(
+        obj.token_ids, obj.ttl_seconds
+    )
+    return ORJSONResponse(
+        content={
+            "status": "ok" if ret.success else "error",
+            "nodes_pinned": ret.nodes_pinned,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

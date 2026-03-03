@@ -6,13 +6,15 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     CpThdConcatParams,
     PickParams,
+    ReduceSumParams,
     UnsharderParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     TOKEN_DIM_NAME,
     DimSpec,
     ParallelAxis,
+    ParallelModifier,
 )
 
 # _CoordsList[tensor_index][axis] =
@@ -30,24 +32,44 @@ def compute_unsharder_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
     *,
+    explicit_replicated_axes: frozenset[ParallelAxis] = frozenset(),
     thd_global_seq_lens: Optional[list[int]] = None,
 ) -> list[UnsharderPlan]:
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axis_infos: dict[ParallelAxis, DimSpec] = {
-        spec.parallel: spec for spec in dim_specs if spec.parallel is not None
-    }
-    sharded_axes_raw: set[ParallelAxis] = set(sharded_axis_infos)
+    # Within each dim spec, reverse modifier order: innermost shard (rightmost) unshards first.
+    reversed_sharded_modifiers: list[tuple[str, ParallelModifier]] = [
+        (spec.sanitized_name, m)
+        for spec in dim_specs
+        for m in reversed(spec.parallel_modifiers)
+    ]
 
+    sharded_axes_raw: set[ParallelAxis] = {
+        m.axis for _, m in reversed_sharded_modifiers
+    }
     all_axes: set[ParallelAxis] = {axis for info in parallel_infos for axis in info}
 
     # axis annotated in dims but absent from all parallel_infos -> axis_size=1, skip
     sharded_axes: set[ParallelAxis] = sharded_axes_raw & all_axes
-    sharded_axis_infos = {
-        k: v for k, v in sharded_axis_infos.items() if k in sharded_axes
-    }
-    replicated_axes: set[ParallelAxis] = all_axes - sharded_axes
+    reversed_sharded_modifiers = [
+        (name, m) for name, m in reversed_sharded_modifiers if m.axis in sharded_axes
+    ]
+
+    # RECOMPUTE_PSEUDO is always implicitly replicated (system-injected, not user-facing)
+    auto_replicated: frozenset[ParallelAxis] = frozenset(
+        {ParallelAxis.RECOMPUTE_PSEUDO} & all_axes
+    )
+    effective_replicated: frozenset[ParallelAxis] = (
+        explicit_replicated_axes | auto_replicated
+    )
+
+    _validate_explicit_replicated(
+        explicit_replicated_axes=effective_replicated,
+        sharded_axes=sharded_axes,
+        all_axes=all_axes,
+    )
+    replicated_axes: frozenset[ParallelAxis] = effective_replicated
 
     if not sharded_axes and not replicated_axes:
         return []
@@ -66,14 +88,15 @@ def compute_unsharder_plan(
         (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
         (
-            axis,
+            modifier.axis,
             _resolve_unshard_params(
-                spec=spec,
+                modifier=modifier,
+                dim_name=dim_name,
                 parallel_infos=parallel_infos,
                 thd_global_seq_lens=thd_global_seq_lens,
             ),
         )
-        for axis, spec in sharded_axis_infos.items()
+        for dim_name, modifier in reversed_sharded_modifiers
     ]
 
     plans: list[UnsharderPlan] = []
@@ -86,6 +109,37 @@ def compute_unsharder_plan(
         current_coords = result.projected_coords
 
     return plans
+
+
+def _validate_explicit_replicated(
+    *,
+    explicit_replicated_axes: frozenset[ParallelAxis],
+    sharded_axes: set[ParallelAxis],
+    all_axes: set[ParallelAxis],
+) -> None:
+    """Validate explicit replicated declarations against sharded axes and parallel_infos."""
+    invalid: frozenset[ParallelAxis] = explicit_replicated_axes - all_axes
+    if invalid:
+        invalid_names: str = ", ".join(sorted(a.value for a in invalid))
+        raise ValueError(
+            f"Declared replicated axes {{{invalid_names}}} not found in parallel_infos "
+            f"(active axes: {{{', '.join(sorted(a.value for a in all_axes))}}})"
+        )
+
+    conflict: set[ParallelAxis] = explicit_replicated_axes & sharded_axes
+    if conflict:
+        conflict_names: str = ", ".join(sorted(a.value for a in conflict))
+        raise ValueError(
+            f"Axes {{{conflict_names}}} declared as both sharded and replicated"
+        )
+
+    undeclared: set[ParallelAxis] = all_axes - sharded_axes - explicit_replicated_axes
+    if undeclared:
+        undeclared_names: str = ", ".join(sorted(a.value for a in undeclared))
+        raise ValueError(
+            f"Axes {{{undeclared_names}}} are active (axis_size > 1) but not declared "
+            f"in dims. Annotate as sharded in dim spec or as '# axis:replicated'."
+        )
 
 
 def _validate(
@@ -150,21 +204,20 @@ def _group_and_project(
 
 def _resolve_unshard_params(
     *,
-    spec: DimSpec,
+    modifier: ParallelModifier,
+    dim_name: str,
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
     thd_global_seq_lens: Optional[list[int]] = None,
 ) -> UnsharderParams:
-    if spec.reduction is not None:
-        raise NotImplementedError(
-            f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
-        )
+    if modifier.reduction is not None:
+        return ReduceSumParams()
 
-    if spec.name == TOKEN_DIM_NAME and thd_global_seq_lens is not None:
-        if spec.parallel is None:
-            raise ValueError(
-                f"THD unshard requires a parallel axis on dim '{spec.name}', but got None"
-            )
-        axis_size: int = parallel_infos[0][spec.parallel].axis_size
+    if (
+        dim_name == TOKEN_DIM_NAME
+        and modifier.axis == ParallelAxis.CP
+        and thd_global_seq_lens is not None
+    ):
+        axis_size: int = parallel_infos[0][modifier.axis].axis_size
         for s in thd_global_seq_lens:
             if s % axis_size != 0:
                 raise ValueError(
@@ -172,8 +225,6 @@ def _resolve_unshard_params(
                     f"Sequences must be padded to a multiple of cp_size for CP zigzag."
                 )
         seq_lens_per_rank: list[int] = [s // axis_size for s in thd_global_seq_lens]
-        return CpThdConcatParams(
-            dim_name=spec.name, seq_lens_per_rank=seq_lens_per_rank
-        )
+        return CpThdConcatParams(dim_name=dim_name, seq_lens_per_rank=seq_lens_per_rank)
 
-    return ConcatParams(dim_name=spec.name)
+    return ConcatParams(dim_name=dim_name)

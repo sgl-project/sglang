@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -38,10 +42,17 @@ def enable_piecewise_cuda_graph_compile():
 def enable_piecewise_cuda_graph():
     global _in_piecewise_cuda_graph
     _in_piecewise_cuda_graph = True
-
-    yield
-
-    _in_piecewise_cuda_graph = False
+    try:
+        yield
+    except Exception as e:
+        logger.error(
+            "Piecewise CUDA Graph failed with error: %s\n%s",
+            e,
+            PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+        )
+        raise
+    finally:
+        _in_piecewise_cuda_graph = False
 
 
 @contextmanager
@@ -56,7 +67,7 @@ def set_pcg_capture_stream(stream: torch.cuda.Stream):
 class ForwardContext:
     def __init__(self):
         self.forward_batch = None
-        self.attention_layer = None
+        self.attention_layers = None
         self.quant_config = None
         self.moe_layers = None
         self.moe_fusions = None
@@ -105,3 +116,10 @@ def set_forward_context(
         yield
     finally:
         _forward_context = None
+
+
+PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+    "Piecewise CUDA Graph is enabled by default as an experimental feature.\n"
+    "To work around this error, add --disable-piecewise-cuda-graph to your launch command.\n"
+    "Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose"
+)
