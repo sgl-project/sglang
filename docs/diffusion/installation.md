@@ -92,16 +92,8 @@ Note:
 
 ```powershell
 # From repo root
-py -3.10 -m venv .venv-win
-.\.venv-win\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip setuptools wheel
-
-# Use the Windows dependency profile
 Remove-Item -Force python/pyproject.toml
 Copy-Item python/pyproject_other.toml python/pyproject.toml
-
-# Install Windows extras
 pip install -e "python[all_windows]"
 ```
 
