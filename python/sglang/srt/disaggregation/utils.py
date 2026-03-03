@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Type, overload
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
@@ -468,6 +468,41 @@ def page_indices_to_cp_rank_page_indices(
 
     mask = (page_indices >= start_page) & (page_indices < end_page)
     return np.asarray(page_indices)[mask]
+
+
+def filter_kv_indices_for_cp_rank(
+    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+) -> Tuple[np.ndarray, slice]:
+    """Filters kv_indices and index_slice for the current CP rank."""
+    total_pages = len(kv_indices)
+    cp_rank = kv_mgr.attn_cp_rank
+    cp_size = kv_mgr.attn_cp_size
+
+    rank_page_indices = page_indices_to_cp_rank_page_indices(
+        page_indices=kv_indices,
+        total_pages=total_pages,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
+
+    if rank_page_indices.size == 0:
+        new_kv_indices = kv_indices[:0]
+        new_index_slice = slice(index_slice.start, index_slice.start)
+    else:
+        mask = np.isin(kv_indices, rank_page_indices)
+        if not mask.any():
+            new_kv_indices = kv_indices[:0]
+            new_index_slice = slice(index_slice.start, index_slice.start)
+        else:
+            first_pos = int(mask.argmax())
+            last_pos = len(mask) - int(mask[::-1].argmax())
+
+            new_kv_indices = kv_indices[first_pos:last_pos]
+            new_index_slice = slice(
+                index_slice.start + first_pos,
+                index_slice.start + last_pos,
+            )
+    return new_kv_indices, new_index_slice
 
 
 #########################
