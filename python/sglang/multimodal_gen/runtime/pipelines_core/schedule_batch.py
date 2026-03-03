@@ -131,8 +131,9 @@ class Req:
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 
-    trajectory_timesteps: list[torch.Tensor] | None = None
+    trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
+    trajectory_log_probs: torch.Tensor | None = None
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
@@ -333,8 +334,9 @@ class OutputBatch:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
-    trajectory_timesteps: list[torch.Tensor] | None = None
+    trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
+    trajectory_log_probs: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None

@@ -48,10 +48,16 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+<<<<<<< HEAD
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
+=======
+    rollout: Optional[bool] = False
+    rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
+>>>>>>> f1d30d1be ([diffusion] feat: add rollout log_prob with flow-matching SDE/CPS support)
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
@@ -108,6 +114,9 @@ class VideoGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
+    rollout: Optional[bool] = False
+    rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 

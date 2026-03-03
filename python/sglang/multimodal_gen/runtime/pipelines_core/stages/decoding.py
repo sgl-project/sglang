@@ -236,6 +236,7 @@ class DecodingStage(PipelineStage):
             output=frames,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
+            trajectory_log_probs=batch.trajectory_log_probs,
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,
