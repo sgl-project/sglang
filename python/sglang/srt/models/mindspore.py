@@ -196,10 +196,12 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         self.key_cache = []
         self.value_cache = []
-    
+
     @property
     def hot_token_id(self):
-        return tensor_ms2torch(getattr(self.model, "hot_token_id", None))
+        if hasattr(self.model, "hot_token_id"):
+            return tensor_ms2torch(self.model.hot_token_id)
+        return None
 
     def get_arch(self, config):
         return _get_arch_from_config(config)
@@ -240,7 +242,7 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         return mutable(self.key_cache), mutable(self.value_cache)
 
-    def get_is_prefill(self, forward_batch: ForwardBatch):
+    def _is_prefill(self, forward_batch: ForwardBatch):
         # Different processing for the mindspore attention operator
         # Without any prefix cache => Use FlashAttentionScore
         # With cache => Use PagedAttention, no matter the query length is 1 or not
@@ -262,7 +264,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         else:
             key_cache, value_cache = self.get_kvcache(forward_batch)
 
-        is_prefill = self.get_is_prefill(forward_batch)
+        is_prefill = self._is_prefill(forward_batch)
         batch_valid_length = forward_batch.seq_lens.cpu().numpy()
         if forward_batch.forward_mode.is_target_verify():
             batch_valid_length += forward_batch.spec_info.num_tokens_per_req
