@@ -219,14 +219,16 @@ class Engine(EngineBase):
             if routed_dp_rank is None:
                 routed_dp_rank = data_parallel_rank
 
-        if self.server_args.enable_dp_attention:
-            if routed_dp_rank is None:
-                logger.debug("routed_dp_rank not provided, using default dispatch")
-            elif routed_dp_rank < 0:
-                raise ValueError("routed_dp_rank must be non-negative")
-            elif routed_dp_rank >= self.server_args.dp_size:
+        if routed_dp_rank is not None:
+            dp_size = self.server_args.dp_size
+            if dp_size <= 1 and routed_dp_rank == 0:
+                logger.warning(
+                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+                return None
+            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
                 raise ValueError(
-                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
