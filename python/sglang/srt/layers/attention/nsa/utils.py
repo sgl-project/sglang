@@ -54,7 +54,12 @@ def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
         return False
     cp_size = get_attention_cp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return is_nsa_prefill_cp_round_robin_split() and seq_len > 0 and seq_len >= cp_size and cp_size > 1
+    return (
+        is_nsa_prefill_cp_round_robin_split()
+        and seq_len > 0
+        and seq_len >= cp_size
+        and cp_size > 1
+    )
 
 
 def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
