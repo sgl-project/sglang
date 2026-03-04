@@ -1302,9 +1302,8 @@ class ServerArgs:
                             self.moe_dense_tp_size = 1
                             self.moe_a2a_backend = "deepep"
                             self.ep_size = self.tp_size
-                            self.kv_cache_dtype = "bf16"
                             logger.warning(
-                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
+                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
                             )
                         else:
                             self.enable_dp_attention = True
