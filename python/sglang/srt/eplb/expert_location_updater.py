@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -27,10 +27,6 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +45,6 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
-        model_runner: "ModelRunner",
     ):
         if self._first_execution:
             self._first_execution = False
@@ -71,39 +66,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
         )
 
-        if len(all_missing_logical_experts) > 0:
-            logger.info(
-                f"[ExpertLocationUpdater] All missing logical experts: {all_missing_logical_experts}"
-            )
-
-            # Load the missing expert weights from disk
-            if callable(
-                getattr(model_runner.model, "generate_weight_name_filter", None)
-            ):
-                # Filter and load only missing expert weights
-                weight_name_filter = model_runner.model.generate_weight_name_filter(
-                    all_missing_logical_experts
-                )
-            else:
-                # Do a full reload from disk
-                logger.info(
-                    "[ExpertLocationUpdater] Model does not implement generate_weight_name_filter. "
-                    "Performing full weight reload."
-                )
-                weight_name_filter = None
-
-            if (
-                model_runner.expert_backup_client is not None
-                and model_runner.expert_backup_client.use_backup
-            ):
-                model_runner.expert_backup_client.update_weights(weight_name_filter)
-                return
-
-            model_runner.update_weights_from_disk(
-                model_runner.server_args.model_path,
-                model_runner.server_args.load_format,
-                weight_name_filter=weight_name_filter,
-            )
+        return all_missing_logical_experts
 
 
 def _update_expert_weights(**kwargs):
@@ -182,7 +145,7 @@ def _update_expert_weights_raw(
     num_gpu_per_node = world_size // nnodes
 
     # Due to rank failures, some logical experts could not be transferred P2P between GPUs.
-    # The ModelRunner will reload these experts from disk.
+    # The ModelRunner will reload these experts from disk/DRAM.
     all_missing_logical_experts: List[Tuple[int, List[int]]] = []
 
     for layer_id in update_layer_ids:
