@@ -222,5 +222,9 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
 
+    from sglang.multimodal_gen.runtime.entrypoints import diffusion_api
+
+    app.include_router(diffusion_api.router)
+
     app.state.server_args = server_args
     return app
