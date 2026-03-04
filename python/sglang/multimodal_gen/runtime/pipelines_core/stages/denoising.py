@@ -75,7 +75,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    torch_compile_log_context,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
@@ -1058,22 +1061,45 @@ class DenoisingStage(PipelineStage):
                             timestep_value=t_int,
                             timesteps=timesteps_cpu,
                         )
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
-                        )
+                        if server_args.enable_torch_compile:
+                            module_name = current_model.__class__.__name__
+                            with torch_compile_log_context(
+                                module_name=module_name,
+                                log_level=server_args.log_level,
+                            ):
+                                noise_pred = self._predict_noise_with_cfg(
+                                    current_model=current_model,
+                                    latent_model_input=latent_model_input,
+                                    timestep=timestep,
+                                    batch=batch,
+                                    timestep_index=i,
+                                    attn_metadata=attn_metadata,
+                                    target_dtype=target_dtype,
+                                    current_guidance_scale=current_guidance_scale,
+                                    image_kwargs=image_kwargs,
+                                    pos_cond_kwargs=pos_cond_kwargs,
+                                    neg_cond_kwargs=neg_cond_kwargs,
+                                    server_args=server_args,
+                                    guidance=guidance,
+                                    latents=latents,
+                                )
+                        else:
+                            noise_pred = self._predict_noise_with_cfg(
+                                current_model=current_model,
+                                latent_model_input=latent_model_input,
+                                timestep=timestep,
+                                batch=batch,
+                                timestep_index=i,
+                                attn_metadata=attn_metadata,
+                                target_dtype=target_dtype,
+                                current_guidance_scale=current_guidance_scale,
+                                image_kwargs=image_kwargs,
+                                pos_cond_kwargs=pos_cond_kwargs,
+                                neg_cond_kwargs=neg_cond_kwargs,
+                                server_args=server_args,
+                                guidance=guidance,
+                                latents=latents,
+                            )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:

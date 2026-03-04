@@ -63,7 +63,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    torch_compile_log_context,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -181,6 +184,22 @@ class MOVADenoisingStage(PipelineStage):
             attn_metadata=attn_metadata,
             forward_batch=forward_batch,
         ):
+            server_args = get_global_server_args()
+            if server_args.enable_torch_compile:
+                with torch_compile_log_context(
+                    module_name=visual_dit.__class__.__name__,
+                    log_level=server_args.log_level,
+                ):
+                    return self.inference_single_step(
+                        visual_dit=visual_dit,
+                        visual_latents=visual_latents,
+                        audio_latents=audio_latents,
+                        y=y,
+                        context=context,
+                        timestep=timestep,
+                        audio_timestep=audio_timestep,
+                        video_fps=video_fps,
+                    )
             return self.inference_single_step(
                 visual_dit=visual_dit,
                 visual_latents=visual_latents,
