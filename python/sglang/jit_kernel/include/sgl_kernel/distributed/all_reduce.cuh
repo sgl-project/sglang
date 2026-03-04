@@ -78,7 +78,9 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         m_graph_buffer_count(graph_buffer_count),
         m_rank(rank),
         m_num_gpu(num_gpu),
-        m_max_num_cta(max_num_cta) {
+        m_max_num_cta(max_num_cta),
+        m_num_cta(0),
+        m_cta_size(0) {
     // The buffer layout is as follows:
     // | SignalArray | AllReduceData (local) |  GraphBuffer (AllReduceData) | buffer data |
     using namespace host;
@@ -87,6 +89,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     RuntimeCheck(rank < m_num_gpu, "Invalid rank: ", rank);
     const int64_t kU32Max = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
     RuntimeCheck(m_buffer_size_bytes <= kU32Max, "Buffer size is too large: ", m_buffer_size_bytes);
+    this->configure(m_max_num_cta, 256);  // set default config
   }
 
   ExternHandle share_storage() {
@@ -196,6 +199,23 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     host::RuntimeDeviceCheck(cudaFree(m_storage));
   }
 
+  void reset_graph() {
+    m_graph_capture_inputs.clear();
+    m_is_registered = false;
+  }
+
+  tvm::ffi::Tuple<uint32_t, uint32_t> configure(uint32_t num_cta, uint32_t cta_size) {
+    using host::RuntimeCheck;
+    const auto min_cta_size = m_num_gpu * device::kWarpThreads;
+    RuntimeCheck(num_cta > 0 && num_cta <= m_max_num_cta, "Invalid number of CTAs: ", num_cta);
+    RuntimeCheck(cta_size >= min_cta_size, "Block size must be at least ", min_cta_size);
+    const auto old_num_cta = m_num_cta;
+    const auto old_block_size = m_cta_size;
+    m_num_cta = num_cta;
+    m_cta_size = cta_size;
+    return tvm::ffi::Tuple<uint32_t, uint32_t>{old_num_cta, old_block_size};
+  }
+
  protected:
   AllReduceData* m_allocate_graph_capture_input(void* data_ptr) {
     using namespace host;
@@ -230,6 +250,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   const uint32_t m_rank;
   const uint32_t m_num_gpu;
   const uint32_t m_max_num_cta;
+  uint32_t m_num_cta;
+  uint32_t m_cta_size;
   bool m_is_graph_capturing = false;
   bool m_is_registered = false;
   void* m_storage = nullptr;

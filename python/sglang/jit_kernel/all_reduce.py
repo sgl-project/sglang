@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple, cast
+from typing import TYPE_CHECKING, List, NamedTuple, Tuple, cast
 
 import torch
 import tvm_ffi
@@ -11,6 +11,12 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+
+
+class ConfigResult(NamedTuple):
+    old_num_blocks: int
+    old_num_threads: int
+
 
 if TYPE_CHECKING:
     CUSTOM_AR_HANDLE = List[int]
@@ -32,7 +38,9 @@ if TYPE_CHECKING:
         def register_inputs(self, handles: List[List[CUSTOM_AR_PAIR]]) -> None: ...
         def set_cuda_graph_capture(self, is_capturing: bool) -> None: ...
         def free(self) -> None: ...
+        def reset_graph(self) -> None: ...
         def all_reduce(self, input: torch.Tensor, shot: int) -> tvm_ffi.Tensor: ...
+        def config(self, num_blocks: int, num_threads: int) -> ConfigResult: ...
 
 
 @cache_once
@@ -56,7 +64,9 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
         cuda_wrappers=[("register_once", "register_custom_all_reduce<void>")],
     )
     module.register_once()
-    MAX_CTA = 32  # fix the max num cta number
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    num_sms = props.multi_processor_count  # used as max CTA number
 
     @tvm_ffi.register_object("sgl.CustomAllReduce")
     class CustomAllReduceObjReal(tvm_ffi.Object):
@@ -67,7 +77,7 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             buffer_bytes: int,
             graph_input_count: int,
         ) -> None:
-            args = (rank, world_size, MAX_CTA, buffer_bytes, graph_input_count)
+            args = (rank, world_size, num_sms, buffer_bytes, graph_input_count)
             self.__ffi_init__(*args)
             object.__setattr__(self, "_world_size", world_size)
 
@@ -75,5 +85,8 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             world_size = object.__getattribute__(self, "_world_size")
             module = _jit_custom_all_reduce_module(input.dtype, world_size)
             return module.all_reduce(self, input, shot)
+
+        def config(self, num_blocks: int, num_threads: int) -> ConfigResult:
+            return ConfigResult(*self.configure(num_blocks, num_threads))  # type: ignore
 
     return cast(type["CustomAllReduceObj"], CustomAllReduceObjReal)

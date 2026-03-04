@@ -9,6 +9,7 @@
 #include <sgl_kernel/distributed/all_reduce.cuh>
 #include <sgl_kernel/distributed/common.cuh>
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
@@ -112,7 +113,7 @@ __global__ void all_reduce_two_shot_kernel(
   const uint32_t local_start = local_vec_start * kVecSize * 2;
   const uint32_t local_length = (local_vec_finish - local_vec_start) * kVecSize * 2;
   const auto local_params = AllReduceParams{
-      .output = nullptr,  // this is not used for 2 shot all reduce
+      .output = nullptr,  // this is not used for 2-shot all reduce
       .rank = params.rank,
       .num_items = local_length,
   };
@@ -133,56 +134,42 @@ __global__ void all_reduce_two_shot_kernel(
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 struct CustomAllReduceImpl : public CustomAllReduceBase {
-  static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);
-  static constexpr uint32_t kItemsPerBlock = kBlockSize * kVecSize * 2;
   static constexpr auto one_shot_kernel = all_reduce_one_shot_kernel<DType, kNumGPU, kUsePDL>;
   static constexpr auto two_shot_kernel = all_reduce_two_shot_kernel<DType, kNumGPU, kUsePDL>;
   static_assert(kNumGPU <= device::distributed::kMaxNumGPU, "kNumGPU exceeds the maximum supported GPUs");
-  static_assert(kBlockSize >= kNumGPU * device::kWarpThreads, "kBlockSize must be at least kNumGPU warps");
 
   tvm::ffi::Tensor all_reduce(tvm::ffi::Tensor input, int shot) {
     using namespace host;
-    RuntimeCheck(m_num_gpu == kNumGPU, "Mismatch handle");
     const bool use_2shot = (shot == 2);
-    RuntimeCheck(shot == 1 || shot == 2, "Invalid shot count: ", shot);
-
-    auto N = SymbolicSize{"batch_size"};
-    auto M = SymbolicSize{"item_size"};
-    auto dtype = SymbolicDType{};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-    TensorMatcher({N, M})  // contiguous input
-        .with_dtype<DType>(dtype)
-        .with_device(device)
-        .verify(input);
-
+    const auto device = input.device();
     const auto input_ptr = input.data_ptr();
     const auto buffer_ptr = pointer::offset(m_storage, m_payload_bytes());
-    const auto num_items_int64 = M.unwrap() * N.unwrap();
+    const auto num_items_int64 = input.numel();
     const auto num_items = static_cast<uint32_t>(num_items_int64);
-    const auto needed_blocks = div_ceil(num_items, kItemsPerBlock);
-    const auto num_blocks = std::min(needed_blocks, m_max_num_cta);
+    const auto items_per_block = m_cta_size * kVecSize * 2;
+    const auto needed_blocks = div_ceil(num_items, items_per_block);
+    const auto num_blocks = std::min(needed_blocks, m_num_cta);
     const auto kernel = use_2shot ? two_shot_kernel : one_shot_kernel;
-    tvm::ffi::Tensor output;
-    if (m_is_graph_capturing) {
-      output = use_2shot ? input : ffi::empty_like(input);
-    } else {
-      output = use_2shot ? ffi::from_blob_like(buffer_ptr, input) : input;
-    }
+    // only 1-shot + graph capture need extra output buffer
+    const auto output = (m_is_graph_capturing && !use_2shot) ? ffi::empty_like(input) : input;
     const auto params = AllReduceParams{
-        .output = output.data_ptr(),
+        .output = use_2shot ? nullptr : output.data_ptr(),
         .rank = m_rank,
         .num_items = num_items,
     };
 
-    RuntimeCheck(M.unwrap() * sizeof(DType) % 16 == 0, "Input is not properly aligned to 16 bytes");
+    RuntimeCheck(m_num_gpu == kNumGPU, "Mismatch GPU count");
+    RuntimeCheck(shot == 1 || shot == 2, "Invalid shot count: ", shot);
+    RuntimeCheck(device.device_type == kDLCUDA, "Only CUDA device is supported");
+    RuntimeCheck(is_type<DType>(input.dtype()), "Input dtype mismatch");
+    RuntimeCheck(std::bit_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
     RuntimeCheck(m_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(static_cast<int64_t>(num_items) == num_items_int64, "Number of items exceeds 4G limit");
 
     const auto& ctrl = *m_ctrl;
-    const auto stream = LaunchKernel::resolve_device(device.unwrap());
-    auto launch = LaunchKernel{num_blocks, kBlockSize, stream};
+    const auto stream = LaunchKernel::resolve_device(device);
+    auto launch = LaunchKernel{num_blocks, m_cta_size, stream};
     const auto check_capturing = [&] {
       if (!m_is_graph_capturing) return false;  // override to avoid cudaRT call overhead
       cudaStreamCaptureStatus status;
@@ -200,9 +187,12 @@ struct CustomAllReduceImpl : public CustomAllReduceBase {
       RuntimeCheck(input_bytes <= m_buffer_size_bytes, "Input is too large, num items: ", num_items);
       RuntimeDeviceCheck(cudaMemcpyAsync(buffer_ptr, input_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
       // 2. launch the all reduce kernel
-      launch.enable_pdl(kUsePDL)(kernel, m_get_data_ptr(), params, ctrl);
+      const auto data_ptr = m_get_data_ptr();  // use default buffer
+      launch.enable_pdl(kUsePDL)(kernel, data_ptr, params, ctrl);
+      if (use_2shot) {  // 3. copy the reduced result back to the output, because 2-shot doesn't write to output
+        RuntimeDeviceCheck(cudaMemcpyAsync(input_ptr, buffer_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
     }
-
     return output;
   }
 };
@@ -224,7 +214,9 @@ void register_custom_all_reduce() {
       .def("post_init", &Class::post_init)
       .def("register_inputs", &Class::register_inputs)
       .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)
-      .def("free", &Class::free);
+      .def("free", &Class::free)
+      .def("reset_graph", &Class::reset_graph)
+      .def("configure", &Class::configure);
 }
 
 }  // namespace

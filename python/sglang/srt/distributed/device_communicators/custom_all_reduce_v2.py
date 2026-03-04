@@ -18,17 +18,18 @@ T = TypeVar("T")
 
 
 class CustomAllReduceV2:
-    # HARDCODED: same max size as v1; should be configurable per-platform
-    _MAX_CAR_SIZE = 8192 * 1024  # 8MB
-
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device, None] = None,
-    ):
+        max_size: Optional[int] = None,
+    ) -> None:
         from sglang.jit_kernel.all_reduce import get_custom_all_reduce_cls
 
-        self.max_size = self._MAX_CAR_SIZE
+        if max_size is None:
+            max_size = 32 * 1024 * 1024  # default to 32MB
+
+        self.max_size = max_size
         self.group = group
         self.disabled = True
 
