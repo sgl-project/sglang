@@ -724,11 +724,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            if _use_aiter:
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                    padding_size,  # Avoid circular import
-                )
 
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                padding_size,  # Avoid circular import
+            )
+
+            if _use_aiter and padding_size == block_n == block_k:
                 align_aiter = (
                     lambda n: ((n + padding_size - 1) // padding_size) * padding_size
                 )
