@@ -27,9 +27,62 @@ from sglang.jit_kernel.timestep_embedding import (
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
+
+
+def _timestep_embedding_cuda_fake(
+    timesteps: torch.Tensor,
+    num_channels: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 0.0,
+    scale: float = 1,
+) -> torch.Tensor:
+    return torch.empty(
+        (timesteps.shape[0], num_channels),
+        dtype=torch.float32,
+        device=timesteps.device,
+    )
+
+
+if _is_cuda:
+
+    @register_custom_op(
+        op_name="diffusion_timestep_embedding_cuda",
+        fake_impl=_timestep_embedding_cuda_fake,
+    )
+    def timestep_embedding_cuda_custom_op(
+        timesteps: torch.Tensor,
+        num_channels: int,
+        flip_sin_to_cos: bool = False,
+        downscale_freq_shift: float = 0.0,
+        scale: float = 1,
+    ) -> torch.Tensor:
+        return timestep_embedding_cuda(
+            timesteps,
+            num_channels,
+            flip_sin_to_cos=flip_sin_to_cos,
+            downscale_freq_shift=downscale_freq_shift,
+            scale=scale,
+        )
+else:
+
+    def timestep_embedding_cuda_custom_op(
+        timesteps: torch.Tensor,
+        num_channels: int,
+        flip_sin_to_cos: bool = False,
+        downscale_freq_shift: float = 0.0,
+        scale: float = 1,
+    ) -> torch.Tensor:
+        return timestep_embedding_cuda(
+            timesteps,
+            num_channels,
+            flip_sin_to_cos=flip_sin_to_cos,
+            downscale_freq_shift=downscale_freq_shift,
+            scale=scale,
+        )
 
 
 class PatchEmbed(nn.Module):
@@ -89,21 +142,20 @@ class PatchEmbed(nn.Module):
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         if _is_cuda:
-            return timestep_embedding_cuda(
+            return timestep_embedding_cuda_custom_op(
                 timesteps,
                 self.num_channels,
                 flip_sin_to_cos=self.flip_sin_to_cos,
                 downscale_freq_shift=self.downscale_freq_shift,
                 scale=self.scale,
             )
-        else:
-            return timestep_embedding_diffusers(
-                timesteps,
-                self.num_channels,
-                flip_sin_to_cos=self.flip_sin_to_cos,
-                downscale_freq_shift=self.downscale_freq_shift,
-                scale=self.scale,
-            )
+        return timestep_embedding_diffusers(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(
