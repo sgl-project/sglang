@@ -97,6 +97,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
+    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -1041,11 +1042,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        # Get quantization config from ModelConfig
+        # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
+        quant_str = self.model_config.get_quantization_config_log_str()
+
         logger.info(
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
+            f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
@@ -1886,6 +1891,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_bs
+
+        if require_gathered_buffer(self.server_args):
+            attn_tp_size = get_attention_tp_size()
+            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
+                num_tokens = num_tokens // attn_tp_size * attn_tp_size
+                batch_size = num_tokens // num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
 
