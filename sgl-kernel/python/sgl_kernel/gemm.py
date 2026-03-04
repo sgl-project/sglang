@@ -1,8 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
-from sgl_kernel.scalar_type import ScalarType
-from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
+from sgl_kernel.utils import _get_cache_buf
 
 
 def awq_dequantize(
@@ -60,7 +59,6 @@ def _bmm_fp8_internal(
         B_scale,
         workspace_buffer,
         cublas_handle,
-        get_cuda_stream(),
     )
 
 
@@ -135,6 +133,11 @@ def sgl_per_token_group_quant_8bit(
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
+
+
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
 def sgl_per_tensor_quant_fp8(
@@ -450,7 +453,7 @@ def scaled_fp4_experts_quant(
         input_tensor.ndim == 2
     ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
     if expert_map is not None:
-        (m, k) = input_tensor.shape
+        m, k = input_tensor.shape
         output_tensor_shape = (m * topk, k)
         input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
     m_numtopk, k = input_tensor.shape
@@ -460,7 +463,7 @@ def scaled_fp4_experts_quant(
     # larger models.
     import os
 
-    MAX_TOKENS_PER_EXPERT = os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
+    MAX_TOKENS_PER_EXPERT = int(os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536))
     assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
         f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
         f"{MAX_TOKENS_PER_EXPERT})"
@@ -502,46 +505,6 @@ def scaled_fp4_experts_quant(
 
 
 # GPTQ kernels
-def gptq_marlin_gemm(
-    a: torch.Tensor,
-    c: Optional[torch.Tensor],
-    b_q_weight: torch.Tensor,
-    b_scales: torch.Tensor,
-    global_scale: Optional[torch.Tensor],
-    b_zeros: Optional[torch.Tensor],
-    g_idx: Optional[torch.Tensor],
-    perm: Optional[torch.Tensor],
-    workspace: torch.Tensor,
-    b_q_type: ScalarType,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-    is_k_full: bool = True,
-    use_atomic_add: bool = False,
-    use_fp32_reduce: bool = False,
-    is_zp_float: bool = False,
-) -> torch.Tensor:
-    return torch.ops.sgl_kernel.gptq_marlin_gemm(
-        a,
-        c,
-        b_q_weight,
-        b_scales,
-        global_scale,
-        b_zeros,
-        g_idx,
-        perm,
-        workspace,
-        b_q_type.id,
-        size_m,
-        size_n,
-        size_k,
-        is_k_full,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float,
-    )
-
-
 def gptq_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,

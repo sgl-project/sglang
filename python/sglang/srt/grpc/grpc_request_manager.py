@@ -11,7 +11,6 @@ import os
 import signal
 import sys
 import threading
-import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -19,20 +18,89 @@ import grpc
 import zmq
 import zmq.asyncio
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.scheduler import is_health_check_generate_req
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    calibrate_time_diff,
+    real_time,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class _GrpcCommunicator:
+    """
+    Communicator for request/response patterns with scheduler.
+
+    Thread-safe and handles the async request/response cycle with proper
+    timeout handling to prevent hangs if the scheduler becomes unresponsive.
+    """
+
+    DEFAULT_TIMEOUT = 30.0  # seconds
+
+    def __init__(self, sender: zmq.Socket, fan_out: int = 1):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._result_event: Optional[asyncio.Event] = None
+        self._result_values: Optional[List[Any]] = None
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, obj, timeout: float = DEFAULT_TIMEOUT) -> List[Any]:
+        """
+        Send request and wait for response(s).
+
+        Args:
+            obj: Request object to send to scheduler
+            timeout: Maximum time to wait for response (seconds)
+
+        Returns:
+            List of response objects from scheduler(s)
+
+        Raises:
+            asyncio.TimeoutError: If no response within timeout
+        """
+        async with self._lock:
+            # Initialize state BEFORE sending to avoid race condition
+            self._result_event = asyncio.Event()
+            self._result_values = []
+
+            # Send request to scheduler
+            if obj:
+                self._sender.send_pyobj(obj)
+
+            try:
+                # Wait for response(s) with timeout
+                await asyncio.wait_for(self._result_event.wait(), timeout=timeout)
+                return self._result_values
+            finally:
+                # Always clean up state
+                self._result_event = None
+                self._result_values = None
+
+    def handle_recv(self, recv_obj: Any):
+        """
+        Handle received response from scheduler.
+
+        Called by handle_loop when a matching response type is received.
+        Safe to call even if no request is pending (will be ignored).
+        """
+        if self._result_values is not None and self._result_event is not None:
+            self._result_values.append(recv_obj)
+            if len(self._result_values) >= self._fan_out:
+                self._result_event.set()
 
 
 class GrpcSignalHandler:
@@ -75,10 +143,7 @@ class GrpcReqState:
     obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
 
     # Metrics (same as TokenizerManager's ReqState)
-    created_time: float
-    finished_time: float = 0.0
-    first_token_time: float = 0.0
-    last_time: float = 0.0
+    time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
 
     # Streaming state
@@ -142,14 +207,23 @@ class GrpcRequestManager:
         self.is_pause_cond = asyncio.Condition()
 
         # Metrics
-        self.last_receive_tstamp = time.time()
+        self.last_receive_tstamp = real_time()
 
         # Crash dump for debugging
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
+        # disaggregation mode
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
+
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
+
+        # Communicators for request/response patterns with scheduler
+        # Note: These must be initialized after send_to_scheduler socket is created
+        self.get_loads_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -292,29 +366,15 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        # Create and register request state
-        # TODO: support log_request
-        state = GrpcReqState(
-            request_id=request_id,
-            grpc_context=grpc_context,
-            out_queue=asyncio.Queue(),
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=time.time(),
-        )
-
-        # Track session if needed
-        if hasattr(obj, "session_params") and obj.session_params:
-            state.session_id = obj.session_params.session_id
-            state.is_session_request = True
-
-        self.rid_to_state[request_id] = state
+        self._req_stats_init(obj, grpc_context)
+        state = self.rid_to_state[request_id]
         self.record_request_for_crash_dump(obj)
 
         try:
             # Send to scheduler - let exceptions bubble up to grpc_server.py
+            state.time_stats.set_api_server_dispatch_time()
             await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
 
             is_stream = getattr(obj, "stream", False)
 
@@ -363,26 +423,17 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        # Create request state
-        state = GrpcReqState(
-            request_id=request_id,
-            grpc_context=None,
-            out_queue=asyncio.Queue(),
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=time.time(),
-        )
-
-        # Register state
-        self.rid_to_state[request_id] = state
+        self._req_stats_init(obj)
+        state = self.rid_to_state[request_id]
 
         # Create future for result
         future = asyncio.Future()
 
         # Send to scheduler
         try:
+            state.time_stats.set_api_server_dispatch_time()
             await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
         except Exception as e:
             del self.rid_to_state[request_id]
             future.set_exception(e)
@@ -442,12 +493,13 @@ class GrpcRequestManager:
             try:
                 # Receive from scheduler
                 recv_obj = await self.recv_from_scheduler.recv_pyobj()
-                self.last_receive_tstamp = time.time()
+                self.last_receive_tstamp = real_time()
 
-                # Check for pause
-                async with self.is_pause_cond:
-                    while self.is_pause:
-                        await self.is_pause_cond.wait()
+                # Check for pause (optimized: check flag before acquiring lock)
+                if self.is_pause:
+                    async with self.is_pause_cond:
+                        while self.is_pause:
+                            await self.is_pause_cond.wait()
 
                 # Handle different output types
                 if isinstance(recv_obj, BatchTokenIDOutput):
@@ -458,6 +510,9 @@ class GrpcRequestManager:
                     await self._handle_health_check_output(recv_obj)
                 elif isinstance(recv_obj, AbortReq):
                     await self._handle_abort_req(recv_obj)
+                elif isinstance(recv_obj, GetLoadsReqOutput):
+                    # Route to communicator for request/response pattern
+                    self.get_loads_communicator.handle_recv(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -532,6 +587,10 @@ class GrpcRequestManager:
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
+        # Collect all queue.put() tasks for parallel execution
+        put_tasks = []
+        cleanup_tasks = []
+
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
@@ -545,10 +604,10 @@ class GrpcRequestManager:
                 continue
 
             # Update metrics
-            now = time.time()
-            if state.first_token_time == 0.0:
-                state.first_token_time = now
-            state.last_time = now
+            if state.time_stats.first_token_time == 0.0:
+                state.time_stats.set_first_token_time()
+            else:
+                state.time_stats.set_last_time()
 
             # Extract output for this request
             output_data = {
@@ -576,12 +635,14 @@ class GrpcRequestManager:
             }
 
             # Accumulate logprobs (following tokenizer_manager pattern)
-            if state.obj.return_logprob:
+            # Use getattr for safe access - not all request types have return_logprob
+            # (e.g., TokenizedEmbeddingReqInput)
+            if getattr(state.obj, "return_logprob", False):
                 self._convert_logprob_style(state, batch_out, i)
 
             # Send input logprobs based if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and state.obj.logprob_start_len >= 0
                 and state.input_token_logprobs_val
             ):
@@ -605,7 +666,7 @@ class GrpcRequestManager:
 
             # Send output logprobs if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and batch_out.output_token_logprobs_val
                 and i < len(batch_out.output_token_logprobs_val)
             ):
@@ -639,22 +700,27 @@ class GrpcRequestManager:
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            await state.out_queue.put(output_data)
+            # Add queue.put() to parallel task list
+            put_tasks.append(state.out_queue.put(output_data))
 
             # Handle completion
             if output_data["finished"]:
                 state.finished = True
-                state.finished_time = now
+                state.time_stats.set_finished_time()
                 state.stream_finished = True
                 state.event.set()
 
                 # Remove from tracking after a delay
-                async def cleanup():
+                async def cleanup(request_id):
                     await asyncio.sleep(5.0)
-                    if rid in self.rid_to_state:
-                        del self.rid_to_state[rid]
+                    if request_id in self.rid_to_state:
+                        del self.rid_to_state[request_id]
 
-                asyncio.create_task(cleanup())
+                cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
+
+        # Execute all queue.put() operations in parallel
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
@@ -672,7 +738,9 @@ class GrpcRequestManager:
                     batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
                 ),
                 "finish_reason": (
-                    batch_out.finish_reason[i] if batch_out.finish_reason else None
+                    batch_out.finished_reasons[i]
+                    if batch_out.finished_reasons
+                    else None
                 ),
             }
 
@@ -681,7 +749,7 @@ class GrpcRequestManager:
 
             # Mark as finished
             state.finished = True
-            state.finished_time = time.time()
+            state.time_stats.set_finished_time()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
@@ -713,7 +781,7 @@ class GrpcRequestManager:
 
         # Mark as finished
         state.finished = True
-        state.finished_time = time.time()
+        state.time_stats.set_finished_time()
         state.event.set()
 
     async def _handle_abort_req(self, recv_obj: AbortReq):
@@ -790,7 +858,7 @@ class GrpcRequestManager:
         if len(self.crash_dump_request_list) < 100:
             self.crash_dump_request_list.append(
                 {
-                    "time": time.time(),
+                    "time": real_time(),
                     "request_id": getattr(obj, "rid", "unknown"),
                     "type": type(obj).__name__,
                 }
@@ -852,21 +920,46 @@ class GrpcRequestManager:
             "last_receive_time": self.last_receive_tstamp,
         }
 
+    async def get_loads(
+        self, include: List[str], dp_rank: Optional[int] = None
+    ) -> List[GetLoadsReqOutput]:
+        """
+        Get comprehensive load metrics from the scheduler.
+
+        This method uses the communicator pattern to send GetLoadsReqInput to the
+        scheduler and wait for GetLoadsReqOutput responses.
+
+        Args:
+            include: List of metric sections to include (core, memory, spec, lora, disagg, queues, all)
+            dp_rank: Optional DP rank filter (None for all ranks)
+
+        Returns:
+            List of GetLoadsReqOutput objects, one per scheduler/DP rank
+        """
+        req = GetLoadsReqInput(include=include, dp_rank=dp_rank)
+        results = await self.get_loads_communicator(req)
+
+        # Filter by dp_rank if specified
+        if dp_rank is not None:
+            results = [r for r in results if r.dp_rank == dp_rank]
+
+        return results
+
     def auto_create_handle_loop(self):
         """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""
         if self.no_create_loop:
             return
 
         self.no_create_loop = True
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
 
         self.event_loop = loop
 
-        # We cannot add signal handler when the grpc manager is not in
-        # the main thread due to the CPython limitation.
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = GrpcSignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
@@ -874,12 +967,7 @@ class GrpcRequestManager:
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
-        else:
-            logger.warning(
-                "Signal handler is not added because the grpc request manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "grpc request manager when SIGTERM is received."
-            )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
@@ -888,6 +976,34 @@ class GrpcRequestManager:
         """Watchdog to handle SIGTERM gracefully, matching TokenizerManager pattern."""
         while not self.gracefully_exit:
             await asyncio.sleep(1.0)
+
+    def _req_stats_init(
+        self,
+        obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        grpc_context: Optional[grpc.ServicerContext] = None,
+    ):
+        calibrate_time_diff()
+        # Create and register request state
+        # TODO: support log_request
+        # TODO: support request tracing
+        time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        state = GrpcReqState(
+            request_id=obj.rid,
+            grpc_context=grpc_context,
+            out_queue=asyncio.Queue(),
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=time_stats,
+        )
+
+        # Track session if needed
+        if hasattr(obj, "session_params") and obj.session_params:
+            state.session_id = obj.session_params.session_id
+            state.is_session_request = True
+
+        self.rid_to_state[obj.rid] = state
+        time_stats.set_created_time()
 
 
 async def print_exception_wrapper(func):

@@ -3,8 +3,6 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var
-
 
 def balanced_packing(
     weight: torch.Tensor, num_packs: int

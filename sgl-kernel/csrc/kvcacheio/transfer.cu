@@ -1,10 +1,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
+#include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 #ifndef USE_ROCM
+#include <dlfcn.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
@@ -68,6 +72,140 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl(
   return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes;
 }
 
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_per_head_lf(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t layer_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_id,
+    int64_t head_num,
+    int64_t /*unused*/) {
+  // layer first offset func per head
+  return base + layer_id * layer_dim + page_id * item_size_bytes + item_size_bytes / head_num * head_id;
+}
+
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_per_head_lf_tbl(
+    T* /*unused*/,
+    const uintptr_t* __restrict__ layer_base_tbl,
+    int64_t layer_id,
+    int64_t /*unused*/,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_id,
+    int64_t head_num,
+    int64_t /*unused*/) {
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes +
+         item_size_bytes / head_num * head_id;
+}
+
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_ph(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t page_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_id,
+    int64_t head_num,
+    int64_t page_size) {
+  // page head layout: [page_num, head_num, page_size, layer_num, head_dim]
+  return base + page_id / page_size * page_size * page_dim +  // page_num dimension offset
+         page_dim / head_num * head_id * page_size +          // head_num dimension offset
+         page_id % page_size * page_dim / head_num +          // page_size dimension offset
+         layer_id * item_size_bytes / head_num;               // layer_num dimension offset
+}
+
+template <auto SrcOffsetFn, auto DstOffsetFn>
+__global__ void transfer_page_head_kernel_impl(
+    const void* __restrict__ src_k,
+    void* __restrict__ dst_k,
+    const void* __restrict__ src_v,
+    void* __restrict__ dst_v,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
+    int64_t start_layer_id,
+    int64_t num_layers_to_process,
+    int64_t num_items,
+    int64_t items_per_warp,
+    int64_t item_size_bytes,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    const uintptr_t* __restrict__ src_k_layer_tbl,
+    const uintptr_t* __restrict__ dst_k_layer_tbl,
+    const uintptr_t* __restrict__ src_v_layer_tbl,
+    const uintptr_t* __restrict__ dst_v_layer_tbl,
+    const int64_t page_size,
+    const int64_t head_num) {
+  int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int32_t lane_id = tid % WARP_SIZE;
+  int32_t warp_id = tid / WARP_SIZE;
+  const int64_t head_size_bytes = item_size_bytes / head_num;
+
+  for (int i = 0; i < items_per_warp; ++i) {
+    int64_t item_id = warp_id * items_per_warp + i;
+    if (item_id >= num_items) {
+      break;
+    }
+    const int64_t src_page_id = src_indices[item_id];
+    const int64_t dst_page_id = dst_indices[item_id];
+
+    // Loop over layers if necessary
+    for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
+      // For page head layout, the cache of each head in the token is discontinuous, need to loop
+      for (int64_t head_id = 0; head_id < head_num; ++head_id) {
+        const char* src_k_ptr = SrcOffsetFn(
+            static_cast<const char*>(src_k),
+            src_k_layer_tbl,
+            layer_id,
+            src_layout_dim,
+            src_page_id,
+            item_size_bytes,
+            head_id,
+            head_num,
+            page_size);
+        char* dst_k_ptr = DstOffsetFn(
+            static_cast<char*>(dst_k),
+            dst_k_layer_tbl,
+            layer_id,
+            dst_layout_dim,
+            dst_page_id,
+            item_size_bytes,
+            head_id,
+            head_num,
+            page_size);
+        transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, head_size_bytes);
+
+        const char* src_v_ptr = SrcOffsetFn(
+            static_cast<const char*>(src_v),
+            src_v_layer_tbl,
+            layer_id,
+            src_layout_dim,
+            src_page_id,
+            item_size_bytes,
+            head_id,
+            head_num,
+            page_size);
+        char* dst_v_ptr = DstOffsetFn(
+            static_cast<char*>(dst_v),
+            dst_v_layer_tbl,
+            layer_id,
+            dst_layout_dim,
+            dst_page_id,
+            item_size_bytes,
+            head_id,
+            head_num,
+            page_size);
+        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, head_size_bytes);
+      }
+    }
+  }
+}
+
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
 __global__ void transfer_kernel_impl(
     const void* __restrict__ src_k,
@@ -118,7 +256,7 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -136,7 +274,9 @@ void transfer_kv_launcher(
     const at::Tensor& src_v_layers,
     const at::Tensor& dst_v_layers,
     int64_t block_quota,
-    int64_t num_warps_per_block) {
+    int64_t num_warps_per_block,
+    const int64_t page_size = 16,
+    const int64_t head_num = 1) {
   TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
   TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
@@ -161,24 +301,47 @@ void transfer_kv_launcher(
   const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
-  transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
-      src_k_ptr,
-      dst_k_ptr,
-      src_v_ptr,
-      dst_v_ptr,
-      src_indices.data_ptr<int64_t>(),
-      dst_indices.data_ptr<int64_t>(),
-      start_layer_id,
-      num_layers_to_process,
-      num_items,
-      items_per_warp,
-      item_size,
-      src_layout_dim,
-      dst_layout_dim,
-      src_k_tbl_ptr,
-      dst_k_tbl_ptr,
-      src_v_tbl_ptr,
-      dst_v_tbl_ptr);
+  if constexpr (PageHeadLayout) {
+    transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+        src_k_ptr,
+        dst_k_ptr,
+        src_v_ptr,
+        dst_v_ptr,
+        src_indices.data_ptr<int64_t>(),
+        dst_indices.data_ptr<int64_t>(),
+        start_layer_id,
+        num_layers_to_process,
+        num_items,
+        items_per_warp,
+        item_size,
+        src_layout_dim,
+        dst_layout_dim,
+        src_k_tbl_ptr,
+        dst_k_tbl_ptr,
+        src_v_tbl_ptr,
+        dst_v_tbl_ptr,
+        page_size,
+        head_num);
+  } else {
+    transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+        src_k_ptr,
+        dst_k_ptr,
+        src_v_ptr,
+        dst_v_ptr,
+        src_indices.data_ptr<int64_t>(),
+        dst_indices.data_ptr<int64_t>(),
+        start_layer_id,
+        num_layers_to_process,
+        num_items,
+        items_per_warp,
+        item_size,
+        src_layout_dim,
+        dst_layout_dim,
+        src_k_tbl_ptr,
+        dst_k_tbl_ptr,
+        src_v_tbl_ptr,
+        dst_v_tbl_ptr);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -246,6 +409,43 @@ void transfer_kv_per_layer_pf_lf(
       num_warps_per_block);
 }
 
+void transfer_kv_per_layer_ph_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_ph<const char>, get_global_offset_per_head_lf<char>, false, true>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,
@@ -311,6 +511,44 @@ void transfer_kv_all_layer_lf_pf(
       empty,
       block_quota,
       num_warps_per_block);
+}
+
+void transfer_kv_all_layer_lf_ph(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_ph<char>, false, true>(
+      empty,
+      dst_k,
+      empty,
+      dst_v,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      src_k_layers,
+      empty,
+      src_v_layers,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
 }
 
 void transfer_kv_per_layer_mla(
@@ -509,48 +747,195 @@ inline void transfer_kv_page_first_direct_impl(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+
+  auto fallback_to_page_copy = [&]() {
+    if constexpr (IsLf2Pf) {
+      const bool is_mla = dst_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size];
+        const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[j + num_layers],
+                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                s_index,
+                0,
+                page_size);
+          }
+        }
+      }
+    } else {
+      const bool is_mla = src_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
+        const int64_t d_index = dst_indices_ptr[i * page_size];
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+                dst_ptrs[j + num_layers],
+                0,
+                d_index,
+                page_size);
+          }
+        }
+      }
+    }
+  };
+
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_page_copy();
+  return;
+
+#else
+  // Driver capability gate: only use cudaMemcpyBatchAsync on CUDA 12.8+ drivers.
+  int driver_version = 0;
+  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
+  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
+  using CudaMemcpyBatchAsyncFn =
+      cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
+  }();
+  if (cuda_memcpy_batch_async == nullptr) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  size_t num_copies = 0;
+  std::vector<void*> batch_srcs;
+  std::vector<void*> batch_dsts;
+  std::vector<size_t> batch_sizes;
+  std::vector<size_t> attrs_idxs(1, 0);
+  cudaMemcpyAttributes attrs{};
+  const int device_id = at::cuda::current_device();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
+    batch_srcs.push_back(src);
+    batch_dsts.push_back(dst);
+    batch_sizes.push_back(size_bytes);
+  };
 
   if constexpr (IsLf2Pf) {
     const bool is_mla = dst_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
 
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t dst_stride1 = dst_ptrs[0].stride(1);
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t elem_size = dst_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    attrs.srcLocHint.id = device_id;
+    attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.id = 0;
+    attrs.flags = 0;
+
+    num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>() / page_size;
+      auto s_index = src_indices_ptr[i * page_size];
+      auto d_index = dst_indices_ptr[i * page_size] / page_size;
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
+                          (start_layer_id + j) * dst_stride1 * elem_size;
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[j + num_layers],
-              dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
-              s_index,
-              0,
-              page_size);
+          const char* src_v_ptr =
+              static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
+                            (start_layer_id + j) * dst_stride1 * elem_size;
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
+
   } else {
     const bool is_mla = src_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
 
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t src_stride1 = src_ptrs[0].stride(1);
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t elem_size = src_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    attrs.srcLocHint.id = 0;
+    attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs.dstLocHint.id = device_id;
+    attrs.flags = 0;
+
+    num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>() / page_size;
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+      auto s_index = src_indices_ptr[i * page_size] / page_size;
+      auto d_index = dst_indices_ptr[i * page_size];
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
+                                (start_layer_id + j) * src_stride1 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
-              dst_ptrs[j + num_layers],
-              0,
-              d_index,
-              page_size);
+          const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
+                                  (start_layer_id + j) * src_stride1 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
   }
+
+  TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
+  if (num_copies > 0) {
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    cudaError_t err = cuda_memcpy_batch_async(
+        batch_dsts.data(),
+        batch_srcs.data(),
+        batch_sizes.data(),
+        num_copies,
+        &attrs,
+        attrs_idxs.data(),
+        1,
+        &fail_idx,
+        stream);
+    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+      fallback_to_page_copy();
+      return;
+    }
+    if (err != cudaSuccess) {
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+    }
+  }
+#endif
 }
 
 void transfer_kv_per_layer_direct_pf_lf(

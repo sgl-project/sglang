@@ -16,8 +16,11 @@ limitations under the License.
 #include <torch/all.h>
 
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
-void scaled_fp4_quant_sm100a(
-    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf);
+void scaled_fp4_quant_sm100a_sm120a(
+    torch::Tensor const& output,
+    torch::Tensor const& input,
+    torch::Tensor const& output_sf,
+    torch::Tensor const& input_sf);
 
 void scaled_fp4_experts_quant_sm100a(
     torch::Tensor& output,
@@ -40,7 +43,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf) {
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
-  return scaled_fp4_quant_sm100a(output, input, output_sf, input_sf);
+  return scaled_fp4_quant_sm100a_sm120a(output, input, output_sf, input_sf);
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 quantization");
 }

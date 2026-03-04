@@ -2,28 +2,39 @@
 
 ## Benchmark
 
-- Benchmark the latency of running a single static batch without a server. The arguments are the same as for `launch_server.py`.
-  Note that this is a simplified test script without a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this simplified script does not.
-  - Without a server (do not need to launch a server)
-    ```bash
-    python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
-    ```
-  - With a server (please use `sglang.launch_server` to launch a server first and run the following command.)
-    ```bash
-    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
-    ```
+SGLang provides four benchmark tools that operate at different levels of the stack. The table below summarizes their key differences:
 
+| Tool                       | HTTP Server                                   | Scheduler                               | Use Case                                                                   |
+| -------------------------- | --------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------------- |
+| `bench_serving`            | Yes (async HTTP client to a running server)   | Yes (indirectly, via server)            | Realistic online serving benchmarks with latency metrics (TTFT, TPOT, ITL) |
+| `bench_one_batch_server`   | Yes (sends HTTP requests to a running server) | Yes (indirectly, via server)            | End-to-end single-batch latency including HTTP and scheduler overhead      |
+| `bench_offline_throughput` | No                                            | Yes (directly uses `Engine` in-process) | Maximum throughput measurement without HTTP overhead                       |
+| `bench_one_batch`          | No                                            | No (directly calls `ModelRunner`)       | Kernel-level latency profiling of a single static batch                    |
 
-- Benchmark offline processing. This script will start an offline engine and run the benchmark.
+Use `bench_serving` by default unless there are specific needs.
+
+**`bench_serving`** is an async HTTP load-testing client that sends requests at controlled rates with configurable concurrency to a running server. It measures realistic online serving metrics including time-to-first-token (TTFT), time-per-output-token (TPOT), inter-token latency (ITL), and throughput. Use `num-prompts >= 5 * max-concurrency` to measure steady-state performance. Launch a server with `sglang.launch_server` first.
+
+  ```bash
+  python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
+  ```
+
+**`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
+
+  ```bash
+  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  ```
+
+**`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash
   python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
   ```
 
-- Benchmark online serving. Please use `sglang.launch_server` to launch a server first and run the following command.
+**`bench_one_batch`** is the lowest-level tool. It directly instantiates a `ModelRunner` and calls `extend()` / `decode()` on a fixed static batch, bypassing the scheduler entirely. The prefill and decode phases are run separately, making profiling easier but rendering the metrics unrealistic. Because there is no dynamic batching, it may run out of memory for batch sizes that a real server can handle (a real server chunks prefill into smaller batches). This is best suited for profiling individual kernel performance.
 
   ```bash
-  python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+  python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 ## Profile with PyTorch Profiler
@@ -43,7 +54,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
-Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
+The `SGLANG_TORCH_PROFILER_DIR` environment variable must be set on both the server and client side; otherwise, the trace file will not be generated correctly. A secure way to do this is by setting it in your shell's resource file (e.g., `~/.bashrc` for bash).
 
 For more details, please refer to [Bench Serving Guide](./bench_serving.md).
 
@@ -116,6 +127,94 @@ python3 -m sglang.test.send_one
 python3 -m sglang.profiler
 ```
 
+You can also combine the above operations into a single command
+
+```
+python3 -m sglang.test.send_one --profile
+```
+
+### Profile a server with HTTP API endpoints
+
+SGLang provides HTTP API endpoints to control profiling on a running server. This allows you to start and stop profiling programmatically, which is useful for capturing specific workload patterns.
+
+#### Using `/start_profile` endpoint
+
+The `/start_profile` endpoint starts profiling on the server. You can control when profiling begins and how long it runs using the following parameters:
+
+**Basic usage:**
+
+```bash
+# Start profiling immediately for 10 steps
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "num_steps": 10
+  }'
+```
+
+**Parameters:**
+
+- `output_dir` (optional): Directory where profile traces will be saved. If not specified, uses `SGLANG_TORCH_PROFILER_DIR` environment variable, or `/tmp` as the default
+- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/end_profile`
+- `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
+- `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
+- `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
+
+**Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
+
+**Advanced usage with `start_step`:**
+
+```bash
+# Wait 5 steps (warmup), then profile for 10 steps
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "/tmp/profiles",
+    "start_step": 5,
+    "num_steps": 10,
+    "activities": ["CPU", "GPU"]
+  }'
+```
+
+**Continuous profiling (manual stop):**
+
+```bash
+# Start profiling without num_steps - must manually stop with /end_profile
+curl -X POST http://127.0.0.1:30000/start_profile
+```
+
+#### Using `/end_profile` endpoint
+
+The `/end_profile` endpoint stops an ongoing profiling session and saves the trace file.
+
+```bash
+# Stop profiling and save traces
+curl -X POST http://127.0.0.1:30000/end_profile
+```
+
+This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
+
+#### Example workflow
+
+```bash
+# Terminal 1: Start the server
+export SGLANG_TORCH_PROFILER_DIR=/tmp/profiles
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+
+# Terminal 2: Start continuous profiling
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_step": 3
+  }'
+
+# Terminal 3: Send requests to generate load
+python -m sglang.bench_serving --backend sglang --num-prompts 100
+
+# Terminal 2: Stop profiling when done
+curl -X POST http://127.0.0.1:30000/end_profile
+```
+
 ### Profiler Trace Merger for Distributed Traces
 
 SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.
@@ -146,7 +245,8 @@ curl -X POST <BASE_URL>/start_profile \
 # Start profiling with merge enabled
 python -m sglang.profiler \
   --num-steps 10 \
-  --activities CPU GPU \
+  --cpu \
+  --gpu \
   --output-dir /tmp/profiles \
   --merge-profiles # optional argument to merge profile traces (default=False)
 ```
@@ -251,6 +351,108 @@ Additionally, if you want to locate the SGLang Python source code through the cu
    with nvtx.annotate("description", color="color"):
        # some critical code
    ```
+
+### Layer-wise NVTX Profiling with Nsight Systems
+
+SGLang provides built-in layerwise NVTX annotations that can be combined with the CUDA Profiler for detailed per-layer profiling in Nsight Systems. This is particularly useful for identifying performance bottlenecks at the layer level.
+
+#### Using `--enable-layerwise-nvtx-marker` with Nsight Systems and `/start_profile`
+
+The `--enable-layerwise-nvtx-marker` flag automatically adds NVTX markers to every layer in your model. This is particularly powerful when combined with Nsight Systems profiling to see detailed per-layer performance.
+
+**Method 1: Using `/start_profile` with CUDA_PROFILER (for programmatic control)**
+
+This method allows you to control exactly when profiling starts/stops via HTTP API while Nsight Systems is running.
+
+1. Launch the server with layerwise NVTX enabled under Nsight Systems:
+
+   ```bash
+   # Terminal 1: Start server with nsys and capture-range option
+   nsys profile --trace-fork-before-exec=true \
+     --cuda-graph-trace=node \
+     --capture-range=cudaProfilerApi \
+     --capture-range-end=stop \
+     -o layerwise_profile \
+     python -m sglang.launch_server \
+       --model-path meta-llama/Llama-3.1-8B-Instruct \
+       --enable-layerwise-nvtx-marker \
+       --disable-cuda-graph
+   ```
+
+   Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
+
+2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity:
+
+   ```bash
+   # Terminal 2: Wait for server to be ready, then start CUDA profiling
+   # Wait 3 steps for warmup, then profile for 10 steps
+   curl -X POST http://127.0.0.1:30000/start_profile \
+     -H "Content-Type: application/json" \
+     -d '{
+       "start_step": 3,
+       "num_steps": 10,
+       "activities": ["CUDA_PROFILER"]
+     }'
+   ```
+
+3. Send requests to generate load:
+
+   ```bash
+   # Terminal 3: Generate workload
+   python -m sglang.bench_serving --backend sglang --num-prompts 100
+   ```
+
+4. Profiling will automatically stop after 10 steps (due to `num_steps: 10`). If you hadn't specified `num_steps`, you would need to manually stop it:
+
+   ```bash
+   # Terminal 2: Only needed if num_steps was not specified
+   curl -X POST http://127.0.0.1:30000/end_profile
+   ```
+
+The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/end_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
+
+**Method 2: Simpler approach without `/start_profile` API**
+
+For simpler use cases where you don't need fine-grained control over profiling start/stop, you can profile with Nsight Systems capturing the entire workload:
+
+```bash
+# Terminal 1: Start server with layerwise NVTX
+# Note: --disable-cuda-graph ensures all NVTX markers are emitted
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-layerwise-nvtx-marker \
+  --disable-cuda-graph
+
+# Terminal 2: Profile the benchmarking client
+nsys profile --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  -o layerwise_profile \
+  python -m sglang.bench_serving --backend sglang --num-prompts 10
+```
+
+This approach profiles the entire client execution, including all server interactions. The layerwise NVTX markers will be visible in the Nsight Systems timeline.
+
+**Viewing the profiling results:**
+
+Open the generated `.qdrep` file with Nsight Systems:
+
+```bash
+nsys-ui layerwise_profile.qdrep
+```
+
+In the Nsight Systems GUI, you'll see:
+- **NVTX ranges**: Each layer appears as a labeled range in the timeline with detailed information in the marker metadata
+- **CUDA kernels**: All GPU kernels are shown alongside the layer annotations
+- **Layer hierarchy**: The full module path (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct.model.layers.0.self_attn.qkv_proj`) helps identify specific layers. The prefix uses the full model path from `--model-path`.
+- **Tensor shapes**: Input/output dimensions and parameter shapes are included in the NVTX marker data
+
+**Benefits of layerwise NVTX profiling:**
+
+- **Granular visibility**: See exactly which layers are taking the most time
+- **Memory tracking**: Identify layers with large memory allocations
+- **Bottleneck identification**: Quickly locate inefficient operations
+- **Communication overhead**: In multi-GPU setups, see per-layer communication costs
+- **Development debugging**: Validate that model architecture changes have the expected performance impact
 
 ## Other tips
 

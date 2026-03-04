@@ -41,7 +41,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
@@ -785,6 +785,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -796,6 +797,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             },
             placeholder_tokens=None,  # using mm_item.pad_value
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states

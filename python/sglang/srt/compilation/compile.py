@@ -1,29 +1,18 @@
-import contextvars
 import inspect
 import logging
 import os
 import sys
 import types
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.utils.common import rank0_log
 
 logger = logging.getLogger(__name__)
-
-_COMPILE_ENABLED = contextvars.ContextVar("_COMPILE_ENABLED", default=False)
-
-
-@contextmanager
-def set_compiled(enabled: bool = True):
-    token = _COMPILE_ENABLED.set(enabled)
-    try:
-        yield
-    finally:
-        _COMPILE_ENABLED.reset(token)
 
 
 @dataclass
@@ -87,12 +76,12 @@ class _MaybeIntermediateTensors:
 
 def _mark_dynamic_on_value(val, dims):
     if isinstance(val, torch.Tensor):
-        torch._dynamo.mark_dynamic(val, _normalize_dims(dims, val.ndim))
+        torch._dynamo.maybe_mark_dynamic(val, _normalize_dims(dims, val.ndim))
     else:
         mit = _MaybeIntermediateTensors(val)
         if mit.is_intermediate:
             for t in mit.obj.tensors.values():
-                torch._dynamo.mark_dynamic(t, _normalize_dims(dims, t.ndim))
+                torch._dynamo.maybe_mark_dynamic(t, _normalize_dims(dims, t.ndim))
         # else: ignore (None or non-tensor)
 
 
@@ -112,6 +101,9 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             for a in getattr(ann, "__args__", [])
         ):
             dyn[name] = 0
+        elif ann == "torch.Tensor" or ann == "Optional[torch.Tensor]":
+            # For future import annotations (e.g. from __future__ import annotations), the annotation is a string
+            dyn[name] = 0
     if not dyn:
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
@@ -126,6 +118,7 @@ def install_torch_compiled(
     fullgraph: bool = True,
     graph_pool: Any = None,
 ):
+    rank0_log(f"install_torch_compiled")
     unbound_fwd = module.__class__.forward
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")
@@ -195,7 +188,7 @@ def install_torch_compiled(
         state["compiled_callable"] = compiled_callable
 
     def trampoline(self, *args, **kwargs):
-        use_compiled = _COMPILE_ENABLED.get()
+        use_compiled = is_in_piecewise_cuda_graph()
         if use_compiled:
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)

@@ -14,16 +14,13 @@
 # limitations under the License.
 """Falcon-H1 model configuration"""
 
-import enum
-
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_size,
-    get_tensor_model_parallel_world_size,
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
 )
 
 logger = logging.get_logger(__name__)
@@ -302,8 +299,10 @@ class FalconH1Config(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         shape = Mamba2StateShape.create(
-            tp_world_size=get_tensor_model_parallel_world_size(),
+            tp_world_size=get_attention_tp_size(),
             intermediate_size=self.mamba_intermediate,
             n_groups=self.mamba_n_groups,
             num_heads=self.mamba_n_heads,
@@ -311,4 +310,6 @@ class FalconH1Config(PretrainedConfig):
             state_size=self.mamba_d_state,
             conv_kernel=self.mamba_d_conv,
         )
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )

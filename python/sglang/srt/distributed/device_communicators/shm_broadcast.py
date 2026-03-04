@@ -215,7 +215,6 @@ class MessageQueue:
             socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
             logger.debug("Binding to %s", socket_addr)
             self.local_socket.bind(socket_addr)
-
             self.current_idx = 0
 
         else:
@@ -232,9 +231,9 @@ class MessageQueue:
             remote_subscribe_port = get_open_port()
             if is_valid_ipv6_address(connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
-            self.remote_socket.bind(
-                format_tcp_address(connect_ip, remote_subscribe_port)
-            )
+            address = format_tcp_address(connect_ip, remote_subscribe_port)
+            logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
+            self.remote_socket.bind(address)
 
         else:
             remote_subscribe_port = None

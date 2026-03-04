@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 
 import jinja2
 import openai.types.responses as openai_responses_types
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
@@ -529,7 +531,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -778,7 +782,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # Abort the request
+        # The response_id is the same as the rid used when submitting the request
+        self.tokenizer_manager.abort_request(rid=response_id)
+
         if task := self.background_tasks.get(response_id):
             task.cancel()
             try:
@@ -1061,7 +1067,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = ororjson.loads(previous_item.content[0].text)
+                    parsed_args = orjson.loads(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",

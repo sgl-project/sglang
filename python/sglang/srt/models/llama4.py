@@ -56,10 +56,13 @@ from sglang.srt.utils import (
     fast_topk,
     get_compiler_backend,
     is_cuda,
+    is_npu,
     make_layers,
 )
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +151,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4 and _is_cuda:
+        if _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -164,7 +167,7 @@ class Llama4MoE(nn.Module):
     def _forward_core_shared_routed_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(self.device_module.current_stream())
+        alt_stream.wait_stream(get_current_device_stream_fast())
 
         shared_out = self.shared_expert(hidden_states)
 
@@ -173,7 +176,7 @@ class Llama4MoE(nn.Module):
             router_logits, _ = self.router(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             routed_out = self.experts(hidden_states, topk_output)
-        self.device_module.current_stream().wait_stream(alt_stream)
+        get_current_device_stream_fast().wait_stream(alt_stream)
 
         return shared_out, routed_out
 
@@ -241,6 +244,7 @@ class Llama4Attention(nn.Module):
             RMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
+                has_weight=False,
             )
             if self.use_qk_norm
             else None
@@ -327,6 +331,8 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
+            if _is_npu:
+                qk = torch.cat([q_out_unused, k_out_unused], dim=-1)
             del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:
@@ -383,6 +389,7 @@ class Llama4DecoderLayer(nn.Module):
         self.config = config
         is_moe_layer = self._is_moe_layer(layer_id)
         is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
+        is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
@@ -409,6 +416,7 @@ class Llama4DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_moe_layer,
             is_previous_layer_sparse=is_previous_moe_layer,
+            is_next_layer_sparse=is_next_moe_layer,
         )
 
         self.layer_communicator = LayerCommunicator(
@@ -483,7 +491,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,

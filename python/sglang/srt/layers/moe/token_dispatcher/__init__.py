@@ -12,17 +12,30 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
     DeepEPDispatcher,
     DeepEPLLCombineInput,
-    DeepEPLLOutput,
+    DeepEPLLDispatchOutput,
     DeepEPNormalCombineInput,
-    DeepEPNormalOutput,
+    DeepEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+    FlashinferDispatcher,
+    FlashinferDispatchOutput,
+)
+from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPDispatcher,
+    MoriEPLLCombineInput,
+    MoriEPLLDispatchOutput,
+    MoriEPNormalCombineInput,
+    MoriEPNormalDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
+    StandardDispatcher,
     StandardDispatchOutput,
 )
 
@@ -35,15 +48,24 @@ __all__ = [
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
+    "FlashinferDispatchOutput",
+    "FlashinferDispatcher",
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
+    "MoriEPNormalDispatchOutput",
+    "MoriEPNormalCombineInput",
+    "MoriEPLLDispatchOutput",
+    "MoriEPLLCombineInput",
+    "MoriEPDispatcher",
+    "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
     "DeepEPConfig",
     "DeepEPDispatcher",
-    "DeepEPNormalOutput",
-    "DeepEPLLOutput",
+    "DeepEPNormalDispatchOutput",
+    "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "NpuFuseEPDispatcher",
 ]

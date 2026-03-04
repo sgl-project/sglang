@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, get_device_name, is_cuda
+from sglang.srt.utils import get_device_name, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -143,7 +143,7 @@ def per_token_group_quant_int8(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor. Note that only `torch.int8` is supported for now.

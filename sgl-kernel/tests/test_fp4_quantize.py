@@ -1,11 +1,10 @@
 import pytest
 import torch
-from sgl_kernel import (
-    scaled_fp4_grouped_quant,
-    scaled_fp4_quant,
-    silu_and_mul,
-    silu_and_mul_scaled_fp4_grouped_quant,
+from flashinfer import (
+    scaled_fp4_grouped_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from sgl_kernel import scaled_fp4_quant, silu_and_mul
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
@@ -186,10 +185,10 @@ def test_quantize_to_fp4_grouped(shape):
     mask = torch.randint(1, max_m, (l,), dtype=torch.int32)
     tensor_amax = x.abs().amax(dim=(1, 2)).to(torch.float32)
     x_sf_global = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    output, output_scales = scaled_fp4_grouped_quant(
+    output, output_scales = scaled_fp4_grouped_quantize(
         x,
-        x_sf_global,
         mask,
+        x_sf_global,
     )
     # output in logical (m, k, l), but its physical layout is (l, m, k).
     # So permute first to (l, m, k).
@@ -225,15 +224,15 @@ def test_silu_and_mul_quantize_to_fp4_grouped(shape):
     ref_y = silu_and_mul(x)
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
     y_sf_global = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    ref_output, ref_output_scales = scaled_fp4_grouped_quant(
+    ref_output, ref_output_scales = scaled_fp4_grouped_quantize(
         ref_y,
-        y_sf_global,
         mask,
+        y_sf_global,
     )
-    output, output_scales = silu_and_mul_scaled_fp4_grouped_quant(
+    output, output_scales = silu_and_mul_scaled_nvfp4_experts_quantize(
         x,
-        y_sf_global,
         mask,
+        y_sf_global,
     )
 
     # output in logical (m, k, l), but its physical layout is (l, m, k).

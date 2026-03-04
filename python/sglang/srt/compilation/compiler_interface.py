@@ -14,6 +14,7 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.inductor_pass import pass_context
+from sglang.srt.utils.common import torch_release
 
 
 class CompilerInterface:
@@ -226,7 +227,7 @@ class InductorAdaptor(CompilerInterface):
         hash_str, file_path = None, None
         from torch._inductor.codecache import FxGraphCache, compiled_fx_graph_hash
 
-        if torch.__version__.startswith("2.5"):
+        if torch_release[:2] == (2, 5):
             original_load = FxGraphCache.load
             original_load_name = "torch._inductor.codecache.FxGraphCache.load"
 
@@ -252,7 +253,7 @@ class InductorAdaptor(CompilerInterface):
             hijacked_compile_fx_inner = (
                 torch._inductor.compile_fx.compile_fx_inner
             )  # noqa
-        elif torch.__version__ >= "2.6":
+        elif torch_release >= (2, 6):
             # function renamed in 2.6
             original_load_name = None
 
@@ -405,7 +406,7 @@ class InductorAdaptor(CompilerInterface):
             # Dynamo metrics context, see method for more details.
             exit_stack.enter_context(self.metrics_context())
 
-            if torch.__version__.startswith("2.5"):
+            if torch_release[:2] == (2, 5):
                 inductor_compiled_graph = FxGraphCache._lookup_graph(
                     hash_str, example_inputs, True, False
                 )
@@ -413,7 +414,7 @@ class InductorAdaptor(CompilerInterface):
                     "Inductor cache lookup failed. Please remove"
                     f"the cache directory and try again."  # noqa
                 )
-            elif torch.__version__ >= "2.6":
+            elif torch_release >= (2, 6):
                 from torch._inductor.output_code import CompiledFxGraphConstantsWithGm
 
                 constants = CompiledFxGraphConstantsWithGm(graph)
@@ -475,3 +476,29 @@ def set_inductor_config(config, runtime_shape):
         # can be beneficial
         config["max_autotune"] = True
         config["coordinate_descent_tuning"] = True
+
+
+class EagerAdapter(CompilerInterface):
+    name = "eager"
+
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compiler_config: dict[str, Any],
+        runtime_shape: Optional[int] = None,
+        key: Optional[str] = None,
+        num_graphs: int = 1,
+    ) -> tuple[Optional[Callable], Optional[Any]]:
+        return graph, None
+
+    def load(
+        self,
+        handle: Any,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        graph_index: int,
+        runtime_shape: Optional[int] = None,
+        num_graphs: int = 1,
+    ) -> Callable:
+        raise NotImplementedError("eager compilation is not supported")

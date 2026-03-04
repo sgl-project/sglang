@@ -15,12 +15,13 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 **Files updated:**
 - `Makefile`
 - `benchmark/deepseek_v3/README.md`
-- `docker/Dockerfile.rocm`
+- `docker/rocm.Dockerfile`
 - `docs/get_started/install.md`
 - `docs/platforms/amd_gpu.md`
 - `docs/platforms/ascend_npu.md`
 - `python/pyproject.toml`
 - `python/pyproject_other.toml`
+- `python/pyproject_npu.toml`
 - `python/sglang/version.py`
 
 ### `bump_kernel_version.py`

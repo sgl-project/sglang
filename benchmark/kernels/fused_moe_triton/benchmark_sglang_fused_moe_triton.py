@@ -3,7 +3,7 @@ import argparse
 
 import torch
 import triton
-from transformers import AutoConfig
+from common_utils import get_model_config
 
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -18,61 +18,13 @@ from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import TopK, TopKConfig, select_experts
-
-
-def get_model_config(model_name: str, tp_size: int):
-    """Get model configuration parameters"""
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-    if config.architectures[0] == "Qwen2MoeForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] == "Qwen3MoeForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] in [
-        "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "Glm4MoeForCausalLM",
-    ]:
-        E = (
-            config.n_routed_experts + 1
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        )
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    else:
-        # Default: Mixtral
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-
-    block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
-
-    shape_configs = {
-        "num_experts": E,
-        "topk": topk,
-        "hidden_size": config.hidden_size,
-        "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
-        "block_shape": block_shape,
-    }
-    print(f"{shape_configs=}")
-    return shape_configs
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKConfig,
+    TopKOutputFormat,
+    select_experts,
+)
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def fused_moe_triton_api(
@@ -86,8 +38,8 @@ def fused_moe_triton_api(
         top_k=topk,
         renormalize=False,
         use_grouped_topk=False,
+        output_format=TopKOutputFormat.TRITON_KERNEL,
     )
-    topk_op.use_triton_kernels = True
     triton_topk_output = topk_op.forward_cuda(
         hidden_states=x,
         router_logits=input_gating,
@@ -239,7 +191,8 @@ def main():
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
-    parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--tp-size", "--tp", type=int, default=2)
+    parser.add_argument("--ep-size", "--ep", type=int, default=1)
     parser.add_argument("--use-fp8-w8a8", action="store_true")
     parser.add_argument(
         "--use-cuda-graph", action="store_true", help="Enable CUDA Graph capture/replay"
@@ -251,6 +204,10 @@ def main():
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
+
+    # Initialize global server args (required by SGLang MoE kernels)
+    server_args = ServerArgs(model_path=args.model)
+    set_global_server_args_for_scheduler(server_args)
 
     try:
         if not torch.distributed.is_initialized():
@@ -271,10 +228,10 @@ def main():
 
         initialize_model_parallel(
             tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
         )
 
-        model_config = get_model_config(args.model, args.tp_size)
+        model_config = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(
             show_plots=True,
             print_data=True,

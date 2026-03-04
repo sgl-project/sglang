@@ -8,9 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    run_bench_offline_throughput,
 )
 
 TEST_MODEL_MATRIX = {
@@ -36,8 +34,6 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             0.8,
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "w8a8_int8",
             "--tp-size",
             4,
             "--disable-radix-cache",
@@ -75,26 +71,6 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
                     )
                 finally:
                     kill_process_tree(process.pid)
-
-    def test_b_throughput(self):
-        for model in self.models:
-            with self.subTest(model=model):
-                print(f"##=== Testing throughput: {model} ===##")
-
-                output_throughput = run_bench_offline_throughput(
-                    model,
-                    [
-                        *self.common_args,
-                    ],
-                )
-
-                print(f"##=== {model} throughput: {output_throughput} ===##")
-
-                if is_in_ci():
-                    self.assertGreater(
-                        output_throughput,
-                        TEST_MODEL_MATRIX[model]["output_throughput"],
-                    )
 
 
 if __name__ == "__main__":

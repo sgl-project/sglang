@@ -17,7 +17,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -38,6 +38,11 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
+
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    parent: Optional[str] = None
     max_model_len: Optional[int] = None
 
 
@@ -96,17 +102,44 @@ class ChoiceLogprobs(BaseModel):
     content: List[ChatCompletionTokenLogprob]
 
 
+class CachedTokensDetails(BaseModel):
+    """Detailed breakdown of cached tokens by cache source."""
+
+    device: int = 0  # Tokens from device cache (GPU)
+    host: int = 0  # Tokens from host cache (CPU memory)
+    # L3 storage fields are only present when storage backend is enabled
+    storage: Optional[int] = None  # Tokens from L3 storage backend
+    storage_backend: Optional[str] = None  # Type of storage backend used
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields so they don't appear in response when L3 is disabled
+        if self.storage is None:
+            data.pop("storage", None)
+        if self.storage_backend is None:
+            data.pop("storage_backend", None)
+        return data
+
+
+class PromptTokensDetails(BaseModel):
+    """Details about prompt tokens."""
+
+    cached_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    # Used to return cached tokens info when --enable-cache-report is set
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -128,10 +161,21 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
-class StructuralTagResponseFormat(BaseModel):
+# NOTE(dark): keep this for backward compatibility
+class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+
+
+StructuralTagResponseFormat: TypeAlias = Union[
+    LegacyStructuralTagResponseFormat, StructuralTag
+]
+
+ToolCallConstraint: TypeAlias = Union[
+    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+]
 
 
 class FileRequest(BaseModel):
@@ -189,10 +233,27 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _migrate_deprecated_dp_rank(values: dict) -> dict:
+    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
+        import warnings
+
+        warnings.warn(
+            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if values.get("routed_dp_rank") is None:
+            values["routed_dp_rank"] = values["data_parallel_rank"]
+    return values
+
+
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -211,6 +272,8 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -228,11 +291,20 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    custom_params: Optional[Dict] = None
+    custom_logit_processor: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -246,12 +318,34 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
         if v is not None and v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+
+class SglExt(BaseModel):
+    """SGLang extension fields for OpenAI-compatible responses.
+
+    Future SGLang-specific extensions to OpenAI-compatible response objects
+    should be added as fields here rather than directly on the choice object.
+    """
+
+    routed_experts: Optional[str] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields to keep response clean
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class CompletionResponseChoice(BaseModel):
@@ -278,6 +372,14 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -303,6 +405,14 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -313,10 +423,14 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -346,6 +460,15 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentAudioPart,
 ]
 
+# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
+# Can be a simple string (text-only) or a list of multimodal content parts
+RerankContentPart = Union[
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
+]
+RerankContent = Union[str, List[RerankContentPart]]
+
 
 class FunctionResponse(BaseModel):
     """Function response."""
@@ -364,23 +487,24 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+    role: Literal["system", "assistant", "tool", "function", "developer"]
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function"}:
+            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
+                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -429,7 +553,10 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -459,6 +586,8 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -486,6 +615,14 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # SGLang multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+
+    # Custom logit processor for advanced sampling control
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    custom_params: Optional[Dict] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -500,6 +637,13 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -508,6 +652,11 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -583,7 +732,7 @@ class ChatCompletionRequest(BaseModel):
         self,
         stop: List[str],
         model_generation_config: Dict[str, Any],
-        tool_call_constraint: Optional[Any] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -598,9 +747,16 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        # add per user request
+        spaces_between_special_tokens = (
+            True
+            if self.chat_template_kwargs is None
+            else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
+        )
+
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -618,6 +774,9 @@ class ChatCompletionRequest(BaseModel):
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
+            "custom_params": self.custom_params,
+            "sampling_seed": self.seed,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -649,7 +808,7 @@ class ChatCompletionRequest(BaseModel):
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value
+                    constraint_value  # type: ignore
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
@@ -692,6 +851,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class DeltaMessage(BaseModel):
@@ -728,11 +895,20 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class MultimodalEmbeddingInput(BaseModel):
     text: Optional[str] = None
     image: Optional[str] = None
+    video: Optional[str] = None
 
 
 EmbeddingInput = Union[
@@ -753,12 +929,45 @@ class EmbeddingRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # LoRA adapter path(s)
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
 
 class EmbeddingObject(BaseModel):
     embedding: List[float]
     index: int
     object: str = "embedding"
+
+
+ClassifyInput = Union[str, List[str], List[int]]
+
+
+class ClassifyRequest(BaseModel):
+    # OpenAI-compatible classification request
+    model: str = DEFAULT_MODEL_NAME
+    input: ClassifyInput
+    user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+
+class ClassifyData(BaseModel):
+    index: int
+    label: str
+    probs: List[float]
+    num_classes: int
+
+
+class ClassifyResponse(BaseModel):
+    id: str
+    object: str = "list"
+    created: int
+    model: str
+    data: List[ClassifyData]
+    usage: UsageInfo
 
 
 class EmbeddingResponse(BaseModel):
@@ -793,15 +1002,60 @@ class ScoringResponse(BaseModel):
 
 
 class V1RerankReqInput(BaseModel):
-    query: str
-    documents: List[str]
+    query: RerankContent = Field(
+        ...,
+        description="The query to match against documents. Can be a string (text-only) "
+        "or a list of content parts for multimodal queries (text, image_url, video_url).",
+    )
+    documents: List[RerankContent] = Field(
+        ...,
+        description="List of documents to rank. Each document can be a string (text-only) "
+        "or a list of content parts for multimodal documents (text, image_url, video_url).",
+    )
+    instruct: Optional[str] = Field(
+        default=None,
+        description="The instruct to the reranker model.",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="Maximum number of documents to return. Defaults to returning all documents. "
+        "If specified value is greater than the total number of documents, all documents will be returned.",
+    )
+    return_documents: bool = Field(
+        default=True,
+        description="Whether to return documents in the response. Only included when set to true.",
+    )
+
+    @field_validator("top_n")
+    @classmethod
+    def validate_top_n(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Value error, parameter top_n should be larger than 0.")
+        return v
+
+    def is_multimodal(self) -> bool:
+        """Check if the request contains any multimodal content."""
+        if isinstance(self.query, list):
+            return True
+        for doc in self.documents:
+            if isinstance(doc, list):
+                return True
+        return False
 
 
 class RerankResponse(BaseModel):
     score: float
-    document: str
+    document: Optional[str] = None
     index: int
     meta_info: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Exclude document field if it's None
+        if self.document is None:
+            data.pop("document", None)
+        return data
 
 
 class TokenizeRequest(BaseModel):
@@ -844,6 +1098,7 @@ OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ClassifyRequest,
     ScoringRequest,
     V1RerankReqInput,
     TokenizeRequest,
@@ -1055,7 +1310,7 @@ class ResponsesResponse(BaseModel):
                 Union[
                     ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
                 ]
-            ]
+            ],
         ) -> bool:
             if not items:
                 return False
@@ -1145,7 +1400,7 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
-    tool_call_constraint: Optional[Any] = None
+    tool_call_constraint: Optional[ToolCallConstraint] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -1166,3 +1421,51 @@ class ResponseReasoningTextContent(BaseModel):
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
+
+
+# ================== Transcription API Protocol Definitions ==================
+
+
+class TranscriptionRequest(BaseModel):
+    """Request model for audio transcription (OpenAI-compatible)."""
+
+    model: str = DEFAULT_MODEL_NAME
+    language: Optional[str] = None
+    response_format: str = "json"
+    temperature: float = 0.0
+    stream: bool = False
+    # Internal fields (not from API)
+    audio_data: Optional[bytes] = None
+    audio_duration_s: float = 0.0
+
+
+class TranscriptionUsage(BaseModel):
+    """Usage info for transcription response (duration-based)."""
+
+    type: Literal["duration"] = "duration"
+    seconds: int  # Audio duration in seconds (rounded up)
+
+
+class TranscriptionResponse(BaseModel):
+    """Non-streaming transcription response (OpenAI-compatible)."""
+
+    text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionStreamChoice(BaseModel):
+    """Delta content for streaming transcription."""
+
+    delta: DeltaMessage
+    finish_reason: Optional[str] = None
+
+
+class TranscriptionStreamResponse(BaseModel):
+    """Streaming transcription chunk (OpenAI-compatible)."""
+
+    id: str = Field(default_factory=lambda: f"trsc-{uuid.uuid4().hex}")
+    object: Literal["transcription.chunk"] = "transcription.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[TranscriptionStreamChoice]
+    usage: Optional[UsageInfo] = None

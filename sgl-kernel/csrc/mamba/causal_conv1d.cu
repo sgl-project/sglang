@@ -182,8 +182,8 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
         TORCH_CHECK(conv_states_.is_cuda());
         params.conv_states_ptr = conv_states_.data_ptr();
         params.conv_states_batch_stride = conv_states_.stride(0);
-        params.conv_states_c_stride = conv_states_.stride(1);
-        params.conv_states_l_stride = conv_states_.stride(2);
+        params.conv_states_c_stride = conv_states_.stride(-2);
+        params.conv_states_l_stride = conv_states_.stride(-1);
     } else {
         params.conv_states_ptr = nullptr;
     }
