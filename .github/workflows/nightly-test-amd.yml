@@ -560,7 +560,7 @@ jobs:
   # 8-GPU Qwen 3.5 (Accuracy)
   nightly-8-gpu-qwen35:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-qwen35')
-    runs-on: linux-mi325-gpu-8
+    runs-on: linux-mi325-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
