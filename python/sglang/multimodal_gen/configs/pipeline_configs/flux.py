@@ -530,10 +530,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
-        if batch.image_latent is not None:
-            image_latent_ids = batch.condition_image_latent_ids
-            img_ids = torch.cat([img_ids, image_latent_ids], dim=1).to(device=device)
-
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
         if txt_ids.ndim == 3:
@@ -543,6 +539,16 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         img_cos, img_sin = rotary_emb.forward(img_ids)
         img_cos = shard_rotary_emb_for_sp(img_cos)
         img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        if batch.image_latent is not None:
+            cond_ids = batch.condition_image_latent_ids
+            if cond_ids.ndim == 3:
+                cond_ids = cond_ids[0]
+            cond_cos, cond_sin = rotary_emb.forward(cond_ids)
+            cond_cos = shard_rotary_emb_for_sp(cond_cos)
+            cond_sin = shard_rotary_emb_for_sp(cond_sin)
+            img_cos = torch.cat([img_cos, cond_cos], dim=0)
+            img_sin = torch.cat([img_sin, cond_sin], dim=0)
 
         txt_cos, txt_sin = rotary_emb.forward(txt_ids)
 
