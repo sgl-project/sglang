@@ -839,8 +839,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """Compute logprobs for accepted tokens on GPU in the forward stream.
 
-        Stores results in logits_output fields so they flow through copy_to_cpu()
-        to the scheduler stream without requiring any GPU operations there.
+        Stores results in logits_output fields so they flow through copy_to_cpu().
         """
 
         bs = len(batch.seq_lens)
