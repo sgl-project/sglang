@@ -516,7 +516,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         if batch.condition_image_latent_ids is None:
             batch.condition_image_latent_ids = image_latent_ids
         else:
-            # Keep monotonic t-coordinates across multiple reference images.
+            # Keep monotonic t-coordinates across multiple reference images
             prev_ids = batch.condition_image_latent_ids
             t_offset = prev_ids[..., 0].amax()
             image_latent_ids[..., 0].add_(t_offset)
