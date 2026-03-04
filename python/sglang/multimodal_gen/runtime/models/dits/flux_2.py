@@ -264,7 +264,10 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query, key, cos_sin_cache, is_neox=False
             )
 
-        hidden_states = self.attn(query, key, value)
+        num_rep = (
+            encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+        )
+        hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -366,6 +369,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         # Parallel in (QKV + MLP in) projection
@@ -398,7 +402,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(
+            query, key, value, num_replicated_prefix=num_replicated_prefix
+        )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -468,6 +474,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             freqs_cis=freqs_cis,
+            num_replicated_prefix=text_seq_len or 0,
             **joint_attention_kwargs,
         )
 
@@ -879,6 +886,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 temb_mod_params=single_stream_mod,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                text_seq_len=num_txt_tokens,
             )
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
