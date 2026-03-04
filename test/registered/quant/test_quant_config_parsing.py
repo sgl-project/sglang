@@ -2,16 +2,13 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-class MockHfConfig:
-    def __init__(self, quant_config=None):
-        self.quantization_config = quant_config
-        self.architectures = ["LlamaForCausalLM"]
-        self.model_type = "llama"
-
-
-class TestQuantLogString(unittest.TestCase):
+class TestQuantLogString(CustomTestCase):
     def test_qwen_fp8_config(self):
         # Example from Qwen/Qwen3-4B-Thinking-2507-FP8
         quant_config = {
