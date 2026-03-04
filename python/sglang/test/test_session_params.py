@@ -64,7 +64,7 @@ if session_id:
         "session_params": {
             "id": session_id
         },
-        "semantic_event": "summary"
+        "semantic_event": "reset"
     }
 
     response = requests.post(url, json=payload_semantic, headers=headers)
@@ -111,7 +111,7 @@ if "metadata" in response_json and "session_id" in response_json["metadata"]:
         "session_params": {
             "id": chat_session_id
         },
-        "semantic_event": "summary"
+        "semantic_event": "reset"
     }
 
     response = requests.post(url_chat, json=payload_chat_summary, headers=headers)

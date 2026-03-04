@@ -18,7 +18,7 @@ After summary: Only [System] remains
 ### Target Flow
 1. Client sends request with `semantic_event="start"` → Auto-creates session
 2. Multiple conversation rounds accumulate in KV cache
-3. Client sends request with `semantic_event="summary"` → Prunes old history
+3. Client sends request with `semantic_event="reset"` → Prunes old history
 4. New conversation starts fresh
 
 ---
@@ -144,10 +144,10 @@ should_auto_create = (
 ```python
 if req.finished():
     semantic_event = getattr(req, 'semantic_event', None)
-    is_insert = not (semantic_event == 'summary')
+    is_insert = not (semantic_event == 'reset')
     release_kv_cache(req, self.tree_cache, is_insert=is_insert)
     
-    if semantic_event == 'summary':
+    if semantic_event == 'reset':
         self.tree_cache.prune_from_node(req.last_node)
 ```
 
@@ -168,7 +168,7 @@ if req.finished() or req.is_retracted:
 if req.finished() or req.is_retracted:
     if req.finished():
         semantic_event = getattr(req, 'semantic_event', None)
-        if semantic_event == 'summary':
+        if semantic_event == 'reset':
             if hasattr(req, 'last_node') and req.last_node is not None:
                 self.tree_cache.prune_from_node(req.last_node)
     continue

@@ -258,17 +258,17 @@ async def main():
     print(f"  Tree size: {before_tree_size} nodes")
     print("-"*50)
 
-    # Round 5: Summary request with semantic_event
-    print("\n[Round 5] Summary request (semantic_event='summary')")
-    summary_messages = conversation_history + [
+    # Round 5: Reset request with semantic_event
+    print("\n[Round 5] Reset request (semantic_event='reset')")
+    reset_messages = conversation_history + [
         {"role": "user", "content": "Summarize our math discussion."}
     ]
 
     result = await send_chat_completion(
         client,
-        summary_messages,
+        reset_messages,
         session_id=session_id,
-        semantic_event="summary",
+        semantic_event="reset",
         max_tokens=15
     )
 
