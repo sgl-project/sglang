@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
+    is_xpu,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -928,8 +929,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, XPU, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
