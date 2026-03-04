@@ -66,7 +66,7 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Unsupported copy between dtypes: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if target_rank < loaded_rank and not envs.SGLANG_ALLOW_DOWNCASTING.get():
+    if target_rank < loaded_rank and not envs.SGLANG_QUANT_ALLOW_DOWNCASTING.get():
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
