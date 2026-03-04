@@ -87,6 +87,4 @@ def test_gptq_marlin_repack(
 
 
 if __name__ == "__main__":
-    import subprocess
-
-    subprocess.call(["pytest", "--tb=short", str(__file__)])
+    pytest.main([__file__, "-v", "-s"])
