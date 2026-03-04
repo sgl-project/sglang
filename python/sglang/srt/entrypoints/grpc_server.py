@@ -227,12 +227,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 ),
                             ),
                         )
-                    elif output.get("finished", False):
-                        yield self._create_completion_response(
-                            request.request_id, output
-                        )
                     else:
                         yield self._create_chunk_response(request.request_id, output)
+                        if output.get("finished", False):
+                            yield self._create_completion_response(
+                                request.request_id, output
+                            )
 
         except Exception as e:
             logger.error(
