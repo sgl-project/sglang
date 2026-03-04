@@ -27,18 +27,19 @@ def fused_topk_npu(
     correction_bias = topk_config.correction_bias
 
     if not use_grouped_topk:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
-            router_logits,
+        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
             k=topk_config.top_k,
+            k_group=1,
+            group_count=1,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=0,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
+            eps=float(1e-20),
         )
-
-        if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
-            )
-        topk_weights = topk_weights.to(torch.float32)
 
     elif use_grouped_topk and correction_bias is not None:
         # Force set routed_scaling_factor = 1 to optimize renormalize
