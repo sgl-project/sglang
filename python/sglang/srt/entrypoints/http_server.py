@@ -2065,7 +2065,7 @@ def launch_server(
                 fd=reserved_socket.fileno(),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
+                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                 loop="uvloop",
             )
         else:
@@ -2084,7 +2084,7 @@ def launch_server(
                 fd=reserved_socket.fileno(),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
+                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
             )
