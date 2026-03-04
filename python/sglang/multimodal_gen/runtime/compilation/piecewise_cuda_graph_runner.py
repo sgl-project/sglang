@@ -305,6 +305,7 @@ class DiffusionPiecewiseCudaGraphRunner:
         self._entries: dict[Hashable, _GraphEntry] = {}
         self._installed = False
         self._compiled = False
+        self._eager_warmup_done = False
 
         device = next(model.parameters()).device
         self.device = device
@@ -359,6 +360,12 @@ class DiffusionPiecewiseCudaGraphRunner:
     def _ensure_compiled(self, call_kwargs: dict[str, Any]) -> None:
         if self._compiled:
             return
+        # Warm up lazy custom kernels (e.g. JIT kernels that touch filesystem)
+        # outside torch.compile to avoid Dynamo tracing unsupported Python/C APIs.
+        if not self._eager_warmup_done:
+            with torch.no_grad():
+                self.model(**call_kwargs)
+            self._eager_warmup_done = True
         with enable_piecewise_cuda_graph():
             with enable_piecewise_cuda_graph_compile():
                 _ = self.model(**call_kwargs)
