@@ -66,14 +66,10 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         cls.encode_port = f"{int(cls.lb_port) + 300}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
 
-        cls.image_man_ironing = _resolve_data_url(
-            IMAGE_MAN_IRONING_URL, "man_ironing_on_back_of_suv.png"
-        )
-        cls.image_sgl_logo = _resolve_data_url(IMAGE_SGL_LOGO_URL, "sgl_logo.png")
-        cls.video_jobs = _resolve_data_url(VIDEO_JOBS_URL, "jobs_presenting_ipod.mp4")
-        cls.audio_trump = _resolve_data_url(
-            AUDIO_TRUMP_SPEECH_URL, "Trump_WEF_2018_10s.mp3"
-        )
+        cls.image_man_ironing = IMAGE_MAN_IRONING_URL
+        cls.image_sgl_logo = IMAGE_SGL_LOGO_URL
+        cls.video_jobs = VIDEO_JOBS_URL
+        cls.audio_trump = AUDIO_TRUMP_SPEECH_URL
 
         print(
             f"Setting up EPD Omni: model={cls.model}, encode={cls.encode_port}, "
