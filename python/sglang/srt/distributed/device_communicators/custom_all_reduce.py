@@ -458,7 +458,19 @@ def dispatch_custom_allreduce():
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
+
+    Set SGLANG_USE_JIT_ALL_REDUCE=1 to use the JIT-compiled v2 implementation.
     """
+    # HARDCODED: opt-in flag for v2 JIT all-reduce.
+    # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
+    if get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
+
+        logger.info("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+        return CustomAllReduceV2
+
     if _is_cuda or _is_musa:
         return CustomAllreduce
 

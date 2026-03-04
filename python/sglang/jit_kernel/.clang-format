@@ -17,7 +17,7 @@ PenaltyReturnTypeOnItsOwnLine: 100    # Keeps return type with function name
 IncludeCategories:
   - Regex: '^<sgl_kernel/.*\.h>$'
     Priority: 0
-  - Regex: '^<sgl_kernel/impl/.*>$'
+  - Regex: '^<sgl_kernel/.*/.*>$'
     Priority: 2
   - Regex: '^<sgl_kernel/.*\.cuh>$'
     Priority: 1

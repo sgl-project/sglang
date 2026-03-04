@@ -1,0 +1,96 @@
+#pragma once
+#include <sgl_kernel/utils.cuh>
+
+namespace device::distributed {
+
+inline constexpr uint32_t kMaxNumGPU = 8;
+
+struct alignas(128) Semaphore {
+ public:
+  __host__ constexpr Semaphore() : m_flag(0), m_counter(0) {}
+
+  template <bool kFence>
+  SGL_DEVICE uint32_t get() const {
+    uint32_t val;
+    if constexpr (kFence) {
+      asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
+    } else {
+      asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
+    }
+    return val;
+  }
+
+  template <bool kFence>
+  SGL_DEVICE uint32_t add(uint32_t val) {
+    uint32_t old_val;
+    if constexpr (kFence) {
+      asm volatile("atom.release.sys.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
+    } else {
+      asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
+    }
+    return old_val;
+  }
+
+  // Only called by the owning GPU - plain load is sufficient
+  SGL_DEVICE uint32_t counter() const {
+    return m_counter;
+  }
+
+  // Only called by the owning GPU - plain store is sufficient
+  SGL_DEVICE void advance(uint32_t val) {
+    m_counter += val;
+  }
+
+ private:
+  uint32_t m_flag;
+  uint32_t m_counter;
+};
+
+struct Controller {
+ public:
+  __host__ Controller(void** signals, uint32_t num_gpu) {
+    for (uint32_t i = 0; i < num_gpu; ++i) {
+      m_signals[i] = static_cast<Semaphore*>(signals[i]);
+    }
+  }
+
+  /// Synchronize all GPUs.
+  /// When kFence is true, establishes happens-before across GPUs using
+  /// release/acquire semantics, ensuring prior writes are visible system-wide.
+  template <bool kFence = false>
+  SGL_DEVICE void sync(uint32_t rank, uint32_t num_gpu, int stage) const {
+    // For fenced sync: ensure all threads in this block have completed their writes,
+    // so the signaling thread's release carries them transitively.
+    if constexpr (kFence) __syncthreads();
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    const auto lane_id = threadIdx.x % kWarpThreads;
+    if (lane_id == 0 && warp_id < num_gpu) {
+      auto& signal = m_signals[warp_id][blockIdx.x];
+      signal.add<kFence>(1);
+      if (warp_id == rank) {
+        const auto target = num_gpu * stage;
+        /// NOTE: correctness here:
+        /// - base is only read/updated locally by the owning GPU
+        const auto base = signal.counter();
+        while (signal.get<kFence>() - base < target)
+          ;
+      }
+    }
+    __syncthreads();
+  }
+
+  SGL_DEVICE void sync_release(uint32_t rank, uint32_t num_gpu, int stage) const {
+    return this->sync</*kFence=*/true>(rank, num_gpu, stage);
+  }
+
+  SGL_DEVICE void reset(uint32_t rank, uint32_t num_gpu, int stage) const {
+    if (threadIdx.x == rank * kWarpThreads) {
+      m_signals[rank][blockIdx.x].advance(num_gpu * stage);
+    }
+  }
+
+ private:
+  Semaphore* __restrict__ m_signals[kMaxNumGPU];
+};
+
+}  // namespace device::distributed
