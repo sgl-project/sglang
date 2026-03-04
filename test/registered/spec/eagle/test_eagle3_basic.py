@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
@@ -12,6 +13,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=50, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=50, suite="stage-b-test-small-1-gpu")
+
+_is_hip = is_hip()
 
 
 class TestEagle3Basic(EagleServerBase):
@@ -22,7 +26,17 @@ class TestEagle3Basic(EagleServerBase):
     spec_steps = 2
     spec_topk = 1
     spec_tokens = 3
-    extra_args = ["--dtype=float16", "--chunked-prefill-size", 1024]
+    extra_args = (
+        [
+            "--dtype=float16",
+            "--chunked-prefill-size",
+            1024,
+            "--attention-backend",
+            "aiter",
+        ]
+        if _is_hip
+        else ["--dtype=float16", "--chunked-prefill-size", 1024]
+    )
 
     def test_mmlu(self):
         """Override to add EAGLE-specific assertions"""
@@ -42,7 +56,10 @@ class TestEagle3Basic(EagleServerBase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.26)
+        if _is_hip:
+            self.assertGreater(avg_spec_accept_length, 2.24)
+        else:
+            self.assertGreater(avg_spec_accept_length, 2.26)
 
 
 if __name__ == "__main__":

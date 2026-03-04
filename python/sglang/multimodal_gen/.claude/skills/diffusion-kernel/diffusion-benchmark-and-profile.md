@@ -10,6 +10,15 @@ This skill covers how to run end-to-end benchmarks for SGLang Diffusion (`sglang
 
 > **Correctness First**: Any performance optimization must be validated for correctness before being considered complete. Faster but incorrect output is not an improvement. Always compare generated images/videos against a reference baseline before and after any change.
 
+**Benchmarking / Perf Report (Reuse Existing Skill)**
+For end-to-end latency measurement, JSON dump format, before/after comparison, and extracting a single number for reports, reuse the `diffusion-perf` skill:
+
+- `../diffusion-perf/SKILL.md`
+
+This document focuses on:
+- The standard diffusion model suite commands (what to run)
+- When and how to do per-layer / per-kernel profiling (how to analyze)
+
 **Primary Metric: Denoise Latency**
 The most important latency signal is the **denoising loop latency** — the total time spent running the DiT forward pass across all inference steps. This is the dominant cost in every diffusion model and the main target for optimization. End-to-end latency (including VAE decode and text encoding) is also recorded as a secondary metric, but denoising latency is the key indicator of DiT model performance.
 
@@ -95,6 +104,8 @@ wget -O astronaut.jpg https://huggingface.co/datasets/huggingface/documentation-
 ## Standard Benchmark Model Suite
 
 All commands include `--warmup` (pre-warm torch.compile) and `--enable-torch-compile` to reflect real production deployment performance. Timing is measured after warmup completes.
+
+If you want a machine-readable perf dump for comparison/reporting, add `--perf-dump-path <file>.json` to any command below, then follow `diffusion-perf` (`../diffusion-perf/SKILL.md`) to interpret and compare the dumps.
 
 ### 1. Qwen/Qwen-Image-2512 (Text-to-Image, single GPU)
 
@@ -288,23 +299,10 @@ sglang generate \
 
 ## Result Recording Format
 
-Record results in the following format for cross-version comparison:
+For recording, extracting, and comparing benchmark results across versions, reuse `diffusion-perf` (`../diffusion-perf/SKILL.md`):
 
-Denoise latency is the primary optimization target. End-to-end latency includes text encoding and VAE decode on top of denoise.
-
-```
-| Model                             | Task       | Steps | Resolution  | Denoise (s) ★ | E2E (s) | Peak Mem (GB) | SGLang Ver | GPU |
-|-----------------------------------|------------|-------|-------------|---------------|---------|---------------|------------|-----|
-| Qwen-Image-2512                   | T2I        |  50   | 1024×1024   |               |         |               |            |     |
-| Qwen-Image-Edit-2511              | Img Edit   |  50   | 1024×1024   |               |         |               |            |     |
-| FLUX.1-dev                        | T2I        |  50   | 1024×1024   |               |         |               |            |     |
-| FLUX.2-dev                        | T2I        |   -   | 1024×1024   |               |         |               |            |     |
-| Z-Image-Turbo                     | T2I Turbo  |   9   | 1024×1024   |               |         |               |            |     |
-| Wan2.2-T2V-A14B 720P (8 GPU)      | T2V        |  40   | 720P 81fr   |               |         |               |            |     |
-| Wan2.2-TI2V-5B 720P               | TI2V       |  50   | 720P 81fr   |               |         |               |            |     |
-```
-
-★ Denoise latency = total time of the denoising loop (all DiT forward passes). Reported separately from text encoding and VAE decode.
+- Use `--perf-dump-path` to generate a JSON perf dump
+- Use `python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json` to generate a Markdown table for PR reports
 
 ---
 
@@ -365,7 +363,7 @@ When establishing a GPU performance baseline, disable all offloading (`false`).
 
 ## Per-Layer Kernel Profiling
 
-When denoise latency is higher than expected, the next step is to understand **which layer and which kernel** inside the DiT is responsible. Two profiling levels are used, from coarse to fine:
+When you have any **model / operator optimization** requirement (e.g., a new fused kernel, a torch.compile graph-break fix, a suspected regression, or a perf goal you need to justify/validate), you should proactively profile to understand **which layer and which kernel** inside the DiT is responsible. Two profiling levels are used, from coarse to fine:
 
 ```
 Level 1 — torch.profiler (built-in --profile flag)  →  per-PyTorch-op breakdown, per DiT layer
@@ -639,7 +637,7 @@ EOF
    sglang generate --seed=42 --save-output → save reference images/videos
    (do this before any optimization; compare against it after every change)
        ↓
-1. Run benchmark → identify slow model (denoise latency > baseline)
+1. Run benchmark → establish baseline / measure impact
        ↓
 2. sglang generate --profile --num-profiled-timesteps 3
    → parse .trace.json.gz → rank ops by self_cuda_time_total
