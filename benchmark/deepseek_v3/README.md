@@ -4,7 +4,7 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek.html).
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek V3/V3.1/R1 Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek_v3.html#optimizations).
 
 ## Installation & Launch
 
@@ -271,7 +271,7 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.0.1 --port 30000
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128

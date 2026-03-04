@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -92,7 +93,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
@@ -245,7 +246,7 @@ is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
 is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version,
-        device_capability_majors=[10, 12],
+        device_capability_majors=[10, 11, 12],
         cuda_version=(12, 8),
     )
 )
@@ -608,8 +609,12 @@ def get_available_gpu_memory(
     return free_gpu_memory / (1 << 30)
 
 
-def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+def is_pin_memory_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if device is not None and str(device) == "cpu":
+        return False
+    return True
 
 
 class LayerFn(Protocol):
@@ -1000,6 +1005,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1055,10 +1062,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -1096,7 +1118,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.2")
+        min_version: Minimum version required (e.g., "0.6.4")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1110,10 +1132,6 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -2345,6 +2363,7 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "torch_npu.",
     }
 
     DENY_CLASSES = {
@@ -3363,7 +3382,12 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+            parts = line.strip().split(",")
+            if len(parts) != 4:
+                logger.warning("Skipping malformed lscpu line: %s", line.strip())
+                continue
+            cpu = int(parts[0])  # CPU id must always be present
+            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
             cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
@@ -3760,13 +3784,28 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+def get_libnuma():
+    libnuma = None
 
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+        try:
+            libnuma = ctypes.CDLL(libnuma_so)
+        except OSError as e:
+            logger.error(f"{e}")
+            libnuma = None
+        if libnuma is not None:
+            break
+    return libnuma
+
+
+def numa_bind_to_node(node: int):
+    libnuma = get_libnuma()
+
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.error("numa not available on this system, skip bind action")
+    else:
+        libnuma.numa_run_on_node(ctypes.c_int(node))
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
@@ -4075,13 +4114,13 @@ def get_numa_node_count() -> int:
     Returns:
         int: The number of NUMA nodes.
     """
-    libnuma = ctypes.CDLL("libnuma.so")
+    libnuma = get_libnuma()
     return libnuma.numa_max_node() + 1
 
 
 def is_numa_available() -> bool:
     try:
-        libnuma = ctypes.CDLL("libnuma.so")
+        libnuma = get_libnuma()
         return libnuma.numa_available() >= 0
     except Exception:
         return False

@@ -16,6 +16,7 @@ on:
 permissions:
   actions: write
   contents: write
+  pull-requests: read
 
 jobs:
   cut-release-branch:

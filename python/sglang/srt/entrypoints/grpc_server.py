@@ -16,16 +16,18 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
+import numpy as np
+import torch
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
@@ -35,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -159,6 +162,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.mm_receiver = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            from sglang.srt.disaggregation import encode_receiver as mm_receiver
+
+            self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -176,6 +187,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
+            self._handle_epd_disaggregation_encode_request(request, tokenized_req)
 
             # Submit to request manager (automatically handles n>1)
             response_generator = self.request_manager.generate_request(
@@ -245,19 +257,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         logger.info(f"Receive embedding request: {request.request_id}")
 
         try:
-            # Convert request
             tokenized_req = self._convert_embed_request(request)
 
-            # Submit to request manager
             future = await self.request_manager.embedding_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
             )
 
-            # Wait for result
             result = await future
 
-            # Create response
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
                 complete=sglang_scheduler_pb2.EmbedComplete(
@@ -325,7 +333,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 token_ids_logprob=None,
             )
             # Set disaggregation params if needed
-            if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_req.bootstrap_room = 0
         else:
@@ -533,6 +541,25 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             aggregate=_compute_aggregate_protobuf(loads),
         )
 
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if not self.mm_receiver:
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = self.mm_receiver.build_and_send_encode_request(
+            image_urls=image_urls,
+            rid=grpc_req.request_id,
+        )
+        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
     # Helper methods for request/response conversion
 
     def _convert_generate_request(
@@ -571,12 +598,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_req.disaggregated_params.bootstrap_room
             )  # Can be 0, don't use 'or None'
 
+        # Parse multimodal inputs if present
+        mm_inputs = None
+        if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField(
+            "pixel_values"
+        ):
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
-            mm_inputs=None,  # TODO: implement mm support
+            mm_inputs=mm_inputs,
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=(
@@ -594,6 +628,51 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
         )
+
+    @staticmethod
+    def _decode_tensor_data(tensor_data):
+        """Decode a proto TensorData message into a torch.Tensor."""
+        dtype_map = {"float32": np.float32, "int64": np.int64}
+        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
+        shape = list(tensor_data.shape)
+        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
+        return torch.from_numpy(arr)
+
+    def _parse_mm_inputs(self, mm_proto) -> dict:
+        """Parse proto MultimodalInputs into the mm_inputs dict expected by scheduler."""
+        # Decode pixel_values from typed TensorData field
+        pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
+
+        # Decode model-specific tensors
+        model_specific_data = {}
+        for key, tensor_data in mm_proto.model_specific_tensors.items():
+            model_specific_data[key] = self._decode_tensor_data(tensor_data)
+
+        # Convert placeholder ranges to offsets: list of (start, end_inclusive)
+        offsets = [
+            (p.offset, p.offset + p.length - 1) for p in mm_proto.mm_placeholders
+        ]
+        if not offsets:
+            logger.warning(
+                "No mm_placeholders from Rust gateway — token expansion may have "
+                "failed to find the placeholder token in input_ids. "
+                "Check that placeholder_token_id matches the tokenized image token."
+            )
+            offsets = None
+
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=pixel_values,
+            model_specific_data=model_specific_data,
+            offsets=offsets,
+        )
+
+        result = {"mm_items": [mm_item]}
+
+        if mm_proto.HasField("im_token_id"):
+            result["im_token_id"] = mm_proto.im_token_id
+
+        return result
 
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
@@ -1087,7 +1166,7 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
             }
 
             # Set disaggregation params if needed
-            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 warmup_request_kwargs["disaggregated_params"] = (
                     sglang_scheduler_pb2.DisaggregatedParams(
                         bootstrap_host=FAKE_BOOTSTRAP_HOST,
