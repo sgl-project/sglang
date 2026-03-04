@@ -513,7 +513,16 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latent_ids = _prepare_image_ids([latent_condition])
         image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
         image_latent_ids = image_latent_ids.to(get_local_torch_device())
-        batch.condition_image_latent_ids = image_latent_ids
+        if batch.condition_image_latent_ids is None:
+            batch.condition_image_latent_ids = image_latent_ids
+        else:
+            # Keep monotonic t-coordinates across multiple reference images.
+            prev_ids = batch.condition_image_latent_ids
+            t_offset = prev_ids[..., 0].amax()
+            image_latent_ids[..., 0].add_(t_offset)
+            batch.condition_image_latent_ids = torch.cat(
+                [prev_ids, image_latent_ids], dim=1
+            )
 
         # latent: (1, 128, 32, 32)
         packed = self.maybe_pack_latents(
