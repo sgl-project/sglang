@@ -45,6 +45,7 @@ from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_e
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
+    detect_oob,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -109,6 +110,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.spec_nan_oob_detection = (
+            server_args.enable_nan_detection or envs.SGLANG_SPEC_NAN_OOB_DETECTION.get()
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -387,6 +391,10 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        if self.spec_nan_oob_detection:
+            detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
@@ -427,10 +435,18 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
+            if self.spec_nan_oob_detection:
+                detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.spec_nan_oob_detection:
+                vocab_size = logits_output.next_token_logits.shape[-1]
+                detect_oob(
+                    topk_index,
+                    0,
+                    vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_size}",
+                )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -447,6 +463,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        if self.spec_nan_oob_detection:
+            detect_oob(
+                top_scores_index,
+                0,
+                ss_token_list.shape[1],
+                "draft_forward: top_scores_index OOB for gather on ss_token_list",
+            )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -499,6 +522,9 @@ class EagleDraftWorker(BaseDraftWorker):
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         logits_output = self.draft_runner.forward(forward_batch).logits_output
+
+        if self.spec_nan_oob_detection:
+            detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -556,6 +582,12 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
 
+        if self.spec_nan_oob_detection:
+            detect_nan(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+            )
+
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
@@ -598,7 +630,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
+        self.spec_nan_oob_detection = (
+            server_args.enable_nan_detection or envs.SGLANG_SPEC_NAN_OOB_DETECTION.get()
+        )
         self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -777,8 +811,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        if self.spec_nan_oob_detection:
+            detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,

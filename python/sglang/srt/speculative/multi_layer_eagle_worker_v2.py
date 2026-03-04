@@ -39,6 +39,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
+    detect_oob,
     draft_tp_context,
     select_top_k_tokens,
 )
@@ -93,6 +94,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.spec_nan_oob_detection = (
+            server_args.enable_nan_detection or envs.SGLANG_SPEC_NAN_OOB_DETECTION.get()
         )
 
         # Set constant
@@ -286,6 +290,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states,
         )
 
+        if self.spec_nan_oob_detection:
+            detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -329,6 +336,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        if self.spec_nan_oob_detection:
+            detect_oob(
+                top_scores_index,
+                0,
+                ss_token_list.shape[1],
+                "draft_forward: top_scores_index OOB for gather on ss_token_list",
+            )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -387,6 +401,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
+            if self.spec_nan_oob_detection:
+                detect_nan(
+                    output.logits_output.next_token_logits,
+                    f"draft_extend_for_prefill step {step}",
+                )
             probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -561,6 +580,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.enable_nan_detection = server_args.enable_nan_detection
+        self.spec_nan_oob_detection = (
+            server_args.enable_nan_detection or envs.SGLANG_SPEC_NAN_OOB_DETECTION.get()
+        )
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -702,8 +724,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         logits_output = forward_batch_output.logits_output
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        if self.spec_nan_oob_detection:
+            detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,
