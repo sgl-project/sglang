@@ -13,6 +13,7 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.piecewise_context_manager import (
     get_pcg_capture_stream,
+    get_pcg_runtime_shape,
     is_in_pcg_torch_compile,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
@@ -104,31 +105,78 @@ class CUDAPiecewiseBackend:
             # save the hash of the inductor graph for the next run
             self.sglang_backend.compiler_manager.save_to_file()
 
+    def _infer_runtime_shape_from_tensors(self, args) -> Optional[int]:
+        # Prefer sequence-like dims from activation tensors:
+        # 1) dim-1 for rank>=2 tensors (e.g. [B, S, C] -> S)
+        # 2) dim-0 for rank>=1 tensors
+        # 3) any dim as final fallback
+        candidates: list[int] = []
+
+        for x in args:
+            if not isinstance(x, torch.Tensor):
+                continue
+            if x.ndim >= 2:
+                s = int(x.shape[1])
+                if s in self.concrete_size_entries:
+                    candidates.append(s)
+        if candidates:
+            return max(candidates)
+
+        for x in args:
+            if not isinstance(x, torch.Tensor):
+                continue
+            if x.ndim >= 1:
+                s = int(x.shape[0])
+                if s in self.concrete_size_entries:
+                    candidates.append(s)
+        if candidates:
+            return max(candidates)
+
+        for x in args:
+            if not isinstance(x, torch.Tensor):
+                continue
+            for d in x.shape:
+                s = int(d)
+                if s in self.concrete_size_entries:
+                    candidates.append(s)
+        if candidates:
+            return max(candidates)
+        return None
+
     def __call__(self, *args) -> Any:
         if not self.first_run_finished:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
 
-        if len(self.sym_shape_indices) == 0:
-            return self.compiled_graph_for_general_shape(*args)
-
         runtime_shape = None
-        for idx in self.sym_shape_indices:
-            candidate = args[idx]
+        runtime_shape_override = get_pcg_runtime_shape()
+        if runtime_shape_override is not None:
             try:
-                candidate = int(candidate)
+                runtime_shape_override = int(runtime_shape_override)
             except Exception:
                 pass
-            if candidate in self.concrete_size_entries:
-                runtime_shape = candidate
-                break
+            if runtime_shape_override in self.concrete_size_entries:
+                runtime_shape = runtime_shape_override
+
+        if runtime_shape is None and len(self.sym_shape_indices) > 0:
+            for idx in self.sym_shape_indices:
+                candidate = args[idx]
+                try:
+                    candidate = int(candidate)
+                except Exception:
+                    pass
+                if candidate in self.concrete_size_entries:
+                    runtime_shape = candidate
+                    break
+            if runtime_shape is None:
+                runtime_shape = args[self.sym_shape_indices[0]]
+                try:
+                    runtime_shape = int(runtime_shape)
+                except Exception:
+                    pass
         if runtime_shape is None:
-            runtime_shape = args[self.sym_shape_indices[0]]
-            try:
-                runtime_shape = int(runtime_shape)
-            except Exception:
-                pass
+            runtime_shape = self._infer_runtime_shape_from_tensors(args)
 
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape

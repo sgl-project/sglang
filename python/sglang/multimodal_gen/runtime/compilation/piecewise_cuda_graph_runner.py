@@ -26,6 +26,7 @@ from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
     set_pcg_capture_stream,
+    set_pcg_runtime_shape,
 )
 
 logger = init_logger(__name__)
@@ -358,7 +359,7 @@ class DiffusionPiecewiseCudaGraphRunner:
             return None
         return self.capture_sizes[idx]
 
-    def _ensure_compiled(self, call_kwargs: dict[str, Any]) -> None:
+    def _ensure_compiled(self, call_kwargs: dict[str, Any], runtime_shape: int) -> None:
         if self._compiled:
             return
         # Warm up lazy custom kernels (e.g. JIT kernels that touch filesystem)
@@ -368,27 +369,29 @@ class DiffusionPiecewiseCudaGraphRunner:
                 self.model(**call_kwargs)
             self._eager_warmup_done = True
         with enable_piecewise_cuda_graph():
-            with enable_piecewise_cuda_graph_compile():
-                _ = self.model(**call_kwargs)
+            with set_pcg_runtime_shape(runtime_shape):
+                with enable_piecewise_cuda_graph_compile():
+                    _ = self.model(**call_kwargs)
         self._compiled = True
 
-    def _capture(self, call_kwargs: dict[str, Any]) -> None:
+    def _capture(self, call_kwargs: dict[str, Any], runtime_shape: int) -> None:
         before = compilation_counter.num_cudagraph_captured
         with enable_piecewise_cuda_graph():
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
+            with set_pcg_runtime_shape(runtime_shape):
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
 
-            with _graph_capture_stream() as stream:
-                if stream is not None:
-                    with set_pcg_capture_stream(stream):
-                        self.model(**call_kwargs)
-                        self.model(**call_kwargs)
-                else:
-                    self.model(**call_kwargs)
-                    self.model(**call_kwargs)
+                with _graph_capture_stream() as stream:
+                    if stream is not None:
+                        with set_pcg_capture_stream(stream):
+                            for _ in range(4):
+                                self.model(**call_kwargs)
+                    else:
+                        for _ in range(4):
+                            self.model(**call_kwargs)
 
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
         after = compilation_counter.num_cudagraph_captured
         if after > before:
             logger.info(
@@ -447,20 +450,21 @@ class DiffusionPiecewiseCudaGraphRunner:
         call_kwargs = _materialize_call_kwargs(entry.slots, kwargs)
 
         if not self._compiled:
-            self._ensure_compiled(call_kwargs)
+            self._ensure_compiled(call_kwargs, static_seq_len)
 
         if not entry.captured:
-            self._capture(call_kwargs)
+            self._capture(call_kwargs, static_seq_len)
             entry.captured = True
 
         with enable_piecewise_cuda_graph():
-            if current_platform.is_cuda_alike():
-                # Runtime recompilation can trigger late on-demand capture in the
-                # backend. Ensure a valid capture stream is always available.
-                with set_pcg_capture_stream(torch.cuda.current_stream()):
+            with set_pcg_runtime_shape(static_seq_len):
+                if current_platform.is_cuda_alike():
+                    # Runtime recompilation can trigger late on-demand capture in the
+                    # backend. Ensure a valid capture stream is always available.
+                    with set_pcg_capture_stream(torch.cuda.current_stream()):
+                        output = self.model(**call_kwargs)
+                else:
                     output = self.model(**call_kwargs)
-            else:
-                output = self.model(**call_kwargs)
 
         return _slice_output_to_raw_seq(output, raw_seq_len, static_seq_len)
 

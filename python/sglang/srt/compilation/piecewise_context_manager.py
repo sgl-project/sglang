@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
 _pcg_capture_stream = None
+_pcg_runtime_shape = None
 
 
 def is_in_piecewise_cuda_graph():
@@ -28,6 +29,10 @@ def is_in_pcg_torch_compile():
 
 def get_pcg_capture_stream():
     return _pcg_capture_stream
+
+
+def get_pcg_runtime_shape():
+    return _pcg_runtime_shape
 
 
 @contextmanager
@@ -61,6 +66,17 @@ def set_pcg_capture_stream(stream: torch.cuda.Stream):
     _pcg_capture_stream = stream
     yield
     _pcg_capture_stream = None
+
+
+@contextmanager
+def set_pcg_runtime_shape(runtime_shape: int | None):
+    global _pcg_runtime_shape
+    old = _pcg_runtime_shape
+    _pcg_runtime_shape = runtime_shape
+    try:
+        yield
+    finally:
+        _pcg_runtime_shape = old
 
 
 @dataclass
