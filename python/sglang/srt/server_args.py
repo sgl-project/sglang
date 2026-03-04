@@ -646,6 +646,7 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
+    enable_fused_moe_sum_all_reduce: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -5031,6 +5032,11 @@ class ServerArgs:
             "--enable-precise-embedding-interpolation",
             action="store_true",
             help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
+        )
+        parser.add_argument(
+            "--enable-fused-moe-sum-all-reduce",
+            action="store_true",
+            help="Enable fused moe triton and sum all reduce.",
         )
 
         # Dynamic batch tokenizer
