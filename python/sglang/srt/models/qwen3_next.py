@@ -423,7 +423,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         )
         is_extend = forward_batch.forward_mode.is_extend()
         # fused_qkvzba_split_reshape_cat will report error when BS large than 65536 on NPU
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu and (not _is_npu or not is_extend):
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and not _is_cpu
+            and (not _is_npu or not is_extend)
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
