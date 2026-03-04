@@ -19,6 +19,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
@@ -372,6 +373,7 @@ class DiffusionPiecewiseCudaGraphRunner:
         self._compiled = True
 
     def _capture(self, call_kwargs: dict[str, Any]) -> None:
+        before = compilation_counter.num_cudagraph_captured
         with enable_piecewise_cuda_graph():
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
@@ -387,6 +389,17 @@ class DiffusionPiecewiseCudaGraphRunner:
 
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
+        after = compilation_counter.num_cudagraph_captured
+        if after > before:
+            logger.info(
+                "Diffusion PCG captured %d piecewise CUDA graphs",
+                after - before,
+            )
+        else:
+            logger.warning(
+                "Diffusion PCG capture completed but no piecewise CUDA graph was captured; "
+                "runtime shape may not match configured capture buckets."
+            )
 
     def run(self, *, seq_len_override: int | None = None, **kwargs) -> Any | None:
         hidden_states = kwargs.get("hidden_states")
