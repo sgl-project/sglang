@@ -1104,9 +1104,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if len(p2p_missing_logical_experts) > 0:
             # Load the missing expert weights from disk
-            if callable(
-                getattr(self.model, "generate_weight_name_filter", None)
-            ):
+            if callable(getattr(self.model, "generate_weight_name_filter", None)):
                 # Filter and load only missing expert weights
                 weight_name_filter = self.model.generate_weight_name_filter(
                     p2p_missing_logical_experts
