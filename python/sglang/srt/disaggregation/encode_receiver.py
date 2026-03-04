@@ -537,8 +537,11 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
     def send_encode_request(self):
         async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
             tasks = []
-            logger.info(f"{self.num_items_assigned = } ")
-            for idx, assigned_num in enumerate(self.num_items_assigned):
+            # gRPC image-only: flatten modality dict to flat list
+            assigned = list(self.num_items_assigned.values())[0]
+            logger.info(f"num_items_assigned={assigned}")
+
+            for idx, assigned_num in enumerate(assigned):
                 if assigned_num == 0:
                     continue
                 encoder_url = self.encoder_urls[idx]
@@ -1207,21 +1210,38 @@ class MMReceiverGrpc(MMReceiverBase):
     async def encode(
         self,
         req_id,
-        img_data,
+        mm_data,
         embedding_port,
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
     ):
-        if not img_data:
+        if not mm_data:
             return
+
+        # gRPC currently only supports image; flatten new dict formats to simple lists
+        if mm_data and isinstance(mm_data[0], dict):
+            non_image = [
+                item.get("modality")
+                for item in mm_data
+                if item.get("modality") != Modality.IMAGE
+            ]
+            if non_image:
+                raise NotImplementedError(
+                    f"gRPC encode only supports IMAGE modality, got: {non_image}"
+                )
+            img_data = [item.get("url") for item in mm_data]
+        else:
+            img_data = mm_data
+        if isinstance(num_items_assigned, dict):
+            num_items_assigned = list(num_items_assigned.values())[0]
 
         encode_requests = []
         if num_items_assigned is None:
-            random.shuffle(self.encode_idx)
+            encode_idx = list(range(len(self.encode_urls)))
+            random.shuffle(encode_idx)
             num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls)
-                for idx in self.encode_idx
+                (idx + len(img_data)) // len(self.encode_urls) for idx in encode_idx
             ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0

@@ -557,7 +557,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             image_urls=image_urls,
             rid=grpc_req.request_id,
         )
-        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.need_wait_for_mm_inputs = bool(encode_req.need_wait_for_mm_inputs)
         tokenized_req.num_items_assigned = encode_req.num_items_assigned
 
     # Helper methods for request/response conversion
