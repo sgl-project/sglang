@@ -446,13 +446,7 @@ def test_scale_unsupported_dtype():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
-```
-
-Run:
-
-```bash
-pytest python/sglang/jit_kernel/tests/test_scale.py -q
+    pytest.main([__file__, "-v", "-s"])
 ```
 
 ---
