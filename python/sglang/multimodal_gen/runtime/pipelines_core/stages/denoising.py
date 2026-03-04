@@ -33,6 +33,10 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
+from sglang.multimodal_gen.runtime.compilation import (
+    DiffusionPiecewiseCudaGraphRunner,
+    resolve_capture_sizes,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -128,6 +132,9 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+        # piecewise cuda graph state
+        self._pcg_runners: dict[int, DiffusionPiecewiseCudaGraphRunner] = {}
+        self._pcg_disabled_model_ids: set[int] = set()
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -1345,12 +1352,79 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
+        runner = self._get_or_create_pcg_runner(current_model, latent_model_input)
+        if runner is not None:
+            try:
+                output = runner.run(
+                    seq_len_override=int(latent_model_input.shape[1]),
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    guidance=guidance,
+                    **kwargs,
+                )
+                if output is not None:
+                    return output
+            except Exception as e:
+                model_id = id(current_model)
+                if model_id not in self._pcg_disabled_model_ids:
+                    logger.warning(
+                        "Disable diffusion PCG for %s after failure: %s",
+                        current_model.__class__.__name__,
+                        e,
+                    )
+                self._pcg_disabled_model_ids.add(model_id)
+
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             guidance=guidance,
             **kwargs,
         )
+
+    def _is_pcg_backend_supported(self) -> bool:
+        return self.attn_backend.get_enum() in {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FA2,
+            AttentionBackendEnum.TORCH_SDPA,
+        }
+
+    def _get_or_create_pcg_runner(
+        self, model: nn.Module, hidden_states: torch.Tensor
+    ) -> DiffusionPiecewiseCudaGraphRunner | None:
+        if not self.server_args.enable_piecewise_cuda_graph:
+            return None
+        if not self._is_pcg_backend_supported():
+            return None
+        if hidden_states is None or hidden_states.ndim != 3:
+            return None
+
+        model_id = id(model)
+        if model_id in self._pcg_disabled_model_ids:
+            return None
+
+        runner = self._pcg_runners.get(model_id)
+        if runner is not None:
+            return runner
+
+        capture_sizes = resolve_capture_sizes(
+            seq_len=int(hidden_states.shape[1]),
+            explicit_sizes=self.server_args.piecewise_cuda_graph_tokens,
+            max_tokens=self.server_args.piecewise_cuda_graph_max_tokens,
+        )
+        runner = DiffusionPiecewiseCudaGraphRunner(
+            model=model,
+            capture_sizes=capture_sizes,
+            compiler=self.server_args.piecewise_cuda_graph_compiler,
+            enable_debug=self.server_args.enable_piecewise_cuda_graph_debug,
+        )
+        self._pcg_runners[model_id] = runner
+        logger.info(
+            "Enable diffusion PCG for %s with %d capture buckets (max=%d)",
+            model.__class__.__name__,
+            len(capture_sizes),
+            max(capture_sizes) if capture_sizes else 0,
+        )
+        return runner
 
     def _predict_noise_with_cfg(
         self,

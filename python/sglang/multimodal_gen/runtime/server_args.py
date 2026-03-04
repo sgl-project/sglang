@@ -270,6 +270,11 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
+    piecewise_cuda_graph_max_tokens: int = 8192
+    piecewise_cuda_graph_tokens: list[int] | None = None
+    piecewise_cuda_graph_compiler: str = "eager"
+    enable_piecewise_cuda_graph_debug: bool = False
 
     # warmup
     warmup: bool = False
@@ -352,6 +357,7 @@ class ServerArgs:
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        self._adjust_piecewise_cuda_graph()
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -359,6 +365,7 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_piecewise_cuda_graph()
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -462,6 +469,51 @@ class ServerArgs:
             logger.info(
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
+
+    def _adjust_piecewise_cuda_graph(self):
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = self._generate_piecewise_cuda_graph_tokens()
+        elif isinstance(self.piecewise_cuda_graph_tokens, str):
+            self.piecewise_cuda_graph_tokens = [
+                int(x.strip())
+                for x in self.piecewise_cuda_graph_tokens.split(",")
+                if x.strip()
+            ]
+
+        self.piecewise_cuda_graph_tokens = sorted(
+            set(
+                int(x)
+                for x in (self.piecewise_cuda_graph_tokens or [])
+                if int(x) > 0 and int(x) <= int(self.piecewise_cuda_graph_max_tokens)
+            )
+        )
+
+        if self.enable_piecewise_cuda_graph and self.enable_torch_compile:
+            logger.warning(
+                "Both --enable-piecewise-cuda-graph and --enable-torch-compile are set. "
+                "Disabling torch.compile and keeping piecewise CUDA graph."
+            )
+            self.enable_torch_compile = False
+
+        if not current_platform.is_cuda_alike() and self.enable_piecewise_cuda_graph:
+            logger.warning(
+                "Piecewise CUDA graph is enabled but current platform is not CUDA-like. "
+                "Feature will be disabled."
+            )
+            self.enable_piecewise_cuda_graph = False
+
+    def _generate_piecewise_cuda_graph_tokens(self) -> list[int]:
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(576, 1024 + 1, 64))
+            + list(range(1280, 4096 + 1, 256))
+            + list(range(4608, int(self.piecewise_cuda_graph_max_tokens) + 1, 512))
+        )
+        return [
+            s for s in capture_sizes if s <= int(self.piecewise_cuda_graph_max_tokens)
+        ]
 
     def _adjust_network_ports(self):
         self.port = self.settle_port(self.port)
@@ -737,6 +789,37 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_piecewise_cuda_graph,
+            help="Enable piecewise CUDA graph with automatic graph splitting and padding buckets.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Maximum sequence length bucket for diffusion piecewise CUDA graph.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=int,
+            nargs="+",
+            default=ServerArgs.piecewise_cuda_graph_tokens,
+            help="Optional explicit token buckets for diffusion piecewise CUDA graph.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compiler",
+            type=str,
+            default=ServerArgs.piecewise_cuda_graph_compiler,
+            help="Compiler backend for diffusion piecewise CUDA graph: eager or inductor.",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph-debug",
+            action=StoreBoolean,
+            default=ServerArgs.enable_piecewise_cuda_graph_debug,
+            help="Enable debug checks for diffusion piecewise CUDA graph.",
         )
 
         # warmup
@@ -1196,6 +1279,21 @@ class ServerArgs:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_piecewise_cuda_graph(self):
+        if self.piecewise_cuda_graph_max_tokens <= 0:
+            raise ValueError("piecewise_cuda_graph_max_tokens must be positive")
+
+        if self.piecewise_cuda_graph_compiler not in ("eager", "inductor"):
+            raise ValueError(
+                "piecewise_cuda_graph_compiler must be one of: eager, inductor"
+            )
+
+        if self.piecewise_cuda_graph_tokens is not None:
+            if len(self.piecewise_cuda_graph_tokens) == 0:
+                raise ValueError(
+                    "piecewise_cuda_graph_tokens is empty; set a non-empty bucket list or unset it"
+                )
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
