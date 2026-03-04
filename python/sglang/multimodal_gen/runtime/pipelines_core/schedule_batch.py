@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import pprint
+from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
 
@@ -247,18 +248,21 @@ class Req:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
 
-        return (
-            os.path.join(self.output_path, output_file_name)
-            if output_file_name
-            else None
-        )
+        if self.output_path is None or not output_file_name:
+            return None
+        return os.path.join(self.output_path, output_file_name)
 
-    def set_as_warmup(self):
+    def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = 1
+        self.num_inference_steps = warmup_steps
+
+    def copy_as_warmup(self, warmup_steps: int = 1) -> "Req":
+        req = deepcopy(self)
+        req.set_as_warmup(warmup_steps)
+        return req
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -272,9 +276,6 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-        if self.is_warmup:
-            self.set_as_warmup()
-
     def adjust_size(self, server_args: ServerArgs):
         pass
 
@@ -282,7 +283,7 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
-        if self.is_warmup:
+        if self.is_warmup or self.suppress_logs:
             return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
@@ -300,8 +301,8 @@ class Req:
             self.negative_prompt, key_hint="negative_prompt"
         )
 
-        # log non-sensitive parameters at info level
-        info_str = f"""Sampling params:
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
@@ -319,16 +320,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-
-        # log full prompts at debug level only (for debugging purposes)
-        debug_str = f"""Full prompts:
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-        """
-
-        if not self.suppress_logs:
-            logger.info(info_str)
-            logger.debug(debug_str)
+        logger.debug(debug_str)
 
 
 @dataclass

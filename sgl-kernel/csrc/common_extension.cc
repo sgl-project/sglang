@@ -288,23 +288,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
   /*
-   * From csrc/moe/marlin_moe_wna16
-   */
-  m.def(
-      "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor? b_bias_or_none, Tensor! b_scales,"
-      "Tensor? global_scale_or_none, Tensor? b_zeros_or_none,"
-      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
-      "Tensor sorted_token_ids,"
-      "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
-      "Tensor! topk_weights, int moe_block_size, int top_k, "
-      "bool mul_topk_weights, bool is_ep, int b_q_type_id,"
-      "int size_m, int size_n, int size_k,"
-      "bool is_k_full, bool use_atomic_add,"
-      "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
-  m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
-
-  /*
    * From csrc/speculative
    */
   m.def(
@@ -417,26 +400,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       {at::Tag::needs_fixed_stride_order});
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
-  m.def(
-      "min_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_min_p_arr, float "
-      "min_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);
-
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
-
-  m.def(
-      "top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? "
-      "maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
-
-  m.def(
-      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_top_k_arr, "
-      "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("top_k_top_p_sampling_from_probs", torch::kCUDA, &top_k_top_p_sampling_from_probs);
 
   m.def("top_k_mask_logits(Tensor logits, Tensor mask_logits, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_mask_logits", torch::kCUDA, &top_k_mask_logits);

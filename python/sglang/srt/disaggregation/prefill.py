@@ -39,7 +39,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
-    poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -95,8 +95,6 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
-        decode_tp_size: int,
-        decode_dp_size: int,
         scheduler: Scheduler,
         pp_rank: int,
         pp_size: int,
@@ -109,8 +107,6 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.decode_tp_size = decode_tp_size
-        self.decode_dp_size = decode_dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.gpu_id = gpu_id
@@ -135,8 +131,6 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
-        kv_args.prefill_pp_size = self.pp_size
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -157,6 +151,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_item_lens = kv_item_lens
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -266,8 +263,10 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.queue], self.gloo_group
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -367,7 +366,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result_disagg_prefill(batch, result)
+                self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
 
@@ -402,7 +401,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -530,7 +529,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.maybe_send_health_check_signal()
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -544,8 +549,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
@@ -612,8 +618,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Used by PP, get the transferred rids but **do not pop**
         """
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
