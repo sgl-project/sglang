@@ -125,6 +125,8 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Base:
             other_args=[
                 "--quantization",
                 "mxfp8",
+                "--fp8-gemm-backend",
+                "flashinfer_trtllm",
                 "--moe-runner-backend",
                 cls.backend,
                 "--tp-size",
