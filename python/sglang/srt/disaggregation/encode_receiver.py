@@ -174,14 +174,10 @@ class EmbeddingData:
             error_msg=self.error_msg,
             error_code=self.error_code,
         )
-        for key in dir(self):
-            if (
-                key.startswith("_")
-                or key == "embedding"
-                or callable(getattr(self, key, None))
-            ):
+        for key, value in self.__dict__.items():
+            if key.startswith("_") or key == "embedding":
                 continue
-            setattr(new_data, key, getattr(self, key, None))
+            setattr(new_data, key, value)
         return new_data
 
 
@@ -285,8 +281,6 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape=embedding_data.shape,
             **extra,
         )
-        if embedding_data.modality == Modality.VIDEO:
-            mm_data._set_video_meta_for_part(embedding_data.part_idx, extra)
         mm_data.send_time = embedding_data.send_time
         return mm_data
 
