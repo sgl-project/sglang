@@ -8,6 +8,8 @@ import triton.language as tl
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.attention.mamba.mamba1 import MambaMixer1
+from sglang.srt.layers.attention.mamba.mamba1_metadata import Mamba1Metadata
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
@@ -719,7 +721,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
 
 class Mamba1AttnBackend(MambaAttnBackendBase):
-    """Attention backend wrapper for Mamba1 (Jamba) mixer kernels.
+    """Attention backend wrapper for Mamba1 mixer kernels (e.g., Jamba).
 
     Mamba1 differs from Mamba2 in:
     - 2D temporal state (intermediate_size/tp, state_size) vs 3D for Mamba2
@@ -733,56 +735,62 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
         assert config is not None, "Mamba1AttnBackend requires mamba1_config"
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata for Mamba1."""
-        self.forward_metadata = self._forward_metadata(forward_batch)
+        metadata = self._forward_metadata(forward_batch)
+        self.forward_metadata = Mamba1Metadata.prepare_mixed(
+            metadata, forward_batch
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
+        self.forward_metadata = Mamba1Metadata.prepare_decode(metadata, seq_lens)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        metadata = self._replay_metadata(
+            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+        )
+        self.forward_metadata = Mamba1Metadata.prepare_decode(metadata, seq_lens)
 
     def forward(
         self,
-        mixer,  # JambaMambaMixer1
+        mixer: MambaMixer1,
         hidden_states: torch.Tensor,
+        output: torch.Tensor,
         layer_id: int,
-        forward_batch: ForwardBatch,
     ):
         """Forward pass through Mamba1 mixer.
 
         Args:
-            mixer: JambaMambaMixer1 instance
+            mixer: MambaMixer1 instance
             hidden_states: Input tensor (num_tokens, hidden_size)
+            output: Preallocated output tensor (num_tokens, hidden_size)
             layer_id: Layer index
-            forward_batch: ForwardBatch with batch info
-
-        Returns:
-            Output tensor (num_tokens, hidden_size)
         """
+        assert isinstance(self.forward_metadata, Mamba1Metadata)
         layer_cache = self.req_to_token_pool.mamba1_layer_cache(layer_id)
-        metadata = self.forward_metadata
-
-        # Get conv and ssm states for this layer
-        # layer_cache.conv is a list (for Mamba1, single element)
-        # layer_cache.temporal is the SSM state
-        conv_state = layer_cache.conv[0]
-        ssm_state = layer_cache.temporal
-
-        # Determine prefill vs decode counts
-        if forward_batch.forward_mode.is_decode_or_idle():
-            num_prefills = 0
-            num_decodes = forward_batch.batch_size
-        elif forward_batch.forward_mode.is_extend():
-            # For mixed batches, extend_num_batches gives prefill count
-            num_prefills = forward_batch.batch_size
-            num_decodes = 0
-        else:
-            num_prefills = forward_batch.batch_size
-            num_decodes = 0
-
         return mixer.forward(
             hidden_states=hidden_states,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            state_indices=metadata.mamba_cache_indices,
-            num_prefills=num_prefills,
-            num_decodes=num_decodes,
-            query_start_loc=metadata.query_start_loc,
+            output=output,
+            layer_cache=layer_cache,
+            metadata=self.forward_metadata,
         )
 
     def forward_decode(self, *args, **kwargs):

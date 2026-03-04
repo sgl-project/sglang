@@ -30,26 +30,19 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.jamba import ATTENTION, MAMBA, MLP, MOE, JambaConfig
-from sglang.srt.configs.mamba_utils import Mamba1CacheParams
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba1AttnBackend,
 )
+from sglang.srt.layers.attention.mamba.mamba1 import MambaMixer1
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.mamba.ops import (
-    HAS_MAMBA_SSM,
-    mamba1_selective_scan,
-    mamba1_selective_state_update,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -69,16 +62,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader, sharded_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
-
-if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
-    )
 
 
 class JambaMLP(nn.Module):
@@ -129,7 +116,7 @@ class JambaMoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
 
-        self.gate = ReplicatedLinear(
+        self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
@@ -159,7 +146,7 @@ class JambaMoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
 
         # Router logits
-        router_logits, _ = self.gate(hidden_states)
+        router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
 
         # Expert forward
@@ -244,280 +231,6 @@ class JambaAttention(nn.Module):
         return output
 
 
-class JambaMambaMixer1(nn.Module):
-    """Mamba1 mixer for Jamba model.
-
-    Jamba uses Mamba1 (not Mamba2) for its SSM layers. The key differences are:
-    - Mamba1: 2D temporal state (intermediate_size/tp, state_size), no groups/heads
-    - Mamba2: 3D temporal state (num_heads/tp, head_dim, state_size), uses n_groups
-
-    This implementation uses selective_scan_fn from mamba-ssm for prefill and
-    a triton kernel for decode.
-    """
-
-    def __init__(
-        self,
-        config: JambaConfig,
-        layer_idx: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
-
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.mamba_intermediate_size
-        self.state_size = config.mamba_d_state
-        self.conv_kernel = config.mamba_d_conv
-        self.dt_rank = config.mamba_dt_rank_value
-        self.use_conv_bias = config.mamba_conv_bias
-        self.use_bias = config.mamba_proj_bias
-        self.layer_idx = layer_idx
-        self.rms_norm_eps = config.rms_norm_eps
-
-        # Intermediate size after TP sharding
-        self.intermediate_size_tp = self.intermediate_size // self.tp_size
-
-        # Input projection: x -> (z, x_proj) where x_proj -> (x, B, C)
-        # z is the gate, x goes through conv and SSM
-        # Total output: 2 * intermediate_size (for z and x_proj)
-        self.in_proj = MergedColumnParallelLinear(
-            self.hidden_size,
-            [self.intermediate_size, self.intermediate_size],
-            bias=self.use_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj",
-        )
-
-        # Conv1d operates on intermediate_size dimension
-        self.conv1d = ColumnParallelLinear(
-            self.conv_kernel,
-            self.intermediate_size,
-            bias=self.use_conv_bias,
-            quant_config=None,  # Conv weights are not quantized
-            prefix=f"{prefix}.conv1d",
-        )
-        # Reshape conv weight from (out, in) to (out, 1, in) for conv1d
-        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-
-        # dt projection: dt_rank -> intermediate_size
-        self.dt_proj = ColumnParallelLinear(
-            self.dt_rank,
-            self.intermediate_size,
-            bias=True,  # dt always has bias
-            quant_config=quant_config,
-            prefix=f"{prefix}.dt_proj",
-        )
-
-        # x_proj: x -> (dt, B, C) projections
-        # dt_rank + 2 * state_size
-        self.x_proj = nn.Linear(
-            self.intermediate_size_tp,
-            self.dt_rank + 2 * self.state_size,
-            bias=False,
-        )
-
-        # Layer norms for dt, B, C (critical for Jamba - prevents NaN)
-        self.dt_layernorm = RMSNorm(self.dt_rank, eps=self.rms_norm_eps)
-        self.b_layernorm = RMSNorm(self.state_size, eps=self.rms_norm_eps)
-        self.c_layernorm = RMSNorm(self.state_size, eps=self.rms_norm_eps)
-
-        # A parameter (stored as log, converted to negative exp during forward)
-        # Shape: (intermediate_size,) - not TP sharded, we shard during forward
-        self.A_log = nn.Parameter(torch.empty(self.intermediate_size_tp, self.state_size))
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-
-        # D parameter (skip connection)
-        self.D = nn.Parameter(torch.empty(self.intermediate_size_tp))
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
-
-        # Output projection
-        self.out_proj = RowParallelLinear(
-            self.intermediate_size,
-            self.hidden_size,
-            bias=self.use_bias,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
-        )
-
-        self.activation = "silu"
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
-        state_indices: torch.Tensor,
-        num_prefills: int,
-        num_decodes: int,
-        query_start_loc: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward pass for Mamba1 mixer.
-
-        Args:
-            hidden_states: (num_tokens, hidden_size)
-            conv_state: (batch, intermediate_size/tp, conv_kernel-1)
-            ssm_state: (batch, intermediate_size/tp, state_size)
-            state_indices: (batch,) indices into state tensors
-            num_prefills: number of prefill requests
-            num_decodes: number of decode tokens
-            query_start_loc: (num_prefills+1,) cumulative sequence lengths
-
-        Returns:
-            output: (num_tokens, hidden_size)
-        """
-        num_tokens = hidden_states.shape[0]
-        num_prefill_tokens = num_tokens - num_decodes
-
-        # 1. Input projection
-        # HF convention: first half = x (main branch), second half = z (gate)
-        projected, _ = self.in_proj(hidden_states)
-        x, z = projected.chunk(2, dim=-1)
-
-        # Split by prefill/decode
-        x_p, x_d = x[:num_prefill_tokens], x[num_prefill_tokens:]
-        z_p, z_d = z[:num_prefill_tokens], z[num_prefill_tokens:]
-        state_indices_p = state_indices[:num_prefills]
-        state_indices_d = state_indices[num_prefills:]
-
-        # Prepare output tensor
-        output = torch.empty_like(x)
-
-        # 2. Process prefill requests
-        if num_prefills > 0 and num_prefill_tokens > 0:
-            # Get conv weights in right format
-            conv_weight = self.conv1d.weight.view(
-                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            )
-
-            # Causal conv1d for prefill
-            x_conv = causal_conv1d_fn(
-                x_p.transpose(0, 1),  # (D, L)
-                conv_weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=None,
-                cache_indices=state_indices_p,
-                query_start_loc=query_start_loc,
-            ).transpose(0, 1)[:num_prefill_tokens]
-
-            # x_proj: compute dt, B, C projections
-            x_dbc = self.x_proj(x_conv)
-            dt, B, C = x_dbc.split([self.dt_rank, self.state_size, self.state_size], dim=-1)
-
-            # Apply layer norms (critical for numerical stability)
-            dt = self.dt_layernorm(dt)
-            B = self.b_layernorm(B)
-            C = self.c_layernorm(C)
-
-            # dt projection
-            dt, _ = self.dt_proj(dt)
-
-            # Get A (negated exponential of A_log)
-            A = -torch.exp(self.A_log.float())
-
-            # Reshape for selective scan
-            # Need to batch by sequence
-            batch_sizes = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
-            x_batched = torch.split(x_conv, batch_sizes, dim=0)
-            dt_batched = torch.split(dt, batch_sizes, dim=0)
-            B_batched = torch.split(B, batch_sizes, dim=0)
-            C_batched = torch.split(C, batch_sizes, dim=0)
-            z_batched = torch.split(z_p, batch_sizes, dim=0)
-
-            outputs_p = []
-            for i, (x_i, dt_i, B_i, C_i, z_i) in enumerate(
-                zip(x_batched, dt_batched, B_batched, C_batched, z_batched)
-            ):
-                # Store original dtype for output conversion
-                dtype_in = x_i.dtype
-
-                # Add batch dim: (L, D) -> (1, L, D), convert to float32 for numerical stability
-                x_i = x_i.unsqueeze(0).float()
-                dt_i = dt_i.unsqueeze(0).float()
-                B_i = B_i.unsqueeze(0).float()
-                C_i = C_i.unsqueeze(0).float()
-                z_i = z_i.unsqueeze(0).float()
-
-                # Selective scan (mamba1_selective_scan handles transposition internally)
-                y_i, final_state = mamba1_selective_scan(
-                    x_i,
-                    dt_i,
-                    A,
-                    B_i,
-                    C_i,
-                    D=self.D.float(),
-                    z=z_i,
-                    delta_softplus=True,
-                    return_last_state=True,
-                )
-
-                # Update SSM state (keep as float32 for numerical precision)
-                ssm_state[state_indices_p[i]] = final_state.squeeze(0)
-                # Convert output back: (1, L, D) -> (L, D) and cast to original dtype
-                outputs_p.append(y_i.squeeze(0).to(dtype_in))
-
-            output[:num_prefill_tokens] = torch.cat(outputs_p, dim=0)
-
-        # 3. Process decode requests
-        if num_decodes > 0:
-            conv_weight = self.conv1d.weight.view(
-                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            )
-
-            # Causal conv1d update for decode (single token)
-            x_conv = causal_conv1d_update(
-                x_d,
-                conv_state,
-                conv_weight,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=state_indices_d,
-            )
-
-            # x_proj: compute dt, B, C projections
-            x_dbc = self.x_proj(x_conv)
-            dt, B, C = x_dbc.split([self.dt_rank, self.state_size, self.state_size], dim=-1)
-
-            # Apply layer norms (critical for numerical stability)
-            dt = self.dt_layernorm(dt)
-            B = self.b_layernorm(B)
-            C = self.c_layernorm(C)
-
-            # dt projection
-            dt, _ = self.dt_proj(dt)
-
-            # Get A
-            A = -torch.exp(self.A_log.float())
-
-            # Selective state update for decode (using Mamba1-specific kernel)
-            y_d = mamba1_selective_state_update(
-                ssm_state,
-                x_conv,
-                dt,
-                A,
-                B,
-                C,
-                D=self.D.float(),
-                z=z_d,
-                dt_softplus=True,
-                state_batch_indices=state_indices_d,
-            )
-
-            output[num_prefill_tokens:] = y_d
-
-        # 4. Output projection
-        output, _ = self.out_proj(output)
-        return output
-
-    @property
-    def mamba_type(self) -> str:
-        return "mamba1"
-
-
 class JambaMambaDecoderLayer(nn.Module):
     """Jamba decoder layer with Mamba1 mixer and MLP/MoE FFN."""
 
@@ -532,10 +245,16 @@ class JambaMambaDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        # Mamba1 mixer
-        self.mamba = JambaMambaMixer1(
-            config=config,
-            layer_idx=layer_idx,
+        # Mamba1 mixer (generic reusable layer, like MambaMixer2 for Mamba2 models)
+        self.mamba = MambaMixer1(
+            cache_params=config.mamba1_cache_params,
+            hidden_size=config.hidden_size,
+            dt_rank=config.mamba_dt_rank_value,
+            use_conv_bias=config.mamba_conv_bias,
+            use_bias=config.mamba_proj_bias,
+            use_dt_bc_layernorm=True,
+            rms_norm_eps=config.rms_norm_eps,
+            activation="silu",
             quant_config=quant_config,
             prefix=f"{prefix}.mamba",
         )
@@ -574,17 +293,18 @@ class JambaMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Use Mamba1AttnBackend for forward pass
+        # Use Mamba1AttnBackend for forward pass (output tensor pattern)
         attn_backend = forward_batch.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba1AttnBackend)
-        hidden_states = attn_backend.linear_attn_backend.forward(
+        output = torch.empty_like(hidden_states)
+        attn_backend.linear_attn_backend.forward(
             mixer=self.mamba,
             hidden_states=hidden_states,
+            output=output,
             layer_id=self.layer_idx,
-            forward_batch=forward_batch,
         )
-        hidden_states = hidden_states + residual
+        hidden_states = output + residual
 
         # Pre-norm for FFN
         residual = hidden_states
@@ -898,10 +618,6 @@ class JambaForCausalLM(nn.Module):
                 "final_layernorm" in name or "lm_head" in name
             ) and not self.pp_group.is_last_rank:
                 continue
-
-            # Map HF router weight name to SGLang gate param name
-            if "feed_forward.router." in name:
-                name = name.replace("feed_forward.router.", "feed_forward.gate.")
 
             # Handle stacked params (QKV, gate_up)
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
