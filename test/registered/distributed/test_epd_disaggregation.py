@@ -34,16 +34,6 @@ from sglang.test.vlm_utils import (
 DEFAULT_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 
-def _resolve_data_url(remote_url: str, filename: str) -> str:
-    """Return a local file:// URL when EPD_SAMPLE_DATA_DIR is set, otherwise the remote URL."""
-    local_dir = os.environ.get("EPD_SAMPLE_DATA_DIR")
-    if local_dir:
-        local_path = os.path.join(local_dir, filename)
-        if os.path.isfile(local_path):
-            return f"file://{local_path}"
-    return remote_url
-
-
 register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
 
 
@@ -53,22 +43,38 @@ register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
 )
 class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
     """
-    EPD disaggregation test for omni models (e.g. Qwen3-Omni) covering
-    image, video, and audio modalities.  The encode server is launched with
-    ``--enable-mm-global-cache`` so the global multimodal embedding cache
-    path is exercised as well.
+    EPD disaggregation test for omni models (e.g. Qwen3-Omni). Covers image, video,
+    and audio when server_type=http (encoder_transfer_backend: mooncake/zmq_to_scheduler/zmq_to_tokenizer).
+    When server_type=grpc, only image is tested (gRPC encode is image-only).
     """
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = os.environ.get("EPD_OMNI_MODEL", DEFAULT_OMNI_MODEL)
+        cls.server_type = os.environ.get("EPD_ENCODE_SERVER_TYPE", "http")
+        assert cls.server_type in (
+            "grpc",
+            "http",
+        ), f"Invalid EPD_ENCODE_SERVER_TYPE: {cls.server_type}"
+        cls.encoder_transfer_backend = os.environ.get(
+            "EPD_ENCODER_TRANSFER_BACKEND", "zmq_to_scheduler"
+        )
+        assert cls.encoder_transfer_backend in (
+            "mooncake",
+            "zmq_to_scheduler",
+            "zmq_to_tokenizer",
+        ), f"Invalid EPD_ENCODER_TRANSFER_BACKEND: {cls.encoder_transfer_backend}"
         cls.enable_global_cache = (
             os.environ.get("MOONCAKE_MASTER") is not None
             or os.environ.get("MOONCAKE_CLIENT") is not None
         )
-        cls.encode_port = f"{int(cls.lb_port) + 300}"
-        cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
+        if cls.server_type == "grpc":
+            cls.encode_port = f"{int(cls.lb_port) + 305}"
+            cls.encode_url = f"grpc://{cls.base_host}:{cls.encode_port}"
+        else:
+            cls.encode_port = f"{int(cls.lb_port) + 300}"
+            cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
 
         cls.image_man_ironing = IMAGE_MAN_IRONING_URL
         cls.image_sgl_logo = IMAGE_SGL_LOGO_URL
@@ -78,6 +84,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         print(
             f"Setting up EPD Omni: model={cls.model}, encode={cls.encode_port}, "
             f"prefill={cls.prefill_port}, decode={cls.decode_port}, "
+            f"server_type={cls.server_type}, backend={cls.encoder_transfer_backend}, "
             f"global_cache={cls.enable_global_cache}"
         )
         print(f"Data URLs: image={cls.image_man_ironing}, audio={cls.audio_trump}")
@@ -90,7 +97,12 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         prefill_thread.join()
         decode_thread.join()
 
-        cls.wait_server_ready(cls.encode_url + "/health", process=cls.process_encode)
+        if cls.server_type == "grpc":
+            cls._wait_grpc_ready(cls.base_host, cls.encode_port, cls.process_encode)
+        else:
+            cls.wait_server_ready(
+                cls.encode_url + "/health", process=cls.process_encode
+            )
         cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
         cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
@@ -102,27 +114,51 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     @classmethod
     def start_encode(cls):
-        encode_args = [
-            "--trust-remote-code",
-            "--encoder-only",
-            "--encoder-transfer-backend",
-            "zmq_to_scheduler",
-            "--tp",
-            "1",
-            "--port",
-            cls.encode_port,
-        ]
-        if cls.enable_global_cache:
-            encode_args.append("--enable-mm-global-cache")
-        cls.encode_stdout = io.StringIO()
-        cls.encode_stderr = io.StringIO()
-        cls.process_encode = popen_launch_server(
-            cls.model,
-            base_url=cls.encode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=encode_args,
-            return_stdout_stderr=(cls.encode_stdout, cls.encode_stderr),
-        )
+        if cls.server_type == "grpc":
+            cls.encode_stdout = io.StringIO()
+            cls.encode_stderr = io.StringIO()
+            cls.process_encode = subprocess.Popen(
+                [
+                    "python3",
+                    "-m",
+                    "sglang.launch_server",
+                    "--model-path",
+                    cls.model,
+                    "--host",
+                    cls.base_host,
+                    "--port",
+                    cls.encode_port,
+                    "--trust-remote-code",
+                    "--encoder-only",
+                    "--grpc-mode",
+                    "--encoder-transfer-backend",
+                    "zmq_to_scheduler",
+                    "--tp",
+                    "1",
+                ]
+            )
+        else:
+            encode_args = [
+                "--trust-remote-code",
+                "--encoder-only",
+                "--encoder-transfer-backend",
+                cls.encoder_transfer_backend,
+                "--tp",
+                "1",
+                "--port",
+                cls.encode_port,
+            ]
+            if cls.enable_global_cache:
+                encode_args.append("--enable-mm-global-cache")
+            cls.encode_stdout = io.StringIO()
+            cls.encode_stderr = io.StringIO()
+            cls.process_encode = popen_launch_server(
+                cls.model,
+                base_url=cls.encode_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=encode_args,
+                return_stdout_stderr=(cls.encode_stdout, cls.encode_stderr),
+            )
 
     @classmethod
     def start_prefill(cls):
@@ -132,7 +168,11 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             "--encoder-urls",
             cls.encode_url,
             "--encoder-transfer-backend",
-            "zmq_to_scheduler",
+            (
+                "zmq_to_scheduler"
+                if cls.server_type == "grpc"
+                else cls.encoder_transfer_backend
+            ),
             "--disaggregation-mode",
             "prefill",
             "--tp",
@@ -143,11 +183,15 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             cls.prefill_port,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_env = os.environ.copy()
+        if cls.server_type == "grpc":
+            prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
+            env=prefill_env,
         )
 
     @classmethod
@@ -185,10 +229,41 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
+    @staticmethod
+    def _wait_grpc_ready(
+        host, port, process, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    ):
+        deadline = time.time() + timeout
+        channel = grpc.insecure_channel(f"{host}:{port}")
+        stub = health_pb2_grpc.HealthStub(channel)
+        try:
+            while time.time() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"gRPC encoder exited with code {process.returncode}"
+                    )
+                try:
+                    response = stub.Check(
+                        health_pb2.HealthCheckRequest(service=""), timeout=2
+                    )
+                    if response.status == health_pb2.HealthCheckResponse.SERVING:
+                        return
+                except grpc.RpcError:
+                    pass
+                time.sleep(1)
+        finally:
+            channel.close()
+        raise RuntimeError(f"gRPC encoder not ready at {host}:{port} within {timeout}s")
+
     # ---- helpers ----
 
     def _client(self):
         return openai.Client(api_key=self.api_key, base_url=f"{self.lb_url}/v1")
+
+    def _skip_if_grpc(self, msg="gRPC encode is image-only"):
+        """Skip this test when encode server is gRPC (image-only)."""
+        if self.server_type == "grpc":
+            self.skipTest(msg)
 
     def _parse_cache_log(self):
         """Parse encode server logs and return list of (local_hits, global_hits, misses)
@@ -242,6 +317,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     def test_image_cache_hit(self):
         """Send the same image twice; the second request should hit the global-mm-cache."""
+        self._skip_if_grpc("gRPC encode is image-only; cache test uses HTTP path")
         if not self.enable_global_cache:
             self.skipTest("global-mm-cache not enabled (MOONCAKE_MASTER not set)")
         client = self._client()
@@ -287,6 +363,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     # ---- video ----
     def test_video(self):
+        self._skip_if_grpc()
         client = self._client()
         response = client.chat.completions.create(
             model="default",
@@ -356,6 +433,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     def test_video_cache_hit(self):
         """Send the same video twice; the second request should hit the global-mm-cache."""
+        self._skip_if_grpc()
         if not self.enable_global_cache:
             self.skipTest("global-mm-cache not enabled (MOONCAKE_MASTER not set)")
         client = self._client()
@@ -399,6 +477,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
     # ---- audio ----
 
     def test_audio(self):
+        self._skip_if_grpc()
         client = self._client()
         response = client.chat.completions.create(
             model="default",
@@ -436,6 +515,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     def test_audio_cache_hit(self):
         """Send the same audio twice; the second request should hit the global-mm-cache."""
+        self._skip_if_grpc()
         if not self.enable_global_cache:
             self.skipTest("global-mm-cache not enabled (MOONCAKE_MASTER not set)")
         client = self._client()
@@ -484,6 +564,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
     def test_mixed_image_audio_video(self):
         """Image + audio + video in one request to test multi-modal routing."""
+        self._skip_if_grpc()
         client = self._client()
         response = client.chat.completions.create(
             model="default",
