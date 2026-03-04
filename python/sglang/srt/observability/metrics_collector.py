@@ -80,9 +80,6 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
-    kv_transfer_bootstrap_ms: float = 0.0
-    kv_transfer_alloc_ms: float = 0.0
-    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -322,35 +319,35 @@ class SchedulerMetricsCollector:
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
-        self.kv_transfer_speed_gb_s = Gauge(
+        self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
-            documentation="The transfer speed of the KV cache in GB/s.",
+            documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
-        self.kv_transfer_latency_ms = Gauge(
+        self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
-            documentation="The transfer latency of the KV cache in ms.",
+            documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
         )
-        self.kv_transfer_bootstrap_ms = Gauge(
+        self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
-            documentation="The bootstrap time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_alloc_ms = Gauge(
+        self.kv_transfer_alloc_ms = Histogram(
             name="sglang:kv_transfer_alloc_ms",
-            documentation="The allocation waiting time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer allocation waiting time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_total_mb = Gauge(
+        self.kv_transfer_total_mb = Histogram(
             name="sglang:kv_transfer_total_mb",
-            documentation="The total number of tokens transferred in the KV cache.",
+            documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
 
         # Utilization
@@ -750,6 +747,24 @@ class SchedulerMetricsCollector:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
 
+    def observe_kv_transfer_metrics(
+        self,
+        latency_ms: float,
+        total_mb: float,
+        speed_gb_s: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
+        self._log_histogram(self.kv_transfer_total_mb, total_mb)
+        self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+
+    def observe_kv_transfer_bootstrap(
+        self,
+        bootstrap_ms: float,
+        alloc_ms: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
+        self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
+
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
@@ -880,12 +895,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
-        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
-        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
-        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
-
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)

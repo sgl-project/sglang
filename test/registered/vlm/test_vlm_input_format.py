@@ -502,5 +502,87 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "openbmb/MiniCPM-V-4"
+    chat_template = "minicpmv"
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model_path is not None, "Set model_path in subclass"
+        assert cls.chat_template is not None, "Set chat_template in subclass"
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.main_image = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.main_image.append(Image.open(BytesIO(response.content)))
+
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls._init_visual()
+
+    @classmethod
+    def _init_visual(cls):
+        model = AutoModel.from_pretrained(
+            cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+        )
+        cls.vpm_model = model.vpm.eval().to(cls.device)
+        cls.resampler_model = model.resampler.eval().to(cls.device)
+        del model
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"]
+            tgt_sizes = processor_output["tgt_sizes"]
+
+            pixel_values_flat = []
+            tgt_sizes_flat = []
+            for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
+                if isinstance(pixel_b, (list, tuple)):
+                    for pixel_n, tgt_n in zip(pixel_b, tgt_b):
+                        pixel_values_flat.append(pixel_n)
+                        tgt_sizes_flat.append(tgt_n)
+                else:
+                    pixel_values_flat.append(pixel_b)
+                    tgt_sizes_flat.append(tgt_b)
+
+            tgt_sizes_tensor = torch.stack(tgt_sizes_flat, dim=0)
+            device = cls.vpm_model.embeddings.position_embedding.weight.device
+            dtype = cls.vpm_model.embeddings.position_embedding.weight.dtype
+
+            all_pixel_values_lst = [
+                i.flatten(end_dim=1).permute(1, 0) for i in pixel_values_flat
+            ]
+            max_patches = int(
+                (tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]).max().item()
+            )
+            all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+                all_pixel_values_lst, batch_first=True, padding_value=0.0
+            )
+            B, L, _ = all_pixel_values.shape
+            all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+            patch_attn_mask = torch.zeros(
+                (B, 1, max_patches), dtype=torch.bool, device=device
+            )
+            tgt_sizes_dev = tgt_sizes_tensor.to(device)
+            mask_shapes = tgt_sizes_dev[:, 0] * tgt_sizes_dev[:, 1]
+            patch_attn_mask[:, 0, :] = torch.arange(
+                max_patches, device=device
+            ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+            vision_output = cls.vpm_model(
+                all_pixel_values.type(dtype),
+                patch_attention_mask=patch_attn_mask,
+                tgt_sizes=tgt_sizes_tensor,
+            )
+            vision_embedding = vision_output.last_hidden_state
+            return cls.resampler_model(vision_embedding, tgt_sizes_tensor)
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ FILES_TO_UPDATE = [
     Path("docker/Dockerfile"),
     Path("scripts/ci/cuda/ci_install_dependency.sh"),
     Path("python/sglang/srt/entrypoints/engine.py"),
-    Path("python/sglang/srt/server_args.py"),
+    Path("python/sglang/srt/utils/common.py"),
 ]
 
 
@@ -20,7 +20,9 @@ def read_current_flashinfer_version(repo_root: Path) -> str:
     """Read the current flashinfer version from python/pyproject.toml."""
     pyproject = repo_root / "python" / "pyproject.toml"
     content = pyproject.read_text()
-    match = re.search(r"flashinfer_python==(\d+\.\d+\.\d+)", content)
+    match = re.search(
+        r"flashinfer_python==(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)", content
+    )
     if not match:
         raise ValueError(f"Could not find flashinfer_python version in {pyproject}")
     return match.group(1)
@@ -56,18 +58,19 @@ def replace_flashinfer_version(
             rf"\g<1>{new_version}",
             new_content,
         )
-    elif name == "engine.py" or name == "server_args.py":
-        new_content = new_content.replace(
-            f'flashinfer-python", "{old_version}"',
-            f'flashinfer-python", "{new_version}"',
+    elif name == "engine.py":
+        new_content = re.sub(
+            r'(assert_pkg_version\(\s*"flashinfer_python",\s*)"'
+            + re.escape(old_version)
+            + r'"',
+            r'\g<1>"' + new_version + '"',
+            new_content,
+            flags=re.DOTALL,
         )
+    elif name == "common.py":
         new_content = new_content.replace(
-            f'flashinfer_python", "{old_version}"',
-            f'flashinfer_python", "{new_version}"',
-        )
-        new_content = new_content.replace(
-            f"flashinfer-python version is >= {old_version}",
-            f"flashinfer-python version is >= {new_version}",
+            f'e.g., "{old_version}"',
+            f'e.g., "{new_version}"',
         )
 
     if content == new_content:
