@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_AMP_SUPPORTED = current_platform.is_amp_supported()
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -153,7 +154,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output = (
             F.linear(x, layer.weight, bias)
-            if current_platform.is_amp_supported() or bias is None
+            if _AMP_SUPPORTED or bias is None
             else F.linear(x, layer.weight, bias.to(x.dtype))
         )  # NOTE: this line assumes that we are using amp when using cuda and is needed to account for the fact that amp isn't supported in mps
         return output
