@@ -50,9 +50,9 @@ def fused_qk_norm_rope_out(
     Matches the call signature of ``sgl_kernel.fused_qk_norm_rope``.
 
     Args:
-        qkv:              [num_tokens, (nq+nk+nv)*head_dim] bfloat16 — modified in-place
-        q_weight:         [head_dim] bfloat16 — RMSNorm weights for Q
-        k_weight:         [head_dim] bfloat16 — RMSNorm weights for K
+        qkv:              [num_tokens, (nq+nk+nv)*head_dim] bfloat16 -modified in-place
+        q_weight:         [head_dim] bfloat16 -RMSNorm weights for Q
+        k_weight:         [head_dim] bfloat16 -RMSNorm weights for K
         position_ids:     [num_tokens] int32
         num_heads_q:      number of query heads
         num_heads_k:      number of key heads
@@ -60,7 +60,7 @@ def fused_qk_norm_rope_out(
         head_dim:         head dimension; must be 64, 128, or 256
         eps:              epsilon for RMSNorm
         base:             RoPE base frequency
-        is_neox:          True → NeoX style, False → interleave (GPT-J) style
+        is_neox:          True ->NeoX style, False ->interleave (GPT-J) style
         factor:           YaRN scaling factor (1.0 = standard RoPE)
         low:              YaRN low-frequency threshold
         high:             YaRN high-frequency threshold
@@ -139,16 +139,16 @@ def fused_qk_norm_rope(
     Matches the call signature of ``sgl_kernel.fused_qk_norm_rope``.
 
     Args:
-        qkv:              [num_tokens, (nq+nk+nv)*head_dim] bfloat16 — modified in-place
+        qkv:              [num_tokens, (nq+nk+nv)*head_dim] bfloat16 -modified in-place
         num_heads_q:      number of query heads
         num_heads_k:      number of key heads
         num_heads_v:      number of value heads
         head_dim:         head dimension; must be 64, 128, or 256
         eps:              epsilon for RMSNorm
-        q_weight:         [head_dim] bfloat16 — RMSNorm weights for Q
-        k_weight:         [head_dim] bfloat16 — RMSNorm weights for K
+        q_weight:         [head_dim] bfloat16 -RMSNorm weights for Q
+        k_weight:         [head_dim] bfloat16 -RMSNorm weights for K
         base:             RoPE base frequency
-        is_neox:          True → NeoX style, False → interleave (GPT-J) style
+        is_neox:          True ->NeoX style, False ->interleave (GPT-J) style
         position_ids:     [num_tokens] int32
         factor:           YaRN scaling factor (1.0 = standard RoPE)
         low:              YaRN low-frequency threshold

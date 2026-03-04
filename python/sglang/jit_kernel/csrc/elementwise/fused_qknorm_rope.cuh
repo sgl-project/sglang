@@ -68,8 +68,8 @@ compute_freq_yarn(float base, int rotary_dim, int half_dim, float factor, float 
 //
 // Each warp processes one (token, head) pair.
 //   head_dim:   compile-time head dimension (64, 128, or 256)
-//   interleave: true  → interleave / GPT-J style RoPE (!is_neox)
-//               false → NeoX style RoPE (is_neox)
+//   interleave: true  -> interleave / GPT-J style RoPE (!is_neox)
+//               false -> NeoX style RoPE (is_neox)
 // ---------------------------------------------------------------------------
 
 template <int head_dim, bool interleave>

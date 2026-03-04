@@ -1,8 +1,8 @@
 """
 Benchmark: fused_qknorm_rope JIT vs AOT (sgl_kernel)
 
-Measures throughput (µs) for fused_qk_norm_rope across typical
-LLM configurations (head_dim × num_heads × num_tokens).
+Measures throughput (us) for fused_qk_norm_rope across typical
+LLM configurations (head_dim x num_heads x num_tokens).
 
 Run:
     python python/sglang/jit_kernel/benchmark/bench_fused_qknorm_rope.py
@@ -36,7 +36,7 @@ NUM_TOKENS_RANGE = get_benchmark_range(
     ci_range=[64, 512],
 )
 
-# (head_dim, num_heads_q, num_heads_k, num_heads_v) — typical MoE/dense configs
+# (head_dim, num_heads_q, num_heads_k, num_heads_v) - typical MoE/dense configs
 MODEL_CONFIGS = get_benchmark_range(
     full_range=[
         (64, 32, 8, 8),  # small
@@ -127,7 +127,7 @@ def bench_fused_qknorm_rope(
 
 def calculate_diff():
     if not AOT_AVAILABLE:
-        print("sgl_kernel not available — skipping AOT diff check")
+        print("sgl_kernel not available - skipping AOT diff check")
         return
 
     device = "cuda"
