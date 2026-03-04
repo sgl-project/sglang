@@ -292,6 +292,19 @@ class MMEncoder:
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
+                if self.engine is None:
+                    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                        init_mooncake_transfer_engine,
+                    )
+
+                    self.engine = init_mooncake_transfer_engine(
+                        hostname=self.local_ip,
+                        gpu_id=self.gpu_id,
+                        ib_device=(
+                            self.server_args.disaggregation_ib_device
+                            or self.server_args.mooncake_ib_device
+                        ),
+                    )
 
             self.embedding_to_send = dict()
 
