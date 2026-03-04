@@ -110,6 +110,42 @@ class VideoRemixRequest(BaseModel):
     prompt: str
 
 
+# Mesh API protocol models
+class MeshResponse(BaseModel):
+    id: str
+    object: str = "mesh"
+    model: str = ""
+    status: str = "queued"
+    progress: int = 0
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    format: str = "glb"
+    url: Optional[str] = None
+    completed_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class MeshGenerationsRequest(BaseModel):
+    prompt: str = "generate 3d mesh"
+    input_image: Optional[str] = None
+    model: Optional[str] = None
+    seed: Optional[int] = None
+    generator_device: Optional[str] = "cuda"
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    negative_prompt: Optional[str] = None
+    output_format: Optional[str] = "glb"
+
+
+class MeshListResponse(BaseModel):
+    data: List[MeshResponse]
+    object: str = "list"
+
+
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)

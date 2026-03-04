@@ -78,7 +78,7 @@ async def get_models(request: Request):
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, model_id=server_args.model_id)
 
     response = {
         "model_path": server_args.model_path,
@@ -214,11 +214,12 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
 
     app.state.server_args = server_args

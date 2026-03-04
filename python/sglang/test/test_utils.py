@@ -1090,6 +1090,7 @@ def get_benchmark_args(
         gsp_num_turns=gsp_num_turns,
         header=header,
         max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 

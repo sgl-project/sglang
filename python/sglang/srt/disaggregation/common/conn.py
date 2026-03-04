@@ -110,6 +110,9 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        self.enable_all_cp_ranks_for_transfer = (
+            envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+        )
 
         # bind zmq socket
         context = zmq.Context()
@@ -124,12 +127,14 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # TODO(shangming): Fix me when we support MHA/GQA + CP, or when we utilize all cp ranks for KV transfer in CP mode.
+            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
+            # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
-                is_mla_backend and self.attn_cp_size > 1 and self.attn_cp_rank != 0
+                not self.enable_all_cp_ranks_for_transfer
+                and self.attn_cp_size > 1
+                and self.attn_cp_rank != 0
             )
-            if not self.is_dummy_cp_rank:
-                self.register_to_bootstrap()
+            self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -396,6 +401,9 @@ class CommonKVSender(BaseKVSender):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        logger.debug(
+            f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
+        )
 
     def send(
         self,
@@ -489,23 +497,22 @@ class CommonKVReceiver(BaseKVReceiver):
                     self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
                 )
 
-        # Decode cp size should be equal to prefill cp size or 1
-        assert (
-            self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size
-            or self.kv_mgr.attn_cp_size == 1
-        ), (
-            f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to prefill cp size ({self.prefill_info.attn_cp_size}) or 1",
+        # Decode cp size should be equal to 1
+        assert self.kv_mgr.attn_cp_size == 1, (
+            f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to 1",
         )
         if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
+            # This means that the prefill cp size is 1
+            assert self.prefill_info.attn_cp_size == 1, (
+                f"When prefill cp size is 1, attn cp size should be 1, but got {self.kv_mgr.attn_cp_size}",
+            )
             self.target_cp_ranks = [self.kv_mgr.attn_cp_rank]
         else:
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            # TODO(shangming): Support KVCache transfer for multiple prefill cp ranks -> 1 decode cp rank
-            # For now, we handle the control plane in advance, but we need to support the data plane in the future.
-            if self.kv_mgr.is_mla_backend:
-                # For MLA: we only need to retrieve KVCache from the first CP rank now
+            if not self.kv_mgr.enable_all_cp_ranks_for_transfer:
+                # Only retrieve from prefill CP rank 0 when not using all ranks
                 self.target_cp_ranks = self.target_cp_ranks[:1]
                 self.required_prefill_response_num *= 1
             else:
@@ -663,7 +670,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, host: str, port: int, dp_size: int = 1):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         self.app = web.Application()
@@ -673,7 +680,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.pp_size = None
         self.attn_tp_size = None
         self.attn_cp_size = None
-        self.dp_size = dp_size
+        self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
@@ -694,11 +701,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _is_ready(self) -> bool:
-        if self.attn_tp_size is None or self.pp_size is None:
+        if (
+            self.attn_tp_size is None
+            or self.attn_cp_size is None
+            or self.pp_size is None
+            or self.dp_size is None
+        ):
             return False
-        # TODO: verify this expected count is correct for all parallelism
-        # combinations (CP / DP attention / system DP / TP / PP).
-        expected = self.dp_size * self.attn_tp_size * self.pp_size
+        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        logger.debug(
+            f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
+        )
         return self._registered_count >= expected
 
     def _setup_routes(self):

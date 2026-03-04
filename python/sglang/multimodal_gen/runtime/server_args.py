@@ -39,7 +39,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.utils import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+    expand_path_fields,
+)
 
 logger = init_logger(__name__)
 
@@ -190,6 +194,9 @@ class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
 
+    # explicit model ID override (e.g. "Qwen-Image")
+    model_id: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -290,6 +297,7 @@ class ServerArgs:
     scheduler_port: int = 5555
 
     output_path: str | None = "outputs/"
+    input_save_path: str | None = "inputs/uploads"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -328,9 +336,14 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def _adjust_path(self):
+        expand_path_fields(self)
+        self._adjust_save_paths()
+
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._adjust_offload()
+        self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
         self._adjust_network_ports()
@@ -346,6 +359,13 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+
+    def _adjust_save_paths(self):
+        """Normalize empty-string save paths to None (disabled)."""
+        if self.output_path is not None and self.output_path.strip() == "":
+            self.output_path = None
+        if self.input_save_path is not None and self.input_save_path.strip() == "":
+            self.input_save_path = None
 
     def _adjust_quant_config(self):
         """validate and adjust"""
@@ -581,6 +601,17 @@ class ServerArgs:
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--model-id",
+            type=str,
+            default=ServerArgs.model_id,
+            help=(
+                "Override the model ID used for config resolution. "
+                "Useful when --model-path is a local directory whose name does not match "
+                "any registered HF repo name. Should be the repo name portion of the HF ID "
+                "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
         )
         # attention
         parser.add_argument(
@@ -820,7 +851,13 @@ class ServerArgs:
             "--output-path",
             type=str,
             default=ServerArgs.output_path,
-            help="Directory path to save generated images/videos",
+            help='Directory path to save generated images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--input-save-path",
+            type=str,
+            default=ServerArgs.input_save_path,
+            help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
 
         # LoRA

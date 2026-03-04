@@ -436,7 +436,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | `0.48` | Type: float |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
 | `--enable-torch-compile-debug-mode` | Enable debug mode for torch compile. | `False` | bool flag (set to enable) |
-| `--enable-piecewise-cuda-graph` | Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature. | `False` | bool flag (set to enable) |
+| `--disable-piecewise-cuda-graph` | Disable piecewise cuda graph for extend/prefill. PCG is enabled by default. | `False` | bool flag (set to disable) |
+| `--enforce-piecewise-cuda-graph` | Enforce piecewise cuda graph, skipping all auto-disable conditions. For testing only. | `False` | bool flag (set to enable) |
 | `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
 | `--piecewise-cuda-graph-compiler` | Set the compiler for piecewise cuda graph. Choices are: eager, inductor. | `eager` | `eager`, `inductor` |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
@@ -492,9 +493,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disaggregation-mode` | Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated | `null` | `null`, `prefill`, `decode` |
 | `--disaggregation-transfer-backend` | The backend for disaggregation transfer. Default is mooncake. | `mooncake` | `mooncake`, `nixl`, `ascend`, `fake` |
 | `--disaggregation-bootstrap-port` | Bootstrap server port on the prefill server. Default is 8998. | `8998` | Type: int |
-| `--disaggregation-decode-tp` | Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server. | `None` | Type: int |
-| `--disaggregation-decode-dp` | Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server. | `None` | Type: int |
-| `--disaggregation-prefill-pp` | Prefill pp size. If not set, it is default to 1. This is only set on the decode server. | `1` | Type: int |
 | `--disaggregation-ib-device` | The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when mooncake backend is enabled. | `None` | Type: str |
 | `--disaggregation-decode-enable-offload-kvcache` | Enable async KV cache offloading on decode server (PD mode). | `False` | bool flag (set to enable) |
 | `--num-reserved-decode-tokens` | Number of decode tokens that will have memory reserved when adding new request to the running batch. | `512` | Type: int |
