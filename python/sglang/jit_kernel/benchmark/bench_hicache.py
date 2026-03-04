@@ -16,6 +16,8 @@ capture doesn't support CPU-GPU memory transfers.
 """
 
 import itertools
+import os
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -23,16 +25,58 @@ import triton
 import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DTYPE,
-    DEFAULT_QUANTILES,
-    get_benchmark_range,
-)
+from sglang.jit_kernel.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
+
+# NOTE: Adjustable hyperparameters for better benchmark stability
+
+# NOTE: torch impl is too slow in benchmark
+DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
+PAGE_SIZE = 1
+ENABLE_SORT = True
+GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
+HOST_CACHE_SIZE = 512 * 1024  # 512K tokens on CPU
+NUM_LAYERS = 8
+
+
+@dataclass(frozen=True)
+class HiCacheCache:
+    k_cache_cuda: torch.Tensor
+    v_cache_cuda: torch.Tensor
+    k_cache_host: torch.Tensor
+    v_cache_host: torch.Tensor
+
+    def get_slice(self, num_layers: int, element_size: int) -> "HiCacheCache":
+        def slice_cuda(t: torch.Tensor) -> torch.Tensor:
+            needed_cuda = num_layers * GPU_CACHE_SIZE
+            return t.view(-1, element_size)[:needed_cuda].unflatten(0, (num_layers, -1))
+
+        def slice_host(t: torch.Tensor) -> torch.Tensor:
+            needed_host = num_layers * HOST_CACHE_SIZE
+            return t.view(-1, element_size)[:needed_host].unflatten(0, (num_layers, -1))
+
+        return HiCacheCache(
+            k_cache_cuda=slice_cuda(self.k_cache_cuda),
+            v_cache_cuda=slice_cuda(self.v_cache_cuda),
+            k_cache_host=slice_host(self.k_cache_host),
+            v_cache_host=slice_host(self.v_cache_host),
+        )
+
+
+def gen_indices(
+    size: int, max_size: int, *, page_size: int = PAGE_SIZE
+) -> torch.Tensor:
+    def align(x: int) -> int:
+        return (x + page_size - 1) // page_size
+
+    assert size <= max_size and max_size % page_size == 0
+    indices = torch.randperm(align(max_size))[: align(size)]
+    offsets = torch.arange(page_size)
+    return (indices[:, None] * page_size + offsets).flatten().cuda()[:size]
 
 
 def sglang_aot_transfer_one(
@@ -138,34 +182,10 @@ def pytorch_transfer(
     v_cache_dst[indices_dst_on_dst] = v_cache_src[indices_src_on_src].to(dst_device)
 
 
-alt_stream = torch.cuda.Stream()
-
-
-def torch_streams_transfer(
-    k_cache_dst: torch.Tensor,
-    v_cache_dst: torch.Tensor,
-    indices_dst_on_dst: torch.Tensor,
-    k_cache_src: torch.Tensor,
-    v_cache_src: torch.Tensor,
-    indices_src_on_src: torch.Tensor,
-) -> None:
-    """PyTorch 2 Stream baseline."""
-    dst_device = k_cache_dst.device
-    current_stream = torch.cuda.current_stream()
-    alt_stream.wait_stream(current_stream)
-    k_cache_dst[indices_dst_on_dst] = k_cache_src[indices_src_on_src].to(dst_device)
-    with torch.cuda.stream(alt_stream):
-        v_cache_dst[indices_dst_on_dst] = v_cache_src[indices_src_on_src].to(dst_device)
-    current_stream.wait_stream(alt_stream)
-
-
 # Benchmark configuration
-GPU_CACHE_SIZE = 32 * 1024  # 32K tokens on GPU
-HOST_CACHE_SIZE = 128 * 1024  # 128K tokens on CPU
-NUM_LAYERS = 8
 
 BS_RANGE = get_benchmark_range(
-    full_range=[2**n for n in range(0, 15)],
+    full_range=[2**n for n in range(0, 16)],
     ci_range=[16],
 )
 ELEMENT_SIZE_RANGE = get_benchmark_range(
@@ -173,9 +193,9 @@ ELEMENT_SIZE_RANGE = get_benchmark_range(
     ci_range=[1024],
 )
 
-LINE_VALS = ["aot", "jit", "pytorch", "torch_streams"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch", "PyTorch 2 Stream"]
-STYLES = [("orange", "-"), ("blue", "--"), ("red", ":"), ("green", "-.")]
+LINE_VALS = ["aot", "jit", "pytorch"]
+LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
+STYLES = [("orange", "-"), ("blue", "--"), ("red", ":")]
 
 CONFIGS = list(itertools.product(ELEMENT_SIZE_RANGE, BS_RANGE))
 
@@ -202,76 +222,78 @@ def benchmark_one_layer_h2d(
     element_size: int, batch_size: int, provider: str
 ) -> Tuple[float, float, float]:
     """One Layer: Host (CPU) -> Device (GPU)."""
-    k_cache_src = torch.randn(
-        (HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE,
-        device="cpu",
-        pin_memory=True,
-    )
-    v_cache_src = torch.randn(
-        (HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE,
-        device="cpu",
-        pin_memory=True,
-    )
-    k_cache_dst = torch.randn(
-        (GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
-    )
-    v_cache_dst = torch.randn(
-        (GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
-    )
+    global cache
+    cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
+    k_cache_src = cache_local.k_cache_host
+    v_cache_src = cache_local.v_cache_host
+    k_cache_dst = cache_local.k_cache_cuda
+    v_cache_dst = cache_local.v_cache_cuda
+    # to avoid fluctutation, we set the seed as const
+    torch.manual_seed(batch_size * 65536 + element_size)
+    indices_src_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
+    indices_dst_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
 
-    indices_src_gpu = torch.randperm(HOST_CACHE_SIZE, device="cuda")[:batch_size]
-    indices_dst_gpu = torch.randperm(GPU_CACHE_SIZE, device="cuda")[:batch_size]
+    # sort by host indices to improve host access performance
+    if ENABLE_SORT:
+        indices_src_gpu, mapping = indices_src_gpu.sort()
+        indices_dst_gpu = indices_dst_gpu[mapping]
     indices_src_cpu = indices_src_gpu.cpu()
     torch.cuda.synchronize()
 
     element_bytes = element_size * k_cache_src.element_size()
 
     FN_MAP = {
-        "aot": lambda: sglang_aot_transfer_one(
-            k_cache_dst,
-            v_cache_dst,
-            indices_dst_gpu,
-            k_cache_src,
-            v_cache_src,
-            indices_src_gpu,
-            element_bytes,
-        ),
-        "jit": lambda: sglang_jit_transfer_one(
-            k_cache_dst,
-            v_cache_dst,
-            indices_dst_gpu,
-            k_cache_src,
-            v_cache_src,
-            indices_src_gpu,
-            element_size,
-        ),
-        "pytorch": lambda: pytorch_transfer(
-            k_cache_dst,
-            v_cache_dst,
-            indices_dst_gpu,
-            k_cache_src,
-            v_cache_src,
-            indices_src_cpu,
-        ),
-        "torch_streams": lambda: torch_streams_transfer(
-            k_cache_dst,
-            v_cache_dst,
-            indices_dst_gpu,
-            k_cache_src,
-            v_cache_src,
-            indices_src_cpu,
-        ),
+        "aot": lambda: [
+            sglang_aot_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
+                element_bytes,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "jit": lambda: [
+            sglang_jit_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
+                element_size,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "pytorch": lambda: [
+            pytorch_transfer(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_cpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
     }
 
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    ms, min_ms, max_ms = triton.testing.do_bench(
-        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    if DISABLE_TORCH and provider in ["pytorch"]:
+        return (float("nan"), float("nan"), float("nan"))
+
+    ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES, warmup=5, rep=25
     )
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return (
+        1000 * ms / NUM_LAYERS,
+        1000 * max_ms / NUM_LAYERS,
+        1000 * min_ms / NUM_LAYERS,
+    )
 
 
 # =============================================================================
@@ -305,27 +327,21 @@ def benchmark_all_layer_d2h(
     element_size: int, batch_size: int, provider: str
 ) -> Tuple[float, float, float]:
     """All Layer: Device (GPU) -> Host (CPU)."""
-    k_caches_src = torch.randn(
-        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
-    )
-    v_caches_src = torch.randn(
-        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
-    )
-    k_caches_dst = torch.randn(
-        (NUM_LAYERS, HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE,
-        device="cpu",
-        pin_memory=True,
-    )
-    v_caches_dst = torch.randn(
-        (NUM_LAYERS, HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE,
-        device="cpu",
-        pin_memory=True,
-    )
+    global cache
+    cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
+    k_caches_src = cache_local.k_cache_cuda
+    v_caches_src = cache_local.v_cache_cuda
+    k_caches_dst = cache_local.k_cache_host
+    v_caches_dst = cache_local.v_cache_host
+    # to avoid fluctutation, we set the seed as const
+    torch.manual_seed(batch_size * 65536 + element_size)
 
-    indices_src_gpu = torch.randperm(GPU_CACHE_SIZE, device="cuda")[:batch_size]
-    indices_dst_gpu = torch.randperm(HOST_CACHE_SIZE, device="cuda")[:batch_size]
+    indices_src_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
+    indices_dst_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
+    # sort by host indices to improve host access performance
+    if ENABLE_SORT:
+        indices_dst_gpu, mapping = indices_dst_gpu.sort()
+        indices_src_gpu = indices_src_gpu[mapping]
     indices_dst_cpu = indices_dst_gpu.cpu()
     torch.cuda.synchronize()
 
@@ -368,24 +384,16 @@ def benchmark_all_layer_d2h(
             )
             for i in range(NUM_LAYERS)
         ],
-        "torch_streams": lambda: [
-            torch_streams_transfer(
-                k_caches_dst[i],
-                v_caches_dst[i],
-                indices_dst_cpu,
-                k_caches_src[i],
-                v_caches_src[i],
-                indices_src_gpu,
-            )
-            for i in range(NUM_LAYERS)
-        ],
     }
 
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    ms, min_ms, max_ms = triton.testing.do_bench(
-        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    if DISABLE_TORCH and provider in ["pytorch"]:
+        return (float("nan"), float("nan"), float("nan"))
+
+    ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES, warmup=5, rep=25
     )
     return (
         1000 * ms / NUM_LAYERS,
@@ -395,6 +403,17 @@ def benchmark_all_layer_d2h(
 
 
 if __name__ == "__main__":
+    MAX_SIZE = max(ELEMENT_SIZE_RANGE)
+    DEVICE_SHAPE = (NUM_LAYERS * GPU_CACHE_SIZE, MAX_SIZE)
+    HOST_SHAPE = (NUM_LAYERS * HOST_CACHE_SIZE, MAX_SIZE)
+
+    cache = HiCacheCache(
+        k_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
+        v_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
+        k_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
+        v_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
+    )
+
     print("=" * 60)
     print("One Layer: Host -> Device (CPU -> GPU)")
     print("=" * 60)

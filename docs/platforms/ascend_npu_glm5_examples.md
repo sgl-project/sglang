@@ -1,4 +1,4 @@
-# GLM-5
+# GLM-5 examples
 
 ## Introduction
 
@@ -12,7 +12,6 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 - `GLM-5.0-w4a8`(Quantized version without mtp): [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5-w4a8).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
 
-It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`
 
 ### Installation
 
@@ -20,9 +19,9 @@ The dependencies required for the NPU runtime environment have been integrated i
 
 ```{code-block} bash
 #Atlas 800 A3
-docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-glm5
 #Atlas 800 A2
-docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-910b-glm5
 
 #start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
@@ -51,7 +50,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:${TAG}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 ```
 
 Note: Using this image, you need to update transformers to main branch
@@ -85,7 +84,7 @@ unset ASCEND_LAUNCH_BLOCKING
 # cann
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
 export STREAMS_PER_DEVICE=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_SPEC_V2=1
@@ -93,6 +92,8 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export HCCL_BUFFSIZE=1000
 export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
 
 python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
@@ -136,7 +137,7 @@ unset ASCEND_LAUNCH_BLOCKING
 # cann
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
 export STREAMS_PER_DEVICE=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_SPEC_V2=1
@@ -146,8 +147,8 @@ export HCCL_BUFFSIZE=1000
 export HCCL_OP_EXPANSION_MODE=AIV
 
 # Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
-export HCCL_SOCKET_IFNAME=enp48s3u1u1
-export GLOO_SOCKET_IFNAME=enp48s3u1u1
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
 
 
 P_IP=('your ip1' 'your ip2')
@@ -188,26 +189,6 @@ done
 
 Not test yet.
 
-## Accuracy Evaluation
+### Using Benchmark
 
-Here are two accuracy evaluation methods.
-
-### Using AISBench
-
-1. Refer to [Using AISBench](../developer_guide/evaluation/using_ais_bench.md) for details.
-
-2. After execution, you can get the result.
-
-### Using Language Model Evaluation Harness
-
-Not test yet.
-
-## Performance
-
-### Using AISBench
-
-Refer to [Using AISBench for performance evaluation](../developer_guide/evaluation/using_ais_bench.md#execute-performance-evaluation) for details.
-
-### Using vLLM Benchmark
-
-Refer to [vllm benchmark](https://docs.vllm.ai/en/latest/contributing/benchmarks.html) for more details.
+Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md) for details.

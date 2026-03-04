@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -410,13 +411,25 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 if _is_hip:
+                    if self.tms_cudagraph:
+                        return self.all_reduce_unreg(input)
                     return self.all_reduce_reg(input)
                 else:
                     return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
-                # If warm up, mimic the allocation pattern since custom
-                # allreduce is out-of-place.
-                return torch.zeros_like(input)
+                # Could be warmup OR piecewise cuda graph split op execution.
+                # In piecewise cuda graph, split ops run eagerly outside the graph
+                # but _IS_CAPTURING is still True. We need to do real all-reduce.
+                if is_in_piecewise_cuda_graph():
+                    # Split op execution - do real all-reduce
+                    if _is_hip:
+                        return self.all_reduce_unreg(input)
+                    else:
+                        return self.all_reduce(input, registered=False)
+                else:
+                    # True warmup - mimic the allocation pattern since custom
+                    # allreduce is out-of-place.
+                    return torch.zeros_like(input)
         else:
             if _is_hip:
                 # note: outside of cuda graph context,

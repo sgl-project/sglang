@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.fused_store_index_cache import (
+    can_use_nsa_fused_store,
+    fused_store_index_k_cache,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -28,6 +33,10 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -35,7 +44,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -43,6 +52,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -122,7 +132,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
-        from sgl_kernel import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -162,8 +172,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
-            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attn_context_model_parallel_world_size()
+            self.cp_rank = get_attn_context_model_parallel_rank()
         else:
             self.cp_size = None
             self.cp_rank = None
@@ -226,21 +236,31 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            weight = self.weights_proj.weight
+            out = torch.empty(
+                (x.shape[0], weight.shape[0]),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+            return out
+
         if _is_hip:
             x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        return weights.float()
+
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    def _project_and_scale_head_gates(self, x: torch.Tensor):
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
-        weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -657,15 +677,15 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
             layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
+            key=key,
+            act_quant=act_quant,
         )
 
         # MHA doesn't need topk_indices
@@ -915,6 +935,58 @@ class Indexer(MultiPlatformOp):
         topk_indices = torch.cat(topk_indices_list, dim=0)
         return topk_indices
 
+    def _store_index_k_cache(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key: torch.Tensor,
+        *,
+        act_quant=None,  # fallback only
+    ) -> None:
+        """
+        Store NSA indexer K cache for current step.
+
+        Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
+        Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
+        """
+
+        # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
+        if (
+            _is_cuda
+            and (not _is_fp8_fnuz)
+            and can_use_nsa_fused_store(
+                key.dtype,
+                forward_batch.out_cache_loc.dtype,
+                forward_batch.token_to_kv_pool.page_size,
+            )
+        ):
+            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            fused_store_index_k_cache(
+                key,
+                buf,
+                forward_batch.out_cache_loc,
+                forward_batch.token_to_kv_pool.page_size,
+            )
+            return
+
+        # Fallback: original path
+        assert act_quant is not None
+        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+            layer_id=layer_id,
+            loc=out_loc,
+            index_k=k_fp8,
+            index_k_scale=k_scale,
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -981,7 +1053,12 @@ class Indexer(MultiPlatformOp):
             )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key=key,
+                    act_quant=act_quant,
+                )
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         else:
@@ -995,11 +1072,21 @@ class Indexer(MultiPlatformOp):
 
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 with torch.cuda.stream(self.alt_stream):
-                    k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        key=key,
+                        act_quant=act_quant,
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key=key,
+                    act_quant=act_quant,
+                )
 
             # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
             # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
@@ -1034,19 +1121,6 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             weights = self._get_logits_head_gate(x_for_gate, q_scale)
-
-        # k_fp8: (seq_len, head_dim) fp8_e4m3fn
-        # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
-        # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
-        # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        if not forward_batch.out_cache_loc.is_contiguous():
-            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
@@ -1132,6 +1206,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
@@ -1152,7 +1227,7 @@ class Indexer(MultiPlatformOp):
         cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
-        bs = x.shape[0]
+        bs = q_lora.shape[0]
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
@@ -1205,6 +1280,12 @@ class Indexer(MultiPlatformOp):
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            k = scattered_to_tp_attn_full(k, forward_batch)
         k_pe, k_nope = torch.split(
             k,
             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
@@ -1285,7 +1366,12 @@ class Indexer(MultiPlatformOp):
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
@@ -1379,3 +1465,19 @@ class Indexer(MultiPlatformOp):
             sparse_mode=3,
         )
         return topk_indices_prev[0], topk_indices_next[0]
+
+
+def scattered_to_tp_attn_full(
+    hidden_states: torch.Tensor,
+    forward_batch,
+) -> torch.Tensor:
+    hidden_states, local_hidden_states = (
+        torch.empty(
+            (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ),
+        hidden_states,
+    )
+    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+    return hidden_states

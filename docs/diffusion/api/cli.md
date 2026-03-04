@@ -12,7 +12,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
-- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
 - `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
 - `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
@@ -41,6 +40,34 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--num-frames {NUM_FRAMES}`: Number of frames to generate
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
+
+**Frame Interpolation** (video only)
+
+Frame interpolation is a post-processing step that synthesizes new frames
+between each pair of consecutive generated frames, producing smoother
+motion without re-running the diffusion model. The `--frame-interpolation-exp`
+flag controls how many rounds of interpolation to apply: each round inserts one
+new frame into every gap between adjacent frames, so the output frame count
+follows the formula **(N − 1) × 2^exp + 1** (e.g. 5 original frames with
+`exp=1` → 4 gaps × 1 new frame + 5 originals = **9** frames; with `exp=2` →
+**17** frames).
+
+- `--enable-frame-interpolation`: Enable frame interpolation. Model weights are downloaded automatically on first use.
+- `--frame-interpolation-exp {EXP}`: Interpolation exponent — `1` = 2× temporal resolution, `2` = 4×, etc. (default: `1`)
+- `--frame-interpolation-scale {SCALE}`: RIFE inference scale; use `0.5` for high-resolution inputs to save memory (default: `1.0`)
+- `--frame-interpolation-model-path {PATH}`: Local directory or HuggingFace repo ID containing RIFE `flownet.pkl` weights (default: `elfgum/RIFE-4.22.lite`, downloaded automatically)
+
+Example — generate a 5-frame video and interpolate to 9 frames ((5 − 1) × 2¹ + 1 = 9):
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --prompt "A dog running through a park" \
+  --num-frames 5 \
+  --enable-frame-interpolation \
+  --frame-interpolation-exp 1 \
+  --save-output
+```
 
 **Output Options**
 
@@ -218,6 +245,32 @@ Once the generation task has finished, the server will shut down automatically.
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
 
+## Component Path Overrides
+
+SGLang diffusion allows you to override any pipeline component (e.g., `vae`, `transformer`, `text_encoder`) by specifying a custom checkpoint path. This is useful for:
+
+### Example: FLUX.2-dev with Tiny AutoEncoder
+
+You can override **any** component by using `--<component>-path`, where `<component>` matches the key in the model's `model_index.json`:
+
+For example, replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
+
+```bash
+sglang serve \
+  --model-path=black-forest-labs/FLUX.2-dev \
+  # with a Huggingface Repo ID
+  --vae-path=fal/FLUX.2-Tiny-AutoEncoder
+  # or use a local path
+  --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
+```
+
+**Important:**
+- The component key must match the one in your model's `model_index.json` (e.g., `vae`).
+- The path must:
+    - either be a Huggingface Repo ID (e.g., fal/FLUX.2-Tiny-AutoEncoder)
+    - or point to a **complete component folder**, containing `config.json` and safetensors files
+
+
 ## Diffusers Backend
 
 SGLang diffusion supports a **diffusers backend** that allows you to run any diffusers-compatible model through SGLang's infrastructure using vanilla diffusers pipelines. This is useful for running models without native SGLang implementations or models with custom pipeline classes.
@@ -271,3 +324,7 @@ For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in 
 ```bash
 sglang generate --config config.json
 ```
+
+### Cache-DiT Acceleration
+
+Users who use the diffusers backend can also leverage Cache-DiT acceleration and load custom cache configs from a YAML file to boost performance of diffusers pipelines. See the [Cache-DiT Acceleration](https://docs.sglang.io/diffusion/performance/cache/cache_dit.html) documentation for details.

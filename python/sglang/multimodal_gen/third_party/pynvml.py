@@ -4855,7 +4855,7 @@ def nvmlDeviceGetFieldValues(handle, fieldIds):
 
     for i, fieldId in enumerate(fieldIds):
         try:
-            (values[i].fieldId, values[i].scopeId) = fieldId
+            values[i].fieldId, values[i].scopeId = fieldId
         except TypeError:
             values[i].fieldId = fieldId
 
@@ -4871,7 +4871,7 @@ def nvmlDeviceClearFieldValues(handle, fieldIds):
 
     for i, fieldId in enumerate(fieldIds):
         try:
-            (values[i].fieldId, values[i].scopeId) = fieldId
+            values[i].fieldId, values[i].scopeId = fieldId
         except TypeError:
             values[i].fieldId = fieldId
 
