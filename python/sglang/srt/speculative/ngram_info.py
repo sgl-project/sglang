@@ -29,6 +29,8 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
+    _SPEC_MAX_NUM_LOOPS,
+    _SPEC_STEP_SIZE,
     TREE_SPEC_KERNEL_AVAILABLE,
     assign_req_to_token_pool,
     get_src_tgt_cache_loc,
@@ -250,7 +252,8 @@ class NgramVerifyInput(SpecInput):
                 batch.out_cache_loc,
                 self.draft_token_num,
                 next_power_of_2(self.draft_token_num),
-                next_power_of_2(bs),
+                _SPEC_STEP_SIZE,
+                _SPEC_MAX_NUM_LOOPS,
             )
 
             # Free the kv cache
