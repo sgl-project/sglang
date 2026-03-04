@@ -72,6 +72,13 @@ class TestEagleConstrainedDecoding(
         kill_process_tree(cls.process.pid)
 
 
+class TestEagleConstrainedDecodingTopK(TestEagleConstrainedDecoding):
+    """Test Eagle constrained decoding with topk > 1 (tree structure)."""
+
+    spec_topk = 4
+    spec_draft_tokens = 16
+
+
 class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
     spec_v2 = True
 
