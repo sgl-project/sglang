@@ -74,6 +74,7 @@ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    cpu_has_amx_support,
     get_int_env_var,
     is_cpu,
     is_npu,
@@ -86,6 +87,7 @@ logger = logging.getLogger(__name__)
 
 
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -353,7 +355,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         if _is_cpu and hasattr(vision_config, "original_num_heads"):
             head_dim = self.hidden_size // vision_config.original_num_heads
         else:
