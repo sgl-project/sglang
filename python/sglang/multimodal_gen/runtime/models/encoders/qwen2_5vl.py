@@ -407,6 +407,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         cu_window_seqlens = torch.cat(cu_window_seqlens_list, dim=0)
         return window_index, cu_window_seqlens
 
+    @torch.compiler.disable
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> torch.Tensor:

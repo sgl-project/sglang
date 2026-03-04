@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Iterable
@@ -144,7 +143,7 @@ class DenoisingStage(PipelineStage):
             _inductor_cfg.reorder_for_compute_comm_overlap = True
         except ImportError:
             pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        mode = envs.SGLANG_TORCH_COMPILE_MODE
         logger.info(f"Compiling transformer with mode: {mode}")
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(mode=mode, fullgraph=False, dynamic=None)

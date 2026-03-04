@@ -7,13 +7,12 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
-import os
-
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
@@ -93,7 +92,7 @@ class ImageEncodingStage(PipelineStage):
             )
             return
 
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        mode = envs.SGLANG_TORCH_COMPILE_MODE
         logger.info(f"Compiling text encoder with mode: {mode}")
         try:
             self.text_encoder.forward = torch.compile(
