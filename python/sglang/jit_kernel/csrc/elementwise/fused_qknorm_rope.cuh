@@ -32,11 +32,6 @@
 
 namespace {
 
-template <typename T>
-inline __device__ __host__ T div_up(T m, T n) {
-  return (m + n - 1) / n;
-}
-
 // ---------------------------------------------------------------------------
 // YaRN-aware frequency computation
 //
@@ -279,7 +274,7 @@ void fused_qk_norm_rope(
   int warpsPerBlock = blockSize / 32;
   int totalQKHeads = num_heads_q + num_heads_k;
   int totalWarps = num_tokens * totalQKHeads;
-  int gridSize = div_up(totalWarps, warpsPerBlock);
+  int gridSize = host::div_ceil(totalWarps, warpsPerBlock);
 
   bool interleave = !neox;
 
@@ -306,12 +301,20 @@ void fused_qk_norm_rope(
       attention_factor,                                              \
       rotary_dim)
 
-  static_assert(
-      JIT_HEAD_DIM == 64 || JIT_HEAD_DIM == 128 || JIT_HEAD_DIM == 256, "JIT_HEAD_DIM must be 64, 128, or 256");
-  static_assert(JIT_INTERLEAVE == 0 || JIT_INTERLEAVE == 1, "JIT_INTERLEAVE must be 0 or 1");
-  RuntimeCheck(head_dim == JIT_HEAD_DIM, "head_dim mismatch with JIT-compiled kernel");
-  RuntimeCheck(interleave == static_cast<bool>(JIT_INTERLEAVE), "interleave mismatch with JIT-compiled kernel");
-  LAUNCH_KERNEL(JIT_HEAD_DIM, static_cast<bool>(JIT_INTERLEAVE));
+  RuntimeCheck(head_dim == 64 || head_dim == 128 || head_dim == 256, "head_dim must be 64, 128, or 256");
+  if (head_dim == 64 && interleave) {
+    LAUNCH_KERNEL(64, true);
+  } else if (head_dim == 64 && !interleave) {
+    LAUNCH_KERNEL(64, false);
+  } else if (head_dim == 128 && interleave) {
+    LAUNCH_KERNEL(128, true);
+  } else if (head_dim == 128 && !interleave) {
+    LAUNCH_KERNEL(128, false);
+  } else if (head_dim == 256 && interleave) {
+    LAUNCH_KERNEL(256, true);
+  } else {
+    LAUNCH_KERNEL(256, false);
+  }
 
 #undef LAUNCH_KERNEL
 }
