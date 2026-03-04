@@ -2,10 +2,10 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
 class TestQuantLogString(CustomTestCase):
