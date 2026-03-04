@@ -60,11 +60,9 @@ class DiffusionGenerateRequest(BaseModel):
     num_outputs_per_prompt: Optional[int] = 1
     enable_teacache: Optional[bool] = False
 
-    # Extended metadata flags
-    return_trajectory_latents: bool = False
-    return_trajectory_decoded: bool = False
-    # TODO: enable after PR #18806 lands and OutputBatch gains log_prob fields
-    # return_log_probs: bool = False
+    # Extended metadata flags (default False — no latency impact when unused)
+    get_latents: bool = False
+    get_log_probs: bool = False
 
     # Output control
     output_quality: Optional[str] = "default"
@@ -85,13 +83,12 @@ class TrajectoryData(BaseModel):
         arr = np.load(io.BytesIO(base64.b64decode(blob)))
     """
 
-    trajectory_latents: Optional[str] = None
-    trajectory_latents_shape: Optional[List[int]] = None
-    trajectory_latents_dtype: Optional[str] = None
-    trajectory_timesteps: Optional[List[str]] = None
-    trajectory_decoded: Optional[List[str]] = None
-    # TODO: add after PR #18806
-    # trajectory_log_probs: Optional[str] = None
+    latents: Optional[str] = None
+    latents_shape: Optional[List[int]] = None
+    latents_dtype: Optional[str] = None
+    timesteps: Optional[List[str]] = None
+    log_probs: Optional[str] = None
+    log_probs_shape: Optional[List[int]] = None
 
 
 class DiffusionGenerateResponse(BaseModel):
@@ -121,32 +118,35 @@ def _tensor_to_b64_npy(t: torch.Tensor) -> str:
 def _build_trajectory(result) -> Optional[TrajectoryData]:
     """Extract trajectory fields from an OutputBatch into serialized form."""
     has_latents = result.trajectory_latents is not None
-    has_decoded = result.trajectory_decoded is not None
-    if not has_latents and not has_decoded:
+    has_log_probs = getattr(result, "trajectory_log_probs", None) is not None
+    if not has_latents and not has_log_probs:
         return None
 
-    traj_latents_b64 = None
-    traj_latents_shape = None
-    traj_latents_dtype = None
+    latents_b64 = None
+    latents_shape = None
+    latents_dtype = None
     if has_latents:
-        traj_latents_b64 = _tensor_to_b64_npy(result.trajectory_latents)
-        traj_latents_shape = list(result.trajectory_latents.shape)
-        traj_latents_dtype = str(result.trajectory_latents.dtype)
+        latents_b64 = _tensor_to_b64_npy(result.trajectory_latents)
+        latents_shape = list(result.trajectory_latents.shape)
+        latents_dtype = str(result.trajectory_latents.dtype)
 
-    traj_timesteps_b64 = None
+    timesteps_b64 = None
     if result.trajectory_timesteps is not None:
-        traj_timesteps_b64 = [_tensor_to_b64_npy(t) for t in result.trajectory_timesteps]
+        timesteps_b64 = [_tensor_to_b64_npy(t) for t in result.trajectory_timesteps]
 
-    traj_decoded_b64 = None
-    if has_decoded:
-        traj_decoded_b64 = [_tensor_to_b64_npy(t) for t in result.trajectory_decoded]
+    log_probs_b64 = None
+    log_probs_shape = None
+    if has_log_probs:
+        log_probs_b64 = _tensor_to_b64_npy(result.trajectory_log_probs)
+        log_probs_shape = list(result.trajectory_log_probs.shape)
 
     return TrajectoryData(
-        trajectory_latents=traj_latents_b64,
-        trajectory_latents_shape=traj_latents_shape,
-        trajectory_latents_dtype=traj_latents_dtype,
-        trajectory_timesteps=traj_timesteps_b64,
-        trajectory_decoded=traj_decoded_b64,
+        latents=latents_b64,
+        latents_shape=latents_shape,
+        latents_dtype=latents_dtype,
+        timesteps=timesteps_b64,
+        log_probs=log_probs_b64,
+        log_probs_shape=log_probs_shape,
     )
 
 
@@ -182,8 +182,8 @@ async def generate(request: DiffusionGenerateRequest):
             true_cfg_scale=request.true_cfg_scale,
             num_outputs_per_prompt=request.num_outputs_per_prompt,
             enable_teacache=request.enable_teacache,
-            return_trajectory_latents=request.return_trajectory_latents,
-            return_trajectory_decoded=request.return_trajectory_decoded,
+            return_trajectory_latents=request.get_latents,
+            return_trajectory_decoded=request.get_latents,
             output_path=output_dir,
             output_file_name=request_id,
             output_quality=request.output_quality,
