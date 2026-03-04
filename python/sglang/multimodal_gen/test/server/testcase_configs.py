@@ -10,7 +10,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t
 
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -21,12 +21,14 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+
+DEFAULT_SMALL_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 
 @dataclass
@@ -98,7 +100,6 @@ class BaselineConfig:
 
     scenarios: dict[str, ScenarioConfig]
     step_fractions: Sequence[float]
-    warmup_defaults: dict[str, int]
     tolerances: ToleranceConfig
     improvement_threshold: float
 
@@ -127,22 +128,38 @@ class BaselineConfig:
         return cls(
             scenarios=scenarios,
             step_fractions=tuple(data["sampling"]["step_fractions"]),
-            warmup_defaults=data["sampling"].get("warmup_requests", {}),
             tolerances=tolerances,
             improvement_threshold=data.get("improvement_reporting", {}).get(
                 "threshold", 0.2
             ),
         )
 
+    def update(self, path: Path):
+        """Load baseline configuration from JSON file."""
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
 
-@dataclass(frozen=True)
+        scenarios_new = {}
+        for name, cfg in data["scenarios"].items():
+            scenarios_new[name] = ScenarioConfig(
+                stages_ms=cfg["stages_ms"],
+                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            )
+
+        self.scenarios.update(scenarios_new)
+        return self
+
+
+@dataclass
 class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
     model_path: str  # HF repo or local path
     modality: str = "image"  # "image" or "video" or "3d"
 
-    warmup: int = 1  # number of warmup requests
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
@@ -160,13 +177,21 @@ class DiffusionServerArgs:
     second_lora_path: str | None = (
         None  # Second LoRA adapter path for multi-LoRA testing
     )
-    # misc
-    enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
+
+    extras: list[str] = field(default_factory=lambda: [])
+
+    def __post_init__(self):
+        if self.modality == "image":
+            self.custom_validator = "image"
+        elif self.modality == "video":
+            self.custom_validator = "video"
+        elif self.modality == "3d":
+            self.custom_validator = "mesh"
 
 
 @dataclass(frozen=True)
@@ -195,6 +220,10 @@ class DiffusionSamplingParams:
     # TeaCache acceleration
     enable_teacache: bool = False
 
+    # Frame interpolation
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
@@ -203,6 +232,7 @@ class DiffusionTestCase:
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
+    run_perf_check: bool = True
 
 
 def sample_step_indices(
@@ -270,6 +300,8 @@ class PerformanceSummary:
             all_denoise_steps=per_step,
         )
 
+
+SMALL_T2I_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
@@ -340,16 +372,24 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.1-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.1-dev", modality="image"
         ),
         T2I_sampling_params,
     ),
+    # TODO: modeling of flux different from official flux, so weights can't be loaded
+    # consider opting for a different quantized hf-repo
+    # DiffusionTestCase(
+    #     "flux_image_t2i_override_transformer_weights_path_fp8",
+    #     DiffusionServerArgs(
+    #         model_path="black-forest-labs/FLUX.1-dev", modality="image",
+    #         extras=["--transformer-weights-path black-forest-labs/FLUX.1-dev-FP8"]
+    #     ),
+    #     T2I_sampling_params,
+    # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.2-dev", modality="image"
         ),
         T2I_sampling_params,
     ),
@@ -365,9 +405,9 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead
     DiffusionTestCase(
-        "flux_2_image_t2i_layerwise_offload",
+        "layerwise_offload",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
+            model_path=SMALL_T2I_MODEL,
             modality="image",
             dit_layerwise_offload=True,
             dit_offload_prefetch_size=2,
@@ -376,16 +416,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
-        DiffusionServerArgs(
-            model_path="Tongyi-MAI/Z-Image-Turbo",
-            modality="image",
-        ),
+        DiffusionServerArgs(model_path="Tongyi-MAI/Z-Image-Turbo", modality="image"),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "zimage_image_t2i_warmup",
+        "zimage_image_t2i_fp8",
         DiffusionServerArgs(
-            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", enable_warmup=True
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
         ),
         T2I_sampling_params,
     ),
@@ -403,37 +442,30 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit",
-            modality="image",
-        ),
+        DiffusionServerArgs(model_path="Qwen/Qwen-Image-Edit", modality="image"),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2509",
-            modality="image",
-        ),
+        DiffusionServerArgs(model_path="Qwen/Qwen-Image-Edit-2509", modality="image"),
         MULTI_IMAGE_TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2511_ti2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2511",
-            modality="image",
-        ),
+        DiffusionServerArgs(model_path="Qwen/Qwen-Image-Edit-2511", modality="image"),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_layered_i2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Layered",
-            modality="image",
-        ),
+        DiffusionServerArgs(model_path="Qwen/Qwen-Image-Layered", modality="image"),
         MULTI_FRAME_I2I_sampling_params,
     ),
 ]
+
+HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
+    prompt="",
+    image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
+)
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
@@ -442,7 +474,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -454,7 +485,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             text_encoder_cpu_offload=True,
         ),
@@ -468,12 +498,27 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
             enable_teacache=True,
+        ),
+    ),
+    # Frame interpolation correctness (2× / exp=1)
+    # Uses the same 1.3B model already in the suite;
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_frame_interp_2x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            num_frames=5,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=1,
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -484,7 +529,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=1,
             dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
@@ -508,17 +552,25 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_2_ti2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.2-dev", modality="image"
         ),
         TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_t2i_customized_vae_path",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
     ),
     DiffusionTestCase(
         "fast_hunyuan_video",
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -531,7 +583,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -541,14 +592,25 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
     ),
 ]
 
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+# Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
+if not current_platform.is_hip():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "hunyuan3d_shape_gen",
+            DiffusionServerArgs(
+                model_path="tencent/Hunyuan3D-2",
+                modality="3d",
+            ),
+            HUNYUAN3D_SHAPE_sampling_params,
+        ),
+    )
+# Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
     ONE_GPU_CASES_B.append(
         DiffusionTestCase(
@@ -556,7 +618,6 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
                 modality="video",
-                warmup=0,
                 custom_validator="video",
             ),
             DiffusionSamplingParams(
@@ -571,7 +632,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -581,7 +641,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),
@@ -595,7 +654,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
@@ -608,7 +666,6 @@ TWO_GPU_CASES_A = [
         "wan2_1_t2v_14b_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
-            warmup=0,
             modality="video",
             num_gpus=2,
             custom_validator="video",
@@ -623,7 +680,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             cfg_parallel=True,
@@ -631,6 +687,16 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
+    ),
+    DiffusionTestCase(
+        "fsdp-inference",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL,
+            modality="image",
+            num_gpus=2,
+            extras=["--use-fsdp-inference"],
+        ),
+        T2I_sampling_params,
     ),
 ]
 
@@ -642,7 +708,6 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
                 modality="video",
-                warmup=0,
                 custom_validator="video",
                 num_gpus=2,
                 tp_size=2,
@@ -656,7 +721,6 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            warmup=0,
             modality="video",
             custom_validator="video",
             num_gpus=2,
@@ -669,7 +733,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
@@ -681,7 +744,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),
@@ -728,7 +790,18 @@ TWO_GPU_CASES_B = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_2_klein_ti2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-4B",
+            modality="image",
+            num_gpus=2,
+        ),
+        TI2I_sampling_params,
+    ),
 ]
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+BASELINE_CONFIG = BaselineConfig.load(
+    Path(__file__).with_name("perf_baselines.json")
+).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")

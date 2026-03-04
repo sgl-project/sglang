@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+    from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -117,6 +119,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -125,7 +129,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
 
         # Alias for better readability
-        self.draft_runner_list = self.draft_worker.model_runner_list
+        self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
+
+        # Chain-style MTP: each step propagates its own output hidden states to the
+        # next step.  Non-chain: each step uses the target model's hidden states.
+        draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
+        self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
 
         self.init_lm_head()
 
@@ -352,9 +361,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -382,6 +391,15 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
+            # Chain-style: use this step's output hidden_states as next step's input
+            if (
+                self.chain_mtp_hidden_states
+                and step < self.speculative_num_steps - 1
+                and output.logits_output.hidden_states is not None
+            ):
+                forward_batch.spec_info.hidden_states = (
+                    output.logits_output.hidden_states
+                )
             if forward_batch.extend_seq_lens is not None:
                 rotate_input_ids_triton(
                     forward_batch.input_ids,
@@ -411,8 +429,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         # Prepare for draft extend in a separate stream
@@ -466,11 +484,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                draft_logits_output, _ = self.draft_runner_list[step].forward(
+                draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
                 probs = torch.softmax(
-                    draft_logits_output.next_token_logits[select_index], dim=-1
+                    draft_logits_output.logits_output.next_token_logits[select_index],
+                    dim=-1,
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 if forward_batch.extend_seq_lens is not None:
@@ -493,13 +512,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.cuda_graph_runner_for_draft_extend.get_last_runner()
             )
             assign_hidden_states_pool_triton(
-                last_cuda_graph_runner.hidden_states,
-                last_cuda_graph_runner.req_pool_indices,
+                last_cuda_graph_runner.buffers.hidden_states,
+                last_cuda_graph_runner.buffers.req_pool_indices,
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
-                last_cuda_graph_runner.extend_seq_lens,
-                last_cuda_graph_runner.extend_start_loc,
+                last_cuda_graph_runner.buffers.extend_seq_lens,
+                last_cuda_graph_runner.buffers.extend_start_loc,
             )
 
         # Reorganize the spec info for the next batch
@@ -531,6 +550,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -556,7 +577,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         self._draft_worker = MultiLayerEagleDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors
@@ -590,8 +619,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
-            # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            # Chain-style MTP needs FULL to get all-token hidden states;
+            # non-chain only needs LAST (the target model's hidden states).
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.draft_worker.chain_mtp_hidden_states
+                else CaptureHiddenMode.LAST
+            )
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,

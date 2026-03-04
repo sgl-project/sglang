@@ -35,6 +35,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -93,6 +94,26 @@ class RadixKey:
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
+def maybe_bigram_convert(
+    is_eagle: bool,
+    key: RadixKey,
+    value: Optional[torch.Tensor] = None,
+) -> Tuple[RadixKey, Optional[torch.Tensor]]:
+    if is_eagle and not key.is_bigram:
+        key.token_ids = convert_to_bigram_key(key.token_ids)
+        key.is_bigram = True
+        if value is not None:
+            value = value[: len(key)]
+    return key, value
+
+
+def page_align_keys(key: list, page_size) -> list:
+    if page_size == 1:
+        return key
+    page_aligned_len = len(key) // page_size * page_size
+    return key[:page_aligned_len]
+
+
 class TreeNode:
 
     counter = 0
@@ -103,6 +124,10 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
+        self.pin_expiry: float = (
+            0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
+        )
+        self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -301,6 +326,8 @@ class RadixCache(BasePrefixCache):
             raise ValueError(
                 f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
             )
+
+        self.evictable_leaves = set()
         self.reset()
 
     @classmethod
@@ -333,17 +360,13 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        if self.is_eagle and not key.is_bigram:
-            key.token_ids = convert_to_bigram_key(key.token_ids)
-            if value is not None:
-                value = value[: len(key)]
-
-        return key, value
+        return maybe_bigram_convert(self.is_eagle, key, value)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -433,12 +456,6 @@ class RadixCache(BasePrefixCache):
         prefix_len = self._insert_helper(self.root_node, key, value, priority)
         return InsertResult(prefix_len=prefix_len)
 
-    def _page_align_keys(self, key: list) -> list:
-        if self.page_size == 1:
-            return key
-        page_aligned_len = len(key) // self.page_size * self.page_size
-        return key[:page_aligned_len]
-
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -451,7 +468,6 @@ class RadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -460,8 +476,8 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
-        keys = self._page_align_keys(keys)
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
@@ -485,7 +501,6 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
 
         # Remove req slot release the cache lock
-        self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -499,8 +514,8 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
-        keys = self._page_align_keys(keys)
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
@@ -521,7 +536,7 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        (new_indices, new_last_node) = (
+        new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
@@ -566,7 +581,7 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        leaves = self._collect_leaves()
+        leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -600,6 +615,7 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
             node.lock_ref += 1
+            self._update_leaf_status(node)
             node = node.parent
         return delta
 
@@ -614,6 +630,7 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
+            self._update_leaf_status(node)
             if node.parent is None:
                 assert (
                     node is self.root_node
@@ -727,6 +744,8 @@ class RadixCache(BasePrefixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
@@ -755,6 +774,24 @@ class RadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.evictable_size_ -= len(node.key)
+        if node in self.evictable_leaves:
+            self.evictable_leaves.remove(node)
+        self._update_leaf_status(node.parent)
+
+    def _update_leaf_status(self, node: TreeNode):
+        if node.evicted or node.lock_ref > 0:
+            if node in self.evictable_leaves:
+                self.evictable_leaves.remove(node)
+            return
+
+        for child in node.children.values():
+            if not child.evicted:
+                if node in self.evictable_leaves:
+                    self.evictable_leaves.remove(node)
+                return
+
+        if node not in self.evictable_leaves:
+            self.evictable_leaves.add(node)
 
     def _total_size_helper(self):
         total_size = 0
@@ -767,20 +804,6 @@ class RadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
-
-    def _collect_leaves(self):
-        ret_list = []
-        stack = list(self.root_node.children.values())
-
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                if cur_node.lock_ref == 0:
-                    ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
@@ -813,6 +836,7 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
+                        medium=MEDIUM_GPU,
                     )
                 )
 
@@ -834,7 +858,9 @@ class RadixCache(BasePrefixCache):
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                )
 
                 page_index += 1
 
