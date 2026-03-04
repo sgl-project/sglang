@@ -47,6 +47,8 @@ _use_sgl_xpu = use_intel_xpu_backend()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+
+    from sglang.srt.server_args import get_global_server_args
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -466,6 +468,14 @@ def fused_experts_impl(
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
+        use_fused_moe_sum_all_reduce = (
+            get_global_server_args().enable_fused_moe_sum_all_reduce
+            and (not no_combine)
+            and (curr_topk_ids.shape[1] > 2)
+            and (not use_int8_w8a16)
+            and (not use_int4_w4a16)
+        )
+
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
@@ -569,14 +579,23 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
+        out_slice = None
+        if use_fused_moe_sum_all_reduce:
+            out_slice = out_hidden_states[begin_chunk_idx:end_chunk_idx]
+            out_slice.zero_()
+
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
             b2,
             (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
+                out_slice
+                if use_fused_moe_sum_all_reduce
+                else (
+                    intermediate_cache3
+                    if not no_combine and topk_ids.shape[1] != 1
+                    else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
+                )
             ),
             a2_scale,
             w2_scale,
@@ -599,6 +618,8 @@ def fused_experts_impl(
             a_use_tma=down_moe_use_tma,
             b_use_tma=down_moe_use_tma,
             filter_expert=filter_expert,
+            fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
+            router_topk=curr_topk_ids.shape[1],
         )
 
         if routed_scaling_factor is None:
@@ -607,7 +628,13 @@ def fused_experts_impl(
         if no_combine:
             pass
         elif _is_cuda:
-            if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
+            if use_fused_moe_sum_all_reduce:
+                if routed_scaling_factor is None:
+                    routed_scaling_factor = 1.0
+                if routed_scaling_factor != 1.0:
+                    assert out_slice is not None
+                    out_slice.mul_(routed_scaling_factor)
+            elif topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
             elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
                 torch.add(
