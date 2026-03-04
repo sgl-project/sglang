@@ -494,14 +494,12 @@ class FlashAttentionImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ):
         attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
-            max_seqlen_q = attn_metadata.max_seqlen_q
-            max_seqlen_k = attn_metadata.max_seqlen_k
-        else:
-            max_seqlen_q = query.shape[1]
-            max_seqlen_k = key.shape[1]
+        # Keep control flow stable for torch.compile/PCG.
+        max_seqlen_q = query.shape[1]
+        max_seqlen_k = key.shape[1]
+        if attn_metadata is not None:
+            attn_metadata.max_seqlen_q = max_seqlen_q
+            attn_metadata.max_seqlen_k = max_seqlen_k
 
         q_shape = tuple(query.shape)
         k_shape = tuple(key.shape)
