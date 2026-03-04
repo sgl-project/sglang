@@ -30,7 +30,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+if _is_cuda:
+    fused_inplace_qknorm = register_custom_op(
+        fused_inplace_qknorm,
+        mutates_args=["q", "k"],
+    )
 
 
 # Copied and adapted from sglang
