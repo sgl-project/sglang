@@ -12,7 +12,6 @@ FILES_TO_UPDATE = [
     Path("docker/Dockerfile"),
     Path("scripts/ci/cuda/ci_install_dependency.sh"),
     Path("python/sglang/srt/entrypoints/engine.py"),
-    Path(".github/workflows/release-docker-cu13-framework.yml"),
     Path("python/sglang/srt/utils/common.py"),
 ]
 
@@ -67,15 +66,6 @@ def replace_flashinfer_version(
             r'\g<1>"' + new_version + '"',
             new_content,
             flags=re.DOTALL,
-        )
-    elif name == "release-docker-cu13-framework.yml":
-        new_content = new_content.replace(
-            f"FlashInfer version (default: {old_version})",
-            f"FlashInfer version (default: {new_version})",
-        )
-        new_content = new_content.replace(
-            f'default: "{old_version}"',
-            f'default: "{new_version}"',
         )
     elif name == "common.py":
         new_content = new_content.replace(
