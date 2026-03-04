@@ -932,8 +932,9 @@ def get_generate_fn(
             if is_image_url(image_path):
                 new_image_paths.append(download_image_from_url(str(image_path)))
             else:
-                new_image_paths.append(Path(image_path))
-                if not image_path.exists():
+                local_path = Path(image_path)
+                new_image_paths.append(local_path)
+                if not local_path.exists():
                     pytest.skip(f"{case_id}: file missing: {image_path}")
 
         image_paths = new_image_paths
