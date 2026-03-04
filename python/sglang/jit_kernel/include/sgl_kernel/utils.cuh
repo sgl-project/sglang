@@ -4,14 +4,14 @@
 ///
 /// This header is included (directly or transitively) by nearly every
 /// JIT kernel. It provides:
-/// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, …).
+/// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, ...).
 /// - `SGL_DEVICE` macro (forced-inline device function qualifier).
 /// - `kWarpThreads` constant (32).
 /// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
 /// - Typed `load_as` / `store_as` for void-pointer access.
 /// - `pointer::offset` for safe void-pointer arithmetic.
-/// - `host::LaunchKernel` — kernel launcher with optional PDL.
-/// - `host::RuntimeDeviceCheck` — CUDA error checking.
+/// - `host::LaunchKernel` - kernel launcher with optional PDL.
+/// - `host::RuntimeDeviceCheck` - CUDA error checking.
 
 #pragma once
 

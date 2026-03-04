@@ -11,7 +11,7 @@
 /// | `fp32_t`  | `fp32x2_t`  | Full math ops (abs,sqrt,...) |
 /// | `fp16_t`  | `fp16x2_t`  | Conversion only             |
 /// | `bf16_t`  | `bf16x2_t`  | Conversion only             |
-/// | `fp32x2_t`| `fp32x4_t`  | Packed float2 ↔ half2/bf162 |
+/// | `fp32x2_t`| `fp32x4_t`  | Packed float2 <-> half2/bf162 |
 
 #pragma once
 #include <sgl_kernel/utils.cuh>

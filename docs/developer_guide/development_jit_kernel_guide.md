@@ -270,7 +270,7 @@ and its key APIs.
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
 | `utils.h` | `host` | Host-side essentials: `RuntimeCheck`, `Panic`, `div_ceil`, `irange` |
-| `utils.cuh` | `device` / `host` | Type aliases (`fp16_t`, `bf16_t`, …), `SGL_DEVICE` macro, PDL helpers, `LaunchKernel`, `RuntimeDeviceCheck` |
+| `utils.cuh` | `device` / `host` | Type aliases (`fp16_t`, `bf16_t`, ...), `SGL_DEVICE` macro, PDL helpers, `LaunchKernel`, `RuntimeDeviceCheck` |
 | `source_location.h` | (global) | Portable `std::source_location` wrapper for error reporting |
 | `runtime.cuh` | `host::runtime` | CUDA runtime queries: `get_blocks_per_sm`, `get_sm_count`, `get_cc_major`, `get_runtime_version`, `get_available_dynamic_smem_per_block` |
 
@@ -291,8 +291,8 @@ and its key APIs.
 
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
-| `vec.cuh` | `device` | `AlignedVector<T, N>` — vectorized load/store (up to 128-bit; 256-bit requires Blackwell GPUs) |
-| `tile.cuh` | `device::tile` | `Memory<T>` — cooperative tiled memory I/O (thread/warp/CTA) |
+| `vec.cuh` | `device` | `AlignedVector<T, N>` - vectorized load/store (up to 128-bit; 256-bit requires Blackwell GPUs) |
+| `tile.cuh` | `device::tile` | `Memory<T>` - cooperative tiled memory I/O (thread/warp/CTA) |
 
 ### Parallel Primitives
 
@@ -300,7 +300,7 @@ and its key APIs.
 |--------|-----------|---------|
 | `warp.cuh` | `device::warp` | `reduce_sum`, `reduce_max` via `__shfl_xor_sync` |
 | `cta.cuh` | `device::cta` | `reduce_max` across warps via shared memory |
-| `atomic.cuh` | `device::atomic` | `max` — atomic float max (CUDA + ROCm fallback) |
+| `atomic.cuh` | `device::atomic` | `max` - atomic float max (CUDA + ROCm fallback) |
 
 ### Reusable Kernel Templates
 

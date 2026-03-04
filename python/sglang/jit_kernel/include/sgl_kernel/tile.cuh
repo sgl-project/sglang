@@ -4,9 +4,9 @@
 /// `tile::Memory<T>` represents a contiguous memory region where multiple
 /// threads cooperatively load/store elements. The three factory methods
 /// determine the thread group:
-/// - `thread()` – single thread (no tiling).
-/// - `warp()`   – all threads in a warp cooperate.
-/// - `cta()`    – all threads in the CTA cooperate.
+/// - `thread()` - single thread (no tiling).
+/// - `warp()`   - all threads in a warp cooperate.
+/// - `cta()`    - all threads in the CTA cooperate.
 
 #pragma once
 #include <sgl_kernel/utils.cuh>

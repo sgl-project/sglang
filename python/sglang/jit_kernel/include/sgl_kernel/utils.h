@@ -2,13 +2,13 @@
 /// \brief Host-side C++ utilities used by JIT kernel wrappers.
 ///
 /// Provides:
-/// - `DebugInfo` — wraps `std::source_location` for error reporting.
-/// - `RuntimeCheck` — runtime assertion with formatted error messages.
-/// - `Panic` — unconditional abort with formatted error messages.
-/// - `pointer::offset` — safe void-pointer arithmetic (host side).
-/// - `div_ceil` — integer ceiling division.
-/// - `dtype_bytes` — byte width of a `DLDataType`.
-/// - `irange` — Python-style integer range for range-for loops.
+/// - `DebugInfo` - wraps `std::source_location` for error reporting.
+/// - `RuntimeCheck` - runtime assertion with formatted error messages.
+/// - `Panic` - unconditional abort with formatted error messages.
+/// - `pointer::offset` - safe void-pointer arithmetic (host side).
+/// - `div_ceil` - integer ceiling division.
+/// - `dtype_bytes` - byte width of a `DLDataType`.
+/// - `irange` - Python-style integer range for range-for loops.
 
 #pragma once
 
@@ -157,7 +157,7 @@ inline auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
-/// \brief Integer ceiling division: ⌈a / b⌉.
+/// \brief Integer ceiling division: ceil(a / b).
 template <std::integral T, std::integral U>
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
@@ -171,13 +171,13 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
 namespace stdr = std::ranges;
 namespace stdv = stdr::views;
 
-/// \brief Python-style integer range: `irange(n)` → `[0, n)`.
+/// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>
 inline auto irange(T end) {
   return stdv::iota(static_cast<T>(0), end);
 }
 
-/// \brief Python-style integer range: `irange(start, end)` → `[start, end)`.
+/// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
 template <std::integral T>
 inline auto irange(T start, T end) {
   return stdv::iota(start, end);
