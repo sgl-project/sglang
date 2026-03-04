@@ -173,6 +173,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self._draft_kv_pool_layout_cached = False
+        self._draft_kv_has_split_buffers = False
+        self._draft_kv_has_packed_buffer = False
 
     def init_token_map(self):
         # Load hot token ids
@@ -460,6 +463,96 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
+    def _zero_fill_draft_kv_for_cached_prefix(self, batch: ModelWorkerBatch):
+        """Zero-fill draft KV slots for cached prefixes populated by target-only KV."""
+        if batch.forward_mode.is_idle():
+            return
+
+        prefix_lens = getattr(batch, "extend_prefix_lens", None)
+        if prefix_lens is None:
+            return
+
+        req_pool_indices = batch.req_pool_indices
+        if req_pool_indices is None:
+            return
+        req_to_token = self.req_to_token_pool.req_to_token
+        device = req_to_token.device
+
+        if isinstance(prefix_lens, torch.Tensor):
+            if prefix_lens.numel() == 0:
+                return
+            if prefix_lens.device.type == "cpu":
+                max_prefix_len = int(prefix_lens.max().item())
+            else:
+                max_prefix_len = req_to_token.shape[1]
+            prefix_lens = prefix_lens.to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+        else:
+            if len(prefix_lens) == 0:
+                return
+            max_prefix_len = max(prefix_lens)
+            prefix_lens = torch.as_tensor(prefix_lens, device=device, dtype=torch.long)
+
+        if max_prefix_len <= 0:
+            return
+        max_prefix_len = min(max_prefix_len, req_to_token.shape[1])
+
+        if isinstance(req_pool_indices, torch.Tensor):
+            if req_pool_indices.numel() == 0:
+                return
+            req_pool_indices = req_pool_indices.to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+        else:
+            if len(req_pool_indices) == 0:
+                return
+            req_pool_indices = torch.as_tensor(
+                req_pool_indices, device=device, dtype=torch.long
+            )
+
+        if req_pool_indices.shape[0] != prefix_lens.shape[0]:
+            bs = min(req_pool_indices.shape[0], prefix_lens.shape[0])
+            req_pool_indices = req_pool_indices[:bs]
+            prefix_lens = prefix_lens[:bs]
+            if bs == 0:
+                return
+
+        prefix_lens = torch.clamp(prefix_lens, min=0, max=max_prefix_len)
+        valid_reqs = prefix_lens > 0
+        req_pool_indices = req_pool_indices[valid_reqs]
+        prefix_lens = prefix_lens[valid_reqs]
+        if req_pool_indices.shape[0] == 0:
+            return
+
+        col_indices = torch.arange(max_prefix_len, device=device, dtype=torch.long)
+        slot_table = req_to_token[req_pool_indices[:, None], col_indices[None, :]]
+        all_slots = slot_table[col_indices[None, :] < prefix_lens[:, None]]
+        all_slots = all_slots[all_slots >= 0]
+        if all_slots.shape[0] == 0:
+            return
+
+        if req_pool_indices.shape[0] > 1:
+            all_slots = torch.unique(all_slots)
+
+        draft_kv_pool = self.draft_runner.token_to_kv_pool
+        if not self._draft_kv_pool_layout_cached:
+            self._draft_kv_has_split_buffers = hasattr(
+                draft_kv_pool, "k_buffer"
+            ) and hasattr(draft_kv_pool, "v_buffer")
+            self._draft_kv_has_packed_buffer = hasattr(draft_kv_pool, "kv_buffer")
+            self._draft_kv_pool_layout_cached = True
+
+        if self._draft_kv_has_split_buffers:
+            for layer_idx in range(draft_kv_pool.layer_num):
+                draft_kv_pool.k_buffer[layer_idx][all_slots] = 0
+                draft_kv_pool.v_buffer[layer_idx][all_slots] = 0
+            return
+
+        if self._draft_kv_has_packed_buffer:
+            for layer_idx in range(draft_kv_pool.layer_num):
+                draft_kv_pool.kv_buffer[layer_idx][all_slots] = 0
+
     def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
@@ -495,6 +588,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         batch.spec_info = next_draft_input
+
+        # Radix cache hits can leave draft KV uninitialized at cached slots.
+        self._zero_fill_draft_kv_for_cached_prefix(batch)
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
