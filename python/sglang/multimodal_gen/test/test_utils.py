@@ -132,7 +132,7 @@ def wait_for_server_health(
         time.sleep(interval)
     raise TimeoutError(
         f"Server at {urljoin(base_url, path)} not healthy after {timeout}s. "
-        f"={last_status=} ={last_err=}"
+        f"{last_status=} {last_err=}"
     )
 
 
@@ -174,6 +174,17 @@ def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | 
             "cannot enforce GPU memory assertions."
         )
         return None
+
+
+def require_gpu_mem_query(gpu_index: int = 0) -> int:
+    """Same as :func:`query_gpu_mem_used_mib` but asserts availability.
+
+    Raises ``AssertionError`` when ``nvidia-smi`` is unavailable instead of
+    returning ``None``, so callers can rely on a valid ``int`` result.
+    """
+    mem = query_gpu_mem_used_mib(gpu_index, required=True)
+    assert mem is not None
+    return mem
 
 
 def assert_gpu_mem_changed(
