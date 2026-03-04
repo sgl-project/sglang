@@ -19,15 +19,15 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 |---------------------------------|-----------------------------|------------------|-----------------|-----------------|-----------------|--------------------|----------------|
 | **FlashInfer**                  | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ❌             |
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
-| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
+| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ✅             |
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ✅               | ✅              | ❌              | ❌              | ❌                 | ✅             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
 | **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ✅              | ❌              | ✅                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ❌              | ✅              | ✅              | ❌                 | ✅             |
+| **AITER (ROCm)**                | ✅                          | ✅               | ❌              | ✅              | ✅              | ❌                 | ✅             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ✅             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 | **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
 
@@ -49,8 +49,12 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-- FlashAttention 4 is prefill-only for now.
+- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). On SM90, `page_size` must be 128.
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+```
+
+```{warning}
+**FA4 on Hopper (SM90):** FA4 decode speed decreases as sequence length grows due to lack of SplitKV support. At batch=1 compared to FA3 on H100: ~-10% at 2K tokens, ~-18% at 4K, ~-31% at 8K, ~-49% at 16K. Larger batch sizes reduce the gap (e.g., batch=8: ~-2% at 2K, ~-8% at 4K). Blackwell (SM100) is not affected.
 ```
 
 ```{note}
@@ -72,6 +76,28 @@ MLA page-size constraints:
 - FlashMLA: page_size = 64.
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ {32, 64}.
+
+### GDN Attention Backends
+
+GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, used in hybrid models that alternate GDN linear attention layers with standard full attention layers. GDN is **not** selected via `--attention-backend`; it is automatically activated when the model architecture requires it (e.g., Qwen 3.5, Qwen 3 Next, Jet Nemotron, Jet VLM).
+
+The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
+
+| **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
+|--------------------------|------------|----------------------|-----------------------------------|
+| **Triton (CUDA)**        | ✅         | ✅                   | ✅                                |
+| **Triton (AMD/ROCm)**    | ✅         | ✅                   | ✅                                |
+| **Triton (NPU)**         | ✅         | ✅                   | ❌                                |
+| **Triton (CPU)**         | ✅         | ✅                   | ❌                                |
+| **CuTe DSL (CUDA only)**| ✅         | ❌                   | ❌                                |
+
+```{important}
+GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
+- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, or `fa4` only.
+- **NPU (Ascend)**: `ascend` only.
+- **AMD (ROCm)**: `triton` recommended.
+- **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
+```
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
@@ -110,6 +136,23 @@ Constraints when combining hybrid attention with speculative decoding:
 If you set only one of `--prefill-attention-backend` or `--decode-attention-backend`, the unspecified phase inherits `--attention-backend`.
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 ```
+
+## Attention Backend Selection Guide (CUDA)
+
+If the `--attention-backend` argument is not specified, SGLang automatically selects the best backend based on the hardware (CUDA) and model architecture.
+
+### Automatic Selection Logic
+
+**1. MHA Models (e.g., Llama, Qwen)**
+- **Hopper (e.g., H100, H200)**: Defaults to `fa3` if using CUDA 12.3+ and the model configuration is supported.
+- **Blackwell (e.g., B200)**: Defaults to `trtllm_mha`, unless using speculative decoding with `topk > 1`.
+- **Other Architectures (Ampere, Ada, etc.)**: Defaults to `flashinfer` if available; otherwise falls back to `triton`.
+
+**2. MLA Models (e.g., DeepSeek V3)**
+- **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
+- **Blackwell**: Defaults to `trtllm_mla`.
+- **Other Architectures**: Defaults to `triton`.
+
 
 ## User Guide
 
@@ -185,8 +228,34 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
+- TRTLLM MHA (Optimized for Blackwell Architecture, e.g., B200)
+```bash
+python3 -m sglang.launch_server \
+  --tp 4 \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
+  --attention-backend trtllm_mha \
+  --trust-remote-code
+```
+
+- TRTLLM MHA (XQA backend) (Optimized for SM90 and SM120, e.g., H20, H200, 5090)
+Note that TRTLLM XQA backend only works well for pagesize 64.
+```bash
+python3 -m sglang.launch_server \
+  --tp 4 \
+  --model Qwen/Qwen3.5-35B-A3B-FP8 \
+  --decode-attention-backend trtllm_mha \
+  --trust-remote-code
+```
+
 - FlashAttention 4 (MHA & MLA)
 ```bash
+# FA4 for both prefill and decode on SM90/SM100
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --attention-backend fa4 \
+  --page-size 128 \
+  --trust-remote-code
+
 python3 -m sglang.launch_server \
   --tp 8 \
   --model deepseek-ai/DeepSeek-R1 \
@@ -249,6 +318,10 @@ python3 -m sglang.launch_server \
 To add a new attention backend, you can learn from the existing backends
 (`python/sglang/srt/layers/attention/triton_backend.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`)
 and follow the steps below.
+
+```{note}
+Linear attention kernel backends (GDN, KDA) follow a different pattern. They implement `LinearAttnKernelBase` in `python/sglang/srt/layers/attention/linear/kernels/` and are dispatched by `GDNKernelDispatcher` / `KDAKernelDispatcher` rather than registered via `@register_attention_backend`.
+```
 
 1. Run without cuda graph. Support the two forward functions
     - forward_extend

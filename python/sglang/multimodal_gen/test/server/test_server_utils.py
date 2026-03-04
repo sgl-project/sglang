@@ -18,7 +18,7 @@ from typing import Any, Callable, Sequence
 from urllib.request import urlopen
 
 import pytest
-from openai import Client, OpenAI
+from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -37,6 +37,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
+    get_video_frame_count,
     is_image_url,
     prepare_perf_log,
     validate_image,
@@ -48,6 +49,10 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 globally_suppress_loggers()
+
+# Tracks mesh output file paths from generate_mesh for later correctness validation.
+# Keyed by case_id, cleaned up after use.
+MESH_OUTPUT_PATHS: dict[str, str] = {}
 
 
 def download_image_from_url(url: str) -> Path:
@@ -451,81 +456,6 @@ class ServerManager:
             return ""
 
 
-class WarmupRunner:
-    """Handles warmup requests for a server."""
-
-    def __init__(
-        self,
-        port: int,
-        model: str,
-        prompt: str,
-        output_size: str,
-        output_format: str = None,
-    ):
-        self.client = OpenAI(
-            api_key="sglang-anything",
-            base_url=f"http://localhost:{port}/v1",
-        )
-        self.model = model
-        self.prompt = prompt
-        self.output_size = output_size
-        self.output_format = output_format
-
-    def run_text_warmups(self, count: int) -> None:
-        """Run text-to-image warmup requests."""
-        if count <= 0:
-            return
-
-        logger.info("[server-test] Running %s text warm-up(s)", count)
-        for _ in range(count):
-            result = self.client.images.generate(
-                model=self.model,
-                prompt=self.prompt,
-                n=1,
-                size=self.output_size,
-                response_format="b64_json",
-            )
-            validate_image(result.data[0].b64_json)
-
-    def run_edit_warmups(
-        self,
-        count: int,
-        edit_prompt: str,
-        image_path: Path,
-    ) -> None:
-        """Run image-edit warmup requests."""
-        if count <= 0:
-            return
-
-        if not isinstance(image_path, list):
-            image_path = [image_path]
-
-        for image in image_path:
-            if not image.exists():
-                logger.warning(
-                    "[server-test] Skipping edit warmup: image missing at %s", image
-                )
-                return
-
-        logger.info("[server-test] Running %s edit warm-up(s)", count)
-        for _ in range(count):
-            images = [open(image, "rb") for image in image_path]
-            try:
-                result = self.client.images.edit(
-                    model=self.model,
-                    image=images,
-                    prompt=edit_prompt,
-                    n=1,
-                    size=self.output_size,
-                    response_format="b64_json",
-                    output_format=self.output_format,
-                )
-            finally:
-                for img in images:
-                    img.close()
-            validate_image(result.data[0].b64_json)
-
-
 class PerformanceValidator:
     """Validates performance metrics against expectations."""
 
@@ -711,10 +641,99 @@ class VideoPerformanceValidator(PerformanceValidator):
             )
 
 
+class MeshValidator(PerformanceValidator):
+    """Validator for 3D mesh generation. Inherits perf validation from PerformanceValidator."""
+
+    pass
+
+
+HUNYUAN3D_REFERENCE_URL = (
+    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
+    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+)
+
+
+def _download_reference_mesh(url: str) -> Path:
+    """Download a reference mesh from URL, caching in temp dir."""
+    import hashlib
+
+    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_path = Path(tempfile.gettempdir()) / cache_name
+    if cache_path.exists():
+        logger.info(f"Using cached reference mesh: {cache_path}")
+        return cache_path
+
+    logger.info(f"Downloading reference mesh from: {url}")
+    with urlopen(url, timeout=60) as resp:
+        cache_path.write_bytes(resp.read())
+    logger.info(f"Reference mesh cached at: {cache_path}")
+    return cache_path
+
+
+def validate_mesh_correctness(
+    generated_mesh_path: str,
+    reference_url: str = HUNYUAN3D_REFERENCE_URL,
+    num_sample_points: int = 4096,
+    cd_threshold_ratio: float = 0.01,
+    random_seed: int = 42,
+):
+    """Validate mesh geometric similarity against a reference via Chamfer Distance.
+
+    Downloads the reference mesh from a URL (cached), samples point clouds from
+    both meshes, and asserts Chamfer Distance is within threshold.
+    """
+    import numpy as np
+
+    try:
+        import trimesh
+    except ImportError:
+        pytest.fail("trimesh is required for mesh validation: pip install trimesh")
+
+    from scipy.spatial import cKDTree
+
+    # Load generated mesh
+    generated_mesh = trimesh.load(generated_mesh_path)
+    if isinstance(generated_mesh, trimesh.Scene):
+        generated_mesh = generated_mesh.dump(concatenate=True)
+
+    # Download and load reference mesh
+    ref_path = _download_reference_mesh(reference_url)
+    reference_mesh = trimesh.load(str(ref_path))
+    if isinstance(reference_mesh, trimesh.Scene):
+        reference_mesh = reference_mesh.dump(concatenate=True)
+
+    # Bounding box diagonal for threshold normalization
+    ref_bbox = reference_mesh.bounding_box.bounds
+    bbox_diagonal = float(np.linalg.norm(ref_bbox[1] - ref_bbox[0]))
+    cd_threshold = cd_threshold_ratio * bbox_diagonal
+
+    # Sample point clouds
+    np.random.seed(random_seed)
+    gen_points = np.array(
+        generated_mesh.sample(num_sample_points, return_index=True)[0]
+    )
+    ref_points = np.array(
+        reference_mesh.sample(num_sample_points, return_index=True)[0]
+    )
+
+    # Bidirectional Chamfer Distance
+    tree1 = cKDTree(gen_points)
+    tree2 = cKDTree(ref_points)
+    forward_cd = float(np.mean(tree2.query(gen_points)[0] ** 2))
+    backward_cd = float(np.mean(tree1.query(ref_points)[0] ** 2))
+    total_cd = forward_cd + backward_cd
+
+    assert total_cd <= cd_threshold, (
+        f"Chamfer Distance check failed: total_cd={total_cd:.6f}, "
+        f"threshold={cd_threshold:.6f} ({cd_threshold_ratio * 100:.2f}% of bbox diagonal {bbox_diagonal:.4f})"
+    )
+
+
 # Registry of validators by name
 VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
+    "mesh": MeshValidator,
 }
 
 
@@ -722,7 +741,7 @@ def get_generate_fn(
     model_path: str,
     modality: str,
     sampling_params: DiffusionSamplingParams,
-) -> Callable[[str, Client], str]:
+) -> Callable[[str, Client], tuple[str, bytes]]:
     """Return appropriate generation function for the case."""
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
     output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
@@ -738,6 +757,7 @@ def get_generate_fn(
         seconds: int | None = None,
         input_reference: Any | None = None,
         extra_body: dict[Any] | None = None,
+        expected_frame_count: int | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -792,7 +812,7 @@ def get_generate_fn(
                     f"{case_id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
-                return video_id
+                return (video_id, b"")
 
             if is_amd:
                 logger.warning(
@@ -821,6 +841,13 @@ def get_generate_fn(
             tmp_path, expected_filename, expected_width, expected_height
         )
 
+        if expected_frame_count is not None:
+            actual_count = get_video_frame_count(tmp_path)
+            assert actual_count == expected_frame_count, (
+                f"{case_id}: frame count mismatch after interpolation — "
+                f"expected {expected_frame_count}, got {actual_count}"
+            )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -830,18 +857,23 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return video_id
+        return (video_id, content)
 
     video_seconds = sampling_params.seconds or 4
 
-    def generate_image(case_id, client) -> str:
+    def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
         req_output_format = None  # Not specified in current request
         req_background = None  # Not specified in current request
+
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         response = client.images.with_raw_response.generate(
             model=model_path,
@@ -849,6 +881,7 @@ def get_generate_fn(
             n=n,
             size=output_size,
             response_format="b64_json",
+            extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
         validate_image(result.data[0].b64_json)
@@ -882,12 +915,12 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_image_edit(case_id, client) -> str:
-        """TI2I: Text + Image ? Image edit."""
+    def generate_image_edit(case_id, client) -> tuple[str, bytes]:
+        """TI2I: Text + Image -> Image edit."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         image_paths = sampling_params.image_path
 
@@ -901,7 +934,7 @@ def get_generate_fn(
             else:
                 new_image_paths.append(Path(image_path))
                 if not image_path.exists():
-                    pytest.skip(f"{id}: file missing: {image_path}")
+                    pytest.skip(f"{case_id}: file missing: {image_path}")
 
         image_paths = new_image_paths
 
@@ -910,6 +943,11 @@ def get_generate_fn(
             sampling_params.output_format
         )  # Not specified in current request
         req_background = None  # Not specified in current request
+
+        # Build extra_body for optional features
+        extra_body = {"num_frames": sampling_params.num_frames}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
@@ -921,7 +959,7 @@ def get_generate_fn(
                 size=output_size,
                 response_format="b64_json",
                 output_format=req_output_format,
-                extra_body={"num_frames": sampling_params.num_frames},
+                extra_body=extra_body,
             )
         finally:
             for img in images:
@@ -960,12 +998,12 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_image_edit_url(case_id, client) -> str:
+    def generate_image_edit_url(case_id, client) -> tuple[str, bytes]:
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
         # Handle both single URL and list of URLs
         image_urls = sampling_params.image_path
         if not isinstance(image_urls, list):
@@ -975,7 +1013,7 @@ def get_generate_fn(
         for url in image_urls:
             if not is_image_url(url):
                 pytest.skip(
-                    f"{id}: image_path must be a URL for URL direct test: {url}"
+                    f"{case_id}: image_path must be a URL for URL direct test: {url}"
                 )
 
         # Request parameters that affect output format
@@ -1029,12 +1067,31 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_video(case_id, client) -> str:
+    def generate_video(case_id, client) -> tuple[str, bytes]:
         """T2V: Text ? Video."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
+
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+        if sampling_params.num_frames:
+            extra_body["num_frames"] = sampling_params.num_frames
+        if sampling_params.enable_frame_interpolation:
+            extra_body["enable_frame_interpolation"] = True
+            extra_body["frame_interpolation_exp"] = (
+                sampling_params.frame_interpolation_exp
+            )
+
+        # Compute expected output frame count for validation
+        expected_frame_count = None
+        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+            n = sampling_params.num_frames
+            exp = sampling_params.frame_interpolation_exp
+            expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
             client,
@@ -1043,19 +1100,26 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
+            extra_body=extra_body if extra_body else None,
+            expected_frame_count=expected_frame_count,
         )
 
-    def generate_image_to_video(case_id, client) -> str:
-        """I2V: Image ? Video (optional prompt)."""
+    def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """I2V: Image -> Video (optional prompt)."""
         if not sampling_params.image_path:
-            pytest.skip(f"{id}: no input image configured")
+            pytest.skip(f"{case_id}: no input image configured")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
+
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1066,11 +1130,18 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body=extra_body if extra_body else None,
             )
 
-    def generate_text_url_image_to_video(case_id, client) -> str:
+    def generate_text_url_image_to_video(case_id, client) -> tuple[str, bytes]:
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
+
+        # Build extra_body for optional features
+        extra_body = {"reference_url": sampling_params.image_path}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         return _create_and_download_video(
             client,
             case_id,
@@ -1085,17 +1156,22 @@ def get_generate_fn(
             },
         )
 
-    def generate_text_image_to_video(case_id, client) -> str:
-        """TI2V: Text + Image ? Video."""
+    def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """TI2V: Text + Image -> Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
+
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1112,7 +1188,103 @@ def get_generate_fn(
                 },
             )
 
-    if modality == "video":
+    def generate_mesh(case_id, client) -> tuple[str, bytes]:
+        """I2M: Image to Mesh generation using async /v1/meshes API."""
+        import requests as http_requests
+
+        if not sampling_params.image_path:
+            pytest.skip(f"{case_id}: no input image configured for mesh generation")
+
+        image_path = sampling_params.image_path
+        if isinstance(image_path, str) and is_image_url(image_path):
+            image_path = download_image_from_url(image_path)
+        elif isinstance(image_path, Path):
+            if not image_path.exists():
+                pytest.skip(f"{case_id}: image file missing: {image_path}")
+        else:
+            image_path = Path(str(image_path))
+            if not image_path.exists():
+                pytest.skip(f"{case_id}: image file missing: {image_path}")
+
+        base_url = str(client.base_url).rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+
+        create_url = f"{base_url}/v1/meshes"
+
+        with open(str(image_path), "rb") as img_file:
+            files = {"image": (Path(str(image_path)).name, img_file, "image/png")}
+            data = {
+                "prompt": "generate 3d mesh",
+                "model": model_path,
+                "seed": "0",
+                "guidance_scale": "5.0",
+                "num_inference_steps": "50",
+            }
+
+            logger.info(f"[Mesh Gen] Sending request to {create_url}")
+
+            try:
+                response = http_requests.post(
+                    create_url, files=files, data=data, timeout=60
+                )
+            except Exception as e:
+                pytest.fail(f"{case_id}: mesh creation request failed: {e}")
+
+        if response.status_code != 200:
+            pytest.fail(f"{case_id}: mesh creation failed: {response.text}")
+
+        job = response.json()
+        mesh_id = job.get("id")
+        if not mesh_id:
+            pytest.fail(f"{case_id}: no mesh id in response: {job}")
+
+        poll_url = f"{base_url}/v1/meshes/{mesh_id}"
+        poll_interval = 5
+        max_wait = 1200
+        elapsed = 0
+
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            try:
+                poll_resp = http_requests.get(poll_url, timeout=30)
+            except Exception as e:
+                logger.warning(f"[Mesh Gen] Poll failed: {e}")
+                continue
+
+            if poll_resp.status_code != 200:
+                continue
+
+            status_data = poll_resp.json()
+            status = status_data.get("status", "")
+
+            if status == "completed":
+                content_url = f"{base_url}/v1/meshes/{mesh_id}/content"
+                try:
+                    content_resp = http_requests.get(content_url, timeout=60)
+                except Exception as e:
+                    pytest.fail(f"{case_id}: mesh download failed: {e}")
+
+                if content_resp.status_code != 200:
+                    pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
+
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
+                temp_path.write_bytes(content_resp.content)
+                MESH_OUTPUT_PATHS[case_id] = str(temp_path)
+
+                logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
+                return (mesh_id, b"")
+            elif status == "failed":
+                error = status_data.get("error", {})
+                pytest.fail(f"{case_id}: mesh generation failed: {error}")
+
+        pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
+
+    if modality == "3d":
+        fn = generate_mesh
+    elif modality == "video":
         if sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video

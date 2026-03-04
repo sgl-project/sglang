@@ -1,11 +1,10 @@
-import itertools
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.testing
 
+from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 try:
@@ -22,11 +21,6 @@ try:
     _is_hip = is_hip()
 except ImportError:
     _is_hip = False
-
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -57,7 +51,7 @@ def sglang_scaled_fp8_quant(
 
 def calculate_diff(batch_size: int, seq_len: int):
     device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
+    x = torch.rand((batch_size, seq_len), dtype=torch.bfloat16, device=device)
 
     if not VLLM_AVAILABLE:
         print("vLLM not available, skipping comparison")
@@ -66,26 +60,18 @@ def calculate_diff(batch_size: int, seq_len: int):
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
 
-    scale_diff = torch.abs(vllm_scale - sglang_scale).item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
+    vllm_out = vllm_out.to(torch.float32)
+    sglang_out = sglang_out.to(torch.float32)
 
-    if torch.allclose(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
-    ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("All implementations match")
-    else:
-        print("Implementations differ")
+    triton.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
+    triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
 
 
-if IS_CI:
-    batch_size_range = [16]
-    seq_len_range = [64]
-else:
-    batch_size_range = [16, 32, 64, 128]
-    seq_len_range = [64, 128, 256, 512, 1024, 2048]
-
-configs = list(itertools.product(batch_size_range, seq_len_range))
-
+# Benchmark configuration
+element_range = get_benchmark_range(
+    full_range=[2**n for n in range(10, 20)],
+    ci_range=[16384],
+)
 
 if VLLM_AVAILABLE:
     line_vals = ["vllm", "sglang"]
@@ -99,8 +85,8 @@ else:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len"],
-        x_vals=configs,
+        x_names=["element_count"],
+        x_vals=element_range,
         line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
@@ -110,13 +96,11 @@ else:
         args={},
     )
 )
-def benchmark(batch_size, seq_len, provider):
+def benchmark(element_count, provider):
     dtype = torch.float16
     device = torch.device("cuda")
 
-    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
-
-    quantiles = [0.5, 0.2, 0.8]
+    x = torch.randn(element_count, 4096, device=device, dtype=dtype)
 
     if provider == "vllm":
         fn = lambda: vllm_scaled_fp8_quant(x.clone())
@@ -125,9 +109,7 @@ def benchmark(batch_size, seq_len, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

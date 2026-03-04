@@ -729,7 +729,7 @@ Router flags map to these values:
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
-- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`.
+- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`. Use `--disable-health-check` to skip health checks entirely.
 - **Cache Management**: `/flush_cache` ensures LRU eviction when redeploying PD workers.
 
 ## Load Balancing Policies

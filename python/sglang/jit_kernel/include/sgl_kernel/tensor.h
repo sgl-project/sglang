@@ -21,9 +21,7 @@
 #include <utility>
 
 #ifdef __CUDACC__
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include <sgl_kernel/utils.cuh>
 #endif
 
 namespace host {
@@ -41,10 +39,10 @@ struct DTypeRef;
 struct DeviceRef;
 
 template <typename T>
-struct dtype_trait {};
+struct _dtype_trait {};
 
 template <std::integral T>
-struct dtype_trait<T> {
+struct _dtype_trait<T> {
   inline static constexpr DLDataType value = {
       .code = std::is_signed_v<T> ? DLDataTypeCode::kDLInt : DLDataTypeCode::kDLUInt,
       .bits = static_cast<std::uint8_t>(sizeof(T) * 8),
@@ -52,36 +50,36 @@ struct dtype_trait<T> {
 };
 
 template <std::floating_point T>
-struct dtype_trait<T> {
+struct _dtype_trait<T> {
   inline static constexpr DLDataType value = {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
 
 #ifdef __CUDACC__
 template <>
-struct dtype_trait<__half> {
+struct _dtype_trait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct dtype_trait<__nv_bfloat16> {
+struct _dtype_trait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct dtype_trait<__nv_fp8_e4m3> {
+struct _dtype_trait<fp8_e4m3_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #endif
 
 template <DLDeviceType Code>
-struct device_trait {
+struct _device_trait {
   inline static constexpr DLDevice value = {.device_type = Code, .device_id = kAnyDeviceID};
 };
 
 template <typename... Ts>
-inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};
+inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{_dtype_trait<Ts>::value...};
 
 template <DLDeviceType... Codes>
-inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{device_trait<Codes>::value...};
+inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{_device_trait<Codes>::value...};
 
 template <typename T>
 struct PrintAbleSpan {
@@ -155,7 +153,7 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 
 template <typename T>
 inline bool is_type(DLDataType dtype) {
-  return dtype == details::dtype_trait<T>::value;
+  return dtype == details::_dtype_trait<T>::value;
 }
 
 struct SymbolicSize {

@@ -22,6 +22,7 @@ def get_thinking_kwargs(args):
         if thinking_mode == "deepseek-v3":
             thinking_param = "thinking"
         else:
+            # Qwen3
             thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
@@ -33,6 +34,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     # Get thinking kwargs based on user's choice
     thinking_kwargs = get_thinking_kwargs(args)
 
+    # Build extra_body with thinking kwargs and top_k if specified
+    extra_body = thinking_kwargs.copy() if thinking_kwargs else {}
+    top_k = getattr(args, "top_k", None)
+    if top_k is not None:
+        extra_body["top_k"] = top_k
+
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
@@ -40,7 +47,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=thinking_kwargs if thinking_kwargs else None,
+        extra_body=extra_body if extra_body else None,
     )
 
     # Run eval
@@ -128,6 +135,15 @@ def run_eval(args):
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "gsm8k":
+        from sglang.test.simple_eval_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -203,7 +219,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -235,13 +251,16 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
     )
 
     # LongBench-v2 specific arguments
@@ -266,6 +285,18 @@ if __name__ == "__main__":
         "--min-context-length",
         type=int,
         help="Minimum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--num-shots",
+        type=int,
+        default=5,
+        help="Number of few-shot examples for GSM8K (default: 5)",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
     )
 
     args = parser.parse_args()

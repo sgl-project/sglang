@@ -24,6 +24,7 @@ import torch
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda
@@ -109,6 +110,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
     )
 
 
@@ -117,20 +119,18 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
-    from sgl_kernel import FusedSetKVBufferArg
+    from sglang.jit_kernel.rope import FusedSetKVBufferArg
 
     layer_id = layer.layer_id
     token_to_kv_pool = forward_batch.token_to_kv_pool
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-
+    assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
     return FusedSetKVBufferArg(
         value=value,
         k_buffer=k_buffer.view(k_buffer.shape[0], -1),
         v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        k_scale=layer.k_scale,
-        v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
     )
 

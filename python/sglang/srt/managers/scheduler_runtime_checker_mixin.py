@@ -8,8 +8,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -21,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _session_held_tokens(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_tokens()
+        return 0
+
+    def _session_held_req_count(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_req_count()
+        return 0
+
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -29,14 +38,16 @@ class SchedulerRuntimeCheckerMixin:
         return num_used, token_usage, available_size, evictable_size
 
     def _get_mamba_token_info(self: Scheduler):
-        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
+        is_mamba_radix_cache = (
+            self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
+        )
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_radix_tree else 0
+            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
         mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
         mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_radix_tree else 0
+            self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
         )
         full_num_used = self.token_to_kv_pool_allocator.size - (
             full_available_size + full_evictable_size
@@ -92,10 +103,11 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        memory_leak = full_num_used != 0 or swa_num_used != 0
+        session_held = self._session_held_tokens()
+        memory_leak = (full_num_used - session_held) != 0 or swa_num_used != 0
         token_msg = (
             f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}, {session_held=}\n"
         )
         return memory_leak, token_msg
 
@@ -110,8 +122,9 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size,
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
+        session_held = self._session_held_tokens()
         memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size()
+            full_num_used != self.tree_cache.full_protected_size() + session_held
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
         if memory_leak:
@@ -150,14 +163,11 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        session_held = self._session_held_tokens()
         memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
-            self.max_total_num_tokens
-            - protected_size
+            self.max_total_num_tokens - protected_size - session_held
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -205,7 +215,14 @@ class SchedulerRuntimeCheckerMixin:
             log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
             logger.info(log_msg)
 
-        total_tokens = available_size + evictable_size + protected_size + uncached_size
+        session_held = self._session_held_tokens()
+        total_tokens = (
+            available_size
+            + evictable_size
+            + protected_size
+            + uncached_size
+            + session_held
+        )
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
@@ -218,10 +235,12 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
+        session_req_count = self._session_held_req_count()
+        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"session_held={session_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
@@ -234,7 +253,7 @@ class SchedulerRuntimeCheckerMixin:
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -307,8 +326,10 @@ class SchedulerRuntimeCheckerMixin:
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
-        if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache)
+        if (
+            self.tree_cache.is_tree_cache()
+            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
+            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
 
@@ -341,9 +362,7 @@ def create_scheduler_watchdog(
             return ""
         if scheduler.is_hybrid_swa:
             _, info_msg = scheduler._check_hybrid_memory()
-        elif scheduler.is_hybrid_ssm and isinstance(
-            scheduler.tree_cache, MambaRadixCache
-        ):
+        elif scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
             _, info_msg = scheduler._check_mamba_memory()
         else:
             _, info_msg = scheduler._check_radix_cache_memory()
