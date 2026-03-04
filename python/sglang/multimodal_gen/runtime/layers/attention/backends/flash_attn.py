@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -71,7 +72,6 @@ def flash_attn_varlen_func_fake_out(
     sinks: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> torch.Tensor:
-    assert ver == 4, "only support flash attention v4"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -131,7 +131,6 @@ def flash_attn_varlen_func_fake_out_lse(
     sinks: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert ver == 4, "only support flash attention v4"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -480,9 +479,10 @@ class FlashAttentionImpl(AttentionImpl):
         q_shape = tuple(query.shape)
         k_shape = tuple(key.shape)
         v_shape = tuple(value.shape)
+        in_piecewise = is_in_piecewise_cuda_graph()
 
         use_upstream = _should_use_upstream_flash_attention(
-            flash_attn_varlen_func_upstream is not None,
+            (flash_attn_varlen_func_upstream is not None) and (not in_piecewise),
             self._upstream_heads_ok,
             q_shape,
             k_shape,
@@ -515,6 +515,37 @@ class FlashAttentionImpl(AttentionImpl):
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
         # - fa_ver == 4: call custom ops with FIXED return schema
         if fa_ver == 3:
+            if in_piecewise:
+                if return_softmax_lse:
+                    out_tensor, softmax_lse = flash_attn_varlen_func_op_lse(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=None,
+                        cu_seqlens_k=None,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.softmax_scale,
+                        causal=self.causal,
+                        return_softmax_lse=True,
+                        ver=fa_ver,
+                    )
+                    return out_tensor, softmax_lse
+                out_tensor = flash_attn_varlen_func_op(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=None,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    return_softmax_lse=False,
+                    ver=fa_ver,
+                )
+                return out_tensor
+
             flash_attn_op = flash_attn_func
             output = flash_attn_op(
                 q=query,
