@@ -502,8 +502,10 @@ class WaitingImageRequest:
                 return
 
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
-                recv_obj.shape
+            recv_obj.embedding = (
+                torch.frombuffer(buffer, dtype=recv_obj.dtype)
+                .reshape(recv_obj.shape)
+                .clone()
             )
 
             # Extract original req_id from part_req_id
@@ -745,11 +747,26 @@ class MMReceiverBase(ABC):
                         "mooncake: embeddings_buffer missing req_id=%s", req_id
                     )
                     return None
-                recv_embedding = self.embeddings_buffer[req_id]
-                del self.embeddings_buffer[req_id]
-                self.embeddings_engine.deregister(recv_embedding.data_ptr())
-            elif self.encoder_transfer_backend == "zmq_to_tokenizer":
-                recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+                raw_buffer = self.embeddings_buffer.pop(req_id)
+                self.embeddings_engine.deregister(raw_buffer.data_ptr())
+                byte_offset = 0
+                for i in range(recv_embedding_data.num_parts):
+                    shape = recv_embedding_data.embedding_shape_list[i]
+                    if shape is None:
+                        continue
+                    part_bytes = (
+                        shape[0]
+                        * shape[1]
+                        * torch.tensor([], dtype=self.dtype).element_size()
+                    )
+                    recv_embedding_data.embedding_list[i] = (
+                        raw_buffer[byte_offset : byte_offset + part_bytes]
+                        .view(self.dtype)
+                        .reshape(shape)
+                    )
+                    byte_offset += part_bytes
+
+            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
             mm_inputs = mm_processor.get_mm_data(
                 prompt,
@@ -764,30 +781,24 @@ class MMReceiverBase(ABC):
         self._send_encode_request(obj)
 
     def _send_encode_request(self, obj):
-        if obj.image_data is None:
-            image_urls = []
-        elif not isinstance(obj.image_data, list):
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if image_urls and self.encode_urls:
-            logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
+        if mm_data and self.encode_urls:
+            logger.info(f"Processing {len(mm_data)} mm items for request {obj.rid}")
+            obj.need_wait_for_mm_inputs = True
 
-            encode_idx = list(range(len(self.encode_urls)))
-            random.shuffle(encode_idx)
-            obj.num_items_assigned = [
-                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
-            ]
+            num_items_assigned = self._assign_items_by_modality(
+                mm_data, len(self.encode_urls)
+            )
+            obj.num_items_assigned = num_items_assigned
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
                     obj.rid,
-                    image_urls,
+                    mm_data,
                     "encode",
-                    obj.num_items_assigned,
+                    num_items_assigned,
                     None,
                 ),
                 daemon=True,
@@ -921,11 +932,8 @@ class MMReceiverBase(ABC):
         req.tokenizer = self.scheduler.tokenizer
         return req
 
-    async def allocate_embedding_buffer(self, req_id, embedding_length, embedding_dim):
-        embeddings = torch.zeros(
-            (embedding_length, embedding_dim),
-            dtype=self.dtype,
-        )
+    async def allocate_embedding_buffer(self, req_id, total_bytes):
+        embeddings = torch.empty(total_bytes, dtype=torch.uint8)
         self.embeddings_engine.register(
             embeddings.data_ptr(),
             embeddings.nbytes,
@@ -1129,20 +1137,20 @@ class MMReceiverHTTP(MMReceiverBase):
             # mooncake backend: send bootstrap info
 
             embedding_size_list_sort = [None for _ in range(total_num_parts)]
-            embedding_length_tot = 0
             response_json_list_sort = [None for _ in range(total_num_parts)]
             for response_json in response_json_list_unsort:
                 idx = response_json["part_idx"]
                 embedding_size_list_sort[idx] = response_json["embedding_size"]
-                embedding_length_tot += response_json["embedding_len"]
                 response_json_list_sort[idx] = response_json
 
+            total_embedding_bytes = sum(
+                s for s in embedding_size_list_sort if s is not None
+            )
             offset = 0
             metadata_tasks = []
             buffer_address = await self.allocate_embedding_buffer(
                 req_id,
-                embedding_length_tot,
-                response_json_list_sort[0]["embedding_dim"],
+                total_embedding_bytes,
             )
             for idx in range(len(tasks)):
                 response_json = response_json_list_sort[idx]
@@ -1268,19 +1276,17 @@ class MMReceiverGrpc(MMReceiverBase):
             return
 
         embedding_size_by_part = [None for _ in range(num_parts)]
-        embedding_length_tot = 0
         response_json_sorted = [None for _ in range(num_parts)]
         for response_json in response_json_unsorted:
             idx = response_json["part_idx"]
             embedding_size_by_part[idx] = response_json["embedding_size"]
-            embedding_length_tot += response_json["embedding_len"]
             response_json_sorted[idx] = response_json
 
+        total_embedding_bytes = sum(s for s in embedding_size_by_part if s is not None)
         offset = 0
         buffer_address = await self.allocate_embedding_buffer(
             req_id,
-            embedding_length_tot,
-            response_json_sorted[0]["embedding_dim"],
+            total_embedding_bytes,
         )
         grpc_metadata_tasks = []
         for response_json in response_json_sorted:
