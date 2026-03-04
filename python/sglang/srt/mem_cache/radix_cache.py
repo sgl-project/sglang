@@ -982,6 +982,41 @@ class RadixCache(BasePrefixCache):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
 
+    def prune_from_node(self, start_node: TreeNode):
+        """Prune nodes starting from start_node up to nodes with lock_ref > 0.
+        
+        Args:
+            start_node: The node to start pruning from
+        """
+        if self.disable or start_node is None:
+            logger.warning(f"Pruning skipped: disable={self.disable}, start_node={start_node}")
+            return
+
+        logger.info(f"Starting pruning from node: {start_node}")
+        node = start_node
+        pruned_count = 0
+        while node is not None and node != self.root_node:
+            # Stop if node has lock_ref > 0 (other requests depend on it)
+            if node.lock_ref > 0:
+                logger.info(f"Stopping pruning at node with lock_ref={node.lock_ref}")
+                break
+
+            # Check if node is a leaf (no children)
+            if len(node.children) == 0:
+                # Free the KV cache memory
+                if node.value is not None:
+                    self.token_to_kv_pool_allocator.free(node.value)
+                    self._record_remove_event(node)
+                    pruned_count += 1
+                
+                # Delete the leaf node
+                self._delete_leaf(node)
+            
+            # Move to parent
+            node = node.parent
+        
+        logger.info(f"Pruning complete. Pruned {pruned_count} nodes.")
+
     def take_events(self):
         """Atomically takes all events and clears the queue.
 

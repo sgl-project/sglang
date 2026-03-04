@@ -123,6 +123,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             session_params=request.session_params,
+            semantic_event=request.semantic_event,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),

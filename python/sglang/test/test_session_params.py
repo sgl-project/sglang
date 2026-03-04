@@ -16,9 +16,7 @@ payload_auto_create = {
     "model": "default",
     "prompt": "Hello, world!",
     "max_tokens": 10,
-    "session_params": {
-        "semantic_event": "start"
-    }
+    "semantic_event": "start"
 }
 
 response = requests.post(url, json=payload_auto_create, headers=headers)
@@ -64,9 +62,9 @@ if session_id:
         "prompt": "Summarize the conversation",
         "max_tokens": 10,
         "session_params": {
-            "id": session_id,
-            "semantic_event": "summary"
-        }
+            "id": session_id
+        },
+        "semantic_event": "summary"
     }
 
     response = requests.post(url, json=payload_semantic, headers=headers)
@@ -86,9 +84,7 @@ payload_chat = {
         {"role": "user", "content": "Hello, world!"}
     ],
     "max_tokens": 10,
-    "session_params": {
-        "semantic_event": "start"
-    }
+    "semantic_event": "start"
 }
 
 response = requests.post(url_chat, json=payload_chat, headers=headers)
@@ -101,6 +97,27 @@ print(f"Chat status code: {response.status_code}")
 if "metadata" in response_json and "session_id" in response_json["metadata"]:
     chat_session_id = response_json["metadata"]["session_id"]
     print(f"\n✓ Auto-created chat session_id: {chat_session_id}")
+
+    # Test 5: Send semantic_event in chat completions
+    print("\n" + "=" * 60)
+    print("Test 5: Send semantic_event in chat completions")
+    print("=" * 60)
+    payload_chat_summary = {
+        "model": "default",
+        "messages": [
+            {"role": "user", "content": "Summarize our conversation"}
+        ],
+        "max_tokens": 10,
+        "session_params": {
+            "id": chat_session_id
+        },
+        "semantic_event": "summary"
+    }
+
+    response = requests.post(url_chat, json=payload_chat_summary, headers=headers)
+    print("Chat Summary Response:")
+    print(json.dumps(response.json(), indent=2))
+    print(f"Chat status code: {response.status_code}")
 
 print("\n" + "=" * 60)
 print("All tests completed!")

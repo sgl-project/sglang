@@ -143,7 +143,7 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
-    semantic_event: Optional[str] = None
+    # Note: semantic_event is NOT part of SessionParams - it's a separate field in the request
 
 
 # Type definitions for multimodal input data
@@ -210,6 +210,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    semantic_event: Optional[Union[List[str], str]] = None
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -652,6 +653,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=session_params,
+            semantic_event=self.semantic_event[i] if isinstance(self.semantic_event, list) else self.semantic_event,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
@@ -730,6 +732,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+    semantic_event: Optional[str] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model

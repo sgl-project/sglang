@@ -198,6 +198,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def prune_from_node(self, start_node):
+        """Prune nodes starting from start_node up to nodes with lock_ref > 0.
+        
+        Args:
+            start_node: The node to start pruning from
+        """
+        pass
+
     def check_hicache_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed

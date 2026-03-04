@@ -1472,6 +1472,7 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                semantic_event=getattr(recv_req, 'semantic_event', None),
             )
             req.tokenizer = self.tokenizer
 
@@ -1498,11 +1499,22 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
             
-            # Auto-create session if session_params is provided but id is None
-            if (
-                recv_req.session_params is not None
-                and recv_req.session_params.id is None
-            ):
+            # Debug session_params
+            session_params_debug = recv_req.session_params
+            session_id_debug = getattr(recv_req.session_params, 'id', None) if recv_req.session_params else None
+            semantic_event_debug = getattr(recv_req, 'semantic_event', None)
+            logger.info(f"Session params check: session_params={session_params_debug}, session_params.id={session_id_debug}, semantic_event={semantic_event_debug}")
+            
+            # Auto-create session if:
+            # 1. session_params is provided but id is None, OR
+            # 2. semantic_event is provided (indicating a new semantic context)
+            should_auto_create = (
+                (recv_req.session_params is not None and recv_req.session_params.id is None)
+                or (semantic_event_debug is not None and recv_req.session_params is None)
+            )
+            
+            if should_auto_create:
+                logger.info(f"Auto-creating session for request {req.rid}")
                 auto_created_session_id = uuid.uuid4().hex
                 self.sessions[auto_created_session_id] = Session(
                     capacity_of_str_len=0,
@@ -1512,12 +1524,26 @@ class Scheduler(
                 self.sessions[auto_created_session_id].req_nodes[req.rid] = SessionReqNode(req)
                 # Add session_id to customized_info so it's returned in the response
                 req.customized_info = {"session_id": auto_created_session_id}
+                logger.info(f"Auto-created session {auto_created_session_id} for request {req.rid}")
+            else:
+                logger.info(f"NOT auto-creating session: session_params is None={recv_req.session_params is None}")
+                if recv_req.session_params:
+                    logger.info(f"  session_params.id={getattr(recv_req.session_params, 'id', 'NOT_FOUND')}")
+                
+            # Debug logging for semantic_event
+            semantic_event_val = getattr(recv_req, 'semantic_event', None)
+            logger.info(f"Creating request {req.rid} with semantic_event={semantic_event_val}, session_id={req.session_id}")
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(
                 recv_req, self.tokenizer, self.model_config.vocab_size
             )
+            
+            # Debug logging for semantic_event
+            semantic_event_val = getattr(recv_req, 'semantic_event', None)
+            logger.info(f"Creating request from session {req.rid} with semantic_event={semantic_event_val}, session_id={req.session_id}")
+            
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)

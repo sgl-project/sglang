@@ -125,6 +125,16 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
+                    # Handle semantic events for already finished requests
+                    if req.finished():
+                        semantic_event = getattr(req, 'semantic_event', None)
+                        if semantic_event == 'summary':
+                            logger.info(f"Request {req.rid} already finished with semantic_event=summary")
+                            if hasattr(req, 'last_node') and req.last_node is not None:
+                                logger.info(f"Pruning from node: {req.last_node}")
+                                self.tree_cache.prune_from_node(req.last_node)
+                            else:
+                                logger.warning(f"No last_node found for already finished request {req.rid}")
                     continue
 
                 if req.is_chunked <= 0:
@@ -137,8 +147,24 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        # Handle semantic events - don't insert summary requests into cache
+                        semantic_event = getattr(req, 'semantic_event', None)
+                        logger.info(f"Request {req.rid} finished. semantic_event={semantic_event}")
+                        is_insert = not (semantic_event == 'summary')
+                        logger.info(f"Request {req.rid} is_insert={is_insert}")
+                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                         req.time_stats.completion_time = time.perf_counter()
+                        
+                        # If this is a summary event, prune the conversation history
+                        if semantic_event == 'summary':
+                            logger.info(f"Pruning cache for summary request {req.rid}")
+                            # Prune conversation history from radix cache
+                            # Start from the last_node and walk up to nodes with lock_ref > 0
+                            if hasattr(req, 'last_node') and req.last_node is not None:
+                                logger.info(f"Pruning from node: {req.last_node}")
+                                self.tree_cache.prune_from_node(req.last_node)
+                            else:
+                                logger.warning(f"No last_node found for request {req.rid}")
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -414,14 +440,31 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
+                # Handle semantic events - don't insert summary requests into cache
+                semantic_event = getattr(req, 'semantic_event', None)
+                logger.info(f"Request {req.rid} finished in decode. semantic_event={semantic_event}")
+                is_insert = not (semantic_event == 'summary')
+                logger.info(f"Request {req.rid} is_insert={is_insert}")
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
                 req.time_stats.completion_time = time.perf_counter()
+
+                # If this is a summary event, prune the conversation history
+                if semantic_event == 'summary':
+                    logger.info(f"Pruning cache for summary request {req.rid}")
+                    # Prune conversation history from radix cache
+                    # Start from the last_node and walk up to nodes with lock_ref > 0
+                    if hasattr(req, 'last_node') and req.last_node is not None:
+                        logger.info(f"Pruning from node: {req.last_node}")
+                        self.tree_cache.prune_from_node(req.last_node)
+                    else:
+                        logger.warning(f"No last_node found for request {req.rid}")
 
             self.maybe_collect_customized_info(i, req, logits_output)
 

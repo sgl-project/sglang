@@ -917,13 +917,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 session_params_data = session_params_data[0] if session_params_data else None
             
             # Ensure all fields are scalar values, not lists
+            # Note: semantic_event is NOT part of session_params - it's a separate field
             if session_params_data:
-                for key in ['id', 'rid', 'offset', 'replace', 'drop_previous_output', 'semantic_event']:
+                for key in ['id', 'rid', 'offset', 'replace', 'drop_previous_output']:
                     if key in session_params_data and isinstance(session_params_data[key], list):
                         session_params_data[key] = session_params_data[key][0] if session_params_data[key] else None
             
             session_params = (
-                SessionParams(**session_params_data) if session_params_data else None
+                SessionParams(**session_params_data) if session_params_data is not None else None
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
@@ -944,6 +945,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
+                semantic_event=obj.semantic_event,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,

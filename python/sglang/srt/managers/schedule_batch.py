@@ -524,6 +524,7 @@ class Req:
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        semantic_event: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -540,6 +541,7 @@ class Req:
         self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
+        self.semantic_event = semantic_event
 
         # For req-level memory management
         self.kv_committed_len = 0
