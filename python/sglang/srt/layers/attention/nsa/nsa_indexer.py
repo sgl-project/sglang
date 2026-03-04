@@ -12,6 +12,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -43,6 +44,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -50,6 +52,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -1203,6 +1206,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
@@ -1223,7 +1227,7 @@ class Indexer(MultiPlatformOp):
         cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
-        bs = x.shape[0]
+        bs = q_lora.shape[0]
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
@@ -1276,6 +1280,12 @@ class Indexer(MultiPlatformOp):
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            k = scattered_to_tp_attn_full(k, forward_batch)
         k_pe, k_nope = torch.split(
             k,
             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
@@ -1356,7 +1366,12 @@ class Indexer(MultiPlatformOp):
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
@@ -1450,3 +1465,19 @@ class Indexer(MultiPlatformOp):
             sparse_mode=3,
         )
         return topk_indices_prev[0], topk_indices_next[0]
+
+
+def scattered_to_tp_attn_full(
+    hidden_states: torch.Tensor,
+    forward_batch,
+) -> torch.Tensor:
+    hidden_states, local_hidden_states = (
+        torch.empty(
+            (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ),
+        hidden_states,
+    )
+    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+    return hidden_states

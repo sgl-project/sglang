@@ -68,7 +68,7 @@ ALL_OTHER_LORA_MODELS = [
         base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
             LoRAAdaptor(
-                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                name="nvidia/llama-3.1-nemoguard-8b-topic-control",
                 prefill_tolerance=1e-1,
             ),
         ],
@@ -109,7 +109,7 @@ ALL_OTHER_MULTI_LORA_MODELS = [
                 prefill_tolerance=1e-1,
             ),
             LoRAAdaptor(
-                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                name="nvidia/llama-3.1-nemoguard-8b-topic-control",
                 prefill_tolerance=1e-1,
             ),
         ],
