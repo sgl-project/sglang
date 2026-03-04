@@ -608,6 +608,18 @@ class MMReceiverBase(ABC):
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
+            if self.embeddings_engine is None:
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    init_mooncake_transfer_engine,
+                )
+
+                self.embeddings_engine = init_mooncake_transfer_engine(
+                    hostname=self.host,
+                    ib_device=(
+                        server_args.disaggregation_ib_device
+                        or server_args.mooncake_ib_device
+                    ),
+                )
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
