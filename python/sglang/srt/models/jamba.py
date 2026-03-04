@@ -29,6 +29,7 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from sglang.srt.models.llama import LlamaMLP as JambaMLP
 from sglang.srt.configs.jamba import ATTENTION, MAMBA, MLP, MOE, JambaConfig
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -38,7 +39,6 @@ from sglang.srt.layers.attention.mamba.mamba1 import MambaMixer1
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -49,7 +49,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -63,44 +62,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
 
-
-class JambaMLP(nn.Module):
-    """Jamba dense MLP layer with SiLU-gated activation."""
-
-    def __init__(
-        self,
-        config: JambaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=f"{prefix}.down_proj",
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class JambaMoE(nn.Module):
@@ -114,7 +78,6 @@ class JambaMoE(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
 
         self.router = ReplicatedLinear(
             config.hidden_size,
@@ -126,17 +89,16 @@ class JambaMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=True,
+            renormalize=False,
             layer_id=layer_idx,
         )
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=False,
+            reduce_results=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             layer_id=layer_idx,
@@ -144,17 +106,9 @@ class JambaMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-
-        # Router logits
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-
-        # Expert forward
         final_hidden_states = self.experts(hidden_states, topk_output)
-
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -270,7 +224,9 @@ class JambaMambaDecoderLayer(nn.Module):
             )
         else:
             self.feed_forward = JambaMLP(
-                config,
+                config.hidden_size,
+                config.intermediate_size,
+                config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.feed_forward",
             )
@@ -304,11 +260,8 @@ class JambaMambaDecoderLayer(nn.Module):
             output=output,
             layer_id=self.layer_idx,
         )
-        hidden_states = output + residual
-
-        # Pre-norm for FFN
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
+        # Pre-norm for FFN (fused residual add in float32 + normalize)
+        hidden_states, residual = self.pre_ff_layernorm(output, residual)
 
         # FFN
         hidden_states = self.feed_forward(hidden_states)
@@ -349,7 +302,9 @@ class JambaAttentionDecoderLayer(nn.Module):
             )
         else:
             self.feed_forward = JambaMLP(
-                config,
+                config.hidden_size,
+                config.intermediate_size,
+                config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.feed_forward",
             )
@@ -374,11 +329,9 @@ class JambaAttentionDecoderLayer(nn.Module):
 
         # Attention
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
-        hidden_states = hidden_states + residual
 
-        # Pre-norm for FFN
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
+        # Pre-norm for FFN (fused residual add in float32 + normalize)
+        hidden_states, residual = self.pre_ff_layernorm(hidden_states, residual)
 
         # FFN
         hidden_states = self.feed_forward(hidden_states)

@@ -1,6 +1,6 @@
 from .mamba_ssm import PAD_SLOT_ID
 from .mamba1_ssm import (
-    HAS_MAMBA_SSM,
+    HAS_SGL_SELECTIVE_SCAN,
     mamba1_selective_scan,
     mamba1_selective_state_update,
 )

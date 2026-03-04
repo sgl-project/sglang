@@ -302,6 +302,7 @@ set(SOURCES
 
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
+    "csrc/mamba/selective_scan.cu"
     "csrc/memory/store.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 

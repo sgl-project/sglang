@@ -17,7 +17,8 @@ Analogous to Mamba2Metadata but simpler since Mamba1 doesn't use
 chunked processing or chunk indices.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 
@@ -32,6 +33,10 @@ class Mamba1Metadata(ForwardMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
+
+    # For prefix caching: which prefill requests have initial states to load
+    has_initial_states: Optional[torch.Tensor] = field(default=None)
+    prep_initial_states: bool = False
 
     @staticmethod
     def prepare_decode(
@@ -64,6 +69,15 @@ class Mamba1Metadata(ForwardMetadata):
         num_prefill_tokens = forward_batch.extend_num_tokens
         num_decodes = len(forward_batch.seq_lens) - num_prefills
 
+        # Compute has_initial_states for prefix caching
+        has_initial_states = None
+        prep_initial_states = False
+        if forward_batch.extend_prefix_lens is not None:
+            prefix_lens = forward_batch.extend_prefix_lens
+            if prefix_lens.any():
+                has_initial_states = (prefix_lens > 0)
+                prep_initial_states = True
+
         return Mamba1Metadata(
             query_start_loc=forward_metadata.query_start_loc[: num_prefills + 1],
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -73,4 +87,6 @@ class Mamba1Metadata(ForwardMetadata):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
+            has_initial_states=has_initial_states,
+            prep_initial_states=prep_initial_states,
         )

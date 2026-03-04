@@ -75,6 +75,7 @@ from sgl_kernel.mamba import (
     causal_conv1d_update,
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
+    selective_scan_fwd,
 )
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (

@@ -807,6 +807,19 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
 
+std::vector<at::Tensor> selective_scan_fwd(
+    const at::Tensor& u,
+    const at::Tensor& delta,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    const std::optional<at::Tensor>& D_,
+    const std::optional<at::Tensor>& z_,
+    const std::optional<at::Tensor>& delta_bias_,
+    const std::optional<at::Tensor>& initial_state_,
+    bool delta_softplus,
+    bool return_last_state);
+
 void causal_conv1d_fwd(
     const at::Tensor& x,
     const at::Tensor& weight,

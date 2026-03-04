@@ -205,13 +205,16 @@ class MambaMixer1(nn.Module):
                 self.conv1d.weight.size(0), self.conv1d.weight.size(2)
             )
 
+            has_initial_states = metadata.has_initial_states
+            prep_initial_states = metadata.prep_initial_states
+
             x_conv = causal_conv1d_fn(
                 x_p.transpose(0, 1),
                 conv_weight,
                 self.conv1d.bias,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=None,
+                has_initial_state=has_initial_states,
                 cache_indices=state_indices_p,
                 query_start_loc=query_start_loc,
             ).transpose(0, 1)[:num_prefill_tokens]
@@ -253,6 +256,12 @@ class MambaMixer1(nn.Module):
                 C_i = C_i.unsqueeze(0).float()
                 z_i = z_i.unsqueeze(0).float()
 
+                # Load initial state for extending sequences (prefix caching)
+                initial_state = None
+                if has_initial_states is not None and prep_initial_states:
+                    if has_initial_states[i]:
+                        initial_state = ssm_state[state_indices_p[i]].unsqueeze(0).float()
+
                 y_i, final_state = mamba1_selective_scan(
                     x_i,
                     dt_i,
@@ -263,6 +272,7 @@ class MambaMixer1(nn.Module):
                     z=z_i,
                     delta_softplus=True,
                     return_last_state=True,
+                    initial_state=initial_state,
                 )
 
                 ssm_state[state_indices_p[i]] = final_state.squeeze(0)

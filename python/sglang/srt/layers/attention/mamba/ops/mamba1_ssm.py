@@ -26,14 +26,14 @@ import triton
 import triton.language as tl
 from packaging import version
 
-# Check for mamba-ssm library
+# Check for sgl_kernel selective_scan
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    from sgl_kernel import selective_scan_fwd
 
-    HAS_MAMBA_SSM = True
+    HAS_SGL_SELECTIVE_SCAN = True
 except ImportError:
-    HAS_MAMBA_SSM = False
-    selective_scan_fn = None
+    HAS_SGL_SELECTIVE_SCAN = False
+    selective_scan_fwd = None
 
 
 PAD_SLOT_ID = -1
@@ -388,10 +388,11 @@ def mamba1_selective_scan(
     delta_bias: Optional[torch.Tensor] = None,
     delta_softplus: bool = False,
     return_last_state: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
 ):
     """Mamba1 selective scan for prefill.
 
-    Uses the mamba-ssm CUDA kernel if available, otherwise falls back to
+    Uses the sgl-kernel CUDA kernel if available, otherwise falls back to
     the reference PyTorch implementation.
 
     Args:
@@ -405,14 +406,15 @@ def mamba1_selective_scan(
         delta_bias: (dim,) - optional delta bias
         delta_softplus: whether to apply softplus to delta
         return_last_state: whether to return the final state
+        initial_state: (batch, dim, dstate) - optional initial state for prefix caching
 
     Returns:
         out: (batch, seqlen, dim) - output
         last_state: (batch, dim, dstate) - final state (if return_last_state)
     """
-    if HAS_MAMBA_SSM and u.is_cuda:
-        # Use the optimized CUDA kernel from mamba-ssm
-        # selective_scan_fn expects:
+    if HAS_SGL_SELECTIVE_SCAN and u.is_cuda:
+        # Use the optimized CUDA kernel from sgl-kernel
+        # selective_scan_fwd expects:
         # u: (B, D, L)
         # delta: (B, D, L)
         # A: (D, N)
@@ -421,32 +423,26 @@ def mamba1_selective_scan(
         # D: (D,)
         # z: (B, D, L) optional
         # delta_bias: (D,) optional
+        # initial_state: (B, D, N) optional
 
-        # Transpose inputs to match mamba-ssm expected format
+        # Transpose inputs from (B, L, D) to kernel format (B, D, L)
         u_t = u.transpose(1, 2).contiguous()  # (B, D, L)
         delta_t = delta.transpose(1, 2).contiguous()  # (B, D, L)
-        B_t = B.transpose(1, 2).contiguous()  # (B, N, L)
-        C_t = C.transpose(1, 2).contiguous()  # (B, N, L)
+        # B,C: (B, L, N) -> (B, N, L) -> (B, 1, N, L) for variable B/C format
+        B_t = B.transpose(1, 2).unsqueeze(1).contiguous()  # (B, 1, N, L)
+        C_t = C.transpose(1, 2).unsqueeze(1).contiguous()  # (B, 1, N, L)
         z_t = z.transpose(1, 2).contiguous() if z is not None else None
 
-        out, last_state = selective_scan_fn(
-            u_t,
-            delta_t,
-            A,
-            B_t,
-            C_t,
-            D,
-            z=z_t,
-            delta_bias=delta_bias,
-            delta_softplus=delta_softplus,
-            return_last_state=True,
+        results = selective_scan_fwd(
+            u_t, delta_t, A, B_t, C_t, D, z_t, delta_bias,
+            initial_state, delta_softplus, True,
         )
 
-        # Transpose output back
-        out = out.transpose(1, 2)  # (B, L, D)
+        # Transpose output back: (B, D, L) -> (B, L, D)
+        out = results[0].transpose(1, 2)
 
         if return_last_state:
-            return out, last_state
+            return out, results[1]  # last_state: (B, D, N)
         return out
 
     # Fallback to reference implementation

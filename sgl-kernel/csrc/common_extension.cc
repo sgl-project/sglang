@@ -508,6 +508,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/mamba
    */
   m.def(
+      "selective_scan_fwd(Tensor u, Tensor delta, Tensor A, Tensor B, Tensor C,"
+      "Tensor? D_, Tensor? z_, Tensor? delta_bias_, Tensor? initial_state_,"
+      "bool delta_softplus, bool return_last_state) -> Tensor[]");
+  m.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
+
+  m.def(
       "causal_conv1d_update(Tensor! x,"
       "Tensor! conv_state,"
       "Tensor! weight,"

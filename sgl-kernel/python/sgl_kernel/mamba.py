@@ -91,6 +91,14 @@ def causal_conv1d_update_cpu(
     )
 
 
+def selective_scan_fwd(u, delta, A, B, C, D=None, z=None, delta_bias=None,
+                       initial_state=None, delta_softplus=False,
+                       return_last_state=False):
+    return torch.ops.sgl_kernel.selective_scan_fwd(
+        u, delta, A, B, C, D, z, delta_bias, initial_state,
+        delta_softplus, return_last_state)
+
+
 def chunk_gated_delta_rule_cpu(
     q,
     k,
