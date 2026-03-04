@@ -441,7 +441,13 @@ class DiffusionPiecewiseCudaGraphRunner:
             entry.captured = True
 
         with enable_piecewise_cuda_graph():
-            output = self.model(**call_kwargs)
+            if current_platform.is_cuda_alike():
+                # Runtime recompilation can trigger late on-demand capture in the
+                # backend. Ensure a valid capture stream is always available.
+                with set_pcg_capture_stream(torch.cuda.current_stream()):
+                    output = self.model(**call_kwargs)
+            else:
+                output = self.model(**call_kwargs)
 
         return _slice_output_to_raw_seq(output, raw_seq_len, static_seq_len)
 

@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -329,18 +328,29 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 fa_ver = 3
 
 
-@lru_cache(maxsize=128)
 def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
-    return torch.arange(
+    key = (device_index, bsz, seqlen)
+    cached = _CU_SEQLENS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cu_seqlens = torch.arange(
         0,
         (bsz + 1) * seqlen,
         step=seqlen,
         device=torch.device("cuda", device_index),
         dtype=torch.int32,
     )
+    _CU_SEQLENS_CACHE[key] = cu_seqlens
+    return cu_seqlens
 
 
-@lru_cache(maxsize=256)
+_CU_SEQLENS_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+_UPSTREAM_FLASH_ATTN_CACHE: dict[
+    tuple[bool, bool, tuple[int, ...], tuple[int, ...], tuple[int, ...]], bool
+] = {}
+
+
 def _should_use_upstream_flash_attention(
     upstream_available: bool,
     upstream_heads_ok: bool,
@@ -348,10 +358,23 @@ def _should_use_upstream_flash_attention(
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
 ) -> bool:
+    cache_key = (
+        upstream_available,
+        upstream_heads_ok,
+        q_shape,
+        k_shape,
+        v_shape,
+    )
+    cached = _UPSTREAM_FLASH_ATTN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     if not upstream_available or not upstream_heads_ok:
+        _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = False
         return False
 
     if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
+        _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = False
         return False
 
     bsz, seqlen, nheads_q, d = q_shape
@@ -366,11 +389,15 @@ def _should_use_upstream_flash_attention(
         or d != d_k
         or d != d_v
     ):
+        _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = False
         return False
     if nheads_k != nheads_v:
+        _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = False
         return False
     if nheads_k == 0 or (nheads_q % nheads_k) != 0:
+        _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = False
         return False
+    _UPSTREAM_FLASH_ATTN_CACHE[cache_key] = True
     return True
 
 

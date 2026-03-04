@@ -1002,6 +1002,21 @@ class DenoisingStage(PipelineStage):
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
 
+        self._maybe_precapture_piecewise_cuda_graph(
+            batch=batch,
+            server_args=server_args,
+            timesteps=timesteps,
+            target_dtype=target_dtype,
+            boundary_timestep=boundary_timestep,
+            seq_len=seq_len,
+            reserved_frames_mask=reserved_frames_mask,
+            guidance=guidance,
+            latents=latents,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs,
+        )
+
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
@@ -1584,6 +1599,106 @@ class DenoisingStage(PipelineStage):
                     guidance_rescale=batch.guidance_rescale,
                 )
             return noise_pred
+
+    def _maybe_precapture_piecewise_cuda_graph(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        timesteps: torch.Tensor,
+        target_dtype: torch.dtype,
+        boundary_timestep: float | None,
+        seq_len: int | None,
+        reserved_frames_mask: torch.Tensor | None,
+        guidance: torch.Tensor | None,
+        latents: torch.Tensor,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+    ) -> None:
+        if not server_args.enable_piecewise_cuda_graph:
+            return
+        if batch.is_warmup:
+            return
+        if timesteps is None or timesteps.numel() == 0:
+            return
+
+        expected_model_count = 2 if self.transformer_2 is not None else 1
+        visited_model_ids: set[int] = set()
+        timesteps_cpu = timesteps.cpu()
+        original_is_cfg_negative = batch.is_cfg_negative
+
+        logger.info(
+            "Pre-capturing diffusion PCG before denoising loop (target_models=%d)",
+            expected_model_count,
+        )
+
+        for i, t_host in enumerate(timesteps_cpu):
+            t_int = int(t_host.item())
+            t_device = timesteps[i]
+            current_model, current_guidance_scale = self._select_and_manage_model(
+                t_int=t_int,
+                boundary_timestep=boundary_timestep,
+                server_args=server_args,
+                batch=batch,
+            )
+
+            model_id = id(current_model)
+            if model_id in visited_model_ids:
+                continue
+
+            latent_model_input = latents.to(target_dtype)
+            if batch.image_latent is not None:
+                latent_model_input = torch.cat(
+                    [latent_model_input, batch.image_latent], dim=1
+                ).to(target_dtype)
+
+            timestep = self.expand_timestep_before_forward(
+                batch,
+                server_args,
+                t_device,
+                target_dtype,
+                seq_len,
+                reserved_frames_mask,
+            )
+            latent_model_input = self.scheduler.scale_model_input(
+                latent_model_input, t_device
+            )
+
+            attn_metadata = self._build_attn_metadata(
+                i,
+                batch,
+                server_args,
+                timestep_value=t_int,
+                timesteps=timesteps_cpu,
+            )
+
+            _ = self._predict_noise_with_cfg(
+                current_model=current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=i,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                current_guidance_scale=current_guidance_scale,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                neg_cond_kwargs=neg_cond_kwargs,
+                server_args=server_args,
+                guidance=guidance,
+                latents=latents,
+            )
+
+            visited_model_ids.add(model_id)
+            if len(visited_model_ids) >= expected_model_count:
+                break
+
+        batch.is_cfg_negative = original_is_cfg_negative
+        logger.info(
+            "Pre-capture finished for %d model(s) before formal denoising",
+            len(visited_model_ids),
+        )
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
