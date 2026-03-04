@@ -274,6 +274,7 @@ class ServerArgs:
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
+    warmup_steps: int = 1
 
     disable_autocast: bool | None = None
 
@@ -754,6 +755,12 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.warmup_resolutions,
             help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+        parser.add_argument(
+            "--warmup-steps",
+            type=int,
+            default=ServerArgs.warmup_steps,
+            help="The number of warmup steps to perform for each resolution.",
         )
 
         parser.add_argument(

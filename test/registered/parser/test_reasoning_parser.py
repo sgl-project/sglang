@@ -5,6 +5,7 @@ from sglang.srt.parser.reasoning_parser import (
     DeepSeekR1Detector,
     Glm45Detector,
     KimiDetector,
+    KimiK2Detector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -314,6 +315,51 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
+class TestKimiK2Detector(CustomTestCase):
+    """Test cases for KimiK2 detector with tool interruption support."""
+
+    def setUp(self):
+        self.detector = KimiK2Detector()
+
+    def test_init(self):
+        """Test KimiK2Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(self.detector.tool_start_token, "<|tool_calls_section_begin|>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """Test parsing with Kimi-K2 tool-section interruption."""
+        text = "<think>thinking<|tool_calls_section_begin|><|tool_call_begin|>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(
+            result.normal_text, "<|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+
+    def test_streaming_tool_interrupt(self):
+        """Test streaming parse interrupted by tool section."""
+        self.detector.parse_streaming_increment("<think>")
+        result1 = self.detector.parse_streaming_increment("reasoning")
+        self.assertEqual(result1.reasoning_text, "reasoning")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>"
+        )
+        self.assertEqual(result2.reasoning_text, "")
+        self.assertEqual(result2.normal_text, "<|tool_calls_section_begin|>")
+
+    def test_streaming_after_interrupt_is_normal(self):
+        """After interruption, subsequent chunks should be normal text."""
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("reasoning<|tool_calls_section_begin|>")
+        result = self.detector.parse_streaming_increment("<|tool_call_begin|>")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "<|tool_call_begin|>")
+
+
 class TestGlm45Detector(CustomTestCase):
     """Test cases for GLM45 detector with tool interruption support."""
 
@@ -478,6 +524,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
 
+        parser = ReasoningParser("kimi_k2")
+        self.assertIsInstance(parser.detector, KimiK2Detector)
+
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
 
@@ -564,6 +613,37 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<tool_call>tool args")
+
+    def test_kimik2_tool_interruption(self):
+        """Test Kimi-K2 tool interruption through ReasoningParser API."""
+        parser = ReasoningParser("kimi_k2")
+
+        # Non-streaming: tool interrupt
+        reasoning, normal = parser.parse_non_stream(
+            "<think>thinking<|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
+        # Streaming: tool interrupt
+        parser = ReasoningParser("kimi_k2")
+        chunks = [
+            "<think>",
+            "reasoning",
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            if reasoning:
+                all_reasoning += reasoning
+            if normal:
+                all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
 
 
 class TestIntegrationScenarios(CustomTestCase):
