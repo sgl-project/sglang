@@ -75,7 +75,7 @@ dependencies = [
   "uvloop",
   "xgrammar==0.1.27",
 
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto>=0.4.1",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
   "grpcio-health-checking>=1.78.0",

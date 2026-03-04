@@ -480,6 +480,7 @@ class DecodePreallocQueue:
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:

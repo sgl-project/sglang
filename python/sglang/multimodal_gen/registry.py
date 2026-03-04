@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
+    HeliosDistilledConfig,
+    HeliosMidConfig,
+    HeliosT2VConfig,
     HunyuanConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -74,6 +77,11 @@ from sglang.multimodal_gen.configs.sample.flux import (
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.helios import (
+    HeliosDistilledSamplingParams,
+    HeliosMidSamplingParams,
+    HeliosT2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
@@ -724,6 +732,34 @@ def _register_configs():
             "tencent/Hunyuan3D-2",
         ],
         model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )
+
+    # Helios
+    register_configs(
+        sampling_param_cls=HeliosT2VSamplingParams,
+        pipeline_config_cls=HeliosT2VConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Base",
+        ],
+        model_detectors=[
+            lambda hf_id: "helios" in hf_id.lower()
+            and "mid" not in hf_id.lower()
+            and "distill" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosMidSamplingParams,
+        pipeline_config_cls=HeliosMidConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Mid",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosDistilledSamplingParams,
+        pipeline_config_cls=HeliosDistilledConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Distilled",
+        ],
     )
 
 
