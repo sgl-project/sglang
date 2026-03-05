@@ -17,7 +17,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=980, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(
+    est_time=1200, suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8", nightly=True
+)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
