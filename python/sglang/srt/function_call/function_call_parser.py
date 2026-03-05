@@ -52,6 +52,7 @@ class FunctionCallParser:
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "glm5": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
         "lfm2": Lfm2Detector,

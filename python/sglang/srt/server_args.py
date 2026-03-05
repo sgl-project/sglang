@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import re
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -735,6 +736,9 @@ class ServerArgs:
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
+        # Auto-detect tool_call_parser from model path if not explicitly set.
+        self._auto_detect_tool_call_parser()
+
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 
@@ -886,6 +890,16 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    def _auto_detect_tool_call_parser(self):
+        if self.tool_call_parser is not None:
+            return
+        model = self.model_path.lower()
+        if re.search(r"glm[-_.]?5", model):
+            self.tool_call_parser = "glm5"
+            logger.info(
+                f"Auto-detected tool_call_parser='glm5' from model path '{self.model_path}'."
+            )
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():

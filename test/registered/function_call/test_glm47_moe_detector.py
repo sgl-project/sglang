@@ -1,8 +1,10 @@
 import json
+import re
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.core_types import StreamingParseResult
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import (
     Glm47MoeDetector,
@@ -1843,5 +1845,70 @@ class TestGlm4ComplexJsonSchema(unittest.TestCase):
         self.assertEqual(params["data"], "nested data")
         self.assertEqual(params["status"], "active")
 
-    if __name__ == "__main__":
-        unittest.main()
+class TestGlm5RegistryAndParsing(unittest.TestCase):
+    """Verify 'glm5' is registered and parses GLM-5 tool calls correctly."""
+
+    def test_glm5_registered_and_uses_glm47_detector(self):
+        self.assertIn("glm5", FunctionCallParser.ToolCallParserEnum)
+        self.assertIs(
+            FunctionCallParser.ToolCallParserEnum["glm5"],
+            Glm47MoeDetector,
+        )
+
+    def test_glm5_parses_bash_tool_call(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="Bash",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                    },
+                ),
+            ),
+        ]
+        parser = FunctionCallParser(tools=tools, tool_call_parser="glm5")
+        text = (
+            "<tool_call>Bash"
+            "<arg_key>command</arg_key>"
+            "<arg_value>ls -la /path/to/dir/</arg_value>"
+            "</tool_call>"
+        )
+        normal_text, calls = parser.parse_non_stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "Bash")
+        params = json.loads(calls[0].parameters)
+        self.assertEqual(params["command"], "ls -la /path/to/dir/")
+
+
+class TestGlm5AutoDetection(unittest.TestCase):
+    """Verify the auto-detection regex for GLM-5 model paths.
+
+    Tests the same regex used by ServerArgs._auto_detect_tool_call_parser
+    without importing ServerArgs (which requires torch/triton).
+    """
+
+    GLM5_PATTERN = re.compile(r"glm[-_.]?5", re.IGNORECASE)
+
+    def _detect(self, model_path):
+        return bool(self.GLM5_PATTERN.search(model_path.lower()))
+
+    def test_detect_glm5(self):
+        self.assertTrue(self._detect("zai-org/GLM-5"))
+
+    def test_detect_glm5_variant(self):
+        self.assertTrue(self._detect("some-org/glm-5-chat"))
+
+    def test_no_detect_non_glm(self):
+        self.assertFalse(self._detect("meta-llama/Llama-3.1-8B-Instruct"))
+
+    def test_no_detect_glm47(self):
+        self.assertFalse(self._detect("zai-org/GLM-4.7"))
+
+
+if __name__ == "__main__":
+    unittest.main()
