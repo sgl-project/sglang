@@ -1432,6 +1432,15 @@ class ServerArgs:
                         logger.info(
                             "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+                        # Validate usage of ep
+                        if self.ep_size == 1:
+                            raise ValueError(
+                                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
+                                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
+                                f"Current ep_size is {self.ep_size}. "
+                                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
+                                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
+                            )
                     else:
                         self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
