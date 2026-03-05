@@ -25,22 +25,12 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
+    get_default_distributed_backend,
     get_mooncake_transfer_engine,
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
-
-try:
-    from sglang.srt.distributed.parallel_state import get_default_distributed_backend
-except ImportError:
-
-    def get_default_distributed_backend(device: str) -> str:
-        return {"cuda": "nccl", "xpu": "xccl", "hpu": "hccl", "npu": "hccl"}.get(
-            device, "gloo"
-        )
-
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
