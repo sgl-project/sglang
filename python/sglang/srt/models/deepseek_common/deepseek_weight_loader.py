@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -610,22 +610,21 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.use_deep_gemm_bmm = True
 
     @classmethod
-    def generate_weight_name_filter(cls, logical_experts: List[Tuple[int, List[int]]]):
+    def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
         """
         Generates a filter function that tests whether the (layer_id, expert_id)
-        indicated by a param name lies in the `logical_experts` list
+        indicated by a param name lies in the `logical_experts` map
         Args:
-            logical_experts: a list of (layer_id, expert_ids) tuples. Each tuple
-            specifies a list of expert_ids of a specific layer_id.
+            logical_experts_map: a map of layer_id to expert_ids, specifying a list of expert_ids by a specific layer_id.
 
         Returns:
             A function (name: str) -> bool
         """
 
         def weight_name_filter(name: str) -> bool:
-            for layer, experts in logical_experts:
-                for expert in experts:
-                    if f"layers.{layer}.mlp.experts.{expert}." in name:
+            for layer_id in logical_experts_map:
+                for expert in logical_experts_map[layer_id]:
+                    if f"layers.{layer_id}.mlp.experts.{expert}." in name:
                         return True
             return False
 
