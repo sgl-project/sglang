@@ -242,6 +242,8 @@ class EagleVerifyInputV2Mixin:
                     dtype=torch.int64,
                     device=device,
                 )
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
 
         # Get a forward batch
         batch.forward_mode = (
