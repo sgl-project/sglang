@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -374,6 +375,9 @@ class DeepseekV2WeightLoaderMixin:
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
+        if os.environ.get("SGLANG_EP_LOAD_FOR_TP", "0") == "1":
+            self._ep_to_tp_transform_all_layers()
+
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
         Initialize the nextn configuration.
@@ -651,6 +655,74 @@ class DeepseekV2WeightLoaderMixin:
             return False
 
         return weight_name_filter
+
+    def _ep_to_tp_transform_all_layers(self) -> None:
+        """After EP-style weight loading, transform all MoE layers to TP layout.
+
+        Processes one layer at a time to keep peak memory overhead to ~1/num_layers.
+        Reuses intermediate buffers across layers for parameters of the same shape.
+        """
+        import torch.distributed as dist
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        buf_cache: dict[tuple[torch.Size, torch.dtype], torch.Tensor] = {}
+
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
+            mlp = layer.mlp
+
+            # Find the FusedMoE module (either mlp itself or mlp.experts)
+            moe_layer = None
+            if isinstance(mlp, FusedMoE):
+                moe_layer = mlp
+            elif hasattr(mlp, "experts") and isinstance(mlp.experts, FusedMoE):
+                moe_layer = mlp.experts
+
+            if moe_layer is None or not getattr(moe_layer, "_ep_load_for_tp", False):
+                continue
+
+            tp_size = moe_layer._orig_moe_tp_size
+            num_shared = moe_layer.num_fused_shared_experts
+            num_routed_local = moe_layer.num_local_experts - num_shared
+            num_routed_total = moe_layer.num_experts - num_shared
+            target_num_experts = num_routed_total + num_shared
+
+            # Allocate or reuse buffers for each parameter
+            for name, param in moe_layer.named_parameters():
+                shard_dim = moe_layer._get_ep_to_tp_shard_dim(name)
+
+                if shard_dim is not None:
+                    # Compute target shape: expert dim expands, shard dim shrinks by tp_size
+                    target_shape = list(param.data.shape)
+                    target_shape[0] = target_num_experts
+                    target_shape[shard_dim] = target_shape[shard_dim] // tp_size
+                    target_shape = torch.Size(target_shape)
+                else:
+                    # Scales with no intermediate dim: expert dim expands, rest same
+                    target_shape = list(param.data.shape)
+                    target_shape[0] = target_num_experts
+                    target_shape = torch.Size(target_shape)
+
+                cache_key = (target_shape, param.data.dtype)
+                if cache_key not in buf_cache:
+                    buf_cache[cache_key] = torch.empty(
+                        target_shape, dtype=param.data.dtype, device=param.data.device
+                    )
+
+                param._ep_to_tp_buf = buf_cache[cache_key]
+
+            moe_layer.ep_to_tp_transform()
+
+            # After transform, param.data points to the buffer.
+            # Clone so buffer can be reused for next layer.
+            for name, param in moe_layer.named_parameters():
+                param.data = param.data.clone()
+
+        # Free cached buffers
+        buf_cache.clear()
+
+        logger.info("EP→TP weight transformation complete for all MoE layers.")
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,

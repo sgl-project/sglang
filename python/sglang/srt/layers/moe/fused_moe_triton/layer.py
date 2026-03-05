@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -203,6 +204,18 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
+
+        # Dev hack: load weights as EP instead of TP so each rank reads
+        # disjoint full experts rather than sharded slices of all experts.
+        self._ep_load_for_tp = os.environ.get("SGLANG_EP_LOAD_FOR_TP", "0") == "1"
+        if self._ep_load_for_tp:
+            self._orig_moe_tp_size = self.moe_tp_size
+            self._orig_moe_tp_rank = self.moe_tp_rank
+            self._orig_intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+            self.moe_ep_size = self.moe_tp_size
+            self.moe_ep_rank = self.moe_tp_rank
+            self.moe_tp_size = 1
+            self.moe_tp_rank = 0
 
         # DeepEP: each rank has its own shared expert slot, so total shared
         # weight slots = num_fused_shared_experts * ep_size.
@@ -596,6 +609,110 @@ class FusedMoE(torch.nn.Module):
             return expert_id - self._num_global_routed + self._num_local_routed
         else:
             return -1
+
+    def ep_to_tp_transform(self) -> None:
+        """Transform EP-loaded weights to TP layout via all_to_all.
+
+        After SGLANG_EP_LOAD_FOR_TP loading, each rank holds a disjoint subset of
+        experts with full intermediate_size. This redistributes so every rank holds
+        all experts with sharded intermediate_size (normal TP layout).
+
+        The caller must provide a pre-allocated buffer ``_ep_to_tp_buf`` on each
+        parameter that needs transformation (sized for the all_to_all output).
+        """
+        if not self._ep_load_for_tp:
+            return
+
+        import torch.distributed as dist
+
+        tp_size = self._orig_moe_tp_size
+        tp_rank = self._orig_moe_tp_rank
+        tp_group = get_tp_group().device_group
+        num_shared = self.num_fused_shared_experts
+        num_routed_local = self.num_local_experts - num_shared
+
+        for name, param in self.named_parameters():
+            if not hasattr(param, "_ep_to_tp_buf"):
+                continue
+
+            data = param.data  # [num_routed_local + shared, ...]
+
+            # Separate routed and shared portions
+            routed = data[:num_routed_local]  # [R, ...]
+            shared = data[num_routed_local:] if num_shared > 0 else None
+
+            # Determine which dim holds intermediate_size to split
+            shard_dim = self._get_ep_to_tp_shard_dim(name)
+
+            if shard_dim is not None:
+                # Split along shard_dim into tp_size chunks, move to dim 0, flatten
+                # routed: [R, ..., full_I, ...] -> [tp_size, R, ..., I/P, ...] -> [tp_size*R, ..., I/P, ...]
+                chunks = routed.chunk(tp_size, dim=shard_dim)
+                stacked = torch.stack(chunks, dim=0)  # [P, R, ...]
+                # Flatten first two dims
+                new_shape = (tp_size * num_routed_local,) + stacked.shape[2:]
+                send_buf = stacked.reshape(new_shape).contiguous()
+
+                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                dist.all_to_all_single(recv_buf, send_buf, group=tp_group)
+
+                if num_shared > 0:
+                    # Slice shared experts' intermediate dim for this TP rank
+                    shard_size = shared.shape[shard_dim] // tp_size
+                    shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
+                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared_sliced
+            else:
+                # Expert-only dimension (scales with no intermediate dim to shard)
+                # Just all_gather along expert dim
+                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                dist.all_gather_into_tensor(recv_buf, routed.contiguous(), group=tp_group)
+
+                if num_shared > 0:
+                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared
+
+            # Swap buffer into param
+            param.data = param._ep_to_tp_buf
+            del param._ep_to_tp_buf
+
+        # Restore TP/EP fields to normal TP values
+        self.moe_tp_size = self._orig_moe_tp_size
+        self.moe_tp_rank = self._orig_moe_tp_rank
+        self.moe_ep_size = 1
+        self.moe_ep_rank = 0
+        num_routed_total = self.num_experts - num_shared
+        self.num_local_experts = num_routed_total + num_shared
+        self.intermediate_size_per_partition = self._orig_intermediate_size_per_partition
+
+        # Update MoeRunnerConfig (mutable dataclass, referenced by runners)
+        self.moe_runner_config.num_local_experts = self.num_local_experts
+        self.moe_runner_config.intermediate_size_per_partition = self.intermediate_size_per_partition
+
+    def _get_ep_to_tp_shard_dim(self, param_name: str) -> int | None:
+        """Return the dimension holding intermediate_size for a given parameter,
+        or None if the parameter has no intermediate dimension to shard (e.g. per-tensor scales)."""
+        is_triton = self.use_triton_kernels
+
+        if "w13_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+            # w13_weight: non-triton [E, 2*I, H], triton [E, H, 2*I]
+            return 2 if is_triton else 1
+        elif "w2_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+            # w2_weight: non-triton [E, H, I], triton [E, I, H]
+            return 1 if is_triton else 2
+        elif "w13_weight_bias" in param_name:
+            return 1  # [E, 2*I]
+        elif "w13_weight_scale_inv" in param_name or "w13_weight_scale1" in param_name:
+            # Block scale: [E, 2*ceil(I/bn), ceil(H/bk)] — shard dim 1
+            # Column scale: [E, 2*I] — shard dim 1
+            return 1
+        elif "w2_weight_scale_inv" in param_name or "w2_weight_scale1" in param_name:
+            # Block scale: [E, ceil(H/bn), ceil(I/bk)] — shard dim 2
+            # Column scale: [E, I] — shard dim 1 (but this is rare for w2)
+            return 2
+        elif "weight_scale" in param_name or "input_scale" in param_name:
+            # Per-tensor scales: [E, 2] or [E] — no intermediate dim, just gather
+            return None
+        else:
+            return None
 
     def weight_loader(
         self,
