@@ -234,8 +234,7 @@ def _get_arch_suffix(major: int) -> str:
     Architectures before Hopper use the plain (no-suffix) target.
     """
     if major >= 10:
-        cuda_major, cuda_minor = _parse_cuda_version()
-        if cuda_major > 12 or (cuda_major == 12 and cuda_minor >= 9):
+        if _parse_cuda_version() >= (12, 9):
             return "f"
         return "a"
     if major >= 9:
