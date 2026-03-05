@@ -23,15 +23,6 @@ from sglang.utils import (
 
 INVALID = -9999999
 
-# Regex to strip thinking tokens from model output.
-# Matches complete <think>...</think> blocks and truncated <think>... (no closing tag).
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>|<think>.*$", re.DOTALL)
-
-
-def strip_thinking_tokens(text):
-    """Remove <think>...</think> blocks (complete or truncated) from model output."""
-    return _THINK_BLOCK_RE.sub("", text).strip()
-
 
 def get_one_example(lines, i, include_answer):
     ret = "Question: " + lines[i]["question"] + "\nAnswer:"
@@ -117,7 +108,7 @@ def run_eval(args):
 
     preds = []
     for i in range(len(states)):
-        preds.append(get_answer_value(strip_thinking_tokens(states[i]["answer"])))
+        preds.append(get_answer_value(states[i]["answer"]))
 
     # print(f"{preds=}")
     # print(f"{labels=}")

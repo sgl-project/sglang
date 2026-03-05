@@ -17,15 +17,6 @@ from sglang.utils import download_and_cache_file, read_jsonl
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 INVALID = -9999999
 
-# Regex to strip thinking tokens from model output.
-# Matches complete <think>...</think> blocks and truncated <think>... (no closing tag).
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>|<think>.*$", re.DOTALL)
-
-
-def strip_thinking_tokens(text):
-    """Remove <think>...</think> blocks (complete or truncated) from model output."""
-    return _THINK_BLOCK_RE.sub("", text).strip()
-
 
 def get_one_example(lines, i, include_answer):
     ret = f"Question: {lines[i]['question']}\nAnswer:"
@@ -88,7 +79,7 @@ class GSM8KEval(Eval):
             except Exception:
                 response_text = ""
 
-            extracted_answer = get_answer_value(strip_thinking_tokens(response_text))
+            extracted_answer = get_answer_value(response_text)
             score = float(extracted_answer == correct_answer)
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
