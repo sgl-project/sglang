@@ -267,6 +267,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 // Fetch from /model_info for model-related metadata
                 if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
                 {
+                    if let Some(tokenizer_path) =
+                        model_info.tokenizer_path.filter(|s| !s.is_empty())
+                    {
+                        labels.insert("tokenizer_path".to_string(), tokenizer_path);
+                    }
                     if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
                         labels.insert("model_type".to_string(), model_type);
                     }
