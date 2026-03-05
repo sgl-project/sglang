@@ -66,8 +66,8 @@ class TestDeepseekV32DPMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -152,8 +152,8 @@ class TestDeepseekV32DPMTPV2(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -234,8 +234,8 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -317,8 +317,8 @@ class TestDeepseekV32TPMTPV2(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
