@@ -8,12 +8,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import (
-    _get_arch_suffix,
-    _parse_cuda_version,
-    cache_once,
-    load_jit,
-)
+from sglang.jit_kernel.utils import _parse_cuda_version, cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -82,12 +77,11 @@ def _get_nvfp4_cuda_arch_list() -> str:
         raise RuntimeError(
             f"NVFP4 JIT kernels require compute capability >= 10.0, got {major}.{minor}."
         )
-    suffix = _get_arch_suffix(major)
-    archs = [f"{major}.{minor}{suffix}"]
+    archs = [f"{major}.{minor}a"]
     cuda_major, _cuda_minor = _parse_cuda_version()
-    if cuda_major >= 13 and f"10.3{suffix}" not in archs:
+    if cuda_major >= 13 and "10.3a" not in archs:
         # Match sgl-kernel AOT fatbin behavior on CUDA 13+ for Blackwell.
-        archs.append(f"10.3{suffix}")
+        archs.append("10.3a")
     return " ".join(dict.fromkeys(archs))
 
 

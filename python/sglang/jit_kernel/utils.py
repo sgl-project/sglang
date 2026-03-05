@@ -212,39 +212,19 @@ def _parse_cuda_version() -> tuple[int, int]:
         return (0, 0)
 
 
-def _get_arch_suffix(major: int) -> str:
-    """Return the CUDA architecture suffix for the given compute-capability major.
-
-    CUDA 12.9 introduced two distinct suffixes for ``-gencode`` / ``-arch``
-    flags that carry different forward-compatibility semantics:
-
-    * ``a`` — **architecture-specific**: targets one exact SM version
-      (e.g. ``sm_120a`` compiles for CC 12.0 only).
-    * ``f`` — **family-specific**: forward-compatible across the whole GPU
-      family and includes family-level ISA extensions such as FP4
-      (e.g. ``sm_120f`` covers all Blackwell SM 12.x variants).
-
-    The ``f`` suffix is preferred for Blackwell and later (major >= 10)
-    because it enables family-level features (NVFP4, etc.) and is
-    forward-compatible with future chips in the same family.  It requires
-    CUDA >= 12.9 where the suffix was first introduced.  For older toolkit
-    versions we fall back to ``a``.
-
-    Hopper (major 9) predates the ``f`` suffix and always uses ``a``.
-    Architectures before Hopper use the plain (no-suffix) target.
-    """
-    if major >= 10:
-        if _parse_cuda_version() >= (12, 9):
-            return "f"
-        return "a"
-    if major >= 9:
-        return "a"
-    return ""
-
-
 @cache_once
 def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
+    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST.
+
+    Plain targets (e.g. ``sm_120``) miss architecture- and family-specific
+    instructions such as FP4 tensor-core ops.  For Hopper (major 9) and
+    Blackwell+ (major >= 10) we append the ``a`` (architecture-specific)
+    suffix which is a superset of ``f`` (family-specific) and gives access
+    to all available instructions for the current GPU.  Forward-compatibility
+    is not a concern here because this runs as JIT on the device that is
+    physically present.
+    """
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}{_get_arch_suffix(major)}"
+    suffix = "a" if major >= 9 else ""
+    return f"{major}.{minor}{suffix}"
