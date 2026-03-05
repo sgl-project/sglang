@@ -84,6 +84,7 @@ suite_xpu = {
 suite_ascend = {
     "per-commit-1-npu-a2": [
         TestFile("ascend/test_ascend_gptq.py", 400),
+        TestFile("ascend/test_ascend_gptq_moe.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
