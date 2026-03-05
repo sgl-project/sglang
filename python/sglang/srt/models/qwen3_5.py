@@ -642,11 +642,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv = qkv.contiguous()
 
         rotary_emb = self.rotary_emb
-        if rotary_emb._padded_cos_sin_cache is not None:
-            cos_sin = rotary_emb._padded_cos_sin_cache
-        else:
-            cos_sin = rotary_emb.cos_sin_cache
-        assert cos_sin.shape[-1] == self.rotary_emb.head_size, f"To use fused aiter kernel, the cos_sin cache must be padded to the head size. cos_sin.shape: {cos_sin.shape}, self.rotary_emb.head_size: {self.rotary_emb.head_size}, rotary_emb.rotary_dim: {rotary_emb.rotary_dim}"
+        cos_sin = rotary_emb.cos_sin_cache
         positions_1d = positions.flatten()
 
         layer_id = self.attn.layer_id
@@ -711,7 +707,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 v_scale,
                 k_out, v_out, True,
                 use_shuffle_layout, 
-                block_size, x
+                block_size, x,
+                rotary_emb.rotary_dim,
             )
 
         q_out = q_out.view(num_tokens, -1)
@@ -748,11 +745,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         save_kv_cache = True
-        if enable_fused_qk_norm_rope_set_kv_aiter(forward_batch) and is_gfx95_supported():
-            q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
-                qkv, positions, forward_batch,
-            )
-            save_kv_cache = False
+        if (
+            enable_fused_qk_norm_rope_set_kv_aiter(forward_batch) 
+            and 
+            is_gfx95_supported() 
+            and get_bool_env_var("SGLANG_FUSED_QK_NORM_ROPE_CACHE_PTS_QUANT_SHUFFLE")
+        ):
+                q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
+                    qkv, positions, forward_batch,
+                )
+                save_kv_cache = False
         else:
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
