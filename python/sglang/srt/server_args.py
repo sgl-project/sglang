@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import random
-import re
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -895,7 +894,7 @@ class ServerArgs:
         if self.tool_call_parser is not None:
             return
         model = self.model_path.lower()
-        if re.search(r"glm[-_.]?5", model):
+        if "glm-5" in model or "glm5" in model:
             self.tool_call_parser = "glm5"
             logger.info(
                 f"Auto-detected tool_call_parser='glm5' from model path '{self.model_path}'."

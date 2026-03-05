@@ -1,5 +1,4 @@
 import json
-import re
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -1887,16 +1886,15 @@ class TestGlm5RegistryAndParsing(unittest.TestCase):
 
 
 class TestGlm5AutoDetection(unittest.TestCase):
-    """Verify the auto-detection regex for GLM-5 model paths.
+    """Verify the auto-detection logic for GLM-5 model paths.
 
-    Tests the same regex used by ServerArgs._auto_detect_tool_call_parser
+    Tests the same string matching used by ServerArgs._auto_detect_tool_call_parser
     without importing ServerArgs (which requires torch/triton).
     """
 
-    GLM5_PATTERN = re.compile(r"glm[-_.]?5", re.IGNORECASE)
-
     def _detect(self, model_path):
-        return bool(self.GLM5_PATTERN.search(model_path.lower()))
+        m = model_path.lower()
+        return "glm-5" in m or "glm5" in m
 
     def test_detect_glm5(self):
         self.assertTrue(self._detect("zai-org/GLM-5"))
