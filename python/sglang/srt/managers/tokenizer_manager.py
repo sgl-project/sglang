@@ -726,7 +726,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         request_obj=obj,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
-                        need_wait_for_image=obj.need_wait_for_image,
+                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(
@@ -739,7 +739,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-                and not obj.need_wait_for_image
+                and not obj.need_wait_for_mm_inputs
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
@@ -2355,14 +2355,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.server_args.enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
-            # Set need_wait_for_image flag based on whether we dispatch to encoder
+            # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
             # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
-                obj.need_wait_for_image = True
+                obj.need_wait_for_mm_inputs = True
                 if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
                     self.mm_receiver.send_encode_request(obj)
             else:
-                obj.need_wait_for_image = False
+                obj.need_wait_for_mm_inputs = False
 
     def convert_to_span_attrs(
         self,

@@ -670,11 +670,11 @@ class MMReceiverBase(ABC):
         pass
 
     async def recv_mm_data(
-        self, request_obj, mm_processor, prompt, need_wait_for_image=True
+        self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
         try:
-            if len(self.encode_urls) == 0 or not need_wait_for_image:
+            if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
