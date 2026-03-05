@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import urllib.request
+import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -120,6 +121,19 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
             fout.write(
                 "=" * 40 + f" {i} " + "=" * 40 + "\n" + s + "\n" + "=" * 80 + "\n\n"
             )
+
+
+def normalize_base_url(host: str, port: int) -> str:
+    if host.startswith("http://") or host.startswith("https://"):
+        warnings.warn(
+            f"Including the scheme in --host ('{host}') is deprecated. "
+            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    else:
+        host = f"http://{host}"
+    return f"{host}:{port}"
 
 
 class HttpResponse:
@@ -393,6 +407,71 @@ def reserve_port(host, start=30000, end=40000):
             sock.close()  # Failed to bind, try next port
             continue
     raise RuntimeError("No free port available.")
+
+
+def _prebind_listening_socket(host: str, port: int) -> socket.socket:
+    """
+    Create and bind a server socket to reserve the port before model loading.
+
+    This prevents port conflicts that could occur if another process (e.g., a
+    subprocess spawned during model loading) binds to the same port before the
+    HTTP server starts. By binding early, we ensure the port is available and
+    reserved for the HTTP server. The socket is intentionally not put into
+    listening mode here to avoid accepting probe connections before uvicorn is
+    ready to serve requests.
+
+    Args:
+        host: The host address to bind to.
+        port: The port number to bind to.
+
+    Returns:
+        A bound socket object.
+
+    Raises:
+        RuntimeError: If the port is already in use or permission is denied.
+    """
+    import errno
+
+    from sglang.srt.utils.common import is_valid_ipv6_address
+
+    # Determine socket family based on address type
+    if host and is_valid_ipv6_address(host):
+        family = socket.AF_INET6
+    else:
+        family = socket.AF_INET
+
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+
+    # Set socket options to allow port reuse
+    # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        sock.bind((host or "", port))
+        sock.set_inheritable(True)
+        logger.info(
+            f"Successfully reserved port {port} on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'"
+        )
+    except OSError as e:
+        sock.close()
+        if e.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"Port {port} is already in use on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'. "
+                f"Please choose a different port with --port or stop the process using this port. "
+                f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
+            ) from e
+        elif e.errno == errno.EACCES:
+            raise RuntimeError(
+                f"Permission denied when trying to bind to port {port}. "
+                f"Ports below 1024 require root/sudo privileges. "
+                f"Consider using a port >= 1024 (e.g., --port 8000) or run with sudo."
+            ) from e
+        else:
+            raise RuntimeError(
+                f"Failed to bind to {host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}:{port}: {e}"
+            ) from e
+
+    return sock
 
 
 def release_port(lock_socket):

@@ -134,6 +134,7 @@ class WanSelfAttention(nn.Module):
         eps=1e-6,
         parallel_attention=False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        is_cross_attention: bool = False,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
@@ -173,20 +174,20 @@ class WanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            skip_sequence_parallel=is_cross_attention,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, is_cross_attention=True)
 
     def forward(self, x, context, context_lens):
         r"""
@@ -240,6 +241,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            is_cross_attention=True,
             quant_config=quant_config,
         )
 
@@ -359,6 +361,7 @@ class WanTransformerBlock(nn.Module):
                 head_size=dim // num_heads,
                 causal=False,
                 supported_attention_backends=self_attn_backends,
+                is_cross_attention=False,
                 prefix=f"{prefix}.attn1",
             )
 

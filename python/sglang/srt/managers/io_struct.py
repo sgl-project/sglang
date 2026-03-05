@@ -187,7 +187,11 @@ class GenerateReqInput(BaseReq):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
@@ -251,6 +255,18 @@ class GenerateReqInput(BaseReq):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -624,9 +640,8 @@ class GenerateReqInput(BaseReq):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            data_parallel_rank=(
-                self.data_parallel_rank if self.data_parallel_rank is not None else None
-            ),
+            routed_dp_rank=self.routed_dp_rank,
+            disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -693,8 +708,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -897,8 +914,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
@@ -984,6 +1001,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # DP rank of the scheduler that processed each request
+    dp_ranks: Optional[List[int]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1076,6 +1095,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # DP rank of the scheduler that processed each request
+    dp_ranks: Optional[List[int]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1208,6 +1229,21 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class PinPrefixReqInput(BaseReq):
+    """Pin a prefix by token_ids to resist eviction."""
+
+    token_ids: List[int] = field(default_factory=list)
+    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
+
+
+@dataclass
+class PinPrefixReqOutput(BaseReq):
+    success: bool
+    nodes_pinned: int = 0
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
@@ -1316,6 +1352,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
 
 
 @dataclass
@@ -1378,6 +1416,19 @@ class SendWeightsToRemoteInstanceReqInput(BaseReq):
 class SendWeightsToRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class UpdateExpertBackupReq(BaseReq):
+    pass
+
+
+@dataclass
+class BackupDramReq(BaseReq):
+    rank: int
+    weight_pointer_map: Dict[str, Any]
+    session_id: str
+    buffer_size: int
 
 
 @dataclass
@@ -1589,6 +1640,8 @@ class ConfigureLoggingReq(BaseReq):
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
 
 
 @dataclass

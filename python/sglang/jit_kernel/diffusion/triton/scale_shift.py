@@ -40,14 +40,15 @@ def _fused_scale_shift_4d_kernel(
     norm_ptrs = normalized_ptr + row_base + col_offsets
     out_ptrs = output_ptr + row_base + col_offsets
 
-    # Pointers for scale and shift for 4D
+    # Pointers for scale (per-frame) and shift (per-token)
     b_idx = pid_row // seq_len
     t_idx = pid_row % seq_len
     frame_idx_in_batch = t_idx // frame_seqlen
 
     scale_row_idx = b_idx * num_frames + frame_idx_in_batch
     scale_ptrs = scale_ptr + scale_row_idx * inner_dim + col_offsets
-    shift_ptrs = shift_ptr + scale_row_idx * inner_dim + col_offsets
+    # shift is per-token [B*L, C], indexed by pid_row directly
+    shift_ptrs = shift_ptr + pid_row * inner_dim + col_offsets
 
     normalized = tl.load(norm_ptrs, mask=mask, other=0.0)
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
@@ -241,9 +242,10 @@ def fuse_scale_shift_kernel(
         ), "seq_len must be divisible by num_frames for 4D scale/shift"
         frame_seqlen = L // num_frames
 
-        # Compact [B, F, C] without the singleton dim into [B*F, C]
+        # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        shift_reshaped = shift.squeeze(2).reshape(-1, C).contiguous()
+        # shift is per-token [B, L, C] -> [B*L, C]
+        shift_reshaped = shift.reshape(rows, C).contiguous()
 
         _fused_scale_shift_4d_kernel[grid](
             output_2d,
@@ -297,7 +299,10 @@ def fuse_scale_shift_kernel(
 
         # If both scalars and both zero, copy fast-path
         if need_scale_scalar and need_shift_scalar:
-            if (scale_blc.abs().max() == 0) and (shift_blc.abs().max() == 0):
+            if not (
+                scale_blc.any().to("cpu", non_blocking=True)
+                or shift_blc.any().to("cpu", non_blocking=True)
+            ):
                 output.copy_(x)
                 return output
 
