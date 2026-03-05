@@ -201,15 +201,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 if isinstance(output, list):
                     for batch_output in output:
                         if "error" in batch_output:
-                            yield sglang_scheduler_pb2.GenerateResponse(
-                                request_id=request.request_id,
-                                error=sglang_scheduler_pb2.GenerateError(
-                                    message=batch_output["error"],
-                                    http_status_code=(
-                                        "500" if "abort" not in batch_output else "499"
-                                    ),
-                                ),
+                            code = (
+                                grpc.StatusCode.CANCELLED
+                                if "abort" in batch_output
+                                else grpc.StatusCode.INTERNAL
                             )
+                            await context.abort(code, batch_output["error"])
                         else:
                             # All non-error batch outputs are final responses
                             yield self._create_completion_response(
@@ -218,15 +215,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 else:
                     # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
-                        yield sglang_scheduler_pb2.GenerateResponse(
-                            request_id=request.request_id,
-                            error=sglang_scheduler_pb2.GenerateError(
-                                message=output["error"],
-                                http_status_code=(
-                                    "500" if "abort" not in output else "499"
-                                ),
-                            ),
+                        code = (
+                            grpc.StatusCode.CANCELLED
+                            if "abort" in output
+                            else grpc.StatusCode.INTERNAL
                         )
+                        await context.abort(code, output["error"])
                     elif request.stream:
                         yield self._create_chunk_response(request.request_id, output)
                         if output.get("finished", False):
@@ -239,24 +233,22 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                             request.request_id, output
                         )
 
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Generate invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(
                 f"Generate failed for request {request.request_id}: {e}\n"
                 f"{get_exception_traceback()}"
             )
-            yield sglang_scheduler_pb2.GenerateResponse(
-                request_id=request.request_id,
-                error=sglang_scheduler_pb2.GenerateError(
-                    message=str(e),
-                    http_status_code="500",
-                    details=get_exception_traceback(),
-                ),
-            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(
         self,
         request: sglang_scheduler_pb2.EmbedRequest,
-        _context: grpc.aio.ServicerContext,
+        context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
         logger.info(f"Receive embedding request: {request.request_id}")
@@ -281,19 +273,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
             )
 
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Embed invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(
                 f"Embed failed for request {request.request_id}: {e}\n"
                 f"{get_exception_traceback()}"
             )
-            return sglang_scheduler_pb2.EmbedResponse(
-                request_id=request.request_id,
-                error=sglang_scheduler_pb2.EmbedError(
-                    message=str(e),
-                    code="INTERNAL_ERROR",
-                    details=get_exception_traceback(),
-                ),
-            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def HealthCheck(
         self,
