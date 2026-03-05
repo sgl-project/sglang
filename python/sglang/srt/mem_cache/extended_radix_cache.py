@@ -30,8 +30,6 @@ class ExtendedRadixCache(BasePrefixCache):
         params: CacheInitParams,
         connector: Optional[BaseKVConnector] = None,
     ):
-        assert not params.disable, "ExtendedRadixCache requires radix cache enabled"
-        
         self._inner_radixtree = RadixCache(params)
         self._connector = connector
 

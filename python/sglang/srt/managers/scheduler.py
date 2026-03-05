@@ -841,6 +841,32 @@ class Scheduler(
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
+            elif server_args.kv_connector_cls is not None:
+                import importlib
+
+                from sglang.srt.mem_cache.extended_radix_cache import (
+                    ExtendedRadixCache,
+                )
+                from sglang.srt.mem_cache.kv_connector import BaseKVConnector
+
+                module_path, class_name = server_args.kv_connector_cls.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                connector_cls = getattr(module, class_name)
+                if not issubclass(connector_cls, BaseKVConnector):
+                    raise TypeError(
+                        f"Connector class {class_name} must inherit from "
+                        "sglang.srt.mem_cache.kv_connector.BaseKVConnector"
+                    )
+                connector = connector_cls(
+                    params=params,
+                    server_args=server_args,
+                    tp_group=self.tp_group,
+                    tp_rank=self.tp_rank,
+                )
+                self.tree_cache = ExtendedRadixCache(
+                    params=params,
+                    connector=connector,
+                )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,

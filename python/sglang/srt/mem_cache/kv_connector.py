@@ -13,13 +13,15 @@ class LoadOperation(NamedTuple):
 
 
 class BaseKVConnector(ABC):
-    def __init__(self, tp_group: Any = None, tp_rank: int = 0):
-        """Initialize connector with tensor-parallel context.
-
-        Args:
-            tp_group: Tensor-parallel process group.
-            tp_rank: Rank within the tp group.
-        """
+    def __init__(
+        self,
+        params: Any = None,
+        server_args: Any = None,
+        tp_group: Any = None,
+        tp_rank: int = 0,
+    ):
+        self.params = params
+        self.server_args = server_args
         self.tp_group = tp_group
         self.tp_rank = tp_rank
 
