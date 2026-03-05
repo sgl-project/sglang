@@ -1766,6 +1766,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
+    load_format: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
