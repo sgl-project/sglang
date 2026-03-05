@@ -834,6 +834,13 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        if self.enable_nan_detection:
+            logger.warning(
+                "--enable-nan-detection is deprecated. "
+                "Use SGLANG_SPEC_NAN_OOB_DETECTION=1 instead."
+            )
+            envs.SGLANG_SPEC_NAN_OOB_DETECTION.set(True)
+
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.enable_prefill_delayer = True
@@ -4882,7 +4889,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            help="[Deprecated] Use SGLANG_SPEC_NAN_OOB_DETECTION=1 instead. Enable NaN detection for debugging.",
         )
         parser.add_argument(
             "--enable-p2p-check",
