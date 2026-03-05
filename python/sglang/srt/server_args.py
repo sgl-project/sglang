@@ -89,6 +89,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "runai_streamer",
 ]
 
 QUANTIZATION_CHOICES = [

@@ -102,6 +102,7 @@ from sglang.srt.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    runai_safetensors_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -342,7 +343,12 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
+        allowed_keys = {
+            "enable_multithread_load",
+            "num_threads",
+            "concurrency",
+            "memory_limit",
+        }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -398,6 +404,7 @@ class DefaultModelLoader(BaseModelLoader):
         elif (
             load_format == LoadFormat.SAFETENSORS
             or load_format == LoadFormat.FASTSAFETENSORS
+            or load_format == LoadFormat.RUNAI_STREAMER
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -505,6 +512,11 @@ class DefaultModelLoader(BaseModelLoader):
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                )
+            elif self.load_config.load_format == LoadFormat.RUNAI_STREAMER:
+                set_runai_streamer_env(self.load_config)
+                weights_iterator = runai_safetensors_weights_iterator(
                     hf_weights_files,
                 )
             elif use_multithread:
