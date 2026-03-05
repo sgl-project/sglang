@@ -60,7 +60,9 @@ class TestQwen35(unittest.TestCase):
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
                 baseline_accuracy=0.95,
-                thinking_mode="qwen3-no-think",
+                thinking_mode="qwen3",
+                max_tokens=8192,
+                num_examples=200,
             ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_qwen35",
