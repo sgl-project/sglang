@@ -227,12 +227,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 ),
                             ),
                         )
-                    elif output.get("finished", False):
+                    elif request.stream:
+                        yield self._create_chunk_response(request.request_id, output)
+                        if output.get("finished", False):
+                            yield self._create_completion_response(
+                                request.request_id, output
+                            )
+                    else:
+                        # Non-streaming n=1: single completion response
                         yield self._create_completion_response(
                             request.request_id, output
                         )
-                    else:
-                        yield self._create_chunk_response(request.request_id, output)
 
         except Exception as e:
             logger.error(
@@ -1045,10 +1050,132 @@ async def serve_grpc(
 
     # Start server
     listen_addr = f"{server_args.host}:{server_args.port}"
-    server.add_insecure_port(listen_addr)
+    if server_args.ssl_certfile and server_args.ssl_keyfile:
+        if server_args.ssl_keyfile_password:
+            raise ValueError(
+                "gRPC mode does not support encrypted SSL key files "
+                "(--ssl-keyfile-password). Please provide an unencrypted key "
+                "file when using --grpc-mode."
+            )
+
+        def _read_ssl_file(filepath: str, description: str) -> bytes:
+            try:
+                with open(filepath, "rb") as f:
+                    return f.read()
+            except OSError as e:
+                raise ValueError(
+                    f"Failed to read {description} '{filepath}': {e}"
+                ) from e
+
+        private_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+        certificate_chain = _read_ssl_file(
+            server_args.ssl_certfile, "SSL certificate file"
+        )
+        root_certificates = None
+        if server_args.ssl_ca_certs:
+            root_certificates = _read_ssl_file(
+                server_args.ssl_ca_certs, "SSL CA certificates file"
+            )
+
+        if server_args.enable_ssl_refresh:
+            # Use dynamic credentials so gRPC re-reads certs on each
+            # new connection via the fetcher callback.
+            _cert_mtime = os.path.getmtime(server_args.ssl_certfile)
+            _key_mtime = os.path.getmtime(server_args.ssl_keyfile)
+            _ca_mtime = (
+                os.path.getmtime(server_args.ssl_ca_certs)
+                if server_args.ssl_ca_certs
+                else None
+            )
+
+            def _cert_config_fetcher():
+                nonlocal _cert_mtime, _key_mtime, _ca_mtime
+                try:
+                    new_cert_mt = os.path.getmtime(server_args.ssl_certfile)
+                    new_key_mt = os.path.getmtime(server_args.ssl_keyfile)
+                    new_ca_mt = (
+                        os.path.getmtime(server_args.ssl_ca_certs)
+                        if server_args.ssl_ca_certs
+                        else None
+                    )
+
+                    if (
+                        new_cert_mt == _cert_mtime
+                        and new_key_mt == _key_mtime
+                        and new_ca_mt == _ca_mtime
+                    ):
+                        return None  # No change
+
+                    new_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+                    new_cert = _read_ssl_file(
+                        server_args.ssl_certfile, "SSL certificate file"
+                    )
+                    new_root = None
+                    if server_args.ssl_ca_certs:
+                        new_root = _read_ssl_file(
+                            server_args.ssl_ca_certs,
+                            "SSL CA certificates file",
+                        )
+
+                    logger.info("gRPC SSL certificate change detected, reloading.")
+                    config = grpc.ssl_server_certificate_configuration(
+                        [(new_key, new_cert)],
+                        root_certificates=new_root,
+                    )
+
+                    # Update mtimes only after successful reload
+                    _cert_mtime = new_cert_mt
+                    _key_mtime = new_key_mt
+                    _ca_mtime = new_ca_mt
+
+                    return config
+                except Exception:
+                    logger.exception(
+                        "Failed to reload gRPC SSL certificates — "
+                        "continuing with previous certificates."
+                    )
+                    return None
+
+            try:
+                initial_config = grpc.ssl_server_certificate_configuration(
+                    [(private_key, certificate_chain)],
+                    root_certificates=root_certificates,
+                )
+                credentials = grpc.dynamic_ssl_server_credentials(
+                    initial_config,
+                    _cert_config_fetcher,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to create gRPC dynamic SSL credentials. "
+                    f"Verify that --ssl-keyfile and --ssl-certfile contain "
+                    f"valid, matching PEM data. Underlying error: {e}"
+                ) from e
+            logger.info("gRPC SSL certificate auto-refresh enabled.")
+        else:
+            try:
+                credentials = grpc.ssl_server_credentials(
+                    [(private_key, certificate_chain)],  # pairs: (key, cert)
+                    root_certificates=root_certificates,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to create gRPC SSL credentials. Verify that "
+                    f"--ssl-keyfile and --ssl-certfile contain valid, matching "
+                    f"PEM data. Underlying error: {e}"
+                ) from e
+        bound_port = server.add_secure_port(listen_addr, credentials)
+        if bound_port == 0:
+            raise RuntimeError(
+                f"Failed to bind gRPC TLS server to {listen_addr}. "
+                f"Check that the port is available and SSL credentials are valid."
+            )
+        logger.info(f"gRPC server (TLS) listening on {listen_addr}")
+    else:
+        server.add_insecure_port(listen_addr)
+        logger.info(f"gRPC server listening on {listen_addr}")
 
     await server.start()
-    logger.info(f"gRPC server listening on {listen_addr}")
 
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(
