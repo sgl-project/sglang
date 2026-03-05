@@ -303,13 +303,3 @@ class DecodeKVCacheOffloadManager:
             )
         start_offset = prefill_len + inc_len
         self._release_finished_req(req, start_offset)
-        start_p, end_p = req.pop_overallocated_kv_cache()
-        if self.page_size > 1:
-            start_p = (
-                (start_p + self.page_size - 1) // self.page_size
-            ) * self.page_size
-        if start_p < end_p:
-            indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, start_p:end_p
-            ]
-            self.token_to_kv_pool_allocator.free(indices)
