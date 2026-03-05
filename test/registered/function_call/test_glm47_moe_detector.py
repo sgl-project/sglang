@@ -1845,6 +1845,7 @@ class TestGlm4ComplexJsonSchema(unittest.TestCase):
         self.assertEqual(params["data"], "nested data")
         self.assertEqual(params["status"], "active")
 
+
 class TestGlm5RegistryAndParsing(unittest.TestCase):
     """Verify 'glm5' is registered and parses GLM-5 tool calls correctly."""
 
