@@ -233,10 +233,10 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
         layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).to(torch.bfloat16), requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
+            layer.w2_weight_scale.data.squeeze(-1).to(torch.bfloat16), requires_grad=False
         )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
@@ -256,24 +256,96 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        if not torch.npu.is_current_stream_capturing():
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights.to(x.dtype)
+            output = npu_fused_experts(
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+            )
+            return StandardCombineInput(hidden_states=output)
+        else:
+            hidden_states = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
 
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_weight,
-            w13_scale=layer.w13_weight_scale,
-            w2=layer.w2_weight,
-            w2_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-        )
-        return StandardCombineInput(hidden_states=output)
+            topk_weights, topk_ids, _ = topk_output
+            top_k = topk_ids.shape[1]
+            group_list_type = 1
+            original_shape = hidden_states.shape
+            topk_weights = topk_weights
+
+            num_tokens = hidden_states.shape[:-1].numel()
+
+            first_expert_idx = 0
+            last_expert_idx = layer.num_experts
+            global_num_experts = layer.num_experts
+
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+                torch.ops.npu.npu_moe_init_routing_v2(
+                    hidden_states,
+                    topk_ids,
+                    active_num=num_tokens * top_k,
+                    expert_num=global_num_experts,
+                    expert_tokens_num_type=1,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[first_expert_idx, last_expert_idx],
+                    quant_mode=1,
+                )
+            )
+
+            expert_tokens = expert_tokens.to(torch.int64)
+
+            w1_scale = [layer.w13_weight_scale]
+            w2_scale = [layer.w2_weight_scale]
+            _output_dtype = torch.bfloat16
+
+            hidden_states = torch.ops.npu.npu_grouped_matmul(
+               x=[sorted_hidden_states],
+               weight=[layer.w13_weight],
+               scale=w1_scale,
+               per_token_scale=[pertoken_scale],
+               group_list=expert_tokens,
+               split_item=2,
+               group_type=0,
+               group_list_type=group_list_type,
+               output_dtype=_output_dtype,
+            )[0]
+
+            # act_fn: swiglu
+            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(hidden_states, quant_mode=1, activate_left=True)
+
+            output = torch.ops.npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[layer.w2_weight],
+                scale=w2_scale,
+                per_token_scale=[swiglu_out_scale],
+                group_list=expert_tokens,
+                split_item=2,
+                group_type=0,
+                group_list_type=group_list_type,
+                output_dtype=_output_dtype,
+            )[0]
+
+            assert original_shape is not None
+            final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+                permuted_tokens=output,
+                sorted_indices=torch.abs(expanded_row_idx),
+                probs=topk_weights,
+            )
+            if len(original_shape) == 3:
+                final_hidden_states = final_hidden_states.view(original_shape)
+
+            return StandardCombineInput(hidden_states=final_hidden_states)
 
     def apply_without_routing_weights(
         self,
