@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     is_weak_contiguous,
 )
@@ -15,6 +16,18 @@ from sglang.srt.utils import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+INF = 1 << 60
+
+THRESHOLD_2_SHOT_MAP = {
+    2: INF,
+    3: 512 * 1024,  # 512KB
+    4: 256 * 1024,  # 256KB
+    5: 256 * 1024,  # 256KB
+    6: 256 * 1024,  # 256KB
+    7: 192 * 1024,  # 192KB
+    8: 192 * 1024,  # 192KB
+}
 
 
 class CustomAllReduceV2:
@@ -27,11 +40,14 @@ class CustomAllReduceV2:
         from sglang.jit_kernel.all_reduce import get_custom_all_reduce_cls
 
         if max_size is None:
-            max_size = 32 * 1024 * 1024  # default to 32MB
+            max_size = 16 * 1024 * 1024  # default to 16MB
 
         self.max_size = max_size
         self.group = group
         self.disabled = True
+        self.rank = dist.get_rank(group=self.group)
+        self.world_size = dist.get_world_size(group=self.group)
+        self.threshold = THRESHOLD_2_SHOT_MAP[self.world_size]
 
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
@@ -45,13 +61,14 @@ class CustomAllReduceV2:
             return
 
         MAX_GRAPH_INPUTS = 131072
-        self.rank = dist.get_rank(group=self.group)
-        self.world_size = dist.get_world_size(group=self.group)
         cls = get_custom_all_reduce_cls()
         self.obj = cls(self.rank, self.world_size, self.max_size, MAX_GRAPH_INPUTS)
         self._post_init_obj()
         self.disabled = False
         log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
+
+    def override_shot(self, shot: int):
+        self.threshold = INF if shot == 1 else 0
 
     @contextmanager
     def capture(self):
@@ -89,6 +106,12 @@ class CustomAllReduceV2:
         """
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if is_in_piecewise_cuda_graph():  # disable inplace optimization
+            try:
+                self.obj.set_cuda_graph_capture(False)
+                return self._all_reduce(input)
+            finally:
+                self.obj.set_cuda_graph_capture(True)
         return self._all_reduce(input)
 
     def close(self):
@@ -98,9 +121,7 @@ class CustomAllReduceV2:
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
         input_bytes = input.numel() * input.element_size()
-        # HARDCODED: 128KB threshold for 1-shot vs 2-shot
-        THRESHOLD_2_SHOT = 128 * 1024
-        shots = 1 if input_bytes <= THRESHOLD_2_SHOT or self.world_size == 2 else 2
+        shots = 1 if input_bytes <= self.threshold or self.world_size == 2 else 2
         return torch.from_dlpack(self.obj.all_reduce(input, shots))
 
     def _post_init_obj(self):

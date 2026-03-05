@@ -14,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -99,7 +100,9 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   tvm::ffi::Array<InputPair> share_graph_inputs() {
     using namespace host;
     tvm::ffi::Array<InputPair> result;
-    result.reserve(m_graph_capture_inputs.size());
+    const auto new_inputs_count = m_registered_count() - m_cum_registered_count;
+    RuntimeCheck(new_inputs_count >= 0, "Invalid new count: ", new_inputs_count);
+    result.reserve(new_inputs_count);
     std::unordered_map<void*, ExternHandle> ipc_cache;
     const auto get_handle = [&](void* ptr) -> ExternHandle {
       auto it = ipc_cache.find(ptr);
@@ -108,7 +111,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
       ipc_cache.try_emplace(ptr, handle);
       return handle;
     };
-    for (const auto ptr : m_graph_capture_inputs) {
+    for (const auto ptr : std::span(m_graph_capture_inputs).subspan(m_cum_registered_count)) {
       // note: must share the base address of each allocation, or we get wrong address
       void* base_ptr;
       const auto cu_result = cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)ptr);
@@ -148,13 +151,12 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
 
   void register_inputs(tvm::ffi::Array<tvm::ffi::Array<InputPair>> ipc_graph_inputs) {
     using namespace host;
-    RuntimeCheck(!m_is_registered, "Inputs have already been registered");
-    m_is_registered = true;
     RuntimeCheck(ipc_graph_inputs.size() == m_num_gpu);
-    const auto registered_count = m_registered_count();
-    if (registered_count == 0) return;  // avoid `m_get_data_ptr(0)` out-of-bounds when no input is registered
+    const auto new_registered_count = m_registered_count() - m_cum_registered_count;
+    RuntimeCheck(new_registered_count >= 0, "Invalid registered count: ", new_registered_count);
+    if (new_registered_count == 0) return;  // avoid `m_get_data_ptr()` out-of-bounds
     std::vector<AllReduceData> data;
-    data.resize(registered_count);
+    data.resize(new_registered_count);
     std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> ipc_cache;
     const auto open_cached = [&](const ExternHandle& h) -> void* {
       RuntimeCheck(h.size() == sizeof(cudaIpcMemHandle_t), "Invalid IPC handle size: ", h.size());
@@ -171,13 +173,13 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     };
     for (const auto i : irange(ipc_graph_inputs.size())) {
       const auto& array = ipc_graph_inputs[i];
-      RuntimeCheck(int64_t(array.size()) == registered_count);
+      RuntimeCheck(int64_t(array.size()) == new_registered_count);
       if (i == m_rank) {
-        for (const auto j : irange(registered_count)) {
+        for (const auto j : irange(new_registered_count)) {
           data[j].input[i] = m_graph_capture_inputs[j];
         }
       } else {
-        for (const auto j : irange(registered_count)) {
+        for (const auto j : irange(new_registered_count)) {
           /// NOTE: structural binding will cause intern compiler error...
           const auto elem = array[j];
           const auto offset = get<0>(elem);
@@ -186,12 +188,14 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         }
       }
     }
-    const auto registered_bytes = sizeof(AllReduceData) * registered_count;
-    RuntimeDeviceCheck(cudaMemcpy(m_get_data_ptr(0), data.data(), registered_bytes, cudaMemcpyHostToDevice));
+
+    const auto new_registered_bytes = sizeof(AllReduceData) * new_registered_count;
+    const auto dst_ptr = m_get_data_ptr(m_cum_registered_count);
+    m_cum_registered_count += new_registered_count;
+    RuntimeDeviceCheck(cudaMemcpy(dst_ptr, data.data(), new_registered_bytes, cudaMemcpyHostToDevice));
   }
 
   void set_cuda_graph_capture(bool enabled) {
-    host::RuntimeCheck(!m_is_registered, "Cannot set graph capture mode after inputs are registered");
     m_is_graph_capturing = enabled;
   }
 
@@ -201,7 +205,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
 
   void reset_graph() {
     m_graph_capture_inputs.clear();
-    m_is_registered = false;
+    m_cum_registered_count = 0;
   }
 
   tvm::ffi::Tuple<uint32_t, uint32_t> configure(uint32_t num_cta, uint32_t cta_size) {
@@ -252,8 +256,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   const uint32_t m_max_num_cta;
   uint32_t m_num_cta;
   uint32_t m_cta_size;
+  int64_t m_cum_registered_count = 0;
   bool m_is_graph_capturing = false;
-  bool m_is_registered = false;
   void* m_storage = nullptr;
   std::vector<void*> m_graph_capture_inputs;
   std::vector<void*> m_storage_pointers;
