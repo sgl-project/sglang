@@ -224,7 +224,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sgl_kernel import (
+        from sglang.jit_kernel.fast_topk import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
             fast_topk_v2,
