@@ -425,31 +425,6 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
-def _get_precomputed_embedding_multi_items(
-    items_per_req: List[MultimodalDataItem],
-    prefix_len: int,
-    extend_len: int,
-    items_offset: List[Tuple[int, int]],
-) -> Optional[torch.Tensor]:
-    """
-    Extract precomputed embedding chunk for a request with multiple items.
-    """
-    if any(item.precomputed_embeddings is None for item in items_per_req):
-        return None
-    req_embeddings = torch.concat(
-        [item.precomputed_embeddings for item in items_per_req]
-    )
-
-    # Extract the chunk using get_embedding_chunk logic (just slicing, no recomputation)
-    embedding_chunk, _, _ = get_embedding_chunk(
-        embedding=req_embeddings,
-        extend_prefix_len=prefix_len,
-        extend_seq_len=extend_len,
-        items_offset=items_offset,
-    )
-    return embedding_chunk
-
-
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
     items_size: List[int],
@@ -470,54 +445,25 @@ def _get_precomputed_embedding(
             continue
 
         items_per_req = items[items_size[i] : items_size[i + 1]]
+        extend_len = extend_length[i] if i < len(extend_length) else 0
         items_offset = items_offset_list[i]
 
-        if len(items_per_req) > 1:
-            embedding_chunk = _get_precomputed_embedding_multi_items(
-                items_per_req=items_per_req,
-                prefix_len=prefix_length[i],
-                extend_len=extend_length[i] if i < len(extend_length) else 0,
+        if any(item.precomputed_embeddings is None for item in items_per_req):
+            chunk = None
+        else:
+            req_embeddings = torch.concat(
+                [item.precomputed_embeddings for item in items_per_req]
+            )
+            chunk, _, _ = get_embedding_chunk(
+                embedding=req_embeddings,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_len,
                 items_offset=items_offset,
             )
-            if embedding_chunk is None:
-                return None
-            precomputed_embeddings.append(embedding_chunk)
-        else:
-            # Single item per request: use original logic
-            item = items_per_req[0]
-            if item.precomputed_embeddings is None:
-                precomputed_embeddings.append(None)
-                continue
-            seq_start_idx = prefix_length[i]
-            seq_end_idx = (
-                seq_start_idx + (extend_length[i] if i < len(extend_length) else 0) - 1
-            )
-            prefix_embedding_length = []
-            extend_embedding_length = []
-            for mm_start_idx, mm_end_idx in items_offset:
-                if mm_start_idx > seq_end_idx:
-                    break
-                if seq_start_idx > mm_start_idx:
-                    prefix_embedding_length.append(
-                        min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
-                    )
-                if mm_end_idx >= seq_start_idx:
-                    extend_embedding_length.append(
-                        min(
-                            mm_end_idx - seq_start_idx + 1,
-                            seq_end_idx - mm_start_idx + 1,
-                            mm_end_idx - mm_start_idx + 1,
-                            seq_end_idx - seq_start_idx + 1,
-                        )
-                    )
-            prefix_embedding_length = int(np.sum(prefix_embedding_length))
-            extend_embedding_length = int(np.sum(extend_embedding_length))
-            precomputed_embeddings.append(
-                item.precomputed_embeddings[
-                    prefix_embedding_length : prefix_embedding_length
-                    + extend_embedding_length
-                ]
-            )
+
+        if chunk is None and len(items_per_req) > 1:
+            return None
+        precomputed_embeddings.append(chunk)
 
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
