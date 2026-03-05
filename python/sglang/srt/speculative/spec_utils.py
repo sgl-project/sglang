@@ -706,26 +706,22 @@ def draft_tp_context(tp_group: GroupCoordinator):
 
 
 def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
+    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_SPEC_NAN_DETECTION.get():
         return
-    if torch.any(torch.isnan(tensor)):
-        full_msg = f"NaN detected! {msg}"
-        logger.error(full_msg)
-        raise ValueError(full_msg)
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
 
 
 def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
-    """Check that all values in `indices` satisfy low <= v < high."""
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_SPEC_OOB_DETECTION.get():
         return
     if indices.numel() == 0:
         return
-    min_val = indices.min().item()
-    max_val = indices.max().item()
-    if min_val < low or max_val >= high:
-        full_msg = f"OOB indices [{min_val}, {max_val}] not in [{low}, {high}): {msg}"
-        logger.error(full_msg)
-        raise ValueError(full_msg)
+    torch._assert_async(
+        (indices.min() >= low) & (indices.max() < high),
+        f"OOB indices not in [{low}, {high}): {msg}",
+    )
 
 
 # Disable torch.compile for this function because it will be
