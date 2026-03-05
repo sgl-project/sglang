@@ -541,7 +541,7 @@ def run_one_case(
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
-            profile_activities=profile_activities,
+            activities=profile_activities,
             output_dir=profile_output_dir,
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
