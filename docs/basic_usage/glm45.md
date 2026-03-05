@@ -35,7 +35,7 @@ To enable the experimental overlap scheduler for EAGLE speculative decoding, set
 ```
 
 ### Thinking Budget for GLM-4.5 / GLM-4.6
-**Note**: For GLM-5, `--tool-call-parser` should be set to `glm5`. For GLM-4.7, use `glm47`. For GLM-4.5 and GLM-4.6, it should be set to `glm45`.
+**Note**: For GLM-5, `--tool-call-parser` should be set to `glm5`. For GLM-4.7, use `glm47`. For GLM-4.5 and GLM-4.6, use `glm45`.
 
 In SGLang, we can implement thinking budget with `CustomLogitProcessor`.
 

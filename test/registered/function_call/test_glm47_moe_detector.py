@@ -1885,29 +1885,5 @@ class TestGlm5RegistryAndParsing(unittest.TestCase):
         self.assertEqual(params["command"], "ls -la /path/to/dir/")
 
 
-class TestGlm5AutoDetection(unittest.TestCase):
-    """Verify the auto-detection logic for GLM-5 model paths.
-
-    Tests the same string matching used by ServerArgs._auto_detect_tool_call_parser
-    without importing ServerArgs (which requires torch/triton).
-    """
-
-    def _detect(self, model_path):
-        m = model_path.lower()
-        return "glm-5" in m or "glm5" in m
-
-    def test_detect_glm5(self):
-        self.assertTrue(self._detect("zai-org/GLM-5"))
-
-    def test_detect_glm5_variant(self):
-        self.assertTrue(self._detect("some-org/glm-5-chat"))
-
-    def test_no_detect_non_glm(self):
-        self.assertFalse(self._detect("meta-llama/Llama-3.1-8B-Instruct"))
-
-    def test_no_detect_glm47(self):
-        self.assertFalse(self._detect("zai-org/GLM-4.7"))
-
-
 if __name__ == "__main__":
     unittest.main()
