@@ -465,11 +465,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
-            raise ValueError(
-                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
-                "Please set `--mamba-scheduler-strategy extra_buffer`."
-            )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
