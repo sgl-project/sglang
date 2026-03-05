@@ -198,9 +198,54 @@ def is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
+def _parse_cuda_version() -> tuple[int, int]:
+    """Parse the CUDA toolkit version from ``torch.version.cuda``."""
+    v = torch.version.cuda
+    if not v:
+        return (0, 0)
+    parts = v.split(".")
+    if len(parts) < 2:
+        return (0, 0)
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return (0, 0)
+
+
+def _get_arch_suffix(major: int) -> str:
+    """Return the CUDA architecture suffix for the given compute-capability major.
+
+    CUDA 12.9 introduced two distinct suffixes for ``-gencode`` / ``-arch``
+    flags that carry different forward-compatibility semantics:
+
+    * ``a`` — **architecture-specific**: targets one exact SM version
+      (e.g. ``sm_120a`` compiles for CC 12.0 only).
+    * ``f`` — **family-specific**: forward-compatible across the whole GPU
+      family and includes family-level ISA extensions such as FP4
+      (e.g. ``sm_120f`` covers all Blackwell SM 12.x variants).
+
+    The ``f`` suffix is preferred for Blackwell and later (major >= 10)
+    because it enables family-level features (NVFP4, etc.) and is
+    forward-compatible with future chips in the same family.  It requires
+    CUDA >= 12.9 where the suffix was first introduced.  For older toolkit
+    versions we fall back to ``a``.
+
+    Hopper (major 9) predates the ``f`` suffix and always uses ``a``.
+    Architectures before Hopper use the plain (no-suffix) target.
+    """
+    if major >= 10:
+        cuda_major, cuda_minor = _parse_cuda_version()
+        if cuda_major > 12 or (cuda_major == 12 and cuda_minor >= 9):
+            return "f"
+        return "a"
+    if major >= 9:
+        return "a"
+    return ""
+
+
 @cache_once
 def _get_cuda_arch_list() -> str:
     """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}"
+    return f"{major}.{minor}{_get_arch_suffix(major)}"
