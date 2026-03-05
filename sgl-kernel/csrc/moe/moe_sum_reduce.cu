@@ -239,6 +239,10 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
   const int64_t topk_num = input.size(1);
   const int64_t hidden_dim = input.size(2);
 
+  if (token_num == 0 || hidden_dim == 0) {
+    return;
+  }
+
   const int64_t in_stride_token = input.stride(0);
   const int64_t in_stride_topk = input.stride(1);
   const int64_t out_stride_token = output.stride(0);

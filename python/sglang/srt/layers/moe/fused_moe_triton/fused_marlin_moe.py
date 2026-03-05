@@ -85,6 +85,10 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    if hidden_states.dtype != w1_scale.dtype:
+        w1_scale = w1_scale.to(hidden_states.dtype)
+    if hidden_states.dtype != w2_scale.dtype:
+        w2_scale = w2_scale.to(hidden_states.dtype)
     assert (
         hidden_states.dtype == w1_scale.dtype
     ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
@@ -212,9 +216,10 @@ def fused_marlin_moe(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    moe_sum_reduce(
-        intermediate_cache3,
-        output,
-        routed_scaling_factor,
-    )
+    if intermediate_cache3.numel() > 0:
+        moe_sum_reduce(
+            intermediate_cache3,
+            output,
+            routed_scaling_factor,
+        )
     return output

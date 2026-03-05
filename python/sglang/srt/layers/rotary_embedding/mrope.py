@@ -111,6 +111,15 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_cos = cos.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
+        return 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float)
+                / self.rotary_dim
+            )
+        )
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         if (
             self.cos_sin_cache.device != query.device
@@ -183,6 +192,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.mrope_section
+        
+        # Ensure positions is contiguous
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+
+        # Dynamically resize cache if positions exceed current size
+        # Note: .max().item() causes a sync, but it is necessary for safety here 
+        # unless handled upstream.
+        max_pos = positions.max().item()
+        if max_pos >= self.cos_sin_cache.shape[0]:
+            # print(f"Resize cos_sin_cache from {self.cos_sin_cache.shape[0]} to {max_pos + 1}")
+            self._compute_cos_sin_cache_dynamically(max_pos + 1, query.device, query.dtype)
+
         self._match_cos_sin_cache_dtype(query)
         triton_mrope_fused(
             query,
@@ -196,6 +218,21 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.is_neox_style,
         )
         return query, key
+
+    def _compute_cos_sin_cache_dynamically(self, new_max_pos: int, device, dtype):
+        if new_max_pos <= self.cos_sin_cache.shape[0]:
+            return
+        
+        # Update max_position_embeddings to the new size
+        self.max_position_embeddings = max(self.max_position_embeddings, new_max_pos)
+        
+        # Recompute cache
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, device=device, dtype=dtype)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        self.cos_sin_cache = torch.cat((cos, sin), dim=-1)
 
     def forward_npu(
         self,
