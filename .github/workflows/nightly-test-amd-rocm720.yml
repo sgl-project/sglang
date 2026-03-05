@@ -643,6 +643,46 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # ============================================== MI30x ROCm 7.2 Diffusion Tests ==============================================
+  # 1-GPU Z-Image-Turbo (Diffusion T2I) ROCm 7.2
+  nightly-1-gpu-zimage-turbo-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-1-gpu-zimage-turbo-rocm720')
+    runs-on: linux-mi325-1gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Z-Image-Turbo Diffusion Test ROCm 7.2 (1-GPU)
+        timeout-minutes: 45
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DIFFUSION_ARTIFACT_DIR="/sglang-checkout/diffusion-artifacts" \
+            pytest test/registered/amd/test_zimage_turbo.py -v -s ${{ inputs.continue_on_error && '|| true' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload generated images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zimage-turbo-outputs-rocm720
+          path: diffusion-artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ============================================== MI35x ROCm 7.2 Tests ==============================================
   # MI35x 1-GPU ROCm 7.2 tests
   nightly-test-1-gpu-mi35x-rocm720:
@@ -1251,6 +1291,8 @@ jobs:
       - nightly-8-gpu-qwen35-rocm720
       - nightly-8-gpu-glm5-rocm720
       - nightly-8-gpu-minimax-m25-rocm720
+      # MI30x ROCm 7.2 Diffusion Tests
+      - nightly-1-gpu-zimage-turbo-rocm720
       # MI35x ROCm 7.2 jobs
       - nightly-test-1-gpu-mi35x-rocm720
       - nightly-accuracy-8-gpu-mi35x-rocm720

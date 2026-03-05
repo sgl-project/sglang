@@ -646,6 +646,46 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # ============================================== MI30x Diffusion Tests ==============================================
+  # 1-GPU Z-Image-Turbo (Diffusion T2I)
+  nightly-1-gpu-zimage-turbo:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-1-gpu-zimage-turbo')
+    runs-on: linux-mi325-1gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Z-Image-Turbo Diffusion Test (1-GPU)
+        timeout-minutes: 45
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DIFFUSION_ARTIFACT_DIR="/sglang-checkout/diffusion-artifacts" \
+            pytest test/registered/amd/test_zimage_turbo.py -v -s ${{ inputs.continue_on_error && '|| true' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload generated images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zimage-turbo-outputs
+          path: diffusion-artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ============================================== MI35x Tests ==============================================
   # MI35x 1-GPU tests - platform-agnostic tests that may work on CDNA4 (gfx950)
   nightly-test-1-gpu-mi35x:
@@ -1257,6 +1297,8 @@ jobs:
       - nightly-8-gpu-qwen35
       - nightly-8-gpu-glm5
       - nightly-8-gpu-minimax-m25
+      # MI30x Diffusion Tests
+      - nightly-1-gpu-zimage-turbo
       # MI35x jobs
       - nightly-test-1-gpu-mi35x
       - nightly-accuracy-8-gpu-mi35x
