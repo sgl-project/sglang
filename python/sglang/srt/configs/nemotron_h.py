@@ -189,13 +189,16 @@ class NemotronHConfig(PretrainedConfig):
         layers_block_type, hybrid_override_pattern, kwargs
     ) -> list[str]:
         """Resolve canonical layers_block_type from new and legacy config fields."""
-        if "hybrid_override_pattern" in kwargs:
-            pattern = kwargs.pop("hybrid_override_pattern")
-            if layers_block_type is None:
+        # Prefer explicit kwargs override first (legacy HF path), otherwise use
+        # the function argument value from config fields.
+        pattern = kwargs.pop("hybrid_override_pattern", hybrid_override_pattern)
+        if layers_block_type is None:
+            if pattern is not None:
                 layers_block_type = NemotronHConfig._pattern_to_list(pattern)
-        elif layers_block_type is None:
-            # Keep compatibility with the forked diff default.
-            layers_block_type = DEFAULT_LAYERS_BLOCK_TYPE
+            else:
+                # Last-resort fallback to preserve compatibility when neither
+                # canonical nor legacy pattern fields are provided.
+                layers_block_type = DEFAULT_LAYERS_BLOCK_TYPE
         return layers_block_type
 
     @staticmethod
