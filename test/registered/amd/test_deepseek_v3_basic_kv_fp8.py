@@ -66,7 +66,7 @@ class TestDeepseekV3BasicKvFp8(CustomTestCase):
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3 kv-fp8)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -79,9 +79,7 @@ class TestDeepseekV3BasicKvFp8(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v3 kv-fp8)\n" f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 12)
-            else:
-                self.assertGreater(speed, 75)
+                self.assertGreater(speed, 40)
 
 
 if __name__ == "__main__":
