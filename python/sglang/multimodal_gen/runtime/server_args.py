@@ -929,10 +929,15 @@ class ServerArgs:
         return parser
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        host = self.host
+        if not host or host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"http://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"http://{host}:{self.port}"
 
     @property
     def scheduler_endpoint(self):

@@ -286,11 +286,6 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/nvfp4_expert_quant.cu"
-    "csrc/gemm/nvfp4_quant_entry.cu"
-    "csrc/gemm/nvfp4_quant_kernels.cu"
-    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
@@ -316,7 +311,6 @@ set(SOURCES
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
@@ -576,44 +570,3 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
-
-# ============================ Extra Install: FA4 ============================= #
-# TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-
-    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
-    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
-
-    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
-
-    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
-         DESTINATION "${FLASH_ATTN_CUTE_DST}"
-         PATTERN ".git*" EXCLUDE
-         PATTERN "__pycache__" EXCLUDE)
-
-    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
-         "${FLASH_ATTN_CUTE_DST}/*.py")
-
-    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
-        file(READ "${FILE_PATH}" FILE_CONTENT)
-
-        set(MODIFIED_CONTENT "${FILE_CONTENT}")
-
-        # The main goal is to avoid using "flash_attn" so that other libraries (such as transformers) do not mistakenly assume that "flash_attn" is already installed.
-
-        string(REPLACE "flash_attn.cute"
-                       "flash_attn_origin.cute"
-                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
-            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
-            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
-        endif()
-    endforeach()
-
-    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
-            DESTINATION "flash_attn_origin/cute"
-            PATTERN ".git*" EXCLUDE
-            PATTERN "__pycache__" EXCLUDE)
-
-endif()
