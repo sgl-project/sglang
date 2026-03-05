@@ -637,8 +637,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         num_heads_v = self.num_kv_heads
         eps = self.q_norm.variance_epsilon
 
-        qw = self.q_norm.weight.data
-        kw = self.k_norm.weight.data
+        qw = 1.0 + self.q_norm.weight.data
+        kw = 1.0 + self.k_norm.weight.data
         qkv = qkv.contiguous()
 
         rotary_emb = self.rotary_emb
@@ -704,7 +704,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 rotary_emb.is_neox_style, eps,
                 q_out, k_cache, v_cache, slot_mapping,
                 k_scale,
-                v_cache,
+                v_scale,
                 k_out, v_out, True,
                 use_shuffle_layout, 
                 block_size, x
@@ -739,6 +739,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 q_gate = q_gate.unflatten(-1, (self.num_heads, 2, self.head_dim))
                 q = q_gate[:, :, 0, :].reshape(q_gate.shape[0], -1)
                 gate = q_gate[:, :, 1, :].reshape(q_gate.shape[0], -1)
+                qkv = torch.cat([q, k, v], dim=-1).contiguous()
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
