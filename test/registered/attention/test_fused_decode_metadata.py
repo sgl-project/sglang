@@ -2,9 +2,6 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import (
-    normal_decode_set_metadata,
-)
 from sglang.srt.layers.attention.fused_decode_metadata import (
     fused_normal_decode_set_metadata,
 )
@@ -16,13 +13,30 @@ register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 
+def _reference_decode_set_metadata(
+    cache_seqlens_int32, cu_seqlens_k, page_table,
+    req_to_token, req_pool_indices, strided_indices,
+    max_seq_pages, seq_lens, seq_len_delta, page_size,
+):
+    """Pure-PyTorch reference matching normal_decode_set_metadata (no SWA)."""
+    cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
+    cu_seqlens_k[1:].copy_(
+        torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32)
+    )
+    page_indices = req_to_token[
+        req_pool_indices[:, None],
+        strided_indices[:max_seq_pages][None, :],
+    ]
+    page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+
+
 class TestFusedDecodeMetadata(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_default_device(get_device())
 
     def _run_test(self, bs, max_batch, max_context_len, page_size, seq_len_delta):
-        """Run both original and fused, assert bit-exact match."""
+        """Run both reference and fused, assert bit-exact match."""
         device = get_device()
 
         req_to_token = torch.randint(
@@ -52,7 +66,7 @@ class TestFusedDecodeMetadata(CustomTestCase):
         ref_cu = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         ref_pt = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=device)
 
-        normal_decode_set_metadata(
+        _reference_decode_set_metadata(
             ref_cache, ref_cu, ref_pt,
             req_to_token, req_pool_indices, strided_indices,
             max_seq_pages, seq_lens, seq_len_delta, page_size,

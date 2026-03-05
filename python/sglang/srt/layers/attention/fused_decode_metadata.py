@@ -6,13 +6,16 @@ separate torch.cumsum call because it is a reduction that is already
 efficient on small vectors (batch-size elements).
 """
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
 @triton.jit
@@ -104,7 +107,6 @@ def fused_normal_decode_set_metadata(
     )
 
     if swa_page_table is not None and token_to_kv_pool is not None:
-        assert isinstance(token_to_kv_pool, SWAKVPool)
         page_indices = req_to_token[
             req_pool_indices[:, None],
             strided_indices[:max_seq_pages][None, :],
