@@ -5619,6 +5619,21 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            if self.default_priority_value is None:
+                logger.warning(
+                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
+                    "Requests without explicit priority will have priority=None, "
+                    "resulting in priority='None' string labels in Prometheus metrics."
+                )
+        else:
+            if self.disable_priority_preemption:
+                logger.warning(
+                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
+                )
+            if self.default_priority_value is not None:
+                logger.warning(
+                    "--default-priority-value has no effect without --enable-priority-scheduling"
+                )
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:
