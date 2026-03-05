@@ -873,7 +873,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
-        except ValueError as e:
+        except Exception as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -1394,8 +1394,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Check if there are remaining arguments to send
         remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
+            expected_call[len(actual_call) :]
+            if expected_call.startswith(actual_call)
             else ""
         )
 
