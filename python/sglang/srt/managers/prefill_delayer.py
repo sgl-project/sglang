@@ -148,6 +148,8 @@ class PrefillDelayer:
                 max_running_requests - global_running_batch.max().item()
                 < global_max_prefill_bs.max().item()
             ):
+                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
+                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
                     pass
