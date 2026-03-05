@@ -124,31 +124,34 @@ def get_top_logprobs(
 
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[Optional[List[int]]],
+    token_ids_logprobs_list: List[Optional[List[int]]],
     stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
     delay_cpu_copy: bool = False,
 ):
     vals, idxs = [], []
+    token_ids_logprobs_tensor = torch.tensor(
+        token_ids_logprobs_list, dtype=torch.long
+    ).to(logprobs.device, non_blocking=True)
     if stage == LogprobStage.DECODE:
-        for i, token_ids in enumerate(token_ids_logprobs):
+        for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None:
                 vals.append([])
                 idxs.append([])
             else:
-                row = logprobs[i, token_ids]
+                row = logprobs[i, token_ids_logprobs_tensor[i]]
                 vals.append(row if delay_cpu_copy else row.tolist())
                 idxs.append(token_ids)
     else:  # prefill
         pt = 0
-        for token_ids, pruned_len in zip(
-            token_ids_logprobs, extend_logprob_pruned_lens_cpu
+        for i, (token_ids, pruned_len) in enumerate(
+            zip(token_ids_logprobs_list, extend_logprob_pruned_lens_cpu)
         ):
             if pruned_len <= 0:
                 vals.append([])
                 idxs.append([])
                 continue
-            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids]
+            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_logprobs_tensor[i]]
             vals.append(pos_logprobs if delay_cpu_copy else pos_logprobs.tolist())
             idxs.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
