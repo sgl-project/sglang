@@ -61,7 +61,9 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             True
         ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
             1
-        ), envs.SGLANG_SPEC_NAN_OOB_DETECTION.override(
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
             True
         ):
             cls.process = popen_launch_server(

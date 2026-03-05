@@ -706,7 +706,7 @@ def draft_tp_context(tp_group: GroupCoordinator):
 
 
 def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
-    if not envs.SGLANG_SPEC_NAN_OOB_DETECTION.get():
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
         return
     if torch.any(torch.isnan(tensor)):
         full_msg = f"NaN detected! {msg}"
@@ -716,7 +716,7 @@ def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
 
 def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
     """Check that all values in `indices` satisfy low <= v < high."""
-    if not envs.SGLANG_SPEC_NAN_OOB_DETECTION.get():
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
         return
     if indices.numel() == 0:
         return
