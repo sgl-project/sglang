@@ -36,12 +36,11 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
-
-# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -434,24 +433,11 @@ class NativeSparseAttnBackend(
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in forward_batch.seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                cache_seqlens_int32,
+                self.speculative_num_draft_tokens * batch_size,
+                self.speculative_num_draft_tokens,
             )
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
@@ -474,20 +460,12 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        forward_batch.extend_seq_lens_cpu,
-                        forward_batch.seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
+
+            seqlens_expanded = seqlens_expand_triton(
+                forward_batch.extend_seq_lens,
+                cache_seqlens_int32,
+                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens,
             )
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
@@ -1005,24 +983,13 @@ class NativeSparseAttnBackend(
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
+                ),
+                cache_seqlens,
+                self.speculative_num_draft_tokens * bs,
+                self.speculative_num_draft_tokens,
             )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
@@ -1048,20 +1015,11 @@ class NativeSparseAttnBackend(
                 page_indices
             )
 
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                extend_seq_lens,
+                cache_seqlens,
+                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens,
             )
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
@@ -1823,8 +1781,6 @@ class NativeSparseAttnBackend(
             )
 
         # Use FA3 for SM90 (Hopper/H200)
-        fa_version = 3
-
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1835,7 +1791,6 @@ class NativeSparseAttnBackend(
             max_seqlen_k=max_seqlen_k,
             softmax_scale=layer.scaling,
             causal=causal,
-            ver=fa_version,
         )
 
     def _forward_tilelang(

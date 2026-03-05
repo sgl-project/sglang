@@ -98,12 +98,39 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="20920706a9004018dbd87c7387f207d08d0e05af"
+ARG MORI_COMMIT="2f88d06aba75400262ca5c1ca5986cf1fdf4cd82"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
 ARG UBUNTU_CODENAME=jammy
 USER root
+
+# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
+# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
+# amdgpu.ids device-ID-to-marketing-name mapping file.
+# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# See https://github.com/ROCm/ROCm/issues/5992
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+        ;; \
+      *) \
+        echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
+          > /etc/apt/sources.list.d/amdgpu-graphics.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+             libdrm-amdgpu-common \
+             libdrm-amdgpu-amdgpu1 \
+             libdrm2-amdgpu \
+        && rm -rf /var/lib/apt/lists/* \
+        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+        ;; \
+    esac
+
 
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm

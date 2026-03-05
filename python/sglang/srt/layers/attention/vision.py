@@ -35,7 +35,22 @@ _is_hip = is_hip()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        from sglang.jit_kernel.flash_attention_v4 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+        )
+
+        def flash_attn_func(*args, ver: int = 3, **kwargs):
+            if ver == 4:
+                return flash_attn_varlen_func_fa4(*args, **kwargs)
+            return flash_attn_varlen_func(*args, **kwargs)
+
+    except ImportError as e:
+        raise e
+
 
 if _is_npu:
     import torch_npu
@@ -391,7 +406,7 @@ class VisionFlash3Attention(nn.Module):
         """
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             max_seqlen = cu_seqlens[1]
-            output = flash_attn_varlen_func(
+            output = flash_attn_func(
                 q,
                 k,
                 v,
@@ -406,7 +421,7 @@ class VisionFlash3Attention(nn.Module):
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
 
-            output = flash_attn_varlen_func(
+            output = flash_attn_func(
                 q,
                 k,
                 v,
@@ -457,7 +472,7 @@ class VisionFlash4Attention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        output = flash_attn_varlen_func(
+        output = flash_attn_func(
             q,
             k,
             v,

@@ -303,7 +303,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )
-            if get_global_server_args().enable_piecewise_cuda_graph
+            if not get_global_server_args().disable_piecewise_cuda_graph
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -387,7 +387,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if (
+            _is_cpu
+            or _is_npu
+            or not get_global_server_args().disable_piecewise_cuda_graph
+        ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
