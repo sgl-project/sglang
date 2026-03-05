@@ -200,16 +200,7 @@ def is_arch_support_pdl() -> bool:
 
 @cache_once
 def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST.
-
-    Plain targets (e.g. ``sm_120``) miss architecture- and family-specific
-    instructions such as FP4 tensor-core ops.  For Hopper (major 9) and
-    Blackwell+ (major >= 10) we append the ``a`` (architecture-specific)
-    suffix which is a superset of ``f`` (family-specific) and gives access
-    to all available instructions for the current GPU.  Forward-compatibility
-    is not a concern here because this runs as JIT on the device that is
-    physically present.
-    """
+    """Return the CUDA arch target string for TVM_FFI_CUDA_ARCH_LIST (e.g. ``8.9``, ``9.0a``, ``10.0a``), appending ``a`` on Hopper+ (CC >= 9.0) for full instruction-set coverage."""
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
     suffix = "a" if major >= 9 else ""
