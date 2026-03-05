@@ -420,7 +420,7 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
 
 class Nemotron3Detector(BaseReasoningFormatDetector):
     """
-    Detector for NanoV3 model.
+    Detector for Nemotron3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
 
     """
