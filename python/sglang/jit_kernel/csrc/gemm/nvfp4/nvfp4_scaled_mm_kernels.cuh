@@ -13,11 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include "utils.h"
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <unordered_map>
+
+using namespace host;
 
 // clang-format off
 #include "cutlass/cutlass.h"
@@ -31,10 +38,10 @@ limitations under the License.
 /**
  * Helper function for checking CUTLASS errors
  */
-#define CUTLASS_CHECK(status)                                                       \
-  {                                                                                 \
-    cutlass::Status error = status;                                                 \
-    TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+#define CUTLASS_CHECK(status)                                                        \
+  {                                                                                  \
+    cutlass::Status error = status;                                                  \
+    RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
 
 using namespace cute;
@@ -49,6 +56,49 @@ inline uint32_t next_pow_2(uint32_t x) {
   x |= x >> 8;
   x |= x >> 16;
   return x + 1;
+}
+
+struct WorkspaceKey {
+  int device_id;
+  uintptr_t stream;
+  auto operator==(const WorkspaceKey&) const -> bool = default;
+};
+
+struct WorkspaceKeyHash {
+  auto operator()(const WorkspaceKey& key) const -> size_t {
+    size_t h1 = std::hash<int>{}(key.device_id);
+    size_t h2 = std::hash<uintptr_t>{}(key.stream);
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+  }
+};
+
+struct WorkspaceState {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+};
+
+inline auto get_cached_workspace(size_t required_bytes, int device_id, cudaStream_t stream) -> void* {
+  if (required_bytes == 0) {
+    return nullptr;
+  }
+
+  thread_local std::unordered_map<WorkspaceKey, WorkspaceState, WorkspaceKeyHash> cache;
+  WorkspaceKey key{device_id, reinterpret_cast<uintptr_t>(stream)};
+  auto& ws = cache[key];
+
+  if (ws.ptr != nullptr && ws.bytes >= required_bytes) {
+    return ws.ptr;
+  }
+
+  RuntimeDeviceCheck(cudaSetDevice(device_id));
+  if (ws.ptr != nullptr) {
+    RuntimeDeviceCheck(cudaFreeAsync(ws.ptr, stream));
+    ws.ptr = nullptr;
+    ws.bytes = 0;
+  }
+  RuntimeDeviceCheck(cudaMallocAsync(&ws.ptr, required_bytes, stream));
+  ws.bytes = required_bytes;
+  return ws.ptr;
 }
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || \
@@ -277,12 +327,12 @@ struct Fp4GemmSm120 {
 
 template <typename T>
 typename T::Gemm::Arguments args_from_options(
-    at::Tensor& D,
-    at::Tensor const& A,
-    at::Tensor const& B,
-    at::Tensor const& A_sf,
-    at::Tensor const& B_sf,
-    at::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int64_t M,
     int64_t N,
     int64_t K) {
@@ -335,12 +385,12 @@ typename T::Gemm::Arguments args_from_options(
 
 template <typename T>
 void runGemm(
-    at::Tensor& D,
-    at::Tensor const& A,
-    at::Tensor const& B,
-    at::Tensor const& A_sf,
-    at::Tensor const& B_sf,
-    at::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int64_t m,
     int64_t n,
     int64_t k,
@@ -349,25 +399,25 @@ void runGemm(
   auto arguments = args_from_options<T>(D, A, B, A_sf, B_sf, alpha, m, n, k);
 
   size_t workspace_size = T::Gemm::get_workspace_size(arguments);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  int device_id = A.device().device_id;
+  void* workspace = get_cached_workspace(workspace_size, device_id, stream);
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
 
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace, stream));
 
-  CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm.run(arguments, workspace, stream));
 }
 
 // SM120 specific args_from_options function
 template <typename Gemm>
 typename Gemm::Arguments args_from_options_sm120(
-    at::Tensor& D,
-    at::Tensor const& A,
-    at::Tensor const& B,
-    at::Tensor const& A_sf,
-    at::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int M,
     int N,
     int K) {
@@ -413,12 +463,12 @@ typename Gemm::Arguments args_from_options_sm120(
 // SM120 specific runGemm function
 template <typename Gemm>
 void runGemmSm120(
-    at::Tensor& D,
-    at::Tensor const& A,
-    at::Tensor const& B,
-    at::Tensor const& A_sf,
-    at::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int M,
     int N,
     int K,
@@ -428,25 +478,25 @@ void runGemmSm120(
   auto arguments = args_from_options_sm120<Gemm>(D, A, B, A_sf, B_sf, alpha, M, N, K);
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  int device_id = A.device().device_id;
+  void* workspace = get_cached_workspace(workspace_size, device_id, stream);
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
 
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace, stream));
 
-  CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm.run(arguments, workspace, stream));
 }
 
 // Dispatch function to select appropriate config based on M
 template <typename OutType>
 void cutlassFp4GemmDispatch(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int64_t m,
     int64_t n,
     int64_t k,
@@ -466,12 +516,12 @@ void cutlassFp4GemmDispatch(
 // Dispatch function to select appropriate config based on M
 template <>
 void cutlassFp4GemmDispatch<float>(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int64_t m,
     int64_t n,
     int64_t k,
@@ -481,12 +531,12 @@ void cutlassFp4GemmDispatch<float>(
 
 // SM120 specific dispatch functions
 void cutlass_fp4_bf16_gemm_dispatch_sm120(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int m,
     int n,
     int k,
@@ -502,12 +552,12 @@ void cutlass_fp4_bf16_gemm_dispatch_sm120(
 }
 
 void cutlass_fp4_f16_gemm_dispatch_sm120(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int m,
     int n,
     int k,
@@ -525,17 +575,17 @@ void cutlass_fp4_f16_gemm_dispatch_sm120(
 #else
 template <typename T>
 void cutlassFp4GemmDispatch(
-    at::Tensor& D,
-    at::Tensor const& A,
-    at::Tensor const& B,
-    at::Tensor const& A_sf,
-    at::Tensor const& B_sf,
-    at::Tensor const& alpha,
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha,
     int64_t m,
     int64_t n,
     int64_t k,
     cudaStream_t stream) {
-  TORCH_CHECK(
+  RuntimeCheck(
       false,
       "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "
       "a CUTLASS 3.8 source directory to enable support.");
@@ -543,39 +593,54 @@ void cutlassFp4GemmDispatch(
 #endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) ||
         // defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
-// Undefine macros from utils.h to redefine with custom signatures
-#undef CHECK_CONTIGUOUS
-#undef CHECK_INPUT
-
-#define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
-#define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
-#define CHECK_INPUT(x, st, m) \
-  CHECK_TH_CUDA(x, m);        \
-  CHECK_CONTIGUOUS(x, m);     \
-  CHECK_TYPE(x, st, m)
-
-constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;
-constexpr auto SF_DTYPE = at::ScalarType::Float8_e4m3fn;
+inline int getSMVersion(int device_id) {
+  int sm_major = 0;
+  int sm_minor = 0;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+  return sm_major * 10 + sm_minor;
+}
 
 void cutlass_scaled_fp4_mm_sm100a_sm120a(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha) {
-  CHECK_INPUT(A, FLOAT4_E2M1X2, "a");
-  CHECK_INPUT(B, FLOAT4_E2M1X2, "b");
+    tvm::ffi::TensorView D,
+    tvm::ffi::TensorView A,
+    tvm::ffi::TensorView B,
+    tvm::ffi::TensorView A_sf,
+    tvm::ffi::TensorView B_sf,
+    tvm::ffi::TensorView alpha) {
+  RuntimeCheck(A.device().device_type == kDLCUDA, "a must be a CUDA tensor");
+  RuntimeCheck(B.device().device_type == kDLCUDA, "b must be a CUDA tensor");
+  RuntimeCheck(A_sf.device().device_type == kDLCUDA, "scale_a must be a CUDA tensor");
+  RuntimeCheck(B_sf.device().device_type == kDLCUDA, "scale_b must be a CUDA tensor");
+  RuntimeCheck(alpha.device().device_type == kDLCUDA, "alpha must be a CUDA tensor");
+  RuntimeCheck(D.device().device_type == kDLCUDA, "out must be a CUDA tensor");
 
-  CHECK_INPUT(A_sf, SF_DTYPE, "scale_a");
-  CHECK_INPUT(B_sf, SF_DTYPE, "scale_b");
+  RuntimeCheck(A.device() == B.device(), "a and b must be on same device");
+  RuntimeCheck(A.device() == A_sf.device(), "a and scale_a must be on same device");
+  RuntimeCheck(A.device() == B_sf.device(), "a and scale_b must be on same device");
+  RuntimeCheck(A.device() == alpha.device(), "a and alpha must be on same device");
+  RuntimeCheck(A.device() == D.device(), "a and out must be on same device");
 
-  CHECK_INPUT(alpha, at::ScalarType::Float, "alpha");
+  RuntimeCheck(A.is_contiguous(), "a must be contiguous");
+  RuntimeCheck(B.is_contiguous(), "b must be contiguous");
+  RuntimeCheck(A_sf.is_contiguous(), "scale_a must be contiguous");
+  RuntimeCheck(B_sf.is_contiguous(), "scale_b must be contiguous");
+  RuntimeCheck(alpha.is_contiguous(), "alpha must be contiguous");
+  RuntimeCheck(D.is_contiguous(), "out must be contiguous");
 
-  TORCH_CHECK(A.dim() == 2, "a must be a matrix");
-  TORCH_CHECK(B.dim() == 2, "b must be a matrix");
-  TORCH_CHECK(
+  RuntimeCheck(host::is_type<uint8_t>(A.dtype()), "a must be uint8");
+  RuntimeCheck(host::is_type<uint8_t>(B.dtype()), "b must be uint8");
+  RuntimeCheck(host::is_type<fp8_e4m3_t>(A_sf.dtype()), "scale_a must be float8_e4m3fn");
+  RuntimeCheck(host::is_type<fp8_e4m3_t>(B_sf.dtype()), "scale_b must be float8_e4m3fn");
+  RuntimeCheck(host::is_type<float>(alpha.dtype()), "alpha must be float32");
+
+  RuntimeCheck(A.dim() == 2, "a must be a matrix");
+  RuntimeCheck(B.dim() == 2, "b must be a matrix");
+  RuntimeCheck(A_sf.dim() == 2, "scale_a must be a matrix");
+  RuntimeCheck(B_sf.dim() == 2, "scale_b must be a matrix");
+  RuntimeCheck(alpha.numel() == 1, "alpha must have exactly one element");
+
+  RuntimeCheck(
       A.size(1) == B.size(1),
       "a and b shapes cannot be multiplied (",
       A.size(0),
@@ -587,42 +652,24 @@ void cutlass_scaled_fp4_mm_sm100a_sm120a(
       B.size(1),
       ")");
 
-  auto const m = A.size(0);
-  auto const n = B.size(0);
-  auto const k = A.size(1) * 2;
+  const auto m = static_cast<int64_t>(A.size(0));
+  const auto n = static_cast<int64_t>(B.size(0));
+  const auto k = static_cast<int64_t>(A.size(1) * 2);
+
+  RuntimeCheck(D.dim() == 2, "out must be 2D");
+  RuntimeCheck(D.size(0) == m, "out first dim must equal m");
+  RuntimeCheck(D.size(1) == n, "out second dim must equal n");
 
   constexpr int alignment = 32;
-  TORCH_CHECK(
-      k % alignment == 0,
-      "Expected k to be divisible by ",
-      alignment,
-      ", but got a shape: (",
-      A.size(0),
-      "x",
-      A.size(1),
-      "), k: ",
-      k,
-      ".");
-  TORCH_CHECK(
-      n % alignment == 0,
-      "Expected n to be divisible by ",
-      alignment,
-      ", but got b shape: (",
-      B.size(0),
-      "x",
-      B.size(1),
-      ").");
+  RuntimeCheck(k % alignment == 0, "Expected k to be divisible by ", alignment, ", but got k: ", k);
+  RuntimeCheck(n % alignment == 0, "Expected n to be divisible by ", alignment, ", but got n: ", n);
 
-  auto round_up = [](int x, int y) { return (x + y - 1) / y * y; };
-  int rounded_m = round_up(m, 128);
-  int rounded_n = round_up(n, 128);
-  // Since k is divisible by 32 (alignment), k / 16 is guaranteed to be an
-  // integer.
-  int rounded_k = round_up(k / 16, 4);
+  auto round_up = [](int64_t x, int64_t y) { return (x + y - 1) / y * y; };
+  const int64_t rounded_m = round_up(m, 128);
+  const int64_t rounded_n = round_up(n, 128);
+  const int64_t rounded_k = round_up(k / 16, 4);
 
-  TORCH_CHECK(A_sf.dim() == 2, "scale_a must be a matrix");
-  TORCH_CHECK(B_sf.dim() == 2, "scale_b must be a matrix");
-  TORCH_CHECK(
+  RuntimeCheck(
       A_sf.size(1) == B_sf.size(1),
       "scale_a and scale_b shapes cannot be multiplied (",
       A_sf.size(0),
@@ -633,55 +680,51 @@ void cutlass_scaled_fp4_mm_sm100a_sm120a(
       "x",
       B_sf.size(1),
       ")");
-  TORCH_CHECK(
+  RuntimeCheck(
       A_sf.size(0) == rounded_m && A_sf.size(1) == rounded_k,
-      "scale_a must be padded and swizzled to a shape (",
+      "scale_a must be padded/swizzled to shape (",
       rounded_m,
       "x",
       rounded_k,
-      "), but got a shape (",
+      "), got (",
       A_sf.size(0),
       "x",
       A_sf.size(1),
       ")");
-  TORCH_CHECK(
+  RuntimeCheck(
       B_sf.size(0) == rounded_n && B_sf.size(1) == rounded_k,
-      "scale_b must be padded and swizzled to a shape (",
+      "scale_b must be padded/swizzled to shape (",
       rounded_n,
       "x",
       rounded_k,
-      "), but got a shape (",
+      "), got (",
       B_sf.size(0),
       "x",
       B_sf.size(1),
       ")");
 
-  auto out_dtype = D.dtype();
-  at::cuda::CUDAGuard device_guard{(char)A.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
-
-  // Check SM version and dispatch accordingly
-  auto sm_version = getSMVersion();
+  const cudaStream_t stream = LaunchKernel::resolve_device(A.device());
+  const int sm_version = getSMVersion(A.device().device_id);
 
   if (sm_version >= 120) {
-    // Use SM120 specific dispatch
-    if (out_dtype == at::ScalarType::Half) {
-      cutlass_fp4_f16_gemm_dispatch_sm120(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    } else if (out_dtype == at::ScalarType::BFloat16) {
-      cutlass_fp4_bf16_gemm_dispatch_sm120(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    if (host::is_type<fp16_t>(D.dtype())) {
+      cutlass_fp4_f16_gemm_dispatch_sm120(
+          D, A, B, A_sf, B_sf, alpha, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), stream);
+    } else if (host::is_type<bf16_t>(D.dtype())) {
+      cutlass_fp4_bf16_gemm_dispatch_sm120(
+          D, A, B, A_sf, B_sf, alpha, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), stream);
     } else {
-      TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm sm120 (", out_dtype, ")");
+      Panic("Unsupported output data type of nvfp4 mm sm120");
     }
   } else {
-    // Use SM100 dispatch for other architectures
-    if (out_dtype == at::ScalarType::Half) {
+    if (host::is_type<fp16_t>(D.dtype())) {
       cutlassFp4GemmDispatch<cutlass::half_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    } else if (out_dtype == at::ScalarType::BFloat16) {
+    } else if (host::is_type<bf16_t>(D.dtype())) {
       cutlassFp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    } else if (out_dtype == at::ScalarType::Float) {
+    } else if (host::is_type<float>(D.dtype())) {
       cutlassFp4GemmDispatch<float>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
     } else {
-      TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm");
+      Panic("Unsupported output data type of nvfp4 mm");
     }
   }
 }

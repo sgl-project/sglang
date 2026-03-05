@@ -13,12 +13,15 @@
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -27,8 +30,12 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+if TYPE_CHECKING:
+    from prometheus_client import Gauge
 
+    from sglang.srt.managers.schedule_batch import Req
+
+SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +55,29 @@ def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
 
 
 @dataclass
+class QueueCount:
+    """Holds both the total count and optional per-priority breakdown for a queue."""
+
+    total: int = 0
+    by_priority: Optional[Dict[int, int]] = None
+
+    @classmethod
+    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+        # NOTE: If requests have priority=None (no --default-priority-value set),
+        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
+        # Set --default-priority-value when enabling priority scheduling to avoid this.
+        by_priority = (
+            dict(Counter(req.priority for req in reqs))
+            if enable_priority_scheduling
+            else None
+        )
+        return cls(total=len(reqs), by_priority=by_priority)
+
+
+@dataclass
 class SchedulerStats:
     # Basics
-    num_running_reqs: int = 0
+    num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
     token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -58,7 +85,7 @@ class SchedulerStats:
     mamba_usage: float = 0.0
     decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
-    num_queue_reqs: int = 0
+    num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
@@ -74,10 +101,10 @@ class SchedulerStats:
     num_paused_reqs: int = 0
 
     # PD disaggregation
-    num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_inflight_queue_reqs: int = 0
-    num_decode_prealloc_queue_reqs: int = 0
-    num_decode_transfer_queue_reqs: int = 0
+    num_prefill_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
 
@@ -155,6 +182,7 @@ class SchedulerMetricsCollector:
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.last_log_time = time.perf_counter()
+        self._known_priorities: Set[int] = set()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -730,9 +758,22 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+    def _log_gauge(self, gauge: Gauge, data: Union[int, float, QueueCount]) -> None:
         # Convenience function for logging to gauge.
-        gauge.labels(**self.labels).set(data)
+        if isinstance(data, QueueCount):
+            # NOTE: When priority scheduling is enabled, the total is recorded under
+            # priority="" (the default label value). Per-priority breakdowns are recorded
+            # with priority="<int>". Grafana queries should use priority="" for totals.
+            gauge.labels(**self.labels).set(data.total)
+            if data.by_priority is not None:
+                self._known_priorities.update(data.by_priority.keys())
+                for priority in self._known_priorities:
+                    value = data.by_priority.get(priority, 0)
+                    labels = dict(self.labels)
+                    labels["priority"] = str(priority)
+                    gauge.labels(**labels).set(value)
+        else:
+            gauge.labels(**self.labels).set(data)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)

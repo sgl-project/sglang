@@ -233,6 +233,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.default_priority_value = server_args.default_priority_value
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -421,6 +423,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "model_name": self.server_args.served_model_name,
                 # TODO: Add lora name/path in the future,
             }
+            if self.enable_priority_scheduling:
+                labels["priority"] = ""
             if self.server_args.tokenizer_metrics_allowed_custom_labels:
                 for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
@@ -482,6 +486,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
         self._validate_rid(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -1894,11 +1899,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
 
         custom_labels = getattr(state.obj, "custom_labels", None)
-        labels = (
-            {**self.metrics_collector.labels, **custom_labels}
-            if custom_labels
-            else self.metrics_collector.labels
-        )
+        labels = dict(self.metrics_collector.labels)
+        if custom_labels:
+            labels.update(custom_labels)
+        if self.enable_priority_scheduling:
+            priority = getattr(state.obj, "priority", None)
+            if priority is not None:
+                labels["priority"] = str(priority)
         if (
             state.time_stats.first_token_time == 0.0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -2366,6 +2373,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         span_attrs.update(state.time_stats.convert_to_gen_ai_span_attrs())
 
         return span_attrs
+
+    def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        """Set the default priority value."""
+        if (
+            self.enable_priority_scheduling
+            and obj.priority is None
+            and self.default_priority_value is not None
+        ):
+            obj.priority = self.default_priority_value
 
 
 class ServerStatus(Enum):
