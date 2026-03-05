@@ -516,7 +516,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            num_frames=5,
             enable_frame_interpolation=True,
             frame_interpolation_exp=1,
         ),
