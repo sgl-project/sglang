@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
