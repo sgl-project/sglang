@@ -190,6 +190,8 @@ class DiffusionServerArgs:
             self.custom_validator = "image"
         elif self.modality == "video":
             self.custom_validator = "video"
+        elif self.modality == "3d":
+            self.custom_validator = "mesh"
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,10 @@ class DiffusionSamplingParams:
 
     # TeaCache acceleration
     enable_teacache: bool = False
+
+    # Frame interpolation
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
 
 
 @dataclass(frozen=True)
@@ -314,6 +320,13 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
     direct_url_test=True,
+)
+MULTI_IMAGE_TI2I_UPLOAD_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
 )
 MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
@@ -456,6 +469,11 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
 ]
 
+HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
+    prompt="",
+    image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
+)
+
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -492,6 +510,21 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
             enable_teacache=True,
+        ),
+    ),
+    # Frame interpolation correctness (2× / exp=1)
+    # Uses the same 1.3B model already in the suite;
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_frame_interp_2x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=1,
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -571,7 +604,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+# Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
+if not current_platform.is_hip():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "hunyuan3d_shape_gen",
+            DiffusionServerArgs(
+                model_path="tencent/Hunyuan3D-2",
+                modality="3d",
+            ),
+            HUNYUAN3D_SHAPE_sampling_params,
+        ),
+    )
+# Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
     ONE_GPU_CASES_B.append(
         DiffusionTestCase(
@@ -661,22 +706,6 @@ TWO_GPU_CASES_A = [
     ),
 ]
 
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-if not current_platform.is_hip():
-    TWO_GPU_CASES_A.append(
-        DiffusionTestCase(
-            "turbo_wan2_2_i2v_a14b_2gpu",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
-                modality="video",
-                custom_validator="video",
-                num_gpus=2,
-                tp_size=2,
-            ),
-            TURBOWAN_I2V_sampling_params,
-        )
-    )
-
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
@@ -751,7 +780,58 @@ TWO_GPU_CASES_B = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_2_klein_ti2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-4B",
+            modality="image",
+            num_gpus=2,
+        ),
+        TI2I_sampling_params,
+    ),
 ]
+
+if not current_platform.is_hip():
+    # Flux2 multi-image edit with cache-dit, regression test
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "flux_2_ti2i_multi_image_cache_dit",
+            DiffusionServerArgs(
+                model_path="black-forest-labs/FLUX.2-dev",
+                modality="image",
+                enable_cache_dit=True,
+            ),
+            MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+        )
+    )
+    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "turbo_wan2_1_t2v_1.3b",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+                modality="video",
+                custom_validator="video",
+            ),
+            DiffusionSamplingParams(
+                prompt=T2V_PROMPT,
+            ),
+        )
+    )
+    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+    TWO_GPU_CASES_A.append(
+        DiffusionTestCase(
+            "turbo_wan2_2_i2v_a14b_2gpu",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+                modality="video",
+                custom_validator="video",
+                num_gpus=2,
+                tp_size=2,
+            ),
+            TURBOWAN_I2V_sampling_params,
+        )
+    )
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(

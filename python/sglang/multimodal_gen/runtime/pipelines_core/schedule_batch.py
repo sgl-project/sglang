@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import pprint
+from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
 
@@ -247,18 +248,21 @@ class Req:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
 
-        return (
-            os.path.join(self.output_path, output_file_name)
-            if output_file_name
-            else None
-        )
+        if self.output_path is None or not output_file_name:
+            return None
+        return os.path.join(self.output_path, output_file_name)
 
-    def set_as_warmup(self):
+    def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = 1
+        self.num_inference_steps = warmup_steps
+
+    def copy_as_warmup(self, warmup_steps: int = 1) -> "Req":
+        req = deepcopy(self)
+        req.set_as_warmup(warmup_steps)
+        return req
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -271,9 +275,6 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
         self.metrics = RequestMetrics(request_id=self.request_id)
-
-        if self.is_warmup:
-            self.set_as_warmup()
 
     def adjust_size(self, server_args: ServerArgs):
         pass

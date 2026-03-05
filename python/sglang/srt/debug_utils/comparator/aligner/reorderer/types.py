@@ -25,4 +25,5 @@ ReordererParams = Annotated[
 
 
 class ReordererPlan(_FrozenBase):
+    type: Literal["reorderer"] = "reorderer"
     params: ReordererParams

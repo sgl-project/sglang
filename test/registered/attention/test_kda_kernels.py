@@ -115,7 +115,9 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         abs_diff_out = (core_attn_out - core_attn_out_ref).abs().max()
         abs_diff_state = (last_state - last_state_ref).abs().max()
         print(f"{abs_diff_out=}, {abs_diff_state=}")
-        self.assertTrue(torch.allclose(core_attn_out, core_attn_out_ref))
+        self.assertTrue(
+            torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
+        )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
 
 

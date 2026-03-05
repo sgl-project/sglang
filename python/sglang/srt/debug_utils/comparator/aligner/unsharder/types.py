@@ -4,7 +4,7 @@ from typing import Annotated, Literal, Union
 
 from pydantic import Field, model_validator
 
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
 
 
@@ -38,13 +38,18 @@ class PickParams(_FrozenBase):
     op: Literal["pick"] = "pick"
 
 
+class ReduceSumParams(_FrozenBase):
+    op: Literal["reduce_sum"] = "reduce_sum"
+
+
 UnsharderParams = Annotated[
-    Union[ConcatParams, CpThdConcatParams, PickParams],
+    Union[ConcatParams, CpThdConcatParams, PickParams, ReduceSumParams],
     Field(discriminator="op"),
 ]
 
 
 class UnsharderPlan(_FrozenBase):
+    type: Literal["unsharder"] = "unsharder"
     axis: ParallelAxis
     params: UnsharderParams
     # groups[i] = indices in the input tensor list, which will be operated (e.g. concat) into i-th output tensor.

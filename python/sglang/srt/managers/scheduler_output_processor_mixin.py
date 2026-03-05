@@ -175,7 +175,6 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
@@ -354,46 +353,6 @@ class SchedulerOutputProcessorMixin:
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
-
-    def process_batch_result_dllm(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-
-        self.token_to_kv_pool_allocator.free_group_begin()
-
-        for idx in range(batch.batch_size()):
-            # If no new tokens generated, meaning the prefilling stage
-            if not result.next_token_ids:
-                break
-
-            req = batch.reqs[idx]
-            next_token_ids = result.next_token_ids[idx].tolist()
-            self.num_generated_tokens += len(next_token_ids)
-
-            for _token_idx, next_token_id in enumerate(next_token_ids):
-                req.output_ids.append(next_token_id)
-                req.check_finished()
-                if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-                    break
-
-                self.tree_cache.cache_unfinished_req(req)
-
-        self.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
-
-        if self.current_scheduler_metrics_enabled:
-            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-            self.log_prefill_stats(
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
 
     def process_batch_result_decode(
         self: Scheduler,

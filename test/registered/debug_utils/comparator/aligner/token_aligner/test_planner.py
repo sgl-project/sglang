@@ -2,14 +2,14 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.planner import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
     _match_sequences,
     compute_token_aligner_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.seq_info_builder import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
     build_seqs_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     SeqId,
     SGLangSeqId,
@@ -19,7 +19,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
