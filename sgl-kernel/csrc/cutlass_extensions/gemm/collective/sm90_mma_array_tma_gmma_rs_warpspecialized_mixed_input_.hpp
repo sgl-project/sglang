@@ -189,7 +189,7 @@ struct CollectiveMmaArrayMixedInput<
   using SmemCopyAtomB = SmemCopyAtomB_;
 
   // We must ensure the type to be scaled goes to RF
-  static constexpr bool SwapAB = !IsATransformed;  // "false" for our case, since A is scaled
+  static constexpr bool SwapAB = !IsATransformed;  // "false" for this case, since A is scaled
   using SwappedStrideA = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using SwappedStrideB = cute::conditional_t<!SwapAB, StrideB, StrideA>;
   using InternalSwappedStrideA = cute::conditional_t<!SwapAB, InternalStrideA, InternalStrideB>;
@@ -323,12 +323,9 @@ struct CollectiveMmaArrayMixedInput<
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
   static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale ||
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
-  static constexpr bool UseScaleLookupTable =
-      KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ScaleA>;
+
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
-  static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
-
   static_assert(SmemAlignmentA >= 128 and SmemAlignmentB >= 128, "Require at least 128B alignment");
 
   struct SharedStorage {
@@ -1079,6 +1076,23 @@ struct CollectiveMmaArrayMixedInput<
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));  // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));  // PIPE
 
+    using SmemCopyAtomA_LDSM = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
+    auto smem_tiled_copy_A_LDSM = make_tiled_copy_A(SmemCopyAtomA_LDSM{}, tiled_mma);
+    auto smem_thr_copy_A_LDSM = smem_tiled_copy_A_LDSM.get_thread_slice(thread_idx);
+
+    Tensor sA_LDSM = recast<ElementB>(sA);
+    auto tCsA_LDSM = smem_thr_copy_A_LDSM.partition_S(sA_LDSM);
+
+    using ABBitWidthRatio = Int<sizeof_bits_v<ElementB> / sizeof_bits_v<ElementA>>;
+    auto tCrA_load_LDSM_shape = replace<2>(tCrA_mma.shape(), size(get<2>(tCrA_mma.shape())) / ABBitWidthRatio{});
+    Tensor tCrA_load_LDSM = make_fragment_like<ElementB>(tCrA_load_LDSM_shape);
+    Tensor tCrA_copy_view_LDSM = smem_thr_copy_A_LDSM.retile_D(tCrA_load_LDSM);  // (CPY,CPY_M,CPY_K)
+
+    auto ptr = recast_ptr<RealSwappedElementA>(tCrA_load_LDSM.data());
+    auto old_shape = tCrA_load_LDSM.shape();
+    auto new_shape = make_shape(size<0>(old_shape), get<1>(old_shape), size<2>(old_shape) * ABBitWidthRatio{});
+    Tensor tCrA_load_4b_packed = make_tensor(ptr, make_layout(new_shape));
+
     //
     // PIPELINED MAIN LOOP
     //
@@ -1109,15 +1123,14 @@ struct CollectiveMmaArrayMixedInput<
 
       // copy smem->rmem for A operand
 
-      Utils::copy_tensors_MK(
-          smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+      Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, read_stage);
+
       if (K_BLOCK_MAX > 1) {
-        Utils::copy_tensors_MK(
-            smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info, copy_partitions_extra_info, 1, read_stage);
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, read_stage);
       }
 
       // src: tCrA_load, dst: tCrA_mma
-      Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+      Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
 
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
@@ -1136,18 +1149,15 @@ struct CollectiveMmaArrayMixedInput<
 
           warpgroup_commit_batch();
 
+          if (k_block == 0) {
+            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+          }
+
           if (k_block < K_BLOCK_MAX - 2) {
-            Utils::copy_tensors_MK(
-                smem_tiled_copy_A,
-                tCsA,
-                tCrA_copy_view,
-                partitioned_extra_info,
-                copy_partitions_extra_info,
-                k_block + 2,
-                read_stage);
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
           }
           if (k_block < K_BLOCK_MAX - 1) {
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
       }
@@ -1223,25 +1233,10 @@ struct CollectiveMmaArrayMixedInput<
         // mma.
         pipeline.consumer_wait(smem_pipe_read, barrier_token);
 
-        Utils::copy_tensors_MK(
-            smem_tiled_copy_A,
-            tCsA,
-            tCrA_copy_view,
-            partitioned_extra_info,
-            copy_partitions_extra_info,
-            0,
-            smem_pipe_read.index());
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
 
-        Utils::copy_tensors_MK(
-            smem_tiled_copy_A,
-            tCsA,
-            tCrA_copy_view,
-            partitioned_extra_info,
-            copy_partitions_extra_info,
-            1,
-            smem_pipe_read.index());
-
-        Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+        Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
       }
     }
 
@@ -1310,10 +1305,15 @@ struct CollectiveMmaArrayMixedInput<
 
           if (k_block == 0) {
             barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
           }
 
           if (k_block == K_BLOCK_MAX - 1) {
             // The last k_block
+
+            pipeline.consumer_wait(smem_pipe_read, barrier_token);
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
 
             warpgroup_wait<0>();
 
@@ -1347,38 +1347,13 @@ struct CollectiveMmaArrayMixedInput<
               }
             }
 
-            pipeline.consumer_wait(smem_pipe_read, barrier_token);
-
             // copy scales when passing k_block=0
-            Utils::copy_tensors_MK(
-                smem_tiled_copy_A,
-                tCsA,
-                tCrA_copy_view,
-                partitioned_extra_info,
-                copy_partitions_extra_info,
-                0,
-                smem_pipe_read.index());
-            Utils::copy_tensors_MK(
-                smem_tiled_copy_A,
-                tCsA,
-                tCrA_copy_view,
-                partitioned_extra_info,
-                copy_partitions_extra_info,
-                1,
-                smem_pipe_read.index());
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
           } else {
             if (k_block < K_BLOCK_MAX - 2) {
-              Utils::copy_tensors_MK(
-                  smem_tiled_copy_A,
-                  tCsA,
-                  tCrA_copy_view,
-                  partitioned_extra_info,
-                  copy_partitions_extra_info,
-                  k_block + 2,
-                  read_stage);
+              Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
             }
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
       }
@@ -1432,6 +1407,10 @@ struct CollectiveMmaArrayMixedInput<
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         warpgroup_commit_batch();
 
+        if (k_block == 0) {
+          Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+        }
+
         if (k_block == K_BLOCK_MAX - 1) {
           // release prior barrier
           pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
@@ -1439,17 +1418,10 @@ struct CollectiveMmaArrayMixedInput<
         }
 
         if (k_block < K_BLOCK_MAX - 2) {
-          Utils::copy_tensors_MK(
-              smem_tiled_copy_A,
-              tCsA,
-              tCrA_copy_view,
-              partitioned_extra_info,
-              copy_partitions_extra_info,
-              k_block + 2,
-              read_stage);
+          Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
         }
         if (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
         }
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {

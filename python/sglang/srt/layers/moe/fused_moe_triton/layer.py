@@ -350,6 +350,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_scale: bool = False,
         is_bias: bool = False,
     ):
         # Load grouped weight scales for group quantization
@@ -361,6 +362,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                is_scale=is_scale,
                 is_bias=is_bias,
             )
         elif shard_id in ("w1", "w3", "w13"):
@@ -370,6 +372,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                is_scale=is_scale,
                 is_bias=is_bias,
             )
 
@@ -400,6 +403,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_scale: bool = False,
         is_bias: bool = False,
     ):
         # Index the loaded weight for tp sharding.
@@ -456,7 +460,27 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+
+        if (
+            self.quant_config is not None
+            and "w4afp8" in self.quant_config.get_name()
+            and not is_scale
+        ):
+            from sglang.srt.layers.quantization.fp8_kernel import interleave_int4
+
+            expert_data_tmp = torch.empty_like(expert_data)
+            expert_data_tmp.copy_(loaded_weight)
+            # print("expert_data_tmp:", expert_data_tmp)
+            interleave_int4(
+                expert_data_tmp,
+                expert_data,
+                expert_data.shape[0],
+                expert_data.shape[1] * 2,
+            )
+            # print("expert_data:", expert_data)
+
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_w2(
         self,
@@ -465,6 +489,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_scale: bool = False,
         is_bias: bool = False,
     ):
         """Load w2 weights for down projection.
@@ -529,7 +554,23 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        if (
+            self.quant_config is not None
+            and "w4afp8" in self.quant_config.get_name()
+            and not is_scale
+        ):
+            from sglang.srt.layers.quantization.fp8_kernel import interleave_int4
+
+            expert_data_tmp = torch.empty_like(expert_data)
+            expert_data_tmp.copy_(loaded_weight)
+            interleave_int4(
+                expert_data_tmp,
+                expert_data,
+                expert_data.shape[0],
+                expert_data.shape[1] * 2,
+            )
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -792,6 +833,7 @@ class FusedMoE(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=tp_rank,
+                    is_scale="scale" in weight_name,
                 )
             return
 
@@ -825,6 +867,7 @@ class FusedMoE(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=tp_rank,
+                    is_scale="scale" in weight_name,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -859,6 +902,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                is_scale="scale" in weight_name,
             )
             return
 
@@ -948,6 +992,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
                 is_bias=is_bias,
+                is_scale="scale" in weight_name,
             )
             return
         else:

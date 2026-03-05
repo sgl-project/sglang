@@ -288,11 +288,10 @@ struct CollectiveMma_<
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
   static constexpr bool UseScaleLookupTable =
       KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ScaleA>;
-  static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
-  static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
-  static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
-
-  static_assert(SmemAlignmentA >= 128 and SmemAlignmentB >= 128, "Require at least 128B alignment");
+  static constexpr bool UseInt4ToFP8LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
+                                                  cute::is_same_v<ElementA, cutlass::int4_t> &&
+                                                  cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
+  static_assert(UseScaleLookupTable && UseInt4ToFP8LookupTable, " Only support lookup table for int4 * fp8.");
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

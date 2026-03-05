@@ -105,7 +105,7 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t topk) {
   uint32_t m;
   if (a_tensors.dim() == 3) {  // low-latency 3d input
-    m = 16;                    // small
+    m = 16;                    // small batch_size
   } else {
     m = a_tensors.size(0) / b_tensors.size(0);  // for 2d input, the average per-expert m
   }
@@ -116,7 +116,7 @@ void dispatch_w4a8_moe_mm_sm90(
   if (n == 4096 && k == 7168) {
     // group gemm 1 for ep
     if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 1024) {
@@ -131,7 +131,7 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (n == 7168 && k == 2048) {
     // group gemm 2 for ep
     if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 4096) {
@@ -154,11 +154,11 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (n == 7168 && k == 256) {
     // group gemm 2 for tp
     if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 16, 128, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 1, 1, 1>));
     } else if (m <= 128) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
     } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
     }
   } else {
     if (k % 512 == 0) {
@@ -175,11 +175,11 @@ void dispatch_w4a8_moe_mm_sm90(
       }
     } else {
       if (m <= 16) {
-        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 16, 128, 1, 1, 1>));
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 2, 1, 1>));  // PP has some bug when k = 128
       } else if (m <= 128) {
-        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
       } else {
-        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
       }
     }
   }
