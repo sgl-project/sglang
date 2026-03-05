@@ -172,6 +172,16 @@ class PrefillDelayer:
                 **debug_info,
             )
         elif prefillable_status == "mixed":
+            # When dp-attention is enabled, if some DPs have no prefill requests
+            # and all uniformly execute decode requests
+            if self.enable_dp_attention:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=False,
+                    output_reason="delay",
+                    **debug_info,
+                )
+
             if global_exists_token_watermark_force_allow:
                 return _NegotiateOutput(
                     next_state=None,
