@@ -27,6 +27,9 @@ def get_thinking_kwargs(args):
         return {
             "chat_template_kwargs": {thinking_param: True},
         }
+    # Explicitly disable thinking (e.g., "qwen3-no-think")
+    if thinking_mode == "qwen3-no-think":
+        return {"chat_template_kwargs": {"enable_thinking": False}}
     return {}
 
 
