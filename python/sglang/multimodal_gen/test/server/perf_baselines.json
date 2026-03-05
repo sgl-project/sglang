@@ -2050,6 +2050,26 @@
             "expected_e2e_ms": 10464.97,
             "expected_avg_denoise_ms": 169.92,
             "expected_median_denoise_ms": 171.37
+        },
+        "flux_2_klein_ti2i_2_gpus": {
+            "stages_ms": {
+                "InputValidationStage": 40.19,
+                "TextEncodingStage": 88.84,
+                "ImageVAEEncodingStage": 80.81,
+                "LatentPreparationStage": 1.05,
+                "TimestepPreparationStage": 28.64,
+                "DenoisingStage": 354.04,
+                "DecodingStage": 11.11
+            },
+            "denoise_step_ms": {
+                "0": 33.54,
+                "1": 61.3,
+                "2": 86.9,
+                "3": 87.55
+            },
+            "expected_e2e_ms": 716.81,
+            "expected_avg_denoise_ms": 67.32,
+            "expected_median_denoise_ms": 74.1
         }
     }
 }

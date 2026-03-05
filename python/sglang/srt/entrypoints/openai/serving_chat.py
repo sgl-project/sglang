@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -641,7 +642,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"]["finish_reason"]
+                finish_reason = content["meta_info"].get("finish_reason", None)
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
@@ -661,7 +662,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    finish_reasons[index] = finish_reason
+                    # If the abort is from scheduler.
+                    if finish_reason_type == "abort":
+                        code = finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        error = self.create_streaming_error_response(
+                            finish_reason.get("message", "Generation aborted."),
+                            code.name,
+                            code.value,
+                        )
+                        yield f"data: {error}\n\n"
+                        break
+                    else:
+                        finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):
