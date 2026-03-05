@@ -416,7 +416,9 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     This prevents port conflicts that could occur if another process (e.g., a
     subprocess spawned during model loading) binds to the same port before the
     HTTP server starts. By binding early, we ensure the port is available and
-    reserved for the HTTP server.
+    reserved for the HTTP server. The socket is intentionally not put into
+    listening mode here to avoid accepting probe connections before uvicorn is
+    ready to serve requests.
 
     Args:
         host: The host address to bind to.
@@ -444,14 +446,8 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # SO_REUSEPORT: Allows multiple processes to bind to the same port
-    # This is useful for multi-worker mode
-    if hasattr(socket, "SO_REUSEPORT"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
     try:
         sock.bind((host or "", port))
-        sock.listen(128)  # Put socket in listening state for uvicorn
         sock.set_inheritable(True)
         logger.info(
             f"Successfully reserved port {port} on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'"

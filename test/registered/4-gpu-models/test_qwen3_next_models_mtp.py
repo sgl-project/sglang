@@ -72,6 +72,7 @@ class TestQwen3NextMTP(CustomTestCase):
                 "2048",
                 "--mamba-scheduler-strategy",
                 "no_buffer",
+                "--disable-radix-cache",
             ],
         )
 
