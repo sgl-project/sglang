@@ -100,7 +100,7 @@ def assert_equal(
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("k", [1024, 2048, 4096])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("has_row_starts", [True, False])
 @torch.inference_mode()
@@ -129,7 +129,7 @@ def test_topk_kernel(bs: int, k: int, seq_len: int, has_row_starts: bool) -> Non
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("k", [1024, 2048, 4096])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("mode", ["extend", "decode", "target_verify"])
 @torch.inference_mode()
@@ -193,7 +193,7 @@ def test_topk_transform_kernel(bs: int, k: int, seq_len: int, mode: str) -> None
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("k", [1024, 2048, 4096])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("has_row_starts", [True, False])
 @torch.inference_mode()
