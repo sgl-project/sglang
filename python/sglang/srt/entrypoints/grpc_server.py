@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
+from sglang.srt.grpc.utils import abort_code_from_output
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
@@ -201,12 +202,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 if isinstance(output, list):
                     for batch_output in output:
                         if "error" in batch_output:
-                            code = (
-                                grpc.StatusCode.CANCELLED
-                                if "abort" in batch_output
-                                else grpc.StatusCode.INTERNAL
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                batch_output["error"],
                             )
-                            await context.abort(code, batch_output["error"])
                         else:
                             # All non-error batch outputs are final responses
                             yield self._create_completion_response(
@@ -215,12 +214,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 else:
                     # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
-                        code = (
-                            grpc.StatusCode.CANCELLED
-                            if "abort" in output
-                            else grpc.StatusCode.INTERNAL
+                        await context.abort(
+                            abort_code_from_output(output),
+                            output["error"],
                         )
-                        await context.abort(code, output["error"])
                     elif request.stream:
                         yield self._create_chunk_response(request.request_id, output)
                         if output.get("finished", False):
