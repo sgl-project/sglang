@@ -654,11 +654,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len: int,
     ) -> torch.Tensor:
         # doing below compute on cpu to avoid frequent small kernels
-        if mm_input.mrope_position_delta_cache is None:
-            mm_input.mrope_position_delta_cache = (
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
                 (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
             )
-        mrope_positions = mm_input.mrope_position_delta_cache + seq_len
+        mrope_positions = mm_input.mrope_position_delta_repeated_cache + seq_len
         return mrope_positions
 
     def _compute_mrope_positions(
