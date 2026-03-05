@@ -190,7 +190,7 @@ class TestDeepseekV32DPMTPV2(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 90)
+            self.assertGreater(speed, 120)
 
 
 class TestDeepseekV32TPMTP(CustomTestCase):
@@ -272,7 +272,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 150)
+            self.assertGreater(speed, 160)
 
 
 class TestDeepseekV32TPMTPV2(CustomTestCase):
@@ -355,7 +355,7 @@ class TestDeepseekV32TPMTPV2(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 150)
+            self.assertGreater(speed, 180)
 
 
 if __name__ == "__main__":
