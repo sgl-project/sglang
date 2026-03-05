@@ -1258,8 +1258,12 @@ class Indexer(MultiPlatformOp):
                     q.record_stream(self.alt_stream)
                     q_rope_event = self.alt_stream.record_event()
             else:
-                q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-                q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+                q_lora = (
+                    (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+                )
+                q = self.wq_b(q_lora)[
+                    0
+                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
                 q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
                 q_pe, q_nope = torch.split(
                     q,
@@ -1333,7 +1337,7 @@ class Indexer(MultiPlatformOp):
                 [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                 dim=-1,
             )  # [bs, 64 + 64]
-            
+
             k_pe = k_pe.unsqueeze(1)
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             k_pe = k_pe.squeeze(1)
