@@ -28,6 +28,44 @@ register_cuda_ci(est_time=1100, suite="stage-b-test-large-1-gpu")
 class TestEAGLEServerBasic(EagleServerBase):
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
+    def test_radix_attention_with_zero_decode(self):
+        """Debug: decode_len=0 can cause max_new_tokens=0 requests that finish
+        immediately after prefill.  If spec-decode init already added them to
+        the batch, this may leave stale entries."""
+        nodes = []
+        # Explicitly include decode_len=0 cases
+        for i in range(50):
+            nodes.append({"input_ids": [37] * random.randint(10, 200), "decode_len": 0})
+        # Mix with normal requests
+        for i in range(350):
+            nodes.append(
+                {
+                    "input_ids": [37] * random.randint(10, 200),
+                    "decode_len": random.randint(1, 256),
+                }
+            )
+        random.shuffle(nodes)
+
+        data = {
+            "input_ids": [n["input_ids"] for n in nodes],
+            "sampling_params": [
+                {"max_new_tokens": n["decode_len"], "temperature": 0} for n in nodes
+            ],
+        }
+        res = requests.post(self.base_url + "/generate", json=data)
+        self.assertEqual(res.status_code, 200)
+        self.assertIsNone(self.process.poll())
+
+    def test_radix_attention_stress(self):
+        """Debug: loop radix_attention to increase repro probability.
+        Also catches stale state leaked from earlier test methods
+        (e.g. TestEAGLERetract with max_total_tokens=4500)."""
+        for i in range(10):
+            print(f"=== radix_attention stress run {i} ===")
+            requests.get(self.base_url + "/flush_cache")
+            run_radix_attention_test(self.base_url)
+            self.assertIsNone(self.process.poll())
+
     # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
         concurrency = 4

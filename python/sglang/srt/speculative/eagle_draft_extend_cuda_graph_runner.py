@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -222,6 +223,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        if os.environ.get("SGLANG_FORCE_EAGER_DRAFT_EXTEND", "0") == "1":
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -437,6 +440,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            buffers.input_ids.zero_()
+            buffers.hidden_states.zero_()
             buffers.accept_length.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
@@ -449,12 +454,31 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
+        # G1: check hidden_states input before copy
+        torch._assert_async(
+            ~torch.isnan(forward_batch.spec_info.hidden_states).any(),
+            "G1: spec_info.hidden_states has NaN before copy into cuda graph buffer",
+        )
         if (
             forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
         ):
             buffers.hidden_states[:num_tokens].copy_(
                 forward_batch.spec_info.hidden_states
+            )
+            # G2: verify copy succeeded
+            torch._assert_async(
+                ~torch.isnan(buffers.hidden_states[:num_tokens]).any(),
+                "G2: buffers.hidden_states has NaN after copy",
+            )
+        else:
+            # G2b: hidden_states shape mismatch — copy skipped!
+            import logging
+
+            logging.warning(
+                f"G2b: hidden_states shape mismatch! "
+                f"spec_info={forward_batch.spec_info.hidden_states.shape}, "
+                f"buffer={buffers.hidden_states.shape}. Copy SKIPPED."
             )
         if forward_batch.spec_info.accept_length is not None:
             buffers.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
@@ -510,6 +534,26 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.bs = bs
         self._replay(forward_batch)
         out = self.output_buffers[bs]
+
+        # H1: check valid portion of graph output
+        torch._assert_async(
+            ~torch.isnan(out.next_token_logits[:num_tokens]).any(),
+            "H1: graph output next_token_logits has NaN in VALID slots",
+        )
+        # H2: check padded portion of graph output
+        if bs * self.num_tokens_per_bs > num_tokens:
+            padded_logits = out.next_token_logits[num_tokens:]
+            has_nan_in_pad = torch.isnan(padded_logits).any()
+            torch._assert_async(
+                ~has_nan_in_pad,
+                "H2: graph output next_token_logits has NaN in PADDED slots only (benign)",
+            )
+        # H3: valid hidden_states
+        if out.hidden_states is not None:
+            torch._assert_async(
+                ~torch.isnan(out.hidden_states[:num_tokens]).any(),
+                "H3: graph output hidden_states has NaN in VALID slots",
+            )
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.

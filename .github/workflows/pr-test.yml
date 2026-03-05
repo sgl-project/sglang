@@ -944,9 +944,9 @@ jobs:
       IS_BLACKWELL: "1"
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 1
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7]
+        partition: [0]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -975,11 +975,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python -m pytest registered/spec/eagle/test_eagle_infer_b.py::TestEAGLEServerBasic -x -v
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1005,9 +1001,9 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
+      max-parallel: 1
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        partition: [0]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1026,16 +1022,15 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
         run: |
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python -m pytest registered/spec/eagle/test_eagle_infer_b.py -x -v
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()

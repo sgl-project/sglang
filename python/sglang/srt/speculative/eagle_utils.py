@@ -24,9 +24,24 @@ def organize_draft_results(
 ):
     score_list = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
+    # C10: shape consistency
+    assert score_list.shape[1] == ss_token_list.shape[1], (
+        f"C10: shape mismatch: score_list.shape={score_list.shape}, "
+        f"ss_token_list.shape={ss_token_list.shape}"
+    )
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
+    # C11: top_scores_index upper bound for gather-B
+    torch._assert_async(
+        (top_scores_index < ss_token_list.shape[1]).all(),
+        "C11: top_scores_index OOB for gather-B",
+    )
+    # C12: top_scores_index non-negative
+    torch._assert_async(
+        (top_scores_index >= 0).all(),
+        "C12: top_scores_index has negative values",
+    )
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     if len(parents_list) > 1:

@@ -622,6 +622,15 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        # D1: initial inputs from target model verify
+        torch._assert_async(
+            ~torch.isnan(topk_p).any(),
+            "D1: initial topk_p from spec_info has NaN",
+        )
+        torch._assert_async(
+            ~torch.isnan(hidden_states).any(),
+            "D1: initial hidden_states from spec_info has NaN",
+        )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
@@ -666,17 +675,63 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
+            # D2: hidden_states input to draft model
+            torch._assert_async(
+                ~torch.isnan(hidden_states).any(),
+                "D2: hidden_states input to draft model has NaN",
+            )
+
             # Run forward
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
+
+            # D3: logits before softmax
+            torch._assert_async(
+                ~torch.isnan(logits_output.next_token_logits).any(),
+                "D3: next_token_logits has NaN before softmax",
+            )
+            torch._assert_async(
+                ~torch.isinf(logits_output.next_token_logits).any(),
+                "D3: next_token_logits has Inf before softmax",
+            )
+
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            # C4: probs no NaN
+            torch._assert_async(
+                ~torch.isnan(probs).any(),
+                "C4: probs has NaN after softmax in draft_forward",
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # C1: fast_topk index in valid range
+            torch._assert_async(
+                (topk_index < probs.shape[-1]).all(),
+                "C1: fast_topk returned index >= vocab_size",
+            )
+            torch._assert_async(
+                (topk_index >= 0).all(),
+                "C1b: fast_topk returned negative index",
+            )
+            # C2: fast_topk values no NaN
+            torch._assert_async(
+                ~torch.isnan(topk_p).any(),
+                "C2: fast_topk returned NaN probability",
+            )
             if self.hot_token_id is not None:
+                # C3: hot_token_id indexing bounds
+                torch._assert_async(
+                    (topk_index < self.hot_token_id.shape[0]).all(),
+                    "C3: topk_index OOB for hot_token_id lookup",
+                )
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            # D4: hidden_states output from draft model
+            torch._assert_async(
+                ~torch.isnan(hidden_states).any(),
+                "D4: hidden_states output from draft model has NaN",
+            )
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -964,6 +1019,15 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            # E5: cuda graph path outputs
+            torch._assert_async(
+                ~torch.isnan(forward_batch.spec_info.topk_p).any(),
+                "E5: topk_p has NaN from cuda_graph draft_extend",
+            )
+            torch._assert_async(
+                ~torch.isnan(forward_batch.spec_info.hidden_states).any(),
+                "E5: hidden_states has NaN from cuda_graph draft_extend",
+            )
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
@@ -992,8 +1056,32 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
+        # E1: logits from draft extend before softmax
+        torch._assert_async(
+            ~torch.isnan(logits_output.next_token_logits).any(),
+            "E1: next_token_logits has NaN in capture_for_decode",
+        )
+        torch._assert_async(
+            ~torch.isinf(logits_output.next_token_logits).any(),
+            "E1: next_token_logits has Inf in capture_for_decode",
+        )
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        # E2: probs after softmax
+        torch._assert_async(
+            ~torch.isnan(probs).any(),
+            "E2: probs has NaN in capture_for_decode",
+        )
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        # E3: topk_p from fast_topk
+        torch._assert_async(
+            ~torch.isnan(draft_input.topk_p).any(),
+            "E3: topk_p has NaN after fast_topk in capture_for_decode",
+        )
+        # E4: hidden_states from draft extend
+        torch._assert_async(
+            ~torch.isnan(logits_output.hidden_states).any(),
+            "E4: hidden_states has NaN in capture_for_decode",
+        )
         draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

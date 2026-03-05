@@ -26,6 +26,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_disable_spec_compile = os.environ.get("SGLANG_SPEC_DISABLE_COMPILE", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -463,7 +464,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _disable_spec_compile)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -488,6 +489,11 @@ def select_top_k_tokens(
         )
     else:
         # The later decode steps
+        # C5: topk_p non-negative
+        torch._assert_async((topk_p >= 0).all(), "C5: topk_p has negative values")
+        # C6: topk_p no NaN
+        torch._assert_async(~torch.isnan(topk_p).any(), "C6: topk_p has NaN")
+
         expand_scores = torch.mul(
             scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
         )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
@@ -497,12 +503,32 @@ def select_top_k_tokens(
         scores = topk_cs_p  # shape: (b, topk)
 
         topk_index = topk_index.reshape(-1, topk**2)
+
+        # C7: topk_cs_index upper bound for gather-A
+        torch._assert_async(
+            (topk_cs_index < topk_index.shape[1]).all(),
+            "C7: topk_cs_index OOB for gather-A",
+        )
+        # C8: topk_cs_index non-negative
+        torch._assert_async(
+            (topk_cs_index >= 0).all(), "C8: topk_cs_index has negative values"
+        )
+
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
         if hidden_states.shape[0] > 0:
             selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
                 0, hidden_states.shape[0], step=topk, device=topk_index.device
             ).repeat_interleave(topk)
+            # C9: selected_input_index bounds
+            torch._assert_async(
+                (selected_input_index >= 0).all(),
+                "C9: selected_input_index has negative values",
+            )
+            torch._assert_async(
+                (selected_input_index < hidden_states.shape[0]).all(),
+                "C9: selected_input_index OOB for hidden_states",
+            )
             hidden_states = hidden_states[selected_input_index, :]
 
         tree_info = (
