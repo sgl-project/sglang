@@ -20,7 +20,7 @@ Key differences from MambaMixer2:
 - 2D temporal state (intermediate_size/tp, state_size), no groups/heads
 - Uses dt_proj to project dt_rank -> intermediate_size
 - Uses x_proj to compute dt, B, C from conv output
-- Uses selective_scan_fn for prefill, triton kernel for decode
+- Uses selective_scan_fwd for prefill, shared selective_state_update for decode
 """
 
 from typing import Optional
@@ -36,7 +36,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.attention.mamba.mamba1_metadata import Mamba1Metadata
 from sglang.srt.layers.attention.mamba.ops import (
     mamba1_selective_scan,
-    mamba1_selective_state_update,
+    selective_state_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -308,7 +308,7 @@ class MambaMixer1(nn.Module):
             dt, _ = self.dt_proj(dt)
             A = -torch.exp(self.A_log.float())
 
-            y_d = mamba1_selective_state_update(
+            selective_state_update(
                 ssm_state,
                 x_conv,
                 dt,
@@ -319,9 +319,8 @@ class MambaMixer1(nn.Module):
                 z=z_d,
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,
+                out=ssm_output[num_prefill_tokens:],
             )
-
-            ssm_output[num_prefill_tokens:] = y_d
 
         # 4. Output projection
         output[:num_tokens], _ = self.out_proj(ssm_output)

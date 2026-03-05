@@ -78,14 +78,15 @@ class JambaMoE(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
-        self.router = ReplicatedLinear(
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.router",
-        )
+        
+        if config.num_experts > 1:
+            self.router = ReplicatedLinear(
+                config.hidden_size,
+                config.num_experts,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.router",
+            )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -199,7 +200,6 @@ class JambaMambaDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        # Mamba1 mixer (generic reusable layer, like MambaMixer2 for Mamba2 models)
         self.mamba = MambaMixer1(
             cache_params=config.mamba1_cache_params,
             hidden_size=config.hidden_size,
@@ -210,7 +210,7 @@ class JambaMambaDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             activation="silu",
             quant_config=quant_config,
-            prefix=f"{prefix}.mamba",
+            prefix=f"{prefix}.mixer",
         )
 
         # FFN: MLP or MoE based on layer pattern
