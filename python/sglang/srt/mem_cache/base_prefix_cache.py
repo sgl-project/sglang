@@ -41,6 +41,8 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # KVConnector specific
+    update_connector_state: bool = False
 
 
 @dataclasses.dataclass
@@ -247,7 +249,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         pass
 
-    def check_hicache_events(self) -> Any:
+    def check_kv_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """
