@@ -20,6 +20,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -200,10 +201,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         # Dynamically resize cache if positions exceed current size
         # Note: .max().item() causes a sync, but it is necessary for safety here 
         # unless handled upstream.
-        max_pos = positions.max().item()
-        if max_pos >= self.cos_sin_cache.shape[0]:
-            # print(f"Resize cos_sin_cache from {self.cos_sin_cache.shape[0]} to {max_pos + 1}")
-            self._compute_cos_sin_cache_dynamically(max_pos + 1, query.device, query.dtype)
+        if not get_is_capture_mode():
+            max_pos = positions.max().item()
+            if max_pos >= self.cos_sin_cache.shape[0]:
+                # print(f"Resize cos_sin_cache from {self.cos_sin_cache.shape[0]} to {max_pos + 1}")
+                self._compute_cos_sin_cache_dynamically(max_pos + 1, query.device, query.dtype)
 
         self._match_cos_sin_cache_dtype(query)
         triton_mrope_fused(
