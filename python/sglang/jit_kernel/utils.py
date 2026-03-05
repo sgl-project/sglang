@@ -198,20 +198,6 @@ def is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
-def _parse_cuda_version() -> tuple[int, int]:
-    """Parse the CUDA toolkit version from ``torch.version.cuda``."""
-    v = torch.version.cuda
-    if not v:
-        return (0, 0)
-    parts = v.split(".")
-    if len(parts) < 2:
-        return (0, 0)
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
-        return (0, 0)
-
-
 @cache_once
 def _get_cuda_arch_list() -> str:
     """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST.
