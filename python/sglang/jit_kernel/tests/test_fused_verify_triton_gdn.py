@@ -129,25 +129,6 @@ def run_fused_mtp(
     )
 
 
-def _check_precision(out_ref, out_fused, label, max_fail_rate=0.01, atol=0.1):
-    abs_diff = (out_ref.float() - out_fused.float()).abs()
-    max_diff = abs_diff.max().item()
-    mean_diff = abs_diff.mean().item()
-    fail_rate = (abs_diff > atol).float().mean().item() * 100
-    has_nan = torch.isnan(out_fused).any() or torch.isinf(out_fused).any()
-
-    print(
-        f"\n  {label}: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, "
-        f"fail_rate(>{atol})={fail_rate:.2f}%"
-    )
-
-    assert not has_nan, f"{label}: Output contains NaN/Inf"
-    assert (
-        fail_rate < max_fail_rate
-    ), f"{label}: Fail rate {fail_rate:.2f}% >= {max_fail_rate}%"
-    return max_diff, mean_diff
-
-
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
 @pytest.mark.parametrize("N", [1, 8, 16])
 @pytest.mark.parametrize("T", [1, 4, 8])
@@ -189,7 +170,61 @@ def test_fused_gdn_mtp_precision(N: int, T: int):
         disable_state_update=True,
     )
 
-    _check_precision(out_ref, out_fused, f"basic N={N} T={T}")
+    torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+@pytest.mark.parametrize("N", [1, 16, 128])
+def test_mtp_single_step_decode(N: int):
+    """Verify MTP kernel matches reference for T=1 (decode scenario)."""
+    T = 1
+    H, HV, K, V = 16, 32, 128, 128
+
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+
+    state_ref = state.clone()
+    state_fused = state.clone()
+
+    out_ref = run_reference(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state_ref,
+        indices,
+        cu_seqlens,
+        disable_state_update=False,
+    )
+    out_fused = run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state_fused,
+        indices,
+        cu_seqlens,
+        disable_state_update=False,
+    )
+
+    torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
+
+    # Also verify states match after update
+    state_diff = (state_ref.float() - state_fused.float()).abs()
+    state_max_diff = state_diff.max().item()
+    state_fail_rate = (state_diff > 0.1).float().mean().item() * 100
+    print(
+        f"  single_step state N={N}: max_diff={state_max_diff:.2e}, "
+        f"fail_rate={state_fail_rate:.2f}%"
+    )
+    assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
 
 
 if __name__ == "__main__":

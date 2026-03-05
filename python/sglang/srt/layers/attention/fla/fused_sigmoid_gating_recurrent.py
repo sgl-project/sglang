@@ -215,12 +215,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         step_idx += 1
 
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q
+        p_k += stride_k
+        p_v += stride_v
+        p_b += stride_b
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
         if IS_KDA:
             p_a += HV * K
         else:
