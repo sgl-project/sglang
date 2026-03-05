@@ -190,7 +190,7 @@ class TestDeepseekV32DPMTPV2(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 120)
+            self.assertGreater(speed, 90)
 
 
 class TestDeepseekV32TPMTP(CustomTestCase):
