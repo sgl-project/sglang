@@ -42,8 +42,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
-# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1783,8 +1781,6 @@ class NativeSparseAttnBackend(
             )
 
         # Use FA3 for SM90 (Hopper/H200)
-        fa_version = 3
-
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1795,7 +1791,6 @@ class NativeSparseAttnBackend(
             max_seqlen_k=max_seqlen_k,
             softmax_scale=layer.scaling,
             causal=causal,
-            ver=fa_version,
         )
 
     def _forward_tilelang(
