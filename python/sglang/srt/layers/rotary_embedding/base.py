@@ -88,6 +88,15 @@ class RotaryEmbedding(MultiPlatformOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+        if (
+            get_global_server_args().enable_fused_qk_norm_rope
+            and _use_aiter
+            and self.rotary_dim != self.head_size
+            ):
+            self._init_padded_cos_sin_cache()
+        else:
+            self._padded_cos_sin_cache = None
+
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         if get_global_server_args().rl_on_policy_target is not None:
@@ -129,6 +138,19 @@ class RotaryEmbedding(MultiPlatformOp):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _init_padded_cos_sin_cache(self):
+        """Pad cos_sin_cache from [max_pos, rotary_dim] to [max_pos, head_size].
+        Follows the same approach as _compute_cos_sin_cache but pads freqs
+        with zeros before cos/sin so that cos(0)=1, sin(0)=0 gives identity."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        freqs = torch.nn.functional.pad(freqs, (0, self.head_size // 2 - freqs.shape[-1]))
+        padded = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+        if not _is_cuda:
+            padded = padded.to(self.dtype)
+        self.register_buffer("_padded_cos_sin_cache", padded, persistent=False)
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""

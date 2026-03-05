@@ -642,7 +642,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv = qkv.contiguous()
 
         rotary_emb = self.rotary_emb
-        cos_sin = rotary_emb.cos_sin_cache
+        if rotary_emb._padded_cos_sin_cache is not None:
+            cos_sin = rotary_emb._padded_cos_sin_cache
+        else:
+            cos_sin = rotary_emb.cos_sin_cache
+        assert cos_sin.shape[-1] == self.rotary_emb.head_size, f"To use fused aiter kernel, the cos_sin cache must be padded to the head size. cos_sin.shape: {cos_sin.shape}, self.rotary_emb.head_size: {self.rotary_emb.head_size}, rotary_emb.rotary_dim: {rotary_emb.rotary_dim}"
         positions_1d = positions.flatten()
 
         layer_id = self.attn.layer_id
@@ -739,7 +743,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 q_gate = q_gate.unflatten(-1, (self.num_heads, 2, self.head_dim))
                 q = q_gate[:, :, 0, :].reshape(q_gate.shape[0], -1)
                 gate = q_gate[:, :, 1, :].reshape(q_gate.shape[0], -1)
-                qkv = torch.cat([q, k, v], dim=-1).contiguous()
+                qkv = torch.cat([q, k, v], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
