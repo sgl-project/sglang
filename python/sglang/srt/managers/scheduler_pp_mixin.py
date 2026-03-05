@@ -193,6 +193,7 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        send_has_batch_work = []
 
         while True:
             server_is_idle = True
@@ -223,15 +224,45 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk()
-                batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+
+                # Stage 0 broadcasts its batch decision to downstream ranks
+                # *before* they call get_new_batch_prefill(), preventing them
+                # from allocating KV cache that would need rollback.
+                # The has_batch signal was sent (async) at the bottom of the
+                # *previous* mb_id iteration and committed here, matching the
+                # same send-at-bottom / recv-at-top pattern used by recv_reqs,
+                # bootstrapped_rids, and transferred_rids.
+                if not self.pp_group.is_first_rank:
+                    prev_stage_has_batch = self._pp_recv_has_batch_from_prev_stage()
+                else:
+                    prev_stage_has_batch = True  # Stage0 decides after scheduling
+                self._pp_commit_comm_work(send_has_batch_work)
+
+                if self.pp_group.is_first_rank:
+                    batch = self.get_new_batch_prefill()
+                    batch = self.maybe_prepare_mlp_sync_batch(batch)
+                    prev_stage_has_batch = batch is not None
+                elif prev_stage_has_batch:
+                    batch = self.get_new_batch_prefill()
+                    batch = self.maybe_prepare_mlp_sync_batch(batch)
+                else:
+                    batch = None
+
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
+
+                # Recv proxy tensors when the previous stage had a batch (i.e.,
+                # it will send proxy tensors on the tensor-dict channel), regardless
+                # of whether this stage produced a batch.  The two must stay in
+                # lock-step to avoid message misalignment across mb_id slots.
+                if not self.pp_group.is_first_rank and prev_stage_has_batch:
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                else:
+                    pp_proxy_tensors = None
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -300,6 +331,9 @@ class SchedulerPPMixin:
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
+                    )
+                    send_has_batch_work = self._pp_send_pyobj_to_next_stage(
+                        [prev_stage_has_batch], async_send=True
                     )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
@@ -870,6 +904,11 @@ class SchedulerPPMixin:
                 async_send=async_send,
             )
         return p2p_work
+
+    def _pp_recv_has_batch_from_prev_stage(self: Scheduler) -> bool:
+        """Receive has_batch flag from the previous PP stage via pyobj channel."""
+        data = self._pp_recv_pyobj_from_prev_stage()
+        return data[0] if data else False
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0:
