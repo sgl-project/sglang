@@ -19,12 +19,10 @@ template <typename DType, int kVecSize>
 __global__ void per_token_quant_fp8_kernel(const DType* __restrict__ input,
                                            fp8_e4m3_t* __restrict__ output_q,
                                            float* __restrict__ output_s,
-                                           const int64_t hidden_dim,
-                                           const int64_t num_tokens) {
+                                           const int64_t hidden_dim) {
   using namespace device;
 
   const int64_t token_idx = blockIdx.x;
-  if (token_idx >= num_tokens) return;
 
   const DType* token_input = input + token_idx * hidden_dim;
   fp8_e4m3_t* token_output = output_q + token_idx * hidden_dim;
@@ -108,7 +106,7 @@ void per_token_quant_fp8(tvm::ffi::TensorView input,
 
   auto launch = [&](auto kernel) {
     LaunchKernel(num_tokens, kBlockSize, device.unwrap())(
-        kernel, input_ptr, output_q_ptr, output_s_ptr, hidden_dim, num_tokens);
+        kernel, input_ptr, output_q_ptr, output_s_ptr, hidden_dim);
   };
 
   if (hidden_dim % kMaxVecSize == 0) {
