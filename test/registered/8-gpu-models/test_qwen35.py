@@ -35,6 +35,7 @@ class TestQwen35(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
+            "--mamba-scheduler-strategy=extra_buffer",
         ]
 
         variants = [
@@ -49,13 +50,16 @@ class TestQwen35(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args + mtp_args,
                 variant="TP8+MTP",
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-A17B",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.95),
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=0.95, max_tokens=2048
+            ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_qwen35",
             ),
