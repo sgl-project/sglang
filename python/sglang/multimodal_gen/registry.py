@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
+    HeliosDistilledConfig,
+    HeliosMidConfig,
+    HeliosT2VConfig,
     HunyuanConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -74,6 +77,11 @@ from sglang.multimodal_gen.configs.sample.flux import (
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.helios import (
+    HeliosDistilledSamplingParams,
+    HeliosMidSamplingParams,
+    HeliosT2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
@@ -390,6 +398,17 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
+    # Detect quantized models and fallback to diffusers
+    is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
+    if is_quantized and backend != Backend.DIFFUSERS:
+        logger.info(
+            "Detected a quantized model format ('%s'). "
+            "The native sglang-diffusion engine currently only supports BF16/FP16. "
+            "Falling back to diffusers backend.",
+            model_path,
+        )
+        return _get_diffusers_model_info(model_path)
+
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
     if pipeline_class_name:
@@ -656,34 +675,49 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        model_detectors=[
+            lambda hf_id: "qwen-image" in hf_id.lower()
+            and "edit" not in hf_id.lower()
+            and "layered" not in hf_id.lower()
+            and "2512" not in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2512"],
+        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+        model_detectors=[
+            lambda hf_id: "qwen-image-edit" in hf_id.lower()
+            and "2509" not in hf_id.lower()
+            and "2511" not in hf_id.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
+        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
     )
 
     register_configs(
@@ -698,6 +732,34 @@ def _register_configs():
             "tencent/Hunyuan3D-2",
         ],
         model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )
+
+    # Helios
+    register_configs(
+        sampling_param_cls=HeliosT2VSamplingParams,
+        pipeline_config_cls=HeliosT2VConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Base",
+        ],
+        model_detectors=[
+            lambda hf_id: "helios" in hf_id.lower()
+            and "mid" not in hf_id.lower()
+            and "distill" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosMidSamplingParams,
+        pipeline_config_cls=HeliosMidConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Mid",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosDistilledSamplingParams,
+        pipeline_config_cls=HeliosDistilledConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Distilled",
+        ],
     )
 
 

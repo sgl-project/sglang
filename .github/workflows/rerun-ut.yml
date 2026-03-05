@@ -1,0 +1,71 @@
+name: Rerun UT
+run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0}', inputs.pr_head_sha) || '[rerun-ut]' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_command:
+        description: "Test command to run (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
+        required: true
+        type: string
+      runner_label:
+        description: "Runner label (e.g. '1-gpu-runner', '1-gpu-5090', '4-gpu-h100')"
+        required: true
+        type: string
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-ut on fork PRs)"
+        required: false
+        type: string
+        default: ""
+      use_deepep:
+        description: "Use ci_install_deepep.sh instead of ci_install_dependency.sh"
+        required: false
+        type: string
+        default: "false"
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun-ut-cuda:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+    env:
+      RUNNER_LABELS: ${{ inputs.runner_label }}
+      IS_BLACKWELL: ${{ (inputs.runner_label == '1-gpu-5090' || contains(inputs.runner_label, 'b200')) && '1' || '' }}
+      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_label == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          if [[ "${{ inputs.use_deepep }}" == "true" ]]; then
+            bash scripts/ci/cuda/ci_install_deepep.sh
+          else
+            bash scripts/ci/cuda/ci_install_dependency.sh
+          fi
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          cd test/
+          python3 ${{ inputs.test_command }}
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
