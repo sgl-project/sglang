@@ -30,7 +30,7 @@ class ImageGenerationsRequest(BaseModel):
     quality: Optional[str] = "auto"
     response_format: Optional[str] = "url"  # url | b64_json
     size: Optional[str] = "1024x1024"  # e.g., 1024x1024
-    # SGLang extension: explicit dimensions (takes precedence over `size`).
+    # Optional explicit output dimensions.
     width: Optional[int] = None
     height: Optional[int] = None
     style: Optional[str] = "vivid"
