@@ -463,6 +463,11 @@ class AnthropicServing:
                         output_tokens=(
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
+                        cache_read_input_tokens=(
+                            usage_info.get("cache_read_input_tokens", None)
+                            if usage_info
+                            else None
+                        ),
                     ),
                 )
                 yield _wrap_sse_event(
@@ -498,6 +503,18 @@ class AnthropicServing:
             if first_chunk:
                 first_chunk = False
 
+                # Calculate input_tokens according to Anthropic protocol:
+                # Full formula: input_tokens = total_input_tokens - cache_read - cache_write
+                # Currently OpenAI protocol only provides cache_read (cached_tokens),
+                # so we use: input_tokens = prompt_tokens - cached_tokens
+                prompt_tokens = chunk.usage.prompt_tokens if chunk.usage else 0
+                cached_tokens = (
+                    chunk.usage.prompt_tokens_details.cached_tokens
+                    if chunk.usage and chunk.usage.prompt_tokens_details
+                    else 0
+                )
+                input_tokens = prompt_tokens - cached_tokens
+
                 start_event = AnthropicStreamEvent(
                     type="message_start",
                     message=AnthropicMessagesResponse(
@@ -505,10 +522,11 @@ class AnthropicServing:
                         content=[],
                         model=model,
                         usage=AnthropicUsage(
-                            input_tokens=(
-                                chunk.usage.prompt_tokens if chunk.usage else 0
-                            ),
+                            input_tokens=input_tokens,
                             output_tokens=0,
+                            cache_read_input_tokens=(
+                                cached_tokens if cached_tokens > 0 else None
+                            ),
                         ),
                     ),
                 )
@@ -522,9 +540,18 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
+                # Calculate input_tokens for usage report
+                # Full Anthropic formula: input_tokens = prompt_tokens - cache_read - cache_write
+                # Currently only cache_read is available in OpenAI protocol
+                cached_tokens = (
+                    chunk.usage.prompt_tokens_details.cached_tokens
+                    if chunk.usage.prompt_tokens_details
+                    else 0
+                )
                 usage_info = {
-                    "input_tokens": chunk.usage.prompt_tokens,
+                    "input_tokens": chunk.usage.prompt_tokens - cached_tokens,
                     "output_tokens": chunk.usage.completion_tokens or 0,
+                    "cache_read_input_tokens": cached_tokens,
                 }
                 continue
 
@@ -678,14 +705,27 @@ class AnthropicServing:
         # Map stop reason
         stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")
 
+        # Calculate input_tokens according to Anthropic protocol:
+        # Full formula: input_tokens = total_input_tokens - cache_read - cache_write
+        # Currently OpenAI protocol only provides cache_read (cached_tokens),
+        # so we use: input_tokens = prompt_tokens - cached_tokens
+        prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+        cached_tokens = (
+            response.usage.prompt_tokens_details.cached_tokens
+            if response.usage and response.usage.prompt_tokens_details
+            else 0
+        )
+        input_tokens = prompt_tokens - cached_tokens
+
         return AnthropicMessagesResponse(
             id=f"msg_{uuid.uuid4().hex}",
             content=content,
             model=response.model,
             stop_reason=stop_reason,
             usage=AnthropicUsage(
-                input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                input_tokens=input_tokens,
                 output_tokens=response.usage.completion_tokens if response.usage else 0,
+                cache_read_input_tokens=cached_tokens if cached_tokens > 0 else None,
             ),
         )
 
