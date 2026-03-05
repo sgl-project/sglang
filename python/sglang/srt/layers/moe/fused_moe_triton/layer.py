@@ -305,7 +305,10 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and get_moe_runner_backend().is_cutlass()
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
         )
 
         self.routing_method_type = routing_method_type
