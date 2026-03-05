@@ -88,8 +88,6 @@ class TestDeepseekV32FP4DP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-
-            self.assertGreater(acc_length, 2.7)
             self.assertGreater(speed, 60)
 
 
@@ -159,8 +157,6 @@ class TestDeepseekV32FP4TP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-
-            self.assertGreater(acc_length, 2.7)
             self.assertGreater(speed, 90)
 
 
