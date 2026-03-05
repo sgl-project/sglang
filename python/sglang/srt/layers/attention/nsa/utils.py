@@ -122,12 +122,12 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     )
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     needs_tbo_pad = forward_batch.tbo_padded_len is not None
-    if not needs_cp_pad and not needs_dp_pad and not needs_tbo_pad:
-        return nsa_cache_seqlens
-    if needs_tbo_pad and not needs_cp_pad and not needs_dp_pad:
+    if needs_cp_pad or needs_dp_pad:
+        tokens = cal_padded_tokens(forward_batch)
+    elif needs_tbo_pad:
         tokens = forward_batch.tbo_padded_len
     else:
-        tokens = cal_padded_tokens(forward_batch)
+        return nsa_cache_seqlens
     pad_len = tokens - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
