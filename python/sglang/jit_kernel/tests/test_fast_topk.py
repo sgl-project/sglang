@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from sglang.jit_kernel.fast_topk import fast_topk_v2
+from sglang.jit_kernel.fast_topk import (
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    fast_topk_v2,
+)
 
 TOPK = 2048
 
@@ -71,6 +75,89 @@ def test_fast_topk_with_row_starts(batch_size):
         result_set = set(result[i].cpu().tolist())
         ref_set = set(ref_idx.cpu().tolist())
         assert result_set == ref_set, f"Row {i}: mismatch"
+
+
+@pytest.mark.parametrize("num_requests", [1, 4])
+def test_fast_topk_transform_decode(num_requests):
+    device = "cuda"
+    input_stride = 8192
+    B = num_requests  # decode: 1 query per request
+    max_pages = input_stride
+
+    score = torch.randn(B, input_stride, dtype=torch.float32, device=device)
+    lengths = torch.full((B,), input_stride, dtype=torch.int32, device=device)
+    # page table: identity mapping for simplicity
+    src_page_table = torch.arange(max_pages, dtype=torch.int32, device=device)
+    src_page_table = src_page_table.unsqueeze(0).expand(B, -1).contiguous()
+    cu_seqlens_q = torch.arange(B + 1, dtype=torch.int32, device=device)
+
+    dst = fast_topk_transform_fused(
+        score, lengths, src_page_table, cu_seqlens_q, TOPK
+    )
+
+    # With identity page table, dst should equal raw topk indices
+    ref_indices = fast_topk_v2(score, lengths, TOPK)
+    for i in range(B):
+        dst_set = set(dst[i].cpu().tolist())
+        ref_set = set(ref_indices[i].cpu().tolist())
+        assert dst_set == ref_set, f"Row {i}: decode transform mismatch"
+
+
+@pytest.mark.parametrize("num_requests", [1, 2])
+def test_fast_topk_transform_prefill(num_requests):
+    device = "cuda"
+    input_stride = 8192
+    queries_per_request = 3
+    B = num_requests * queries_per_request
+    max_pages = input_stride
+
+    score = torch.randn(B, input_stride, dtype=torch.float32, device=device)
+    lengths = torch.full((B,), input_stride, dtype=torch.int32, device=device)
+    src_page_table = torch.arange(max_pages, dtype=torch.int32, device=device)
+    src_page_table = src_page_table.unsqueeze(0).expand(num_requests, -1).contiguous()
+    cu_seqlens_q = torch.arange(
+        0, B + 1, queries_per_request, dtype=torch.int32, device=device
+    )
+    # Ensure last element is B
+    cu_seqlens_q = torch.cat([
+        cu_seqlens_q[:-1],
+        torch.tensor([B], dtype=torch.int32, device=device),
+    ])
+
+    dst = fast_topk_transform_fused(
+        score, lengths, src_page_table, cu_seqlens_q, TOPK
+    )
+
+    ref_indices = fast_topk_v2(score, lengths, TOPK)
+    for i in range(B):
+        dst_set = set(dst[i].cpu().tolist())
+        ref_set = set(ref_indices[i].cpu().tolist())
+        assert dst_set == ref_set, f"Row {i}: prefill transform mismatch"
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_fast_topk_transform_ragged(batch_size):
+    device = "cuda"
+    input_stride = 8192
+
+    score = torch.randn(batch_size, input_stride, dtype=torch.float32, device=device)
+    lengths = torch.full((batch_size,), input_stride, dtype=torch.int32, device=device)
+    # Each row has offset = row_index * input_stride
+    topk_indices_offset = torch.arange(
+        0, batch_size * input_stride, input_stride,
+        dtype=torch.int32, device=device,
+    )
+
+    dst = fast_topk_transform_ragged_fused(
+        score, lengths, topk_indices_offset, TOPK
+    )
+
+    ref_indices = fast_topk_v2(score, lengths, TOPK)
+    for i in range(batch_size):
+        offset = topk_indices_offset[i].item()
+        dst_set = set(dst[i].cpu().tolist())
+        ref_set = set((ref_indices[i] + offset).cpu().tolist())
+        assert dst_set == ref_set, f"Row {i}: ragged transform mismatch"
 
 
 if __name__ == "__main__":

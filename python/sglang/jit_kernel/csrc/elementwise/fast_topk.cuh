@@ -187,8 +187,8 @@ __device__ void fast_topk_cuda_tl(
     }
     __syncthreads();
 
-    const auto threshold_bin2 = s_threshold_bin_id;
-    topk -= s_histogram[threshold_bin2 + 1];
+    const auto threshold_bin = s_threshold_bin_id;
+    topk -= s_histogram[threshold_bin + 1];
 
     if (topk == 0) {
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
@@ -196,7 +196,7 @@ __device__ void fast_topk_cuda_tl(
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) &
                          0xFF;
-        if (bin > threshold_bin2) {
+        if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           index[pos] = idx;
         }
@@ -215,10 +215,10 @@ __device__ void fast_topk_cuda_tl(
         const auto offset = 24 - round * 8;
         const auto bin =
             (convert_to_uint32(raw_input) >> offset) & 0xFF;
-        if (bin > threshold_bin2) {
+        if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           index[pos] = idx;
-        } else if (bin == threshold_bin2) {
+        } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
