@@ -30,7 +30,7 @@ try:
     from flashinfer.comm.mnnvl import MnnvlConfig
 
     use_flashinfer = True
-except ImportError:
+except (ImportError, AssertionError):
     use_flashinfer = False
 
 logger = logging.getLogger(__name__)
