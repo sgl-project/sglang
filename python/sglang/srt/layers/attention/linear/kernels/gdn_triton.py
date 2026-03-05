@@ -10,9 +10,6 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent_mtp import (
-        fused_sigmoid_gating_delta_rule_update_mtp,
-    )
 
 if is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
@@ -115,7 +112,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_sigmoid_gating_delta_rule_update_mtp(
+        return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

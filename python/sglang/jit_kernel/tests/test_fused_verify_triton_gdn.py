@@ -1,6 +1,6 @@
 """Tests for fused sigmoid gating delta rule MTP kernel (GDN target_verify).
 
-Compares the fused kernel `fused_sigmoid_gating_delta_rule_update_mtp` against
+Compares the fused kernel `fused_sigmoid_gating_delta_rule_update` against
 the reference two-step implementation:
     1. g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
     2. o = fused_recurrent_gated_delta_rule_update(q, k, v, g, beta, ...)
@@ -14,8 +14,8 @@ try:
     from sglang.srt.layers.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
     )
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent_mtp import (
-        fused_sigmoid_gating_delta_rule_update_mtp,
+    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
     )
 
     KERNELS_AVAILABLE = True
@@ -105,8 +105,8 @@ def run_fused_mtp(
     cache_steps=None,
     retrieve_parent_token=None,
 ):
-    """Fused: fused_sigmoid_gating_delta_rule_update_mtp."""
-    return fused_sigmoid_gating_delta_rule_update_mtp(
+    """Fused: fused_sigmoid_gating_delta_rule_update."""
+    return fused_sigmoid_gating_delta_rule_update(
         A_log=A_log,
         dt_bias=dt_bias,
         q=q,
@@ -129,7 +129,7 @@ def run_fused_mtp(
     )
 
 
-def _check_precision(out_ref, out_fused, label, max_fail_rate=1.0, atol=0.1):
+def _check_precision(out_ref, out_fused, label, max_fail_rate=0.01, atol=0.1):
     abs_diff = (out_ref.float() - out_fused.float()).abs()
     max_diff = abs_diff.max().item()
     mean_diff = abs_diff.mean().item()
