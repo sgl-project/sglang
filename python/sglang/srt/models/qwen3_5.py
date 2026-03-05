@@ -71,6 +71,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_reshuffle_qkv_gate = get_bool_env_var("SGLANG_RESHUFFLE_QKV_GATE")
 
 # Utils - weight loading
 def _reshuffle_q_proj_weight_for_gated_attn(
@@ -666,7 +667,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         use_shuffle_layout = False # Only support no shuffle layout for now
         block_size = 0
         x = 0
-
+        k_scale = self.attn.k_scale if self.attn.k_scale is not None else torch.tensor(1.0)
+        v_scale = self.attn.v_scale if self.attn.v_scale is not None else torch.tensor(1.0)
 
 
         is_mrope = not isinstance(rotary_emb, RotaryEmbedding)
@@ -691,7 +693,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 rotary_emb.is_neox_style, 
                 mrope_section, is_interleaved, eps,
                 q_out, k_cache, v_cache, slot_mapping,
-                self.attn.k_scale, self.attn.v_scale,
+                k_scale, v_scale,
                 k_out, v_out, True,
                 use_shuffle_layout, block_size, x,
             )
@@ -701,8 +703,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size,
                 rotary_emb.is_neox_style, eps,
                 q_out, k_cache, v_cache, slot_mapping,
-                torch.tensor(1.0),
-                torch.tensor(1.0),
+                k_scale,
+                v_cache,
                 k_out, v_out, True,
                 use_shuffle_layout, 
                 block_size, x
@@ -723,12 +725,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            qkv, gate = qkv.split(
-                [self.q_size + self.kv_size + self.kv_size, self.q_size], dim=-1
-            )
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
+            if _reshuffle_qkv_gate:
+                qkv, gate = qkv.split(
+                    [self.q_size + self.kv_size + self.kv_size, self.q_size], dim=-1
+                )
+                q, k, v = qkv.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1
+                )
+            else:
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                q_gate = q_gate.unflatten(-1, (self.num_heads, 2, self.head_dim))
+                q = q_gate[:, :, 0, :].reshape(q_gate.shape[0], -1)
+                gate = q_gate[:, :, 1, :].reshape(q_gate.shape[0], -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -965,14 +975,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
-                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
-                    num_heads = self.config.num_attention_heads
-                    head_dim = getattr(
-                        self.config, "head_dim", None
-                    ) or self.config.hidden_size // num_heads
-                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
-                        loaded_weight, num_heads, head_dim
-                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -988,24 +990,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
-        for layer in self.layers:
-            if hasattr(layer, "self_attn") and getattr(
-                layer.self_attn, "attn_output_gate", False
-            ):
-                block = layer.self_attn
-                for pname, param in block.qkv_proj.named_parameters():
-                    if "weight" in pname:
-                        w = param.data
-                        q_size = block.q_size
-                        gate_size = block.q_size
-                        kv_size = block.kv_size
-                        param.data.copy_(
-                            _reshuffle_qkv_proj_weight_q_k_v_gate(
-                                w, q_size, gate_size, kv_size
-                            )
-                        )
-                        break
         return loaded_params
 
 
@@ -1122,14 +1106,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
-                    num_heads = self.config.num_attention_heads
-                    head_dim = getattr(
-                        self.config, "head_dim", None
-                    ) or self.config.hidden_size // num_heads
-                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
-                        loaded_weight, num_heads, head_dim
-                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1209,24 +1185,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
-        for layer in self.layers:
-            if hasattr(layer, "self_attn") and getattr(
-                layer.self_attn, "attn_output_gate", False
-            ):
-                block = layer.self_attn
-                for pname, param in block.qkv_proj.named_parameters():
-                    if "weight" in pname:
-                        w = param.data
-                        q_size = block.q_size
-                        gate_size = block.q_size
-                        kv_size = block.kv_size
-                        param.data.copy_(
-                            _reshuffle_qkv_proj_weight_q_k_v_gate(
-                                w, q_size, gate_size, kv_size
-                            )
-                        )
-                        break
         return loaded_params
 
 
@@ -1298,15 +1256,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
-                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
-                    text_config = getattr(self.config, "text_config", self.config)
-                    num_heads = text_config.num_attention_heads
-                    head_dim = getattr(
-                        text_config, "head_dim", None
-                    ) or text_config.hidden_size // num_heads
-                    loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
-                        loaded_weight, num_heads, head_dim
-                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1328,24 +1277,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
-        for layer in self.model.layers:
-            if hasattr(layer, "self_attn") and getattr(
-                layer.self_attn, "attn_output_gate", False
-            ):
-                block = layer.self_attn
-                for pname, param in block.qkv_proj.named_parameters():
-                    if "weight" in pname:
-                        w = param.data
-                        q_size = block.q_size
-                        gate_size = block.q_size
-                        kv_size = block.kv_size
-                        param.data.copy_(
-                            _reshuffle_qkv_proj_weight_q_k_v_gate(
-                                w, q_size, gate_size, kv_size
-                            )
-                        )
-                        break
         return loaded_params
 
 
@@ -1482,12 +1413,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                if param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
-                    text_config = getattr(self.config, "text_config", self.config)
-                    num_heads = text_config.num_attention_heads
+                if _reshuffle_qkv_gate and param_name == "qkv_proj" and weight_name == "q_proj" and shard_id == "q":
+                    num_heads = self.config.text_config.num_attention_heads
                     head_dim = getattr(
-                        text_config, "head_dim", None
-                    ) or text_config.hidden_size // num_heads
+                        self.config.text_config, "head_dim", None
+                    ) or self.config.text_config.hidden_size // num_heads
                     loaded_weight = _reshuffle_q_proj_weight_for_gated_attn(
                         loaded_weight, num_heads, head_dim
                     )
@@ -1577,24 +1507,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        # Reshuffle qkv_proj from [q, gate, k, v] to [q, k, v, gate] for gated attention
-        for layer in self.model.layers:
-            if hasattr(layer, "self_attn") and getattr(
-                layer.self_attn, "attn_output_gate", False
-            ):
-                block = layer.self_attn
-                for pname, param in block.qkv_proj.named_parameters():
-                    if "weight" in pname:
-                        w = param.data
-                        q_size = block.q_size
-                        gate_size = block.q_size
-                        kv_size = block.kv_size
-                        param.data.copy_(
-                            _reshuffle_qkv_proj_weight_q_k_v_gate(
-                                w, q_size, gate_size, kv_size
-                            )
+        if _reshuffle_qkv_gate:
+            text_config = getattr(self.config, "text_config", self.config)
+            num_heads = text_config.num_attention_heads
+            head_dim = getattr(text_config, "head_dim", None) or text_config.hidden_size // num_heads
+            tp = 8
+            q_size = num_heads * head_dim // tp
+            kv_heads = text_config.num_key_value_heads
+            kv_size = kv_heads * head_dim // tp
+            gate_size = q_size
+            for name, param in self.named_parameters():
+                if name.endswith("qkv_proj.weight") and "visual" not in name:
+                    param.data.copy_(
+                        _reshuffle_qkv_proj_weight_q_k_v_gate(
+                            param.data, q_size, gate_size, kv_size
                         )
-                        break
+                    )
+
         return loaded_params
 
     @classmethod
