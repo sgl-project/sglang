@@ -73,6 +73,7 @@ dependencies = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xgrammar==0.1.27",
 
   "smg-grpc-proto>=0.4.1",
