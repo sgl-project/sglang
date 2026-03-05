@@ -30,6 +30,8 @@ MAMBA = "M"
 ATTENTION = "*"
 MLP = "-"
 MOE = "E"
+DEFAULT_LAYERS_BLOCK_TYPE = ["mamba", "moe", "attention", "moe"]
+DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
 
 
 class NemotronHConfig(PretrainedConfig):
@@ -52,13 +54,17 @@ class NemotronHConfig(PretrainedConfig):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 21504):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 52):
-            Number of hidden layers in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*):
+            Deprecated. Kept only for backward compatibility. The effective
+            layer count is derived from `layers_block_type`.
         hybrid_override_pattern (`str`, *optional*, defaults to
             `"M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"`):
-            The pattern of the hybrid model. The pattern is a string of
-            characters where each character represents
-            M: Mamba2, *: Attention, -: MLP
+            Deprecated compatibility field. Pattern string where each
+            character represents Mamba2 (`M`), Attention (`*`), MLP (`-`),
+            or MoE (`E`).
+        layers_block_type (`list[str]`, *optional*):
+            Canonical layer layout. Each entry is one of:
+            `"mamba"`, `"attention"`, `"mlp"`, `"moe"`.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -171,12 +177,38 @@ class NemotronHConfig(PretrainedConfig):
             raise ValueError(
                 f"{param_name} must have length {expected_length}. Got length {len(layers_block_type)}."
             )
-        valid_types = {"mamba", "attention", "moe"}
+        valid_types = {"mamba", "attention", "mlp", "moe"}
         if not all(block_type in valid_types for block_type in layers_block_type):
             invalid = set(layers_block_type) - valid_types
             raise ValueError(
                 f"{param_name} contains invalid types: {invalid}. Must be one of: {valid_types}"
             )
+
+    @staticmethod
+    def _resolve_layers_block_type(
+        layers_block_type, hybrid_override_pattern, kwargs
+    ) -> list[str]:
+        """Resolve canonical layers_block_type from new and legacy config fields."""
+        if "hybrid_override_pattern" in kwargs:
+            pattern = kwargs.pop("hybrid_override_pattern")
+            if layers_block_type is None:
+                layers_block_type = NemotronHConfig._pattern_to_list(pattern)
+        elif layers_block_type is None:
+            # Keep compatibility with the forked diff default.
+            layers_block_type = DEFAULT_LAYERS_BLOCK_TYPE
+        return layers_block_type
+
+    @staticmethod
+    def _resolve_mtp_layers_block_type(mtp_layers_block_type, kwargs) -> list[str]:
+        """Resolve canonical mtp_layers_block_type from new and legacy config fields."""
+        if "mtp_hybrid_override_pattern" in kwargs:
+            pattern = kwargs.pop("mtp_hybrid_override_pattern")
+            if mtp_layers_block_type is None or mtp_layers_block_type == [
+                "attention",
+                "moe",
+            ]:
+                mtp_layers_block_type = NemotronHConfig._pattern_to_list(pattern)
+        return mtp_layers_block_type
 
     def __init__(
         self,
@@ -233,19 +265,16 @@ class NemotronHConfig(PretrainedConfig):
         topk_group=1,
         norm_topk_prob=True,
         num_nextn_predict_layers=0,
-        mtp_layers_block_type=["attention", "moe"],
+        mtp_layers_block_type=DEFAULT_MTP_LAYERS_BLOCK_TYPE,
         **kwargs,
     ):
-        # Backward compatibility: convert hybrid_override_pattern to layers_block_type.
-        # Always pop hybrid_override_pattern from kwargs to prevent it from being
-        # set as an arbitrary attribute by PretrainedConfig.
-        if "hybrid_override_pattern" in kwargs:
-            pattern = kwargs.pop("hybrid_override_pattern")
-            if layers_block_type is None:
-                layers_block_type = self._pattern_to_list(pattern)
-        elif layers_block_type is None:
-            # Default layers_block_type if not provided
-            layers_block_type = ["mamba", "moe", "attention", "moe"]
+        # Compatibility parsing: normalize legacy pattern fields into canonical list fields.
+        layers_block_type = self._resolve_layers_block_type(
+            layers_block_type, hybrid_override_pattern, kwargs
+        )
+        mtp_layers_block_type = self._resolve_mtp_layers_block_type(
+            mtp_layers_block_type, kwargs
+        )
 
         # num_hidden_layers is deprecated and ignored as a source of truth.
         if (
@@ -257,17 +286,7 @@ class NemotronHConfig(PretrainedConfig):
                 f"layers_block_type length ({len(layers_block_type)}). Using layers_block_type length."
             )
 
-        # Backward compatibility: convert mtp_hybrid_override_pattern to mtp_layers_block_type.
-        # Always pop mtp_hybrid_override_pattern from kwargs to prevent it from
-        # being set as an arbitrary attribute by PretrainedConfig.
-        if "mtp_hybrid_override_pattern" in kwargs:
-            pattern = kwargs.pop("mtp_hybrid_override_pattern")
-            if mtp_layers_block_type is None or mtp_layers_block_type == [
-                "attention",
-                "moe",
-            ]:
-                mtp_layers_block_type = self._pattern_to_list(pattern)
-
+        # Core model attributes.
         self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
         self.hidden_size = hidden_size
@@ -300,6 +319,7 @@ class NemotronHConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.num_logits_to_keep = num_logits_to_keep
 
+        # Mamba attributes.
         self.use_mamba_kernels = use_mamba_kernels
         self.mamba_n_groups = mamba_n_groups
         self.mamba_head_dim = mamba_head_dim
@@ -316,6 +336,7 @@ class NemotronHConfig(PretrainedConfig):
         self.mamba_proj_bias = mamba_proj_bias
         self.mamba_chunk_size = mamba_chunk_size
         self.rescale_prenorm_residual = rescale_prenorm_residual
+        # MoE attributes.
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.moe_intermediate_size = moe_intermediate_size
@@ -326,6 +347,7 @@ class NemotronHConfig(PretrainedConfig):
         self.n_group = n_group
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
+        # MTP attributes.
         self.num_nextn_predict_layers = num_nextn_predict_layers
 
         if self.num_nextn_predict_layers > 0:
@@ -421,14 +443,34 @@ class NemotronHConfig(PretrainedConfig):
         """
         return self._list_to_pattern(self.mtp_layers_block_type)
 
+    @mtp_hybrid_override_pattern.setter
+    def mtp_hybrid_override_pattern(self, value):
+        """Setter for backward compatibility when loading configs."""
+        self.mtp_layers_block_type = self._pattern_to_list(value)
+
     @staticmethod
     def _list_to_pattern(layers_list: list[str]) -> str:
         """Convert list of layer types back to pattern string (for backward compatibility)."""
-        reverse_mapping = {"mamba": "M", "moe": "E", "attention": "*"}
+        reverse_mapping = {
+            "mamba": MAMBA,
+            "moe": MOE,
+            "attention": ATTENTION,
+            "mlp": MLP,
+        }
         return "".join(reverse_mapping[layer_type] for layer_type in layers_list)
 
     @staticmethod
     def _pattern_to_list(pattern: str) -> list[str]:
         """Convert pattern string to list of layer types (for backward compatibility)."""
-        pattern_mapping = {"M": "mamba", "E": "moe", "*": "attention"}
+        if any(char not in {MAMBA, MOE, ATTENTION, MLP} for char in pattern):
+            raise ValueError(
+                "Pattern must only contain characters 'M', '*', '-' or 'E'. "
+                f"Got: {pattern}"
+            )
+        pattern_mapping = {
+            MAMBA: "mamba",
+            MOE: "moe",
+            ATTENTION: "attention",
+            MLP: "mlp",
+        }
         return [pattern_mapping[char] for char in pattern]
