@@ -26,7 +26,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
-        "stage-c-test-aiter-fusion-8-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
@@ -76,6 +76,7 @@ NIGHTLY_SUITES = {
         "nightly-amd",
         "nightly-amd-1-gpu",
         "nightly-amd-1-gpu-mi35x",
+        "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)

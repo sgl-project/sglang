@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
+        description: "Specific stage(s) to run, comma-separated (e.g. 'stage-a-test-1-amd,stage-b-test-small-1-gpu-amd')"
         required: false
         type: string
         default: ""
@@ -141,7 +141,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',sgl-kernel-unit-test-amd,')) ||
         (
           !inputs.target_stage &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -188,7 +188,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
           !inputs.target_stage &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -230,7 +230,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-a-test-1-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -270,7 +270,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'jit-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',jit-kernel-unit-test-amd,')) ||
         (
           !inputs.target_stage &&
           needs.check-changes.outputs.jit_kernel == 'true'
@@ -309,7 +309,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -349,7 +349,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-nondeterministic') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -388,7 +388,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -427,7 +427,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-1-gpu-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -467,7 +467,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-2-gpu-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -504,7 +504,15 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -624,7 +632,15 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -746,7 +762,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-c-test-large-8-gpu-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -794,7 +810,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -835,7 +851,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
+        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
