@@ -624,7 +624,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """AITER fused qk_norm + RoPE + set_kv (HIP only, bf16 KV cache).
+        """AITER fused qk_norm + RoPE + set_kv (HIP only).
         qkv: [batch, q_size + kv_size + kv_size]. Returns (q, k, v)."""
         import aiter
         from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
@@ -636,18 +636,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         num_heads_v = self.num_kv_heads
         eps = self.q_norm.variance_epsilon
 
-        # GemmaRMSNorm: (1 + weight) * x
-        qw = (1.0 + self.q_norm.weight.data).contiguous().to(qkv.dtype)
-        kw = (1.0 + self.k_norm.weight.data).contiguous().to(qkv.dtype)
-
+        qw = self.q_norm.weight.data
+        kw = self.k_norm.weight.data
         qkv = qkv.contiguous()
 
         rotary_emb = self.rotary_emb
-        if hasattr(rotary_emb, "_ensure_cos_sin_cache_length"):
-            max_pos = int(positions.flatten().max().item()) + 1
-            rotary_emb._ensure_cos_sin_cache_length(max_pos)
-        cos_sin = rotary_emb.cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
-        positions_1d = positions.flatten().to(torch.int64)
+        cos_sin = rotary_emb.cos_sin_cache
+        positions_1d = positions.flatten()
 
         layer_id = self.attn.layer_id
         token_to_kv_pool = forward_batch.token_to_kv_pool
@@ -668,8 +663,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=v_cache.dtype, device=v_cache.device,
         )
 
-        k_scale = torch.tensor(1.0, dtype=torch.float32, device=qkv.device)
-        v_scale = torch.tensor(1.0, dtype=torch.float32, device=qkv.device)
+        use_shuffle_layout = False # Only support no shuffle layout for now
+        block_size = 0
+        x = 0
+
+
 
         is_mrope = not isinstance(rotary_emb, RotaryEmbedding)
         if is_mrope:
@@ -680,26 +678,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             else:
                 positions_3d = positions
             aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-                qkv, qw, kw, cos_sin, positions_3d,
-                num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size,
-                is_neox_style=True, mrope_section_=mrope_section,
-                is_interleaved=is_interleaved, eps=eps,
-                q_out=q_out, k_cache=k_cache, v_cache=v_cache,
-                slot_mapping=slot_mapping,
-                per_tensor_k_scale=k_scale, per_tensor_v_scale=v_scale,
-                k_out=k_out, v_out=v_out, return_kv=True,
-                use_shuffle_layout=False, block_size=0, x=0,
+                qkv, 
+                qw, 
+                kw, 
+                cos_sin, 
+                positions_3d,
+                num_tokens, 
+                num_heads_q, 
+                num_heads_k, 
+                num_heads_v, 
+                head_size,
+                rotary_emb.is_neox_style, 
+                mrope_section, is_interleaved, eps,
+                q_out, k_cache, v_cache, slot_mapping,
+                self.attn.k_scale, self.attn.v_scale,
+                k_out, v_out, True,
+                use_shuffle_layout, block_size, x,
             )
         else:
             aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
                 qkv, qw, kw, cos_sin, positions_1d,
                 num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size,
-                is_neox_style=True, eps=eps,
-                q_out=q_out, k_cache=k_cache, v_cache=v_cache,
-                slot_mapping=slot_mapping,
-                per_tensor_k_scale=k_scale, per_tensor_v_scale=v_scale,
-                k_out=k_out, v_out=v_out, return_kv=True,
-                use_shuffle_layout=False, block_size=0, x=0,
+                rotary_emb.is_neox_style, eps,
+                q_out, k_cache, v_cache, slot_mapping,
+                torch.tensor(1.0),
+                torch.tensor(1.0),
+                k_out, v_out, True,
+                use_shuffle_layout, 
+                block_size, x
             )
 
         q_out = q_out.view(num_tokens, -1)
