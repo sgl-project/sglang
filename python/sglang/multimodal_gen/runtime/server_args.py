@@ -21,6 +21,7 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -353,6 +354,7 @@ class ServerArgs:
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        self.adjust_pipeline_config()
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -389,6 +391,26 @@ class ServerArgs:
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
                 transformer_weights_path=self.nunchaku_config.transformer_weights_path,
+            )
+
+    def adjust_pipeline_config(self):
+        # enable parallel folding when SP is enabled
+        if self.tp_size != 1 or self.sp_degree <= 1:
+            return
+
+        enabled = False
+        for text_encoder_config in self.pipeline_config.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                enabled = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
+        if enabled:
+            logger.info(
+                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                self.__class__.__name__,
+                self.tp_size,
+                self.sp_degree,
             )
 
     def _adjust_offload(self):
