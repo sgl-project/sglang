@@ -18,10 +18,9 @@ import itertools
 import logging
 import os
 import subprocess
-import sys
-import unittest
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 import triton
 from tqdm import tqdm
@@ -45,7 +44,7 @@ TEST_SIZES = [
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHOTS = [1, 2]
-USE_GRAPH_OPTIONS = [False]
+USE_GRAPH_OPTIONS = [False, True]
 TEST_CONFIG = itertools.product(TEST_SIZES, TEST_DTYPES, SHOTS, USE_GRAPH_OPTIONS)
 TEST_LOOP = 16
 
@@ -54,18 +53,14 @@ TEST_LOOP = 16
 # ---------------------------------------------------------------------------
 
 
-def _run_torchrun(nproc: int, mode: str, timeout: int = 300) -> None:
+def _run_torchrun(nproc: int, timeout: int = 300) -> None:
     """Launch this script as a torchrun worker and assert success."""
     cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
+        "torchrun",
         f"--nproc_per_node={nproc}",
         __file__,
-        "--mode",
-        mode,
     ]
+    os.environ["DISABLE_PBAR"] = "1"
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -73,28 +68,20 @@ def _run_torchrun(nproc: int, mode: str, timeout: int = 300) -> None:
         text=True,
         timeout=timeout,
     )
-    if result.returncode != 0:
-        raise AssertionError(
-            f"torchrun (nproc={nproc}, mode={mode}) failed with rc={result.returncode}\n"
-            f"{result.stdout}"
+    assert result.returncode == 0, (
+        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n"
+        f"{result.stdout}"
+    )
+
+
+@pytest.mark.parametrize("nproc", [2, 3, 4, 5, 6, 7, 8])
+def test_custom_allreduce(nproc: int) -> None:
+    device_count = torch.cuda.device_count()
+    if device_count < nproc:
+        pytest.skip(
+            f"Requires at least {nproc} GPUs, but only {device_count} available"
         )
-
-
-class TestJitCustomAllReduce(unittest.TestCase):
-    WORLD_SIZES = [2, 4, 8]
-
-    def _run_for_world_sizes(self, mode: str):
-        for ws in self.WORLD_SIZES:
-            if ws > torch.cuda.device_count():
-                continue
-            with self.subTest(world_size=ws):
-                _run_torchrun(nproc=ws, mode=mode)
-
-    def test_eager_allreduce(self):
-        self._run_for_world_sizes("eager")
-
-    def test_graph_allreduce(self):
-        self._run_for_world_sizes("graph")
+    _run_torchrun(nproc)
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +158,8 @@ def _worker_test(
     out_jits = []
     if use_graph:
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            with comm.capture():
+        with comm.capture():
+            with torch.cuda.graph(graph):
                 for i in range(TEST_LOOP):
                     out_jits.append(comm.custom_all_reduce(inp[i]))
         torch.cuda.synchronize()
@@ -191,12 +178,14 @@ def worker_main() -> None:
     import torch.distributed as dist
 
     rank, device, cpu_group, nccl_group, comm = _init_distributed()
+    world_size = dist.get_world_size()
 
     torch.cuda.set_stream(torch.cuda.Stream())
 
     logging.disable(logging.INFO)  # Suppress internal logging for cleaner test output
     items = list(enumerate(TEST_CONFIG))
-    pbar = tqdm(items, desc=f"Worker {rank} testing", disable=(rank != 0))
+    disable_pbar = os.environ.get("DISABLE_PBAR", "0") == "1" or rank != 0
+    pbar = tqdm(items, desc=f"Testing {world_size} GPUs", disable=disable_pbar)
     for i, (size, dtype, shot, use_graph) in pbar:
         try:
             _worker_test(device, nccl_group, comm, size, dtype, use_graph, shot)

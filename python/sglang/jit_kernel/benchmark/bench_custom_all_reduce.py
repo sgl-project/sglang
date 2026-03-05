@@ -45,23 +45,9 @@ MESSAGE_SIZES_BYTES = [
     8 * 1024 * 1024,  # 8M
     16 * 1024 * 1024,  # 16M
     32 * 1024 * 1024,  # 32M
+    64 * 1024 * 1024,  # 64M
+    128 * 1024 * 1024,  # 128M
 ]
-
-
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-
-def human_bytes(n: int) -> str:
-    for suffix, unit in [("M", 1 << 20), ("K", 1 << 10)]:
-        if n >= unit and n % unit == 0:
-            return f"{n // unit}{suffix}"
-    return f"{n}B"
-
-
-def fmt_us(v: float) -> str:
-    return f"{v:8.1f}" if not isnan(v) else "     n/a"
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +66,12 @@ class NCCLBackend:
     def __init__(self, group: dist.ProcessGroup):
         self.group = group
 
-    def capture(self):
+    def capture(self, register_input: bool):
         return contextlib.nullcontext()
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        out = tensor.clone()
-        dist.all_reduce(out, group=self.group)
-        return out
+        dist.all_reduce(tensor, group=self.group)
+        return tensor
 
 
 class AOTAllReduceBackend:
@@ -104,8 +89,8 @@ class AOTAllReduceBackend:
         if self.comm.disabled:
             raise RuntimeError("AOT CustomAllreduce is disabled on this system")
 
-    def capture(self):
-        return self.comm.capture()
+    def capture(self, register_input: bool):
+        return self.comm.capture()  # ignore register_input since v1 always requires it
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         assert self.comm.should_custom_ar(tensor), str(tensor.shape)
@@ -115,20 +100,20 @@ class AOTAllReduceBackend:
 class JITAllReduceBackend:
     """JIT custom all-reduce (v2)."""
 
-    name = "JIT-CAR"
-
-    def __init__(self, group: dist.ProcessGroup, device: torch.device):
+    def __init__(self, group: dist.ProcessGroup, device: torch.device, shot: int):
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
 
+        self.name = f"JIT-CAR-{shot}shot"
         max_size = max(MESSAGE_SIZES_BYTES)
         self.comm = CustomAllReduceV2(group=group, device=device, max_size=max_size)
+        self.comm.override_shot(shot)
         if self.comm.disabled:
             raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
 
-    def capture(self):
-        return self.comm.capture()
+    def capture(self, register_input: bool):
+        return self.comm.capture() if register_input else contextlib.nullcontext()
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         assert self.comm.should_custom_ar(tensor), str(tensor.shape)
@@ -145,6 +130,7 @@ def parse_args():
     p.add_argument("--dtype", choices=DTYPE_MAP.keys(), default="bfloat16")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--no-inplace", dest="register_input", action="store_false")
     return p.parse_args()
 
 
@@ -155,6 +141,7 @@ def bench_one(
     warmup: int,
     iters: int,
     group: dist.ProcessGroup,
+    register_input: bool,
 ) -> float:
     """Run *warmup* + *iters* iterations and return median latency in us."""
     dist.barrier(group=group)
@@ -165,20 +152,21 @@ def bench_one(
     # Capture a CUDA graph with *iters* all-reduce calls.
     inp_batch = torch.stack([inp] * 4)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        with backend.capture():
+    with backend.capture(register_input):
+        with torch.cuda.graph(graph):
             for i in range(iters):
                 backend.all_reduce(inp_batch[i % 4])
 
+    torch.cuda.synchronize()
     # Warm up the graph once.
     graph.replay()
 
     # Timed replay.
-    torch.cuda.synchronize()
-    dist.barrier(group=group)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    torch.cuda._sleep(10_000_000)
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    graph.replay()  # make the stream busy
     start.record()
     graph.replay()
     end.record()
@@ -194,15 +182,16 @@ def bench_sweep(
     warmup: int,
     iters: int,
     group: dist.ProcessGroup,
+    register_input: bool,
 ) -> Dict[int, float]:
     """Benchmark one backend over all message sizes."""
     elem_size = torch.tensor([], dtype=dtype).element_size()
     results: Dict[int, float] = {}
     for sz in sizes_bytes:
         numel = sz // elem_size
-        inp = torch.randn(numel, dtype=dtype, device=device)
+        inp = torch.zeros(numel, dtype=dtype, device=device)
         try:
-            elapsed_ms = bench_one(backend, inp, warmup, iters, group)
+            elapsed_ms = bench_one(backend, inp, warmup, iters, group, register_input)
             results[sz] = elapsed_ms * 1000 / iters  # convert to us per iter
         except AssertionError:
             results[sz] = float("nan")
@@ -220,16 +209,26 @@ def print_results(
     sizes_bytes: List[int],
 ) -> None:
     """Print a comparison table on rank 0."""
+
+    def human_bytes(n: int) -> str:
+        for suffix, unit in [("M", 1 << 20), ("K", 1 << 10)]:
+            if n >= unit and n % unit == 0:
+                return f"{n // unit}{suffix}"
+        return f"{n}B"
+
+    def fmt_us(v: float) -> str:
+        return f"{v:13.1f}" if not isnan(v) else "     n/a"
+
     names = [b.name for b in backends]
     nccl_name = "NCCL"
 
     # Header
-    header_cols = [f"{n:>10}" for n in names]
-    speedup_cols = [f"{n}/NCCL" for n in names if n != nccl_name]
+    header_cols = [f"{n:>13}" for n in names]
+    speedup_cols = [f"{n:>13}/NCCL" for n in names if n != nccl_name]
     header = f"{'Size':>8}  " + "  ".join(header_cols)
     for sc in speedup_cols:
-        header += f"  {sc:>10}"
-    header += "  (us, lower is better)"
+        header += f"  {sc}"
+    header += "  "
     print()
     print(header)
     print("-" * len(header))
@@ -245,9 +244,9 @@ def print_results(
                 continue
             lat = all_results[n][sz]
             if not isnan(lat):
-                row += f"  {nccl_lat / lat:10.2f}x"
+                row += f"  {nccl_lat / lat:17.2f}x"
             else:
-                row += f"  {'n/a':>10}"
+                row += f"  {'n/a':>17}"
         print(row)
 
 
@@ -299,11 +298,13 @@ def main():
     backends = [
         NCCLBackend(nccl_group),
         AOTAllReduceBackend(cpu_group, device),
-        JITAllReduceBackend(cpu_group, device),
+        JITAllReduceBackend(cpu_group, device, 1),
+        JITAllReduceBackend(cpu_group, device, 2),
     ]
 
     # Run benchmarks.
     all_results: Dict[str, Dict[int, float]] = {}
+    torch.cuda.synchronize()
     for backend in backends:
         if rank == 0:
             print(f"Benchmarking {backend.name} ...")
@@ -314,7 +315,8 @@ def main():
             device,
             args.warmup,
             args.iters,
-            nccl_group,
+            cpu_group,
+            args.register_input,
         )
 
     # Aggregate across ranks (use max to reflect the slowest rank).

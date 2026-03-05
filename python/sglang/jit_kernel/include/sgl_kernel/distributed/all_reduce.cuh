@@ -105,7 +105,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     result.reserve(new_inputs_count);
     std::unordered_map<void*, ExternHandle> ipc_cache;
     const auto get_handle = [&](void* ptr) -> ExternHandle {
-      auto it = ipc_cache.find(ptr);
+      const auto it = ipc_cache.find(ptr);
       if (it != ipc_cache.end()) return it->second;
       const auto handle = to_extern_handle(ptr);
       ipc_cache.try_emplace(ptr, handle);
@@ -157,13 +157,12 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     if (new_registered_count == 0) return;  // avoid `m_get_data_ptr()` out-of-bounds
     std::vector<AllReduceData> data;
     data.resize(new_registered_count);
-    std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> ipc_cache;
     const auto open_cached = [&](const ExternHandle& h) -> void* {
       RuntimeCheck(h.size() == sizeof(cudaIpcMemHandle_t), "Invalid IPC handle size: ", h.size());
       cudaIpcMemHandle_t handle;
       for (size_t i = 0; i < sizeof(handle); ++i)
         handle.reserved[i] = h[i];
-      const auto [it, success] = ipc_cache.try_emplace(handle, nullptr);
+      const auto [it, success] = m_ipc_cache.try_emplace(handle, nullptr);
       if (success) {
         void* ptr;
         RuntimeDeviceCheck(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
@@ -176,7 +175,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
       RuntimeCheck(int64_t(array.size()) == new_registered_count);
       if (i == m_rank) {
         for (const auto j : irange(new_registered_count)) {
-          data[j].input[i] = m_graph_capture_inputs[j];
+          data[j].input[i] = m_graph_capture_inputs[m_cum_registered_count + j];
         }
       } else {
         for (const auto j : irange(new_registered_count)) {
@@ -199,8 +198,16 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     m_is_graph_capturing = enabled;
   }
 
-  void free() {
+  void free_ipc_handles() {
+    for (const auto& pair : m_ipc_cache) {
+      host::RuntimeDeviceCheck(cudaIpcCloseMemHandle(pair.second));
+    }
+    m_ipc_cache.clear();
+  }
+
+  void free_storage() {
     host::RuntimeDeviceCheck(cudaFree(m_storage));
+    m_storage = nullptr;
   }
 
   void reset_graph() {
@@ -262,6 +269,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   std::vector<void*> m_graph_capture_inputs;
   std::vector<void*> m_storage_pointers;
   std::optional<device::distributed::Controller> m_ctrl;
+  std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> m_ipc_cache;
 };
 
 struct CustomAllReduceRef : public tvm::ffi::ObjectRef {

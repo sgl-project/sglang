@@ -24,6 +24,13 @@ struct AllReduceParams {
   uint32_t num_items;  // NOTE: support at most 4G, but that's too much
 };
 
+[[maybe_unused]]
+SGL_DEVICE void prefetch_uniform_ptr(const void* ptr) {
+  asm volatile("prefetchu.L1 [%0];" ::"l"(ptr) : "memory");
+}
+
+#define CUSTOM_AR_KERNEL __global__ __launch_bounds__(1024, 1)
+
 template <bool kBroadcast, typename DType, uint32_t kNumGPU>
 SGL_DEVICE void reduce_impl(const AllReduceParams& params, DType* (&input)[kNumGPU]) {
   using namespace device;
@@ -73,12 +80,13 @@ SGL_DEVICE void reduce_impl(const AllReduceParams& params, DType* (&input)[kNumG
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
-__global__ void all_reduce_one_shot_kernel(
+CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(
     const AllReduceData* __restrict__ data,
     const AllReduceParams __grid_constant__ params,
     const DistributedController __grid_constant__ ctrl) {
   /// NOTE: we assume the data array is ready before the previous kernel
   DType* input[kNumGPU];
+  prefetch_uniform_ptr(data);
 #pragma unroll
   for (uint32_t i = 0; i < kNumGPU; ++i)
     input[i] = static_cast<DType*>(data->input[i]);
@@ -92,13 +100,14 @@ __global__ void all_reduce_one_shot_kernel(
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
-__global__ void all_reduce_two_shot_kernel(
+CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
     const AllReduceData* __restrict__ data,
     const AllReduceParams __grid_constant__ params,
     const DistributedController __grid_constant__ ctrl) {
   // get the range of this rank
   using device::kWarpThreads, device::div_ceil;
 
+  prefetch_uniform_ptr(data);
   DType* input[kNumGPU];
 #pragma unroll
   for (uint32_t i = 0; i < kNumGPU; ++i)
@@ -201,22 +210,6 @@ template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 tvm::ffi::Tensor custom_all_reduce(CustomAllReduceRef obj, tvm::ffi::Tensor input, int shot) {
   using Impl = CustomAllReduceImpl<DType, kNumGPU, kUsePDL>;
   return static_cast<Impl&>(*obj.get()).all_reduce(input, shot);
-}
-
-template <typename T = void>
-void register_custom_all_reduce() {
-  namespace refl = tvm::ffi::reflection;
-  using Class = CustomAllReduceBase;
-  refl::ObjectDef<Class>()
-      .def(refl::init<uint32_t, uint32_t, uint32_t, int64_t, int64_t>(), "__init__")
-      .def("share_storage", &Class::share_storage)
-      .def("share_graph_inputs", &Class::share_graph_inputs)
-      .def("post_init", &Class::post_init)
-      .def("register_inputs", &Class::register_inputs)
-      .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)
-      .def("free", &Class::free)
-      .def("reset_graph", &Class::reset_graph)
-      .def("configure", &Class::configure);
 }
 
 }  // namespace

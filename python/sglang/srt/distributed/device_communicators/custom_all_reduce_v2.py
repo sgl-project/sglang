@@ -19,6 +19,8 @@ T = TypeVar("T")
 
 INF = 1 << 60
 
+
+# NOTE(dark): This is tuned on hopper GPUs, also need tuning on blackwell/ampere
 THRESHOLD_2_SHOT_MAP = {
     2: INF,
     3: 512 * 1024,  # 512KB
@@ -78,6 +80,10 @@ class CustomAllReduceV2:
         finally:
             self.obj.set_cuda_graph_capture(False)
         if not self.disabled:
+            # cannot call when graph is capturing
+            assert (
+                torch.cuda.is_current_stream_capturing() == False
+            ), "Cannot register graph inputs while capturing CUDA graph"
             pairs = self.obj.share_graph_inputs()
             handles = [handle for _, handle in pairs]
             offsets = [offset for offset, _ in pairs]
@@ -116,7 +122,7 @@ class CustomAllReduceV2:
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
-            self.obj.free()
+            self.obj.free(self.group)
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
