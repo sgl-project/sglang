@@ -37,6 +37,7 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -199,6 +200,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if offsets is not None:
             positions = positions + offsets
+
         positions = positions.flatten()
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)
@@ -233,8 +235,14 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
-            return self.forward_native(positions, query, key, offsets)
+        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float or key.ndim == 3:
+            return fused_rope_qk_mqa(
+                query,
+                key,
+                self.cos_sin_cache.index_select(0, positions),
+                self.rotary_dim,
+                self.is_neox_style,
+            )
         if self.is_neox_style:
             rotary_mode = "half"
         else:
