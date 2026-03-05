@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
 )
+from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+    DiffusersPipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -339,10 +342,6 @@ class GPUWorker:
             target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
-        from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
-            DiffusersPipeline,
-        )
-
         if not isinstance(self.pipeline, (LoRAPipeline, DiffusersPipeline)):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
@@ -358,10 +357,6 @@ class GPUWorker:
             target: Which transformer(s) to merge.
             strength: LoRA strength for merge, default 1.0.
         """
-        from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
-            DiffusersPipeline,
-        )
-
         if not isinstance(self.pipeline, (LoRAPipeline, DiffusersPipeline)):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
@@ -374,10 +369,6 @@ class GPUWorker:
         Args:
             target: Which transformer(s) to unmerge.
         """
-        from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
-            DiffusersPipeline,
-        )
-
         if not isinstance(self.pipeline, (LoRAPipeline, DiffusersPipeline)):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
@@ -387,13 +378,6 @@ class GPUWorker:
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
-            DiffusersPipeline,
-        )
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
-            LoRAPipeline,
-        )
-
         if not isinstance(self.pipeline, (LoRAPipeline, DiffusersPipeline)):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
