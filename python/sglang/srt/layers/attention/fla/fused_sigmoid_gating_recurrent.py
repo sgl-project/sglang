@@ -4,8 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.utils import input_guard
-
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -24,6 +22,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     scale,
     T,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_b,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -57,10 +59,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    p_b = b + bos * HV + i_hv
+    p_q = q + bos * stride_q + i_h * K + o_k
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
@@ -164,7 +166,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -188,6 +189,10 @@ def fused_sigmoid_gating_delta_rule_update(
     and the recurrent delta rule update for better performance.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
+    stride_q = q.stride()[1]
+    stride_k = k.stride()[1]
+    stride_v = v.stride()[1]
+    stride_b = b.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
@@ -220,6 +225,10 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
+        stride_q=stride_q,
+        stride_k=stride_k,
+        stride_v=stride_v,
+        stride_b=stride_b,
         B=B,
         H=H,
         HV=HV,

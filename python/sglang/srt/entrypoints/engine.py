@@ -684,16 +684,23 @@ class Engine(EngineBase):
         )
 
     def load_lora_adapter_from_tensors(
-        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+        self,
+        lora_name: str,
+        tensors,
+        config_dict: Dict,
+        load_format: Optional[str] = None,
     ):
-        # Load LoRA adapter again
-        serialized_tensors = MultiprocessingSerializer.serialize(
-            tensors, output_str=True
-        )
+        if load_format == "flattened_bucket":
+            serialized_tensors = tensors
+        else:
+            serialized_tensors = MultiprocessingSerializer.serialize(
+                tensors, output_str=True
+            )
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
             serialized_tensors=serialized_tensors,
+            load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
