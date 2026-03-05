@@ -119,7 +119,7 @@ def enable_fused_set_kv_buffer_hip(forward_batch: ForwardBatch):
     return (
         is_hip()
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        and forward_batch.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
     )   
 
