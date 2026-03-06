@@ -639,6 +639,8 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    default_custom_logit_processor: Optional[str] = None
+    default_custom_params: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -817,6 +819,9 @@ class ServerArgs:
 
         # Handle debug utilities.
         self._handle_debug_utils()
+
+        # Handle default custom logit processor.
+        self._handle_default_custom_logit_processor()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -3150,6 +3155,34 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+    def _handle_default_custom_logit_processor(self):
+        """Validate and prepare the default custom logit processor if specified."""
+        if self.default_custom_logit_processor is not None:
+            # Automatically enable custom logit processor
+            self.enable_custom_logit_processor = True
+
+            # Import and validate the class from the provided import path
+            module_path, class_name = self.default_custom_logit_processor.rsplit(
+                ".", 1
+            )
+            module = importlib.import_module(module_path)
+            cls = getattr(module, class_name)
+
+            # Verify it is a CustomLogitProcessor subclass
+            from sglang.srt.sampling.custom_logit_processor import (
+                CustomLogitProcessor,
+            )
+
+            if not (isinstance(cls, type) and issubclass(cls, CustomLogitProcessor)):
+                raise ValueError(
+                    f"--default-custom-logit-processor must point to a "
+                    f"CustomLogitProcessor subclass, got {cls}"
+                )
+
+            # Serialize to dill string for downstream pipeline use
+            self._default_custom_logit_processor_str = cls.to_str()
+
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -5083,6 +5116,22 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--default-custom-logit-processor",
+            type=str,
+            default=None,
+            help="Python import path to a CustomLogitProcessor subclass "
+                 "(e.g., 'mypackage.MyProcessor'). Applied to ALL requests "
+                 "that don't provide their own custom_logit_processor. "
+                 "Automatically enables --enable-custom-logit-processor.",
+        )
+        parser.add_argument(
+            "--default-custom-params",
+            type=str,
+            default=None,
+            help="JSON string of default custom_params for the default custom logit processor. "
+                 "Applied to requests that don't provide their own custom_params.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import json
 import faulthandler
 import logging
 import os
@@ -1538,6 +1539,15 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Inject default custom_params if not provided by client
+            if (
+                recv_req.sampling_params.custom_params is None
+                and self.server_args.default_custom_params is not None
+            ):
+                recv_req.sampling_params.custom_params = json.loads(
+                    self.server_args.default_custom_params
+                )
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1549,7 +1559,14 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
-                custom_logit_processor=recv_req.custom_logit_processor,
+                custom_logit_processor=(
+                    recv_req.custom_logit_processor
+                    or getattr(
+                        self.server_args,
+                        "_default_custom_logit_processor_str",
+                        None,
+                    )
+                ),
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
