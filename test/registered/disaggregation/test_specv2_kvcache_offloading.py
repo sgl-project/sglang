@@ -172,7 +172,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefix_indices_len=5,
         )
 
-        manager._release_finished_req(req, prefill_offloaded_len=0)
+        manager._release_finished_req(req, start_offset=0)
 
         self.assertEqual(manager.tree_cache.protected_size_, 5)
 
