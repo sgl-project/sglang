@@ -954,7 +954,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
     # We use torchcodec instead of decord here for a more stable video loading
-    from torchcodec.decoders import VideoDecoder
+    from torchcodec.decoders import VideoDecoder, set_cuda_backend
 
     vr = None
     if isinstance(video_file, bytes):
@@ -977,7 +977,9 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             video_file = pybase64.b64decode(video_file, validate=True)
     else:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
-    vr=VideoDecoder(video_file, dimension_order="NHWC")
+    # torchcodec recommend use beta abckend
+    with set_cuda_backend("beta"):
+        vr = VideoDecoder(video_file, dimension_order="NHWC", device="cuda") # will fallback to cpu when cuda backend failed
     return vr
 
 

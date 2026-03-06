@@ -166,7 +166,7 @@ async def preprocess_video(
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx).tolist()
-    video = vr.get_frames_at(idx).data.pin_memory()
+    video = vr.get_frames_at(idx).data.cpu().pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
     nframes, _, height, width = video.shape
