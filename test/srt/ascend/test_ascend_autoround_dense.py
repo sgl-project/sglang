@@ -15,16 +15,13 @@ from sglang.test.test_utils import (
 logger = logging.getLogger(__name__)
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/Intel/Qwen3-30B-A3B-Instruct-2507-int4-AutoRound": {
-        "accuracy": 0.85,
-    },
     "/root/.cache/modelscope/hub/models/Intel/Qwen3-8B-int4-AutoRound": {
         "accuracy": 0.85,
     },
 }
 
 
-class TestAscendAutoRound(CustomTestCase):
+class TestAscendAutoRoundDense(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
