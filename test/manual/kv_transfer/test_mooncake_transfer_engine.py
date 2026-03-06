@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 
 try:
     import mooncake
-
-    BENCH_TOOL_PATH = f"{mooncake.__path__[0]}/transfer_engine_bench"
-    print(f"Mooncake is installed. Bench tool path:\n{BENCH_TOOL_PATH}")
 except ImportError:
-    BENCH_TOOL_PATH = None
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.importorskip("mooncake")
     print("Mooncake is not installed.")
-    exit(0)
+    sys.exit(0)
+
+BENCH_TOOL_PATH = f"{mooncake.__path__[0]}/transfer_engine_bench"
 
 
 def run_cmd(args):
