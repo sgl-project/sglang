@@ -34,7 +34,7 @@ python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/
 
 - [add-cuda-kernel.md](./add-cuda-kernel.md)
 
-  Step-by-step guide for adding a JIT CUDA kernel. CUDA source goes in `jit_kernel/csrc/diffusion/<op>.cuh`; Python wrapper at `jit_kernel/diffusion_<op>.py` (top-level, matching the `timestep_embedding.py` convention). Uses SGLang's JIT compilation system (`load_jit`, `cache_once`) and internal abstractions (`TensorMatcher`, `device::AlignedVector`, `host::LaunchKernel`, `device::warp::reduce_sum`). Use for bandwidth-bound reductions (RMSNorm, LayerNorm) or ops needing fine-grained vectorization and shared memory control. Adapted from [HuggingFace kernels cuda-kernels skill](https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels).
+  Step-by-step guide for adding a JIT CUDA kernel. CUDA source goes in `jit_kernel/csrc/diffusion/<op>.cuh`; Python wrapper at `jit_kernel/diffusion/<op>.py`. Uses SGLang's JIT compilation system (`load_jit`, `cache_once`) and internal abstractions (`TensorMatcher`, `device::AlignedVector`, `host::LaunchKernel`, `device::warp::reduce_sum`). Use for bandwidth-bound reductions (RMSNorm, LayerNorm) or ops needing fine-grained vectorization and shared memory control. Adapted from [HuggingFace kernels cuda-kernels skill](https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels).
 
 - [use-efficient-diffusion-kernels.md](./use-efficient-diffusion-kernels.md)
 

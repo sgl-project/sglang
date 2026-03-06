@@ -20,7 +20,7 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
-- `docs/diffusion/performance/attention_backends.md`
+- `docs/diffusion/performance/attention_backends.md` (repo root)
 
 **Core Fusion Patterns**
 

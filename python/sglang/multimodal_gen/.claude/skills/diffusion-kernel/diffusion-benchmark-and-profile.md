@@ -273,7 +273,7 @@ After pinpointing the slow op, choose the right tool:
 
 Both kernel types use SGLang's JIT compilation:
 - **Triton**: `python/sglang/jit_kernel/diffusion/triton/<op>.py`
-- **CUDA JIT**: `python/sglang/jit_kernel/csrc/diffusion/<op>.cuh` + wrapper `python/sglang/jit_kernel/diffusion_<op>.py`
+- **CUDA JIT**: `python/sglang/jit_kernel/csrc/diffusion/<op>.cuh` + wrapper `python/sglang/jit_kernel/diffusion/<op>.py`
 
 ### Step 5: torch.compile Coverage
 

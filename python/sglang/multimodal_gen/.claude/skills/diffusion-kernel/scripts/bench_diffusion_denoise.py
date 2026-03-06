@@ -231,6 +231,9 @@ def run_benchmark_once(
 
     env = os.environ.copy()
     if use_custom_kernels:
+        # NOTE: This env var is a convention for user-implemented kernel injection
+        # logic. SGLang runtime does not read it by default — you must add handling
+        # in your denoising stage or model code to check this var and apply patches.
         env["SGLANG_DIFFUSION_CUSTOM_CUDA_KERNELS"] = "1"
 
     print(f"\n{'=' * 64}")
@@ -345,10 +348,10 @@ def inject_kernels_example():
     import torch.nn as nn
 
     try:
-        from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
+        from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
     except ImportError:
         print(
-            "diffusion_rmsnorm JIT kernel not available. "
+            "diffusion.rmsnorm JIT kernel not available. "
             "Implement add-cuda-kernel.md first."
         )
         return

@@ -1,6 +1,6 @@
 ---
 name: add-cuda-kernel
-description: Step-by-step guide for adding a new JIT CUDA kernel to SGLang Diffusion. CUDA source files go in jit_kernel/csrc/diffusion/<op>.cuh; Python wrapper at jit_kernel/diffusion_<op>.py. Use when implementing optimized CUDA kernels for diffusion model operators (RMSNorm, RoPE, AdaLN, GEGLU, etc.) on NVIDIA GPUs (H100, A100). Covers kernel authoring with sglang abstractions, JIT compilation, Python wrapper, integration into the denoise stage, and benchmarking. Adapted from https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels.
+description: Step-by-step guide for adding a new JIT CUDA kernel to SGLang Diffusion. CUDA source files go in jit_kernel/csrc/diffusion/<op>.cuh; Python wrapper at jit_kernel/diffusion/<op>.py. Use when implementing optimized CUDA kernels for diffusion model operators (RMSNorm, RoPE, AdaLN, GEGLU, etc.) on NVIDIA GPUs (H100, A100). Covers kernel authoring with sglang abstractions, JIT compilation, Python wrapper, integration into the denoise stage, and benchmarking. Adapted from https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels.
 ---
 
 # Adding a CUDA Kernel to SGLang Diffusion (JIT Style)
@@ -39,14 +39,14 @@ python/sglang/jit_kernel/
 │   └── elementwise/             # shared JIT CUDA csrc (non-diffusion)
 ├── diffusion/
 │   ├── triton/                  # Triton kernels (scale_shift, norm, rope, ...)
-│   └── cutedsl/                 # CuTe DSL kernels
-├── timestep_embedding.py        # existing CUDA diffusion kernel Python wrapper
-└── diffusion_rmsnorm.py         # NEW: Python wrapper (follow this top-level convention)
+│   ├── cutedsl/                 # CuTe DSL kernels
+│   └── rmsnorm.py               # NEW: CUDA JIT Python wrapper (add here)
+├── timestep_embedding.py        # existing CUDA diffusion kernel Python wrapper (legacy)
 ```
 
 New diffusion CUDA kernel source files go into `python/sglang/jit_kernel/csrc/diffusion/<op_name>.cuh`.
-The Python wrapper follows the existing convention (`timestep_embedding.py`) and goes at
-`python/sglang/jit_kernel/diffusion_<op_name>.py` (top-level, **not** inside `diffusion/`).
+The Python wrapper goes at `python/sglang/jit_kernel/diffusion/<op_name>.py`
+(inside `diffusion/`, alongside the `triton/` and `cutedsl/` subdirectories).
 
 ---
 
@@ -62,6 +62,7 @@ Always use these — do **not** use raw CUDA primitives directly.
 #include <sgl_kernel/vec.cuh>     // AlignedVector<T, N> — 128-bit vector loads
 #include <sgl_kernel/warp.cuh>    // warp::reduce_sum, warp::reduce_max
 #include <sgl_kernel/math.cuh>    // device::math::rsqrt, sqrt, ...
+#include <sgl_kernel/tile.cuh>    // tile::Memory (strided access pattern)
 ```
 
 Key types: `fp16_t` = `__half`, `bf16_t` = `__nv_bfloat16`, `fp32_t` = `float`.
@@ -213,7 +214,7 @@ void rmsnorm(
 
 ## Step 2: Python Wrapper
 
-Create `python/sglang/jit_kernel/diffusion_rmsnorm.py`:
+Create `python/sglang/jit_kernel/diffusion/rmsnorm.py`:
 
 ```python
 from __future__ import annotations
@@ -281,13 +282,13 @@ The kernel replaces a slow operator inside the DiT forward pass. Find the correc
 
 ```
 python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
-python/sglang/multimodal_gen/models/diffusion/<model>/transformer.py
+python/sglang/multimodal_gen/runtime/models/dits/<model>.py
 ```
 
 **Pattern — monkey-patch the DiT block's RMSNorm:**
 
 ```python
-from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
+from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
 
 def _patch_rmsnorm(model: torch.nn.Module) -> None:
     for name, module in model.named_modules():
@@ -389,7 +390,7 @@ Create `python/sglang/jit_kernel/tests/test_diffusion_rmsnorm.py`:
 ```python
 import pytest
 import torch
-from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
+from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -426,7 +427,7 @@ import torch
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE, run_benchmark
-from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
+from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
 
 SHAPES = [(4096, 2048), (4096, 3072), (4096, 4096)]
 
@@ -607,8 +608,8 @@ for r in rows[:30]:
 python/sglang/jit_kernel/csrc/diffusion/
 └── rmsnorm.cuh                                  # NEW: JIT CUDA kernel source
 
-python/sglang/jit_kernel/
-└── diffusion_rmsnorm.py                         # NEW: Python wrapper + load_jit
+python/sglang/jit_kernel/diffusion/
+└── rmsnorm.py                                   # NEW: Python wrapper + load_jit
 
 python/sglang/jit_kernel/tests/
 └── test_diffusion_rmsnorm.py                    # NEW: correctness tests
@@ -637,8 +638,8 @@ python/sglang/jit_kernel/benchmark/
 
 - **JIT system**: `add-jit-kernel` skill (`sglang/.claude/skills/add-jit-kernel/SKILL.md`)
 - **JIT utils**: `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`
-- **Abstractions**: `python/sglang/jit_kernel/include/sgl_kernel/` — `tensor.h`, `utils.cuh`, `vec.cuh`, `warp.cuh`, `math.cuh`
-- **Real csrc examples**: `csrc/elementwise/rmsnorm.cuh`, `csrc/elementwise/qknorm.cuh`
+- **Abstractions**: `python/sglang/jit_kernel/include/sgl_kernel/` — `tensor.h`, `utils.cuh`, `vec.cuh`, `warp.cuh`, `math.cuh`, `tile.cuh`
+- **Real csrc examples**: `python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh`, `python/sglang/jit_kernel/csrc/elementwise/qknorm.cuh`
 
 ### Other Diffusion Kernel Skills (this directory)
 

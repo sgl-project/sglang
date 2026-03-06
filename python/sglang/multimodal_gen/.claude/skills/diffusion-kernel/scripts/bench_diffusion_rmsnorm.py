@@ -23,16 +23,16 @@ import torch
 # ---------------------------------------------------------------------------
 # Import the JIT CUDA kernel.
 # When you implement add-cuda-kernel.md, the file will be at:
-#   python/sglang/jit_kernel/diffusion_rmsnorm.py
+#   python/sglang/jit_kernel/diffusion/rmsnorm.py
 # ---------------------------------------------------------------------------
 try:
-    from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
+    from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
 
     JIT_AVAILABLE = True
 except ImportError:
     JIT_AVAILABLE = False
     print(
-        "WARNING: diffusion_rmsnorm JIT kernel not available. "
+        "WARNING: diffusion.rmsnorm JIT kernel not available. "
         "Run after implementing add-cuda-kernel.md."
     )
 

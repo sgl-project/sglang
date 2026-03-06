@@ -96,7 +96,7 @@ if cap[0] < 9:
 3. Profile with `ncu`:
    ```bash
    ncu --set full --csv -o metrics.csv \
-     python -c "from sglang.jit_kernel.diffusion.cuda_rmsnorm import diffusion_rmsnorm; ..."
+     python -c "from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm; ..."
    ```
    Look at `dram__throughput.avg.pct_of_peak_sustained_elapsed` — if < 30%, check coalescing.
 
@@ -314,7 +314,7 @@ nsys profile -o denoise_profile \
 # 7. Verify a patched module produces correct output
 python - << 'EOF'
 import torch
-from sglang.jit_kernel.diffusion.cuda_rmsnorm import diffusion_rmsnorm
+from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
 
 x = torch.randn(4, 2048, dtype=torch.bfloat16, device="cuda")
 w = torch.ones(2048, dtype=torch.bfloat16, device="cuda")

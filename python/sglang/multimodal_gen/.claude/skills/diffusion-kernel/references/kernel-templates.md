@@ -123,7 +123,7 @@ void silu_gate(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 }  // namespace
 ```
 
-### Python wrapper: `diffusion_silu_gate.py`
+### Python wrapper: `diffusion/silu_gate.py`
 
 ```python
 from __future__ import annotations
@@ -409,6 +409,8 @@ void adaln(
 
 ## Template 4: Python Wrapper (generic pattern)
 
+File location: `python/sglang/jit_kernel/diffusion/<op>.py`
+
 ```python
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -471,7 +473,7 @@ def diffusion_your_op(
 # python/sglang/jit_kernel/tests/test_diffusion_<op>.py
 import pytest
 import torch
-from sglang.jit_kernel.diffusion.cuda_<op> import diffusion_<op>
+from sglang.jit_kernel.diffusion.<op> import diffusion_<op>
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -513,7 +515,7 @@ import torch
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE, run_benchmark
-from sglang.jit_kernel.diffusion.cuda_<op> import diffusion_<op>
+from sglang.jit_kernel.diffusion.<op> import diffusion_<op>
 
 SHAPES = [(4096, 2048), (4096, 3072), (4096, 4096)]
 
@@ -554,8 +556,8 @@ if __name__ == "__main__":
 python/sglang/jit_kernel/csrc/diffusion/
 └── <op>.cuh                               # CUDA kernel + launcher
 
-python/sglang/jit_kernel/
-└── diffusion_<op>.py                      # Python wrapper (load_jit + cache_once)
+python/sglang/jit_kernel/diffusion/
+└── <op>.py                                # Python wrapper (load_jit + cache_once)
 
 python/sglang/jit_kernel/tests/
 └── test_diffusion_<op>.py                 # correctness tests
