@@ -336,9 +336,9 @@ class ModelRunnerKVCacheMixin:
             f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
         )
 
-    def calculate_mamba_ratio(self: ModelRunner) -> float:
+    def _calculate_mamba_ratio(self: ModelRunner) -> float:
         if self.server_args.disable_radix_cache:
-            return 1
+            return 1.0
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
@@ -350,7 +350,6 @@ class ModelRunnerKVCacheMixin:
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
     def _init_pools(self: ModelRunner, max_num_reqs: int):
-
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
@@ -693,7 +692,7 @@ class ModelRunnerKVCacheMixin:
             )
 
         if self.mambaish_config is not None:
-            ratio = self.calculate_mamba_ratio()
+            ratio = self._calculate_mamba_ratio()
 
             # Constrain the max_num_reqs by the mamba cache size
             max_num_reqs = min(
