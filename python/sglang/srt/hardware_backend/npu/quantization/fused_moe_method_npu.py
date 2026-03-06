@@ -76,15 +76,21 @@ def npu_fused_experts(
         output_dtype=original_dtype,
     )[0]
     # act_fn: swiglu
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        expert_tokens_diff = expert_tokens.diff(prepend=torch.tensor([0], device=expert_tokens.device))
+        hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            hidden_states,
+            group_index=expert_tokens_diff,
+            activate_left=True,
+            quant_mode=1
+        )
 
         scale_args2 = {
             "scale": [w2_scale.to(scale_dtype)],
             "per_token_scale": [pertoken_scale],
         }
     else:
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
