@@ -188,9 +188,7 @@ class BaseFormatDetector(ABC):
                     return StreamingParseResult()
 
                 try:
-                    obj, end_idx = _partial_json_loads(
-                        current_text[start_idx:], flags
-                    )
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
                 except (MalformedJSON, json.JSONDecodeError):
                     # For block-based formats (e.g., Qwen25) the separator sits
                     # between JSON objects but eot_token/bot_token markup also

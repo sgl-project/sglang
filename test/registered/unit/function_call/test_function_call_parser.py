@@ -4008,6 +4008,5 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(cities, ["NYC", "LA"])
 
 
-
 if __name__ == "__main__":
     unittest.main()
