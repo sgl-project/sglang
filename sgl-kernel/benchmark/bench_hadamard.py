@@ -9,7 +9,18 @@ import triton.testing
 
 from sglang.jit_kernel.hadamard import hadamard_transform
 
-# Optional: scipy reference
+# AOT kernel: might not be available in all environments.
+# The hadamard_transform in sgl_kernel may be marked as deprecated/migrated
+# or the build might not include it. This is used for performance baseline comparison.
+try:
+    from sgl_kernel import hadamard_transform as hadamard_transform_aot
+
+    AOT_AVAILABLE = True
+except Exception:
+    AOT_AVAILABLE = False
+
+# Naive reference implementation using scipy hadamard matrix.
+# This is primarily for validating correctness; scipy may not be installed.
 try:
     from scipy.linalg import hadamard
 
@@ -39,10 +50,15 @@ available_providers = ["jit_kernel"]
 available_names = ["JIT Kernel"]
 available_styles = [("red", "-")]
 
+if AOT_AVAILABLE:
+    available_providers.insert(0, "aot_kernel")
+    available_names.insert(0, "AOT Kernel")
+    available_styles.insert(0, ("green", "-"))
+
 if SCIPY_AVAILABLE:
-    available_providers.insert(0, "naive")
-    available_names.insert(0, "Naive (scipy)")
-    available_styles.insert(0, ("blue", "-"))
+    available_providers.append("naive")
+    available_names.append("Naive (scipy)")
+    available_styles.append(("blue", "-"))
 
 
 @triton.testing.perf_report(
@@ -87,6 +103,11 @@ def benchmark(batch_size, dim, provider):
             naive_fn,
             quantiles=quantiles,
         )
+    elif provider == "aot_kernel":
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: hadamard_transform_aot(x.clone(), scale=scale),
+            quantiles=quantiles,
+        )
     elif provider == "jit_kernel":
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: hadamard_transform(x.clone(), scale=scale),
@@ -98,6 +119,6 @@ def benchmark(batch_size, dim, provider):
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("Benchmarking Fast Hadamard Transform (JIT Kernel)")
+    print("Benchmarking Fast Hadamard Transform")
     print("=" * 80)
     benchmark.run(print_data=True)
