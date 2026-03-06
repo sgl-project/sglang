@@ -197,11 +197,11 @@ def compute_flops_saved(prefix_len, total_len, config) -> float:
     """Total FLOPs saved by reusing a cached prefix."""
     # ... sums across all layer types using config fields ...
 
-def compute_memory_bytes(prefix_len, cache_params, config) -> float:
-    """Total memory: SSM state (fixed) + KV cache (proportional to prefix_len)."""
-    ssm_bytes = cache_params.mamba_cache_per_req  # from BaseLinearStateParams
-    kv_bytes = prefix_len * num_kv_heads * head_dim * 2 * kv_dtype_bytes * num_attn_layers
-    return ssm_bytes + kv_bytes
+  def compute_memory_bytes(prefix_len, cache_params, config, model_config, tp_world_size) -> float:
+      ssm_bytes = cache_params.mamba_cache_per_req
+      num_kv_heads_per_gpu = model_config.get_num_kv_heads(tp_world_size)  # handles max(1, n//tp)
+      kv_bytes = prefix_len * num_kv_heads_per_gpu * head_dim * 2 * kv_dtype_bytes * num_attn_layers
+      return ssm_bytes + kv_bytes
 
 def compute_flop_efficiency(prefix_len, total_len, cache_params, config) -> float:
     """Marconi efficiency score: FLOPs_saved / memory_bytes."""
@@ -253,27 +253,17 @@ else:
 ### Unit Tests
 
 1. **FLOP utility tests** (`test_marconi_utils.py`):
-   - Validate `get_full_attn_flops`, `get_linear_attn_flops`, `get_moe_flops` against paper formulas
-   - Verify `compute_memory_bytes` matches `mamba_cache_per_req` for standard configs
-   - Test edge cases: `prefix_len = 0`, `prefix_len = total_len`
 
 2. **Eviction policy tests** (`test_mamba_radix_cache_marconi.py`):
-   - Insert entries with known efficiency profiles; verify higher-efficiency entries survive eviction
-   - Verify LRU behavior is unchanged when `eviction_policy="lru"`
-   - Test intermediate node eviction (tombstoning) with Marconi scoring
-   - Test score normalization edge cases (all equal efficiencies → recency-only)
 
 3. **Integration tests**:
-   - Full `cache_finished_req` / `cache_unfinished_req` / `match_prefix` cycle with `eviction_policy="marconi"`
-   - Verify `mamba_cache_per_req` bytes accounting remains consistent
 
 ### Benchmarks
 
 Metrics to track against baseline LRU:
 
 **SSM state hit rate**: ≥ 2× improvement (paper shows 4.5–34.4× on LMSys)     
-**TTFT for cacheable requests**: ≥ 10% reduction                              
-**TTFT regression on non-cacheable**: < 1% (should be zero)                   
+**TTFT for cacheable requests**: ≥ 10% reduction                                              
 **Eviction overhead (latency)**: < 1ms per eviction call   
 
 ---
