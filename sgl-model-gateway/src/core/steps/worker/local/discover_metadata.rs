@@ -53,48 +53,6 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
-/// Fallback function to GET JSON from old endpoint (with "get_" prefix) for backward compatibility.
-async fn get_json_fallback(
-    base_url: &str,
-    endpoint: &str,
-    api_key: Option<&str>,
-) -> Result<Value, String> {
-    // FIXME: This fallback logic should be removed together with /get_server_info
-    // and /get_model_info endpoints in http_server.py
-    warn!(
-        concat!(
-            "Endpoint '/{}' returned 404, falling back to '/get_{}' for backward compatibility. ",
-            "The '/get_{}' endpoint is deprecated and will be removed in a future version. ",
-            "Please use '/{}' instead."
-        ),
-        endpoint, endpoint, endpoint, endpoint
-    );
-
-    let old_url = format!("{}/get_{}", base_url, endpoint);
-    let mut req = HTTP_CLIENT.get(&old_url);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to {}: {}", old_url, e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "Server returned status {} from {}",
-            response.status(),
-            old_url
-        ));
-    }
-
-    response
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("Failed to parse response from {}: {}", old_url, e))
-}
-
 /// Get server info from /server_info endpoint.
 pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
     let base_url = url.trim_end_matches('/');
@@ -109,13 +67,6 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
         .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", server_info_url, e))?;
-
-    // If /server_info returns 404, fallback to /get_server_info for backward compatibility
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        let json = get_json_fallback(base_url, "server_info", api_key).await?;
-        return serde_json::from_value(json)
-            .map_err(|e| format!("Failed to parse server info: {}", e));
-    }
 
     if !response.status().is_success() {
         return Err(format!(
@@ -147,13 +98,6 @@ pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInf
         .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", model_info_url, e))?;
-
-    // If /model_info returns 404, fallback to /get_model_info for backward compatibility
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        let json = get_json_fallback(base_url, "model_info", api_key).await?;
-        return serde_json::from_value(json)
-            .map_err(|e| format!("Failed to parse model info: {}", e));
-    }
 
     if !response.status().is_success() {
         return Err(format!(

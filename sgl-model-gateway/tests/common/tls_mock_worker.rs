@@ -101,7 +101,10 @@ impl TlsMockWorker {
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
+            .route("/server_info", get(server_info_handler))
+            .route("/model_info", get(model_info_handler))
             .route("/get_server_info", get(server_info_handler))
+            .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .with_state(config);
@@ -286,6 +289,29 @@ async fn server_info_handler(State(config): State<Arc<RwLock<TlsMockWorkerConfig
         "host": "127.0.0.1",
         "tls_enabled": true,
         "version": "0.3.0"
+    }))
+    .into_response()
+}
+
+async fn model_info_handler(State(config): State<Arc<RwLock<TlsMockWorkerConfig>>>) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Random failure" })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "model_path": "mock-tls-model-path",
+        "tokenizer_path": "mock-tls-tokenizer-path",
+        "is_generation": true,
+        "preferred_sampling_params": {
+            "temperature": 0.7,
+            "top_p": 0.9
+        }
     }))
     .into_response()
 }
