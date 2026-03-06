@@ -1,6 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -19,7 +22,7 @@ FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
 
-class TestDeepseekV32FP4DP(CustomTestCase):
+class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
@@ -30,6 +33,8 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             "--dp",
             "4",
             "--enable-dp-attention",
+            "--attention-backend",
+            "nsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
@@ -40,15 +45,24 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             "deepseekv32",
             "--reasoning-parser",
             "deepseek-v3",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=other_args,
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=SERVER_LAUNCH_TIMEOUT,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -57,11 +71,13 @@ class TestDeepseekV32FP4DP(CustomTestCase):
     def test_a_gsm8k(
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1319,
-            parallel=1319,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -69,12 +85,20 @@ class TestDeepseekV32FP4DP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v32 mtp)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
             )
-
-        self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -88,10 +112,12 @@ class TestDeepseekV32FP4DP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 60)
+
+            self.assertGreater(acc_length, 2.7)
+            self.assertGreater(speed, 90)
 
 
-class TestDeepseekV32FP4TP(CustomTestCase):
+class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
@@ -99,6 +125,8 @@ class TestDeepseekV32FP4TP(CustomTestCase):
         other_args = [
             "--tp",
             "4",
+            "--attention-backend",
+            "nsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
@@ -109,15 +137,24 @@ class TestDeepseekV32FP4TP(CustomTestCase):
             "deepseekv32",
             "--reasoning-parser",
             "deepseek-v3",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=other_args,
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=SERVER_LAUNCH_TIMEOUT,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -126,11 +163,13 @@ class TestDeepseekV32FP4TP(CustomTestCase):
     def test_a_gsm8k(
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1319,
-            parallel=1319,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -138,12 +177,20 @@ class TestDeepseekV32FP4TP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v32 mtp)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
             )
-
-        self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -157,7 +204,9 @@ class TestDeepseekV32FP4TP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 90)
+
+            self.assertGreater(acc_length, 2.7)
+            self.assertGreater(speed, 150)
 
 
 if __name__ == "__main__":
