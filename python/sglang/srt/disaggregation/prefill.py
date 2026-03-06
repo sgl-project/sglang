@@ -42,7 +42,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -299,6 +304,7 @@ class PrefillBootstrapQueue:
                 continue
 
             # KV.WaitingForInput - init here
+            req.time_stats.set_bootstrap_done_time()
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -596,6 +602,27 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kv_item_lens = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
+        )
+        bytes_per_page_all_layers = sum(kv_item_lens)
+
+        for req in done_reqs:
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                continue
+            metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
+                num_tokens=len(req.origin_input_ids),
+                page_size=page_size,
+                bytes_per_page_all_layers=bytes_per_page_all_layers,
+            )
+            if metrics:
+                # Update last-value for REST API
+                if "latency_ms" in metrics:
+                    self.kv_transfer_latency_ms = metrics["latency_ms"]
+                if "speed_gb_s" in metrics:
+                    self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
         self.stream_output(
