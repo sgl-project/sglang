@@ -17,7 +17,6 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -706,11 +705,23 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-def detect_nan(logits_output: LogitsProcessorOutput):
-    logits = logits_output.next_token_logits
-    if torch.any(torch.isnan(logits)):
-        logger.error("Detected errors during sampling! NaN in the logits.")
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
+def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
+    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
+        return
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+
+
+def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
+        return
+    if indices.numel() == 0:
+        return
+    torch._assert_async(
+        (indices.min() >= low) & (indices.max() < high),
+        f"OOB indices not in [{low}, {high}): {msg}",
+    )
 
 
 # Disable torch.compile for this function because it will be
