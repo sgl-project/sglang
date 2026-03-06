@@ -141,7 +141,7 @@ class ExtendedRadixCache(BasePrefixCache):
         if host_hit_length <= 0 or (
             mem_quota is not None and host_hit_length > mem_quota
         ):
-            self._connector.cancel_load_task(req.rid)
+            self._connector.release_load_state(req.rid)
             return
 
         device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
@@ -157,7 +157,7 @@ class ExtendedRadixCache(BasePrefixCache):
                 "Failed to allocate %d GPU slots for external load",
                 host_hit_length,
             )
-            self._connector.cancel_load_task(req.rid)
+            self._connector.release_load_state(req.rid)
             return
 
         gpu_cached_len = len(req.prefix_indices)

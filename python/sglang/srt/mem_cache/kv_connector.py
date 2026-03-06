@@ -49,8 +49,8 @@ class BaseKVConnector(ABC):
         ...
 
     @abstractmethod
-    def cancel_load_task(self, rid: str) -> None:
-        """Cancel a locked load, releasing state acquired by get_new_hit_length.
+    def release_load_state(self, rid: str) -> None:
+        """Release the load state acquired by get_new_hit_length.
 
         Args:
             rid: Request id previously passed to get_new_hit_length.
