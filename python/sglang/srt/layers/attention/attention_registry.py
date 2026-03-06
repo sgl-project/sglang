@@ -200,7 +200,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import is_blackwell, is_hip, is_npu
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
@@ -218,7 +218,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
-            linear_attn_backend = Mamba2AttnBackend(runner)
+            from sglang.srt.utils import get_bool_env_var
+
+            _use_aiter_mamba = get_bool_env_var("SGLANG_AITER_MAMBA", "False")
+            if (
+                is_hip()
+                and runner.server_args.attention_backend == "aiter"
+                and _use_aiter_mamba
+            ):
+                from sglang.srt.layers.attention.aiter_backend import (
+                    AiterMamba2AttnBackend,
+                )
+
+                linear_attn_backend = AiterMamba2AttnBackend.create(runner)
+            else:
+                linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
             linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:

@@ -2248,3 +2248,22 @@ class AiterMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+
+class AiterMamba2AttnBackend:
+    """Factory for creating Mamba2 backend using aiter's causal conv1d on AMD/ROCm.
+
+    On ROCm, the MambaMixer2 module automatically imports aiter's causal_conv1d_fn
+    and causal_conv1d_update (via the is_hip() branch in mamba.py), so the standard
+    Mamba2AttnBackend works out of the box. This factory provides a named entry point
+    for the aiter backend registry and logs the kernel selection for diagnostics.
+    """
+
+    @staticmethod
+    def create(model_runner: "ModelRunner"):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            Mamba2AttnBackend,
+        )
+
+        logger.info("Using AiterMamba2AttnBackend with aiter causal_conv1d kernels")
+        return Mamba2AttnBackend(model_runner)

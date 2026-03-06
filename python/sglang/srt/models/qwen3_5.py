@@ -628,7 +628,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """AITER fused qk_norm + RoPE + set_kv (HIP only).
         qkv: [batch, q_size + kv_size + kv_size]. Returns (q, k, v)."""
         import aiter
-        from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+        from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 
         num_tokens = qkv.shape[0]
         head_size = self.head_dim
@@ -664,38 +664,38 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=v_cache.dtype, device=v_cache.device,
         )
 
-        use_shuffle_layout = False # Only support no shuffle layout for now
+        use_shuffle_layout = False
         block_size = 0
         x = 0
         k_scale = self.attn.k_scale if self.attn.k_scale is not None else torch.tensor(1.0)
         v_scale = self.attn.v_scale if self.attn.v_scale is not None else torch.tensor(1.0)
 
-
-        is_mrope = not isinstance(rotary_emb, RotaryEmbedding)
+        is_mrope = isinstance(rotary_emb, MRotaryEmbedding)
         if is_mrope:
             mrope_section = getattr(rotary_emb, "mrope_section", [head_size // 3] * 3)
-            is_interleaved = getattr(rotary_emb, "is_interleaved", False)
+            is_interleaved = getattr(rotary_emb, "mrope_interleaved", False)
             if positions.dim() == 1:
                 positions_3d = positions_1d.unsqueeze(0).expand(3, -1)
             else:
                 positions_3d = positions
             aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-                qkv, 
-                qw, 
-                kw, 
-                cos_sin, 
+                qkv,
+                qw,
+                kw,
+                cos_sin,
                 positions_3d,
-                num_tokens, 
-                num_heads_q, 
-                num_heads_k, 
-                num_heads_v, 
+                num_tokens,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
                 head_size,
-                rotary_emb.is_neox_style, 
+                rotary_emb.is_neox_style,
                 mrope_section, is_interleaved, eps,
                 q_out, k_cache, v_cache, slot_mapping,
                 k_scale, v_scale,
                 k_out, v_out, True,
                 use_shuffle_layout, block_size, x,
+                rotary_emb.rotary_dim,
             )
         else:
             aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
@@ -706,7 +706,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_scale,
                 v_scale,
                 k_out, v_out, True,
-                use_shuffle_layout, 
+                use_shuffle_layout,
                 block_size, x,
                 rotary_emb.rotary_dim,
             )
