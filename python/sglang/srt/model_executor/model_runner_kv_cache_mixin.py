@@ -676,7 +676,7 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
-    def init_memory(self: ModelRunner, total_gpu_memory: int):
+    def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
