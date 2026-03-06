@@ -2137,7 +2137,7 @@
             "expected_avg_denoise_ms": 67.32,
             "expected_median_denoise_ms": 74.1
         },
-      "flux_2_image_t2i_upscaling_4x": {
+        "flux_2_image_t2i_upscaling_4x": {
             "stages_ms": {
                 "DiffusersExecutionStage": 19403.86
             },
