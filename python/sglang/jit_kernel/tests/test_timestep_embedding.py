@@ -157,4 +157,4 @@ def test_timestep_embedding_perf():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])

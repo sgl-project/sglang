@@ -1229,6 +1229,21 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class PinPrefixReqInput(BaseReq):
+    """Pin a prefix by token_ids to resist eviction."""
+
+    token_ids: List[int] = field(default_factory=list)
+    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
+
+
+@dataclass
+class PinPrefixReqOutput(BaseReq):
+    success: bool
+    nodes_pinned: int = 0
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
@@ -1337,6 +1352,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
 
 
 @dataclass
@@ -1623,6 +1640,8 @@ class ConfigureLoggingReq(BaseReq):
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
 
 
 @dataclass
@@ -1747,6 +1766,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
+    load_format: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(

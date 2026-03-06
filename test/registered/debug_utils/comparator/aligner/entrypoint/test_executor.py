@@ -1,11 +1,12 @@
 import sys
-from typing import Optional
 
 import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
     AlignerResult,
+    StepPlansResult,
+    SubPlansResult,
     _execute_step_plans,
     execute_aligner_plan,
     execute_sub_plan,
@@ -15,7 +16,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
@@ -23,7 +24,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis, TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -32,22 +33,28 @@ register_cpu_ci(est_time=15, suite="default", nightly=True)
 
 class TestExecuteSubPlans:
     def test_empty_tensors_returns_none(self) -> None:
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=[], plans=[])
-        assert result is None
+        r: SubPlansResult = execute_sub_plans(tensors=[], plans=[])
+        assert r.tensor is None
+        assert r.checks == []
+        assert r.snapshots == []
 
     def test_no_plans_single_tensor_passthrough(self) -> None:
         tensor: torch.Tensor = torch.tensor([1.0, 2.0, 3.0])
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=[tensor], plans=[])
-        assert result is not None
-        assert torch.equal(result, tensor)
+        r: SubPlansResult = execute_sub_plans(tensors=[tensor], plans=[])
+        assert r.tensor is not None
+        assert torch.equal(r.tensor, tensor)
+        assert r.checks == []
+        assert r.snapshots == []
 
     def test_no_plans_multiple_tensors_returns_none(self) -> None:
         tensors: list[torch.Tensor] = [
             torch.tensor([1.0]),
             torch.tensor([2.0]),
         ]
-        result: Optional[torch.Tensor] = execute_sub_plans(tensors=tensors, plans=[])
-        assert result is None
+        r: SubPlansResult = execute_sub_plans(tensors=tensors, plans=[])
+        assert r.tensor is None
+        assert r.checks == []
+        assert r.snapshots == []
 
     def test_with_unsharder_plan(self) -> None:
         t0: torch.Tensor = torch.tensor([[1.0, 2.0]]).refine_names("b", "h")
@@ -59,13 +66,13 @@ class TestExecuteSubPlans:
             groups=[[0, 1]],
         )
 
-        result: Optional[torch.Tensor] = execute_sub_plans(
-            tensors=[t0, t1], plans=[plan]
-        )
+        r: SubPlansResult = execute_sub_plans(tensors=[t0, t1], plans=[plan])
 
-        assert result is not None
+        assert r.tensor is not None
         expected: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        assert torch.equal(result.rename(None), expected)
+        assert torch.equal(r.tensor.rename(None), expected)
+        assert r.checks == []
+        assert len(r.snapshots) == 1
 
 
 class TestExecuteSubPlan:
@@ -74,7 +81,7 @@ class TestExecuteSubPlan:
             pass
 
         with pytest.raises(NotImplementedError, match="Unknown"):
-            execute_sub_plan(tensors=[torch.tensor([1.0])], plan=_FakePlan())  # type: ignore[arg-type]
+            execute_sub_plan(tensors=[torch.tensor([1.0])], plan=_FakePlan())
 
 
 class TestExecuteStepPlans:
@@ -90,11 +97,13 @@ class TestExecuteStepPlans:
             sub_plans=[],
         )
 
-        result: dict[int, torch.Tensor] = _execute_step_plans(
+        r: StepPlansResult = _execute_step_plans(
             tensors=tensors, step_plans=[step_plan]
         )
 
-        assert result == {}
+        assert r.tensors == {}
+        assert r.checks == []
+        assert len(r.traced_side.step_plans) == 1
 
     def test_single_step_passthrough(self) -> None:
         tensor: torch.Tensor = torch.tensor([1.0, 2.0])
@@ -105,12 +114,15 @@ class TestExecuteStepPlans:
             sub_plans=[],
         )
 
-        result: dict[int, torch.Tensor] = _execute_step_plans(
+        r: StepPlansResult = _execute_step_plans(
             tensors=[tensor], step_plans=[step_plan]
         )
 
-        assert 5 in result
-        assert torch.equal(result[5], tensor)
+        assert 5 in r.tensors
+        assert torch.equal(r.tensors[5], tensor)
+        assert r.checks == []
+        assert len(r.traced_side.step_plans) == 1
+        assert r.traced_side.step_plans[0].step == 5
 
 
 class TestExecuteAlignerPlan:
@@ -235,6 +247,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 
@@ -286,6 +299,7 @@ class TestExecuteAlignerPlanWithTokenDim:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_mode="smart",
             token_aligner_plan=token_plan,
         )
 

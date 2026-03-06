@@ -5,7 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -25,6 +25,7 @@ from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
+    QueueCount,
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
@@ -34,6 +35,8 @@ from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 logger = logging.getLogger(__name__)
@@ -50,8 +53,25 @@ class PrefillStats:
     log_input_tokens: int
     log_hit_tokens: int
     new_token_ratio: float
-    running_bs: int
+    num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+
+    @classmethod
+    def from_adder(
+        cls,
+        adder: PrefillAdder,
+        running_reqs: List[Req],
+        enable_priority_scheduling: bool = False,
+    ):
+        return cls(
+            log_input_tokens=adder.log_input_tokens,
+            log_hit_tokens=adder.log_hit_tokens,
+            new_token_ratio=adder.new_token_ratio,
+            num_running_reqs=QueueCount.from_reqs(
+                running_reqs, enable_priority_scheduling
+            ),
+            num_new_seqs=len(adder.can_run_list),
+        )
 
 
 class KvMetrics:
@@ -90,9 +110,6 @@ class SchedulerMetricsMixin:
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
-        self.kv_transfer_bootstrap_ms: float = 0.0
-        self.kv_transfer_alloc_ms: float = 0.0
-        self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -118,6 +135,8 @@ class SchedulerMetricsMixin:
                 "pp_rank": pp_rank,
                 "moe_ep_rank": self.moe_ep_rank,
             }
+            if self.enable_priority_scheduling:
+                labels["priority"] = ""
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             if self.server_args.extra_metric_labels:
@@ -125,6 +144,7 @@ class SchedulerMetricsMixin:
             self.metrics_collector = SchedulerMetricsCollector(
                 labels=labels,
                 enable_lora=self.enable_lora,
+                enable_hierarchical_cache=self.enable_hierarchical_cache,
                 server_args=self.server_args,
             )
 
@@ -216,7 +236,7 @@ class SchedulerMetricsMixin:
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
-            f"#running-req: {prefill_stats.running_bs}, "
+            f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
@@ -227,7 +247,10 @@ class SchedulerMetricsMixin:
         else:
             msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
-        if self.server_args.language_only:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
         graph_backend = defaultdict(
             lambda: "cuda graph",
@@ -254,7 +277,7 @@ class SchedulerMetricsMixin:
                 prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
-            self.stats.num_running_reqs = prefill_stats.running_bs
+            self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -262,7 +285,11 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
-            self.stats.num_queue_reqs = len(self.waiting_queue)
+
+            priority_enabled = self.enable_priority_scheduling
+            self.stats.num_queue_reqs = QueueCount.from_reqs(
+                self.waiting_queue, priority_enabled
+            )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -275,28 +302,26 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
+                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
+                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
-                self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
-                self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
-                self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
+                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
+                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
+            self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -396,7 +421,10 @@ class SchedulerMetricsMixin:
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-        if self.server_args.language_only:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 
         graph_backend = defaultdict(
@@ -414,8 +442,11 @@ class SchedulerMetricsMixin:
 
         logger.info(msg)
         if self.enable_metrics:
+            priority_enabled = self.enable_priority_scheduling
             # Basics
-            self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_running_reqs = QueueCount.from_reqs(
+                batch.reqs, priority_enabled
+            )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -425,7 +456,9 @@ class SchedulerMetricsMixin:
                 self.stats.mamba_usage = mamba_usage
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs = QueueCount.from_reqs(
+                self.waiting_queue, priority_enabled
+            )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -442,20 +475,19 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
+                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
+                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
+                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
+                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
-
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
             (
@@ -469,6 +501,7 @@ class SchedulerMetricsMixin:
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
+            self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -507,13 +540,13 @@ class SchedulerMetricsMixin:
             return
 
         kv_metrics = KvMetrics()
-        kv_metrics.request_active_slots = self.stats.num_running_reqs
+        kv_metrics.request_active_slots = self.stats.num_running_reqs.total
         kv_metrics.request_total_slots = self.max_running_requests
         kv_metrics.kv_active_blocks = int(
             self.stats.token_usage * self.max_total_num_tokens
         )
         kv_metrics.kv_total_blocks = self.max_total_num_tokens
-        kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
+        kv_metrics.num_requests_waiting = self.stats.num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
@@ -529,6 +562,20 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def _log_hicache_stats(self: Scheduler):
+        """Populate HiCache host-tier stats on self.stats.
+
+        These are pushed to Prometheus by SchedulerMetricsCollector.log_stats().
+        """
+        if not self.enable_hierarchical_cache:
+            return
+
+        host_pool = self.tree_cache.token_to_kv_pool_host
+        self.stats.hicache_host_used_tokens = (
+            host_pool.size - host_pool.available_size()
+        )
+        self.stats.hicache_host_total_tokens = host_pool.size
 
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""
@@ -583,7 +630,7 @@ class SchedulerMetricsMixin:
                 and self.stats.max_running_requests_under_SLO > 0
             ):
                 self.stats.utilization = max(
-                    self.stats.num_running_reqs
+                    self.stats.num_running_reqs.total
                     / self.stats.max_running_requests_under_SLO,
                     self.stats.token_usage / 0.9,
                 )
