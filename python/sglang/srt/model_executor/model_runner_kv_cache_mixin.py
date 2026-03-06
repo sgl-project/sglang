@@ -684,15 +684,10 @@ class ModelRunnerKVCacheMixin:
         if max_num_reqs is not None:
             max_num_reqs = max_num_reqs // self.dp_size
         else:
-            max_num_reqs = min(
-                max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
-                    2048,
-                ),
-                4096,
+            estimated = int(
+                self.max_total_num_tokens / self.model_config.context_len * 512
             )
+            max_num_reqs = max(min(estimated, 4096), 2048)
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
