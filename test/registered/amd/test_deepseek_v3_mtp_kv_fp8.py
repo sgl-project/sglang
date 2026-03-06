@@ -3,40 +3,38 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=900, suite="stage-b-test-4-gpu-b200")
+register_amd_ci(
+    est_time=1200, suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8", nightly=True
+)
+
+FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
 
-FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
-SERVER_LAUNCH_TIMEOUT = 1200
-
-
-class TestDeepseekV3FP4MTP(CustomTestCase):
+class TestDeepseekV3MTPKvFp8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
+        cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp",
-            "4",
-            "--attention-backend",
-            "trtllm_mla",
-            "--moe-runner-backend",
-            "flashinfer_trtllm",
-            "--quantization",
-            "modelopt_fp4",
+            "8",
+            "--trust-remote-code",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -45,24 +43,17 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
-            "--kv-cache-dtype",
-            "fp8_e4m3",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true,"num_threads": 64}',
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
-            True
-        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-            True
-        ):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -85,21 +76,21 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/server_info").json()
-        avg_spec_accept_length = server_info["internal_states"][0][
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
+                f"### test_gsm8k (deepseek-v3 mtp kv-fp8)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-
-        self.assertGreater(metrics["accuracy"], 0.94)
-        self.assertGreater(avg_spec_accept_length, 2.7)
+            self.assertGreater(metrics["accuracy"], 0.93)
+            if is_in_amd_ci():
+                self.assertGreater(avg_spec_accept_length, 2.8)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -109,13 +100,16 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3-fp4 mtp)\n"
+                f"### test_bs_1_speed (deepseek-v3 mtp kv-fp8)\n"
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-
-        self.assertGreater(acc_length, 2.65)
-        self.assertGreater(speed, 150)
+            if is_in_amd_ci():
+                self.assertGreater(acc_length, 2.8)
+            else:
+                self.assertGreater(acc_length, 2.9)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 90)
 
 
 if __name__ == "__main__":
