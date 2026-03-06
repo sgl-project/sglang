@@ -9,7 +9,7 @@ You are welcome to enable various models based on your business requirements.
 | Models                                     | Model Family                   |               A2 Supported               |               A3 Supported               |
 |--------------------------------------------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
 | DeepSeek V3/V3.1                           | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| DeepSeek-V3.2-Exp-W8A8                     | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| DeepSeek-V3.2-W8A8                         | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | DeepSeek-R1-0528-W8A8                      | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | DeepSeek-V2-Lite-W8A8                      | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-30B-A3B-Instruct-2507           | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
