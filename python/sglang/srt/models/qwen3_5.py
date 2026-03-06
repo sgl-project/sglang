@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import (
 )
 
 # Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -54,12 +54,20 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -343,8 +351,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        norm_cls = (
+            GemmaRMSNorm if getattr(config, "norm_uses_gemma_offset", True) else RMSNorm
+        )
+        self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_communicator = LayerCommunicator(
@@ -447,11 +458,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
+        # Only pass rope_scaling to get_rope if it contains an actual scaling
+        # type (e.g., "yarn", "llama3"). If it's just a parameter container
+        # (rope_theta, partial_rotary_factor), pass None for plain RoPE.
+        rope_scaling_for_rope = self.rope_scaling
+        if (
+            rope_scaling_for_rope
+            and "rope_type" not in rope_scaling_for_rope
+            and "type" not in rope_scaling_for_rope
+        ):
+            rope_scaling_for_rope = None
+
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
+            rope_scaling=rope_scaling_for_rope,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
             is_neox_style=True,
@@ -530,13 +552,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        norm_cls = (
+            GemmaRMSNorm if getattr(config, "norm_uses_gemma_offset", True) else RMSNorm
+        )
+        self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -678,6 +703,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
             )
 
@@ -705,7 +731,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Final normalization
         if self.pp_group.is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_cls = (
+                GemmaRMSNorm
+                if getattr(config, "norm_uses_gemma_offset", True)
+                else RMSNorm
+            )
+            self.norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -840,7 +871,49 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # GGUF norm weights have +1 baked in — skip Gemma's +1 offset.
+        # Must be set before super().__init__() which creates decoder layers.
+        config.norm_uses_gemma_offset = False
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        if getattr(config, "tie_word_embeddings", False):
+            self.lm_head = self.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix="lm_head",
+            )
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        hidden_states = super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            input_deepstack_embeds,
+        )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -907,6 +980,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
+        # Accumulator for GGUF MoE w13 shards (gate_proj=w1 + up_proj=w3).
+        # GGUF merged expert tensors are [E, I, bytes] — we cat gate+up
+        # along dim 1 to form w13 [E, 2*I, bytes] after all weights load.
+        gguf_w13_shards: dict[str, dict[str, torch.Tensor]] = {}
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -918,6 +996,64 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            # Handle GGUF merged expert tensors (no per-expert ID in name).
+            # GGUF experts arrive as [num_experts, rows, bytes_per_row]
+            # with names like experts.gate_proj.qweight.
+            # For w13: accumulate gate (w1) and up (w3) shards, then
+            # concatenate along dim 1 after the main loop.
+            # For w2: materialize directly (single tensor).
+            gguf_expert_mapping = [
+                ("experts.gate_proj.", "experts.w13_", "w1"),
+                ("experts.up_proj.", "experts.w13_", "w3"),
+                ("experts.down_proj.", "experts.w2_", "w2"),
+            ]
+            gguf_expert_handled = False
+            for gguf_pattern, param_prefix, gguf_shard_id in gguf_expert_mapping:
+                if gguf_pattern in name and "experts.0." not in name:
+                    param_name = name.replace(gguf_pattern, param_prefix)
+                    if param_name in params_dict:
+                        if "qweight_type" in name:
+                            # qweight_type is a scalar type tag — set data AND attribute
+                            param = params_dict[param_name]
+                            default_weight_loader(param, loaded_weight)
+                            param.weight_type = loaded_weight.item()
+                        elif gguf_shard_id == "w2":
+                            # down_proj — single tensor, materialize directly
+                            param = params_dict[param_name]
+                            param.materialize(
+                                loaded_weight.shape,
+                                dtype=loaded_weight.dtype,
+                            )
+                            param.data.copy_(loaded_weight)
+                        else:
+                            # gate_proj (w1) or up_proj (w3) — accumulate
+                            if param_name not in gguf_w13_shards:
+                                gguf_w13_shards[param_name] = {}
+                            gguf_w13_shards[param_name][gguf_shard_id] = loaded_weight
+                    gguf_expert_handled = True
+                    loaded_params.add(param_name)  # Track the actual param name
+                    break
+            if gguf_expert_handled:
+                loaded_params.add(name)  # Also track original name
+                continue
+
+            # GGUF conv1d weight is [kernel, dim] but model expects
+            # [dim, 1, kernel] (transposed + unsqueezed).
+            if "conv1d.weight" in name and loaded_weight.dim() == 2:
+                if loaded_weight.shape[0] == self.config.linear_conv_kernel_dim:
+                    loaded_weight = loaded_weight.T
+                loaded_weight = loaded_weight.unsqueeze(1)
+
+            # GGUF shared_expert_gate is [hidden] but model expects [1, hidden]
+            if "shared_expert_gate" in name and loaded_weight.dim() == 1:
+                loaded_weight = loaded_weight.unsqueeze(0)
+
+            # GGUF ssm_a stores raw decay rates (negative values like -0.036, -72.33).
+            # SGLang's fused_gdn_gating expects A_log (log-space): g = -exp(A_log) * softplus(...)
+            # Convert: A_log = log(-ssm_a) so that -exp(A_log) = ssm_a
+            if "A_log" in name and loaded_weight.dtype == torch.float32:
+                loaded_weight = torch.log(-loaded_weight)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -1024,6 +1160,32 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+            # A_log and dt_bias are registered on both Qwen3_5GatedDeltaNet (parent)
+            # and RadixLinearAttention (child) pointing to the same nn.Parameter.
+            # Mark the alias path as loaded too to suppress false UNLOADED warnings.
+            if "linear_attn.attn.A_log" in name:
+                loaded_params.add(
+                    name.replace("linear_attn.attn.A_log", "linear_attn.A_log")
+                )
+            elif "linear_attn.attn.dt_bias" in name:
+                loaded_params.add(
+                    name.replace("linear_attn.attn.dt_bias", "linear_attn.dt_bias")
+                )
+
+        # Finalize GGUF MoE w13 params: concatenate gate (w1) + up (w3)
+        # along dim 1 to form the combined [E, 2*I, bytes] tensor.
+        for param_name, shards in gguf_w13_shards.items():
+            if "w1" in shards and "w3" in shards:
+                gate = shards["w1"]  # [E, I, bytes_per_row]
+                up = shards["w3"]  # [E, I, bytes_per_row]
+                w13 = torch.cat([gate, up], dim=1)  # [E, 2*I, bytes_per_row]
+                param = params_dict[param_name]
+                param.materialize(w13.shape, dtype=w13.dtype)
+                param.data.copy_(w13)
+            else:
+                logger.warning(
+                    f"Incomplete w13 shards for {param_name}: " f"{list(shards.keys())}"
+                )
 
         return loaded_params
 
@@ -1350,4 +1512,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+]
