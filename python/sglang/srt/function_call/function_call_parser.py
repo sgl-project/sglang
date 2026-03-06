@@ -1,6 +1,9 @@
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from xgrammar import StructuralTag
+from xgrammar.structural_tag import JSONSchemaFormat, TagFormat, TriggeredTagsFormat
+
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuresResponseFormat,
@@ -183,6 +186,51 @@ class FunctionCallParser:
             triggers=list(tool_trigger_set),
         )
 
+    def _build_structural_tag_for_required(self) -> Optional[object]:
+        """Build a StructuralTag with at_least_one=True for tool_choice="required".
+
+        Uses xgrammar's TriggeredTagsFormat so the grammar enforces at least one
+        tool call while keeping the model in its native output format (e.g. Qwen's
+        <tool_call> blocks).
+        """
+        get_structure_info = self.detector.structure_info()
+        tags: List[TagFormat] = []
+        trigger_set: Set[str] = set()
+
+        for tool in self.tools:
+            function = tool.function
+            name = function.name
+            assert name is not None
+            info = get_structure_info(name)
+
+            is_strict = (
+                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+            )
+            schema = function.parameters if is_strict else {}
+
+            tags.append(
+                TagFormat(
+                    type="tag",
+                    begin=info.begin,
+                    content=JSONSchemaFormat(
+                        type="json_schema", json_schema=schema or {}
+                    ),
+                    end=info.end,
+                )
+            )
+            trigger_set.add(info.trigger)
+
+        return StructuralTag(
+            type="structural_tag",
+            format=TriggeredTagsFormat(
+                type="triggered_tags",
+                triggers=list(trigger_set),
+                tags=tags,
+                at_least_one=True,
+                stop_after_first=False,
+            ),
+        )
+
     def get_structure_constraint(
         self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
     ) -> Optional[ToolCallConstraint]:
@@ -209,6 +257,11 @@ class FunctionCallParser:
         ):
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+        elif tool_choice == "required":
+            if self.detector.supports_structural_tag():
+                return ("structural_tag", self._build_structural_tag_for_required())
+            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            return ("json_schema", json_schema)
+        elif isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)

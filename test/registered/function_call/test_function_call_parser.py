@@ -3724,5 +3724,65 @@ function call<|role_sep|>
         self.assertEqual(params["city"], "Rome")
 
 
+class TestStructuralTagForRequired(unittest.TestCase):
+    """Test that get_structure_constraint returns a structural_tag for tool_choice='required'."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_weather",
+                    description="Get the current weather in a given location",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "The city name",
+                            },
+                            "state": {
+                                "type": "string",
+                                "description": "Two-letter state abbreviation",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city", "state", "unit"],
+                    },
+                ),
+            ),
+        ]
+
+    def test_required_returns_structural_tag_for_qwen25(self):
+        """tool_choice='required' should return a structural_tag constraint
+        (not None and not json_schema) when the detector supports structural tags."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "qwen25")
+        constraint = parser.get_structure_constraint("required")
+        self.assertIsNotNone(constraint)
+        constraint_type, constraint_value = constraint
+        self.assertEqual(constraint_type, "structural_tag")
+
+        dumped = constraint_value.model_dump()
+        fmt = dumped["format"]
+        self.assertEqual(fmt["type"], "triggered_tags")
+        self.assertTrue(fmt["at_least_one"])
+        self.assertFalse(fmt["stop_after_first"])
+        self.assertIn("<tool_call>", fmt["triggers"])
+        self.assertGreaterEqual(len(fmt["tags"]), 1)
+
+    def test_auto_no_strict_returns_none(self):
+        """tool_choice='auto' without strict tools should return None (no constraint)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "qwen25")
+        constraint = parser.get_structure_constraint("auto")
+        self.assertIsNone(constraint)
+
+
 if __name__ == "__main__":
     unittest.main()
