@@ -111,7 +111,7 @@ DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
 )
 GLM_4_7_FLASH_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "ZhipuAI/CLM-4.7-Flash"
+    MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.7-Flash"
 )
 
 # VLM model weights path

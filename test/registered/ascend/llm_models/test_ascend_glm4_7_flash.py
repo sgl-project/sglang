@@ -18,7 +18,7 @@ class TestGLM47Flash(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the ZhipuAI/CLM-4.7-Flash model on the GSM8K dataset is no less than 0.78.
 
     [Test Category] Model
-    [Test Target] ZhipuAI/CLM-4.7-Flash
+    [Test Target] ZhipuAI/GLM-4.7-Flash
     """
 
     model = GLM_4_7_FLASH_WEIGHTS_PATH
@@ -30,7 +30,7 @@ class TestGLM47Flash(GSM8KAscendMixin, CustomTestCase):
         "--attention-backend",
         "ascend",
         "--tp-size",
-        "8",
+        "4",
         "--disable-cuda-graph",
         "--disable-radix-cache",
         "--disable-overlap-schedule",
@@ -43,7 +43,7 @@ class TestGLM47Flash(GSM8KAscendMixin, CustomTestCase):
         "--reasoning-parser",
         "glm45",
         "--chat-template",
-        f"{GLM_4_7_FLASH_WEIGHTS_PATH}/chat_template.jinja",
+        f"{model}/chat_template.jinja",
         "--served-model-name",
         "glm47Flash",
     ]
