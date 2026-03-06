@@ -8,7 +8,7 @@ from sglang.jit_kernel.kimi_k2_moe_fused_gate import kimi_k2_moe_fused_gate
 
 NUM_EXPERTS = 384
 
-M_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+M_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 TOPK_LIST = [1, 2, 4, 6]
 RENORMALIZE_LIST = [True, False]
 
