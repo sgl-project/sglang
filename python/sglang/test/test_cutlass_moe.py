@@ -5,10 +5,25 @@ import triton  # Added import
 import triton.testing  # Added import
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.cutlass_moe_params import (
+    CutlassMoEParams,
+    CutlassMoEQuantType,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+
+# Create a dummy class to mimic the expected server arguments
+class MockServerArgs:
+    def __init__(self):
+        # Set the specific flag the config builder is looking for
+        self.enable_deterministic_inference = False
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
@@ -109,64 +124,17 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.rand(batch_size, topk, device="cuda", dtype=dtype), dim=-1
     )
     topk_ids = torch.randint(0, E, (batch_size, topk), dtype=torch.int32, device="cuda")
+    router_logits = torch.randn((batch_size, E), device="cuda", dtype=dtype)
 
-    a1_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
-    c1_strides = torch.full((E,), I, dtype=torch.int64, device="cuda")
-    a2_strides = torch.full((E,), I // 2, dtype=torch.int64, device="cuda")
-    c2_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
-
-    workspace = torch.empty(
-        (7182 * 1024), device="cuda", dtype=torch.uint8
-    )  # Allocate sufficient workspace
-    # Pointer arrays (often filled by the kernel or a prep step, but needed as args)
-    a_ptrs = torch.empty((E,), dtype=torch.int64, device="cuda")
-    b_ptrs = torch.empty((E,), dtype=torch.int64, device="cuda")
-    out_ptrs = torch.empty((E,), dtype=torch.int64, device="cuda")
-    a_scales_ptrs = torch.empty((E,), dtype=torch.int64, device="cuda")
-    b_scales_ptrs = torch.empty((E,), dtype=torch.int64, device="cuda")
-    expert_offsets = torch.empty((E + 1,), dtype=torch.int32, device="cuda")
-    problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
-    problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
-
-    enable_es = (False, False)
-    if torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H200":
-        enable_es = (False, True)
-    elif torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H20":
-        enable_es = (True, True)
-
-    # --- Lambdas for Benchmarking ---
-    cutlass_lambda = lambda: cutlass_fused_experts_fp8(
-        x,
-        w1.transpose(1, 2),  # Transposed
-        w2.transpose(1, 2),  # Transposed
-        w1_scale.transpose(1, 2),
-        w2_scale.transpose(1, 2),
-        topk_weights,
-        topk_ids,
-        a1_strides,
-        c1_strides,
-        a2_strides,
-        c2_strides,
-        workspace,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        enable_es=enable_es,
+    cutlass_moe_params = CutlassMoEParams(
+        quant_type=CutlassMoEQuantType.BlockscaledFP8,
+        device=torch.device("cuda"),
+        num_experts=E,
+        intermediate_size_per_partition=I // 2,
+        hidden_size=H,
     )
 
-    topk_output = StandardTopKOutput(
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        router_logits=torch.randn(
-            (batch_size, topk), device=topk_weights.device, dtype=dtype
-        ),
-    )
-
+    # --- Setup for refactored MoeRunner ---
     moe_runner_config = MoeRunnerConfig(
         num_experts=E,
         top_k=topk,
@@ -177,18 +145,49 @@ def run_test(tp_size, batch_size, model_config, check=False):
         inplace=False,
     )
 
+    # Create dispatch output
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=topk_output,
+    )
+
+    # CUTLASS runner setup
+    cutlass_runner = MoeRunner(MoeRunnerBackend.CUTLASS, moe_runner_config)
+    cutlass_quant_info = CutlassMoeQuantInfo(
+        deepep_ll_or_deepep_normal=None,
+        w13_weight=w1.transpose(1, 2),
+        w2_weight=w2.transpose(1, 2),
+        w13_scale=w1_scale.transpose(1, 2),
+        w2_scale=w2_scale.transpose(1, 2),
+        params=cutlass_moe_params,
+    )
+
+    # TRITON runner setup
     # Note: Triton expects non-transposed weights
-    triton_lambda = lambda: fused_experts(
-        x,
-        w1,
-        w2,
-        topk_output,
-        moe_runner_config,
+    triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+    triton_quant_info = TritonMoeQuantInfo(
+        w13_weight=w1,
+        w2_weight=w2,
         use_fp8_w8a8=True,
-        w1_scale=w1_scale,
+        w13_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
     )
+
+    # Lambdas using refactored runner paths
+    cutlass_lambda = lambda: cutlass_runner.run(
+        dispatch_output, cutlass_quant_info
+    ).hidden_states
+
+    triton_lambda = lambda: triton_runner.run(
+        dispatch_output, triton_quant_info
+    ).hidden_states
 
     # --- Warmup ---
     print("Warming up...")
@@ -219,43 +218,15 @@ def run_test(tp_size, batch_size, model_config, check=False):
     if check:
         print("Running correctness check...")
         with torch.no_grad():
-            # Run CUTLASS version (requires transposed weights)
-            y_cutlass = cutlass_fused_experts_fp8(
-                x,
-                w1.transpose(1, 2),  # Transposed
-                w2.transpose(1, 2),  # Transposed
-                w1_scale.transpose(1, 2),
-                w2_scale.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                a1_strides,
-                c1_strides,
-                a2_strides,
-                c2_strides,
-                workspace,
-                a_ptrs,
-                b_ptrs,
-                out_ptrs,
-                a_scales_ptrs,
-                b_scales_ptrs,
-                expert_offsets,
-                problem_sizes1,
-                problem_sizes2,
-                enable_es=enable_es,
-            )
+            # Run CUTLASS version using refactored runner
+            y_cutlass = cutlass_runner.run(
+                dispatch_output, cutlass_quant_info
+            ).hidden_states
 
-            # Run Triton version (requires original shape weights, use inplace=False)
-            y_triton = fused_experts(
-                x,
-                w1,  # Original shape
-                w2,  # Original shape
-                topk_output,
-                moe_runner_config,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                block_shape=block_shape,
-            )
+            # Run Triton version using refactored runner
+            y_triton = triton_runner.run(
+                dispatch_output, triton_quant_info
+            ).hidden_states
 
         diff = calc_diff(y_cutlass, y_triton)
         print(f"Diff: {diff:.6f}")
@@ -274,6 +245,7 @@ def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512], check=Fals
 
 
 if __name__ == "__main__":
+    set_global_server_args_for_scheduler(MockServerArgs())
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp-size", type=int, default=8, help="Tensor Parallel size")
     parser.add_argument(

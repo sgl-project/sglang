@@ -125,6 +125,8 @@ class TestMoERunner(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "cutlass",
+                "--quantization",
+                "modelopt_fp4",
                 "--attention-backend",
                 "torch_native",
                 "--sampling-backend",

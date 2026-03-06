@@ -70,6 +70,8 @@ class TestMoERunner4GPU(CustomTestCase):
                 "pytorch",
                 "--tp-size",
                 "4",
+                "--mem-fraction-static",
+                "0.7",
             ],
         },
     }
