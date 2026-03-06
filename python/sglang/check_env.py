@@ -51,6 +51,7 @@ PACKAGE_LIST = [
     "anthropic",
     "litellm",
     "decord2",
+    "diffusers",
 ]
 
 
