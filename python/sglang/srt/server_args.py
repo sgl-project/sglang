@@ -53,7 +53,6 @@ from sglang.srt.utils.common import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
-    is_xpu,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
