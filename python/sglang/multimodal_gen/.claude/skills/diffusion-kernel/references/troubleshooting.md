@@ -256,9 +256,9 @@ def _(out, src, weight, eps):
 
 | Approach | Speedup (denoise) | torch.compile | Notes |
 |----------|-------------------|---------------|-------|
-| CUDA JIT kernel | best | No | Default for production when peak kernel performance is the priority (e.g., bandwidth-bound ops); best for T4/A100/H100 when a well-tuned CUDA kernel is available |
-| Triton kernel | good | Yes | Default when `torch.compile` coverage is required and/or for faster iteration and portability |
-| Triton + compile | best | Yes | Use when you need both Triton kernels and `torch.compile` end-to-end performance |
+| CUDA JIT kernel | best | Yes (via `torch.library.custom_op`) | Performance-optimal regardless of whether `torch.compile` is enabled; use `custom_op` + `register_fake` for compile compatibility |
+| Triton kernel | good | Yes | Use when you need faster iteration/portability, or when you do not have a well-tuned CUDA kernel yet |
+| Triton + compile | good | Yes | Use for end-to-end `torch.compile` integration convenience; typically slower than a well-tuned CUDA kernel |
 
 ### 13. Unstable benchmark results from JIT timing
 
