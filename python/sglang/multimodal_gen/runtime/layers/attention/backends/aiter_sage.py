@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import aiter
+
 import torch
-import functools
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -30,7 +29,9 @@ class AITERSageBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError("AITER Sage backend does not have a metadata builder.")
+        raise NotImplementedError(
+            "AITER Sage backend does not have a metadata builder."
+        )
 
 
 class AITERSageImpl(AttentionImpl):
@@ -49,9 +50,12 @@ class AITERSageImpl(AttentionImpl):
 
         try:
             from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+
             self.aiter_sage_attn_fn = fav3_sage_wrapper_func
         except ImportError:
-            raise ImportError("AITER Sage attention is not available, please update AITER version.")
+            raise ImportError(
+                "AITER Sage attention is not available, please update AITER version."
+            )
 
     def forward(
         self,
