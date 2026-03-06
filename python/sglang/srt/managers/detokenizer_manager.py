@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
-from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -378,6 +378,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             cached_tokens_details=recv_obj.cached_tokens_details,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_accepted_tokens=recv_obj.spec_accepted_tokens,
+            spec_acceptance_histogram=recv_obj.spec_acceptance_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -399,11 +400,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
-            queue_time=recv_obj.queue_time,
-            forward_entry_time=recv_obj.forward_entry_time,
-            prefill_launch_delay=recv_obj.prefill_launch_delay,
-            prefill_launch_latency=recv_obj.prefill_launch_latency,
-            prefill_finished_ts=recv_obj.prefill_finished_ts,
+            dp_ranks=recv_obj.dp_ranks,
+            time_stats=recv_obj.time_stats,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

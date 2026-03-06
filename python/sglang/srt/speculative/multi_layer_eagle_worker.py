@@ -47,11 +47,11 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
     load_token_map,
+    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
@@ -76,6 +76,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -84,7 +86,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -135,6 +136,8 @@ class MultiLayerEagleWorker(TpModelWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -378,6 +381,8 @@ class MultiLayerEagleWorker(TpModelWorker):
             spec_info.hidden_states,
         )
 
+        maybe_detect_nan(topk_p, "draft: NaN in initial topk_p from spec_info")
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -511,8 +516,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -619,8 +623,10 @@ class MultiLayerEagleWorker(TpModelWorker):
             logits_output = (
                 self.mtp_model_runner(step).forward(forward_batch).logits_output
             )
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -638,21 +644,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
-        has_finished, unfinished_req_index = False, []
-        for i, req in enumerate(batch.reqs):
-            if req.finished():
-                has_finished = True
-            else:
-                unfinished_req_index.append(i)
-        if has_finished:
-            unfinished_index_device = torch.tensor(
-                unfinished_req_index,
-                dtype=torch.int64,
-                device=batch.spec_info.topk_p.device,
-            )
-            batch.spec_info.filter_batch(
-                unfinished_index_device, has_been_filtered=False
-            )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -729,8 +720,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                     .logits_output
                 )
 
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_after_decode step {step} (cuda_graph={can_cuda_graph})",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
