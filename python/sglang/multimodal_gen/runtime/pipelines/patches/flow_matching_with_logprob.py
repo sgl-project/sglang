@@ -20,8 +20,9 @@ def sde_step_with_logprob(
 ):
     """Run one rollout step and compute per-sample log_prob.
 
-    sde_type="sde" uses the Gaussian transition objective.
-    sde_type="cps" uses the simplified CPS objective.
+    sde_type:
+        1. "sde": Standard Stochastic Differential Equation transition. 
+        2. "cps": Coupled Particle Sampling. 
     """
     sample_dtype = sample.dtype
     model_output = model_output.float()
