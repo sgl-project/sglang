@@ -19,11 +19,13 @@ class BaseKVConnector(ABC):
         server_args: Any = None,
         tp_group: Any = None,
         tp_rank: int = 0,
+        kvcache: Any = None,
     ):
         self.params = params
         self.server_args = server_args
         self.tp_group = tp_group
         self.tp_rank = tp_rank
+        self.kvcache = kvcache
 
     @abstractmethod
     def get_new_hit_length(
