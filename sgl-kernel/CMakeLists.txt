@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        cc75c5c5979a607ad20a6828635646f9841acf01
+    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -297,9 +297,6 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/gemm/marlin/gptq_marlin.cu"
-    "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
@@ -311,7 +308,6 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
@@ -332,7 +328,6 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
 
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
@@ -581,44 +576,3 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
-
-# ============================ Extra Install: FA4 ============================= #
-# TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-
-    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
-    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
-
-    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
-
-    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
-         DESTINATION "${FLASH_ATTN_CUTE_DST}"
-         PATTERN ".git*" EXCLUDE
-         PATTERN "__pycache__" EXCLUDE)
-
-    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
-         "${FLASH_ATTN_CUTE_DST}/*.py")
-
-    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
-        file(READ "${FILE_PATH}" FILE_CONTENT)
-
-        set(MODIFIED_CONTENT "${FILE_CONTENT}")
-
-        # The main goal is to avoid using "flash_attn" so that other libraries (such as transformers) do not mistakenly assume that "flash_attn" is already installed.
-
-        string(REPLACE "flash_attn.cute"
-                       "flash_attn_origin.cute"
-                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
-            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
-            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
-        endif()
-    endforeach()
-
-    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
-            DESTINATION "flash_attn_origin/cute"
-            PATTERN ".git*" EXCLUDE
-            PATTERN "__pycache__" EXCLUDE)
-
-endif()

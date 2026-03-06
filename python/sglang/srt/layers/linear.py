@@ -64,6 +64,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
+    "GPTQLinearAscendMethod",
+    "GPTQMoEAscendMethod",
     "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
     "ModelOptFp8LinearMethod",
@@ -575,8 +577,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             current_shard_offset = 0
             shard_offsets: List[Tuple[int, int, int]] = []
             for i, output_size in enumerate(self.output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
-                current_shard_offset += output_size
+                effective_size = (
+                    output_size // self.tp_size
+                    if self.use_presharded_weights
+                    else output_size
+                )
+                shard_offsets.append((i, current_shard_offset, effective_size))
+                current_shard_offset += effective_size
             packed_dim = getattr(param, "packed_dim", None)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
