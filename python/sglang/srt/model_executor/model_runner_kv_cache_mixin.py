@@ -367,9 +367,12 @@ class ModelRunnerKVCacheMixin:
 
         if self.mambaish_config is not None:
             ratio = self.calculate_mamba_ratio()
+
+            # Constrain the max_num_reqs by the mamba cache size
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
+
             # for dp attention, we need control the max_num_reqs for speculative decoding mamba space
             if (
                 not self.spec_algorithm.is_none()
