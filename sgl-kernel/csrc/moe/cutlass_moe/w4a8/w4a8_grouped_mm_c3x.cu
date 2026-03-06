@@ -116,7 +116,7 @@ void dispatch_w4a8_moe_mm_sm90(
   if (n == 4096 && k == 7168) {
     // group gemm 1 for ep
     if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
     } else if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 1024) {
@@ -131,7 +131,7 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (n == 7168 && k == 2048) {
     // group gemm 2 for ep
     if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
     } else if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 4096) {
