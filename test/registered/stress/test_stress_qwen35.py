@@ -8,28 +8,32 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 # Register for CI - estimated 45 minutes
 register_cuda_ci(est_time=2700, suite="stress")
 
-DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3"
+QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"
 
 
-class TestStressDeepSeekV3(unittest.TestCase):
-    """Stress test for DeepSeek-V3.
+class TestStressQwen35(unittest.TestCase):
+    """Stress test for Qwen3.5-397B-A17B.
 
+    Qwen3.5 is a 397B MoE VLM with 17B active params.
     Sends 50K prompts over 45 minutes to validate stability.
     """
 
-    def test_stress_deepseek_v3(self):
-        """Run stress test for DeepSeek-V3."""
+    def test_stress_qwen35(self):
+        """Run stress test for Qwen3.5-397B-A17B."""
         model = ModelLaunchSettings(
-            DEEPSEEK_V3_MODEL_PATH,
+            QWEN35_MODEL_PATH,
             tp_size=8,
             extra_args=[
                 "--trust-remote-code",
+                "--reasoning-parser=qwen3",
+                "--tool-call-parser=qwen3_coder",
+                "--mem-fraction-static=0.8",
             ],
             variant="TP8",
         )
 
         runner = StressTestRunner(
-            test_name="DeepSeek-V3 Stress Test",
+            test_name="Qwen3.5-397B-A17B Stress Test",
             base_url=DEFAULT_URL_FOR_TEST,
             num_prompts=int(os.environ.get("NUM_PROMPTS", "50000")),
             duration_minutes=int(os.environ.get("DURATION_MINUTES", "45")),
@@ -38,9 +42,9 @@ class TestStressDeepSeekV3(unittest.TestCase):
         try:
             success = runner.run_stress_test_for_model(
                 model_path=model.model_path,
-                random_input_len=16384,
-                random_output_len=1024,
-                output_file="stress_test_deepseek_v3.jsonl",
+                random_input_len=4096,
+                random_output_len=512,
+                output_file="stress_test_qwen35.jsonl",
                 server_args=model.extra_args,
             )
 

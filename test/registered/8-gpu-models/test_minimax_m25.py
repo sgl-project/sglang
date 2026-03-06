@@ -9,42 +9,42 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
-KIMI_K2_THINKING_MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
+MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
 
-class TestKimiK2(unittest.TestCase):
-    """Unified test class for Kimi-K2-Thinking performance and accuracy.
+class TestMiniMaxM25(unittest.TestCase):
+    """Unified test class for MiniMax-M2.5 performance and accuracy.
 
-    Single variant with TP=8 + tool/reasoning parsers.
+    Single variant with TP=8 + EP=8 configuration.
     Runs BOTH:
     - Performance test (using NightlyBenchmarkRunner with extra_bench_args)
     - Accuracy test (using run_eval with mgsm_en)
     """
 
-    def test_kimi_k2(self):
-        """Run performance and accuracy for Kimi-K2-Thinking."""
+    def test_minimax_m25(self):
+        """Run performance and accuracy for MiniMax-M2.5."""
         base_args = [
-            "--tp=8",
             "--trust-remote-code",
-            "--tool-call-parser=kimi_k2",
-            "--reasoning-parser=kimi_k2",
+            "--ep=8",
+            "--mem-fraction-static=0.85",
+            "--reasoning-parser=minimax-append-think",
         ]
 
         variants = [
             ModelLaunchSettings(
-                KIMI_K2_THINKING_MODEL_PATH,
+                MINIMAX_M25_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
-                variant="TP8",
+                variant="TP8+EP8",
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="Kimi-K2-Thinking",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.94),
+            test_name="MiniMax-M2.5",
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_kimi_k2_thinking",
+                profile_dir="performance_profiles_minimax_m25",
             ),
         )
 
