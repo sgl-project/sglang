@@ -141,7 +141,7 @@ def cutlass_w4a8_moe(
         num_local_experts,
         n,
         k,
-        None,
+        swap_mn=True,
     )
 
     a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)

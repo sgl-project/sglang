@@ -224,6 +224,7 @@ def prepare_moe_input(
     num_experts,
     n,
     k,
+    swap_mn=False,
     blockscale_offsets: Optional[torch.Tensor] = None,
 ):
     torch.ops.sgl_kernel.prepare_moe_input.default(
@@ -237,6 +238,7 @@ def prepare_moe_input(
         num_experts,
         n,
         k,
+        swap_mn,
     )
 
 
