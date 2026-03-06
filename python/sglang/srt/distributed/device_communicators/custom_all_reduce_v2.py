@@ -127,7 +127,7 @@ class CustomAllReduceV2:
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
         input_bytes = input.numel() * input.element_size()
-        shots = 1 if input_bytes <= self.threshold or self.world_size == 2 else 2
+        shots = 1 if input_bytes <= self.threshold else 2
         return torch.from_dlpack(self.obj.all_reduce(input, shots))
 
     def _post_init_obj(self):

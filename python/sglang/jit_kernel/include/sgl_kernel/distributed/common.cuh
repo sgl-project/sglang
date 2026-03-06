@@ -7,7 +7,7 @@ inline constexpr uint32_t kMaxNumGPU = 8;
 
 struct alignas(128) Semaphore {
  public:
-  __host__ constexpr Semaphore() : m_flag(0), m_counter(0) {}
+  constexpr Semaphore() : m_flag(0), m_counter(0) {}
 
   template <bool kFence>
   SGL_DEVICE uint32_t get() const {
@@ -48,7 +48,7 @@ struct alignas(128) Semaphore {
 
 struct Controller {
  public:
-  __host__ Controller(void** signals, uint32_t num_gpu) {
+  Controller(void** signals, uint32_t num_gpu) {
     for (uint32_t i = 0; i < num_gpu; ++i) {
       m_signals[i] = static_cast<Semaphore*>(signals[i]);
     }
@@ -57,36 +57,31 @@ struct Controller {
   /// Synchronize all GPUs.
   /// When kFence is true, establishes happens-before across GPUs using
   /// release/acquire semantics, ensuring prior writes are visible system-wide.
-  template <bool kFence = false>
-  SGL_DEVICE void sync(uint32_t rank, uint32_t num_gpu, int stage) const {
+  template <bool kFence, bool kStart>
+  SGL_DEVICE void sync(uint32_t rank, uint32_t num_gpu) const {
     // For fenced sync: ensure all threads in this block have completed their writes,
     // so the signaling thread's release carries them transitively.
-    if constexpr (kFence) __syncthreads();
+    static_assert(!(kFence && kStart), "Start stage does not need to wait fence");
+    if constexpr (kFence || !kStart) __syncthreads();
+    constexpr auto kStage = kStart ? 1 : 2;
     const auto warp_id = threadIdx.x / kWarpThreads;
     const auto lane_id = threadIdx.x % kWarpThreads;
     if (lane_id == 0 && warp_id < num_gpu) {
       auto& signal = m_signals[warp_id][blockIdx.x];
       signal.add<kFence>(1);
       if (warp_id == rank) {
-        const auto target = num_gpu * stage;
+        const auto target = num_gpu * kStage;
         /// NOTE: correctness here:
         /// - base is only read/updated locally by the owning GPU
         const auto base = signal.counter();
         while (signal.get<kFence>() - base < target)
           ;
+        if constexpr (!kStart) {
+          signal.advance(target);
+        }
       }
     }
-    __syncthreads();
-  }
-
-  SGL_DEVICE void sync_release(uint32_t rank, uint32_t num_gpu, int stage) const {
-    return this->sync</*kFence=*/true>(rank, num_gpu, stage);
-  }
-
-  SGL_DEVICE void reset(uint32_t rank, uint32_t num_gpu, int stage) const {
-    if (threadIdx.x == rank * kWarpThreads) {
-      m_signals[rank][blockIdx.x].advance(num_gpu * stage);
-    }
+    if constexpr (kStart) __syncthreads();
   }
 
  private:

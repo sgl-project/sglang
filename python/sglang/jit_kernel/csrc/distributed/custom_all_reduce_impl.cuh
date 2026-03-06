@@ -92,11 +92,11 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(
     input[i] = static_cast<DType*>(data->input[i]);
   device::PDLWaitPrimary<kUsePDL>();
 
-  ctrl.sync(params.rank, kNumGPU, /*stage=*/1);
+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);
   reduce_impl</*kBroadcast=*/false>(params, input);
 
   device::PDLTriggerSecondary<kUsePDL>();
-  ctrl.reset(params.rank, kNumGPU, /*stage=*/1);
+  ctrl.sync</*kFence=*/0, /*kStart=*/0>(params.rank, kNumGPU);
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
@@ -133,12 +133,11 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  ctrl.sync(local_params.rank, kNumGPU, /*stage=*/1);
+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);
   reduce_impl</*kBroadcast=*/true>(local_params, input);
-  ctrl.sync_release(local_params.rank, kNumGPU, /*stage=*/2);
 
   device::PDLTriggerSecondary<kUsePDL>();
-  ctrl.reset(local_params.rank, kNumGPU, /*stage=*/2);
+  ctrl.sync</*kFence=*/1, /*kStart=*/0>(params.rank, kNumGPU);
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
@@ -168,6 +167,7 @@ struct CustomAllReduceImpl : public CustomAllReduceBase {
         .num_items = num_items,
     };
 
+    RuntimeCheck(input.IsContiguous(), "Input tensor must be contiguous");
     RuntimeCheck(m_num_gpu == kNumGPU, "Mismatch GPU count");
     RuntimeCheck(shot == 1 || shot == 2, "Invalid shot count: ", shot);
     RuntimeCheck(device.device_type == kDLCUDA, "Only CUDA device is supported");
@@ -175,10 +175,12 @@ struct CustomAllReduceImpl : public CustomAllReduceBase {
     RuntimeCheck(std::bit_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
     RuntimeCheck(m_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(static_cast<int64_t>(num_items) == num_items_int64, "Number of items exceeds 4G limit");
+    RuntimeCheck(static_cast<int64_t>(num_items) % (kVecSize * 2) == 0);
 
     const auto& ctrl = *m_ctrl;
     const auto stream = LaunchKernel::resolve_device(device);
     auto launch = LaunchKernel{num_blocks, m_cta_size, stream};
+    launch.enable_pdl(kUsePDL);
     const auto check_capturing = [&] {
       if (!m_is_graph_capturing) return false;  // override to avoid cudaRT call overhead
       cudaStreamCaptureStatus status;
@@ -189,7 +191,7 @@ struct CustomAllReduceImpl : public CustomAllReduceBase {
       // no-op if not really capturing, we're in a dummy run
       const auto data_ptr = m_allocate_graph_capture_input(input_ptr);
       /// NOTE: we assume when the graph is replayed, the data_ptr should be ready
-      launch.enable_pdl(kUsePDL)(kernel, data_ptr, params, ctrl);
+      launch(kernel, data_ptr, params, ctrl);
     } else {
       // 1.copy the input to the buffer
       const auto input_bytes = static_cast<int64_t>(sizeof(DType) * num_items);
@@ -197,7 +199,7 @@ struct CustomAllReduceImpl : public CustomAllReduceBase {
       RuntimeDeviceCheck(cudaMemcpyAsync(buffer_ptr, input_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
       // 2. launch the all reduce kernel
       const auto data_ptr = m_get_data_ptr();  // use default buffer
-      launch.enable_pdl(kUsePDL)(kernel, data_ptr, params, ctrl);
+      launch(kernel, data_ptr, params, ctrl);
       if (use_2shot) {  // 3. copy the reduced result back to the output, because 2-shot doesn't write to output
         RuntimeDeviceCheck(cudaMemcpyAsync(input_ptr, buffer_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
       }

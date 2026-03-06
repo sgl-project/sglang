@@ -18,11 +18,11 @@ import itertools
 import logging
 import os
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import pytest
 import torch
-import triton
+import torch.distributed as dist
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -35,17 +35,22 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 TEST_SIZES = [
+    16,
+    32,
     512,
-    4096,
-    32768,
-    262144,  # 256K elements
-    2097152,  # 2M elements
-    16777216,  # 16M elements
+    1024,
+    1024 + 16,  # weird case
+    4 * 1024,
+    32 * 1024,
+    256 * 1024,
+    2 * 1024 * 1024,  # 2M elements
+    4 * 1024 * 1024,  # 4M elements
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHOTS = [1, 2]
-USE_GRAPH_OPTIONS = [False, True]
+USE_GRAPH_OPTIONS = [True, False]
 TEST_CONFIG = itertools.product(TEST_SIZES, TEST_DTYPES, SHOTS, USE_GRAPH_OPTIONS)
+TEST_LAYERS = 2
 TEST_LOOP = 16
 
 # ---------------------------------------------------------------------------
@@ -53,7 +58,7 @@ TEST_LOOP = 16
 # ---------------------------------------------------------------------------
 
 
-def _run_torchrun(nproc: int, timeout: int = 300) -> None:
+def run_torchrun(nproc: int, timeout: int = 300) -> None:
     """Launch this script as a torchrun worker and assert success."""
     cmd = [
         "torchrun",
@@ -81,7 +86,7 @@ def test_custom_allreduce(nproc: int) -> None:
         pytest.skip(
             f"Requires at least {nproc} GPUs, but only {device_count} available"
         )
-    _run_torchrun(nproc)
+    run_torchrun(nproc)
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +94,11 @@ def test_custom_allreduce(nproc: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _init_distributed():
+def init_distributed():
     """Initialize distributed groups via torchrun env vars.
 
     Returns (rank, device, cpu_group, nccl_group, comm).
     """
-    import torch.distributed as dist
-
     import sglang.srt.distributed.parallel_state as ps
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -118,13 +121,7 @@ def _init_distributed():
     nccl_group = coord.device_group
     assert nccl_group is not None
 
-    # Warmup NCCL to ensure the communicator is ready.
-    warmup = torch.zeros(1, device=device)
-    dist.all_reduce(warmup, group=nccl_group)
-    torch.cuda.synchronize()
-    del warmup
-
-    max_size = 32 * 1024 * 1024  # 32MB
+    max_size = max(TEST_SIZES) * 4
     comm = CustomAllReduceV2(group=cpu_group, device=device, max_size=max_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -132,52 +129,70 @@ def _init_distributed():
     return rank, device, cpu_group, nccl_group, comm
 
 
-def _worker_test(
+@torch.inference_mode()
+def worker_test(
     device: torch.device,
-    nccl_group: torch.distributed.ProcessGroup,
+    nccl_group: dist.ProcessGroup,
     comm: CustomAllReduceV2,
     size: int,
     dtype: torch.dtype,
     use_graph: bool,
     shot: int,
-) -> None:
-    import torch.distributed as dist
-
-    inp = torch.randint(0, 16, (TEST_LOOP, size), dtype=dtype, device=device)
-    # NOTE: 16 * 8 <= 128, the max precision that can be exactly represented in BF16
-    if not comm.should_custom_ar(inp):
-        return
+) -> Optional[RuntimeError]:
     comm.override_shot(shot)
 
-    # Build a reference tensor via NCCL.
-    ref = inp.clone()
-    dist.all_reduce(ref, group=nccl_group)
-
-    # Capture the JIT custom all-reduce in a CUDA graph.
-    torch.cuda.synchronize()
-    out_jits = []
-    if use_graph:
+    def get_run_graph_fn():
         graph = torch.cuda.CUDAGraph()
+        graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
+        out_jits = []
         with comm.capture():
             with torch.cuda.graph(graph):
-                for i in range(TEST_LOOP):
-                    out_jits.append(comm.custom_all_reduce(inp[i]))
+                for i in range(TEST_LAYERS):
+                    out_jits.append(comm.custom_all_reduce(graph_inp[i]))
+                out_jit = torch.stack(out_jits)
         torch.cuda.synchronize()
-        # Replay and verify.
-        graph.replay()
-    else:
-        for i in range(TEST_LOOP):
-            out_jits.append(comm.custom_all_reduce(inp[i]))
-    torch.cuda.synchronize()
-    out_jit = torch.stack(out_jits)
-    triton.testing.assert_close(out_jit, ref)  # should be no error
+
+        def run_graph(x: torch.Tensor) -> torch.Tensor:
+            graph_inp.copy_(x)
+            graph.replay()
+            return out_jit.clone()
+
+        return run_graph
+
+    def get_run_eager_fn():
+        def run_eager(x: torch.Tensor) -> torch.Tensor:
+            eager_inp = x.clone()
+            out_eagers = []
+            for i in range(TEST_LAYERS):
+                out_eagers.append(comm.custom_all_reduce(eager_inp[i]))
+                torch.cuda.synchronize()
+            return torch.stack(out_eagers)
+
+        return run_eager
+
+    run_fn = get_run_graph_fn() if use_graph else get_run_eager_fn()
+    num_errors = 0
+    for _ in range(TEST_LOOP):
+        # NOTE: 15 * 8 < 128, which is the precision limit for bf16
+        inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
+        assert comm.should_custom_ar(inp[0])
+        out_ref = inp.clone()
+        dist.all_reduce(out_ref, group=nccl_group)
+        out_jit = run_fn(inp)
+        num_errors += not torch.all(out_jit == out_ref)
+        torch.cuda.synchronize()
+        nccl_group.barrier().wait()
+    if num_errors > 0:
+        return RuntimeError(
+            f"Test failed for size={size}, dtype={dtype}, shot={shot}, "
+            f"use_graph={use_graph} with {num_errors} errors. "
+        )
+    return None
 
 
 def worker_main() -> None:
     """Entry point for each torchrun worker process."""
-    import torch.distributed as dist
-
-    rank, device, cpu_group, nccl_group, comm = _init_distributed()
+    rank, device, cpu_group, nccl_group, comm = init_distributed()
     world_size = dist.get_world_size()
 
     torch.cuda.set_stream(torch.cuda.Stream())
@@ -187,13 +202,22 @@ def worker_main() -> None:
     disable_pbar = os.environ.get("DISABLE_PBAR", "0") == "1" or rank != 0
     pbar = tqdm(items, desc=f"Testing {world_size} GPUs", disable=disable_pbar)
     for i, (size, dtype, shot, use_graph) in pbar:
-        try:
-            _worker_test(device, nccl_group, comm, size, dtype, use_graph, shot)
-        except Exception as e:
-            raise RuntimeError(
+        error = worker_test(device, nccl_group, comm, size, dtype, use_graph, shot)
+        if error is not None:
+            print(
                 f"Worker {rank} failed for size={size}, dtype={dtype}, "
-                f"shot={shot}, use_graph={use_graph}, iteration={i}"
-            ) from e
+                f"shot={shot}, use_graph={use_graph}, iteration={i}\n"
+                f"Error: {error}"
+            )
+        # communicate the result to rank 0 for logging
+        result = torch.tensor([int(error is not None)], device=device)
+        dist.all_reduce(result, group=cpu_group)
+        failed = bool(result.item())
+        if failed:
+            raise RuntimeError(
+                f"Test failed on rank {rank} for config: "
+                f"size={size}, dtype={dtype}, shot={shot}, use_graph={use_graph}"
+            )
 
     comm.close()
     dist.destroy_process_group()
