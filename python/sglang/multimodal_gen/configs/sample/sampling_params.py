@@ -116,7 +116,7 @@ class SamplingParams:
     # Upscaling
     enable_upscaling: bool = False
     upscaling_model_path: str | None = (
-        None  # local .pth or HF repo ID (default: ai-forever/Real-ESRGAN)
+        None  # local .pth, HF repo ID, or repo_id:filename (default: ai-forever/Real-ESRGAN)
     )
     upscaling_scale: int = 4
 
@@ -891,8 +891,9 @@ class SamplingParams:
             "--upscaling-model-path",
             type=str,
             default=SamplingParams.upscaling_model_path,
-            help="Local .pth file or HuggingFace repo ID for Real-ESRGAN weights "
-            "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth).",
+            help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
+            "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
+            "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
         )
         parser.add_argument(
             "--upscaling-scale",

@@ -78,7 +78,7 @@ subsequent runs.
 
 - `--enable-upscaling`: Enable post-generation upscaling using Real-ESRGAN.
 - `--upscaling-scale {SCALE}`: Desired upscaling factor (default: `4`). The 4× model is used internally; if a different scale is requested, a bicubic resize is applied after the network output.
-- `--upscaling-model-path {PATH}`: Local `.pth` file or HuggingFace repo ID for Real-ESRGAN weights (default: `ai-forever/Real-ESRGAN` with `RealESRGAN_x4.pth`, downloaded automatically).
+- `--upscaling-model-path {PATH}`: Local `.pth` file, HuggingFace repo ID, or `repo_id:filename` for Real-ESRGAN weights (default: `ai-forever/Real-ESRGAN` with `RealESRGAN_x4.pth`, downloaded automatically). Use the `repo_id:filename` format to specify a custom weight file from a HuggingFace repo (e.g. `my-org/my-esrgan:weights.pth`).
 
 Example — generate a 1024×1024 image and upscale to 4096×4096:
 

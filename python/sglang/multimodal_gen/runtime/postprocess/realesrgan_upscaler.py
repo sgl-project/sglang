@@ -466,7 +466,8 @@ def upscale_frames(
 
     Args:
         frames:         List of uint8 HWC numpy frames.
-        model_path:     Local .pth file or HuggingFace repo ID.
+        model_path:     Local .pth file, HuggingFace repo ID, or
+                        ``repo_id:filename`` for a custom weight file.
                         None → default ``ai-forever/Real-ESRGAN`` with
                         ``RealESRGAN_x4.pth``.
         scale:          Desired final upscaling factor (e.g. 2, 3, 4).
