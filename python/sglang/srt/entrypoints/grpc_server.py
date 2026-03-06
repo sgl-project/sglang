@@ -1007,6 +1007,12 @@ async def serve_grpc(
         options=[
             ("grpc.max_send_message_length", 1024 * 1024 * 256),
             ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+            # Allow client HTTP/2 keepalive pings every 10s+.
+            # Without this, the gRPC C-core default (300s minimum) causes
+            # GOAWAY when clients send pings more frequently during long
+            # requests (e.g. prefill) where no DATA frames flow.
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+            ("grpc.keepalive_permit_without_calls", True),
         ],
     )
 
