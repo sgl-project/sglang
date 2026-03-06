@@ -335,6 +335,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
+        triton_kernels_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -347,7 +348,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size = round_up(hidden_size, 256)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 64
+                    intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
         elif _use_aiter:
 
@@ -362,11 +363,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 - layer.intermediate_size_per_partition
             )
         elif has_triton_kernels:
-            # TODO: this is a hack to make
-            # intermediate_size_per_partition_after_pad the same as the
-            # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
+                intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
