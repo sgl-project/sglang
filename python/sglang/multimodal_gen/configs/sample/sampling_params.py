@@ -361,8 +361,6 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
         if self.guidance_scale is None:
             try:

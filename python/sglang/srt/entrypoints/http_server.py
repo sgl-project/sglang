@@ -67,7 +67,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
-    _launch_subprocesses,
+    Engine,
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
@@ -173,7 +173,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
-from sglang.utils import get_exception_traceback
+from sglang.utils import _prebind_listening_socket, get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -1756,12 +1756,16 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
+    ssl_verify = server_args.ssl_verify()
+
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/model_info", timeout=5, headers=headers)
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1850,6 +1854,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 json=json_data,
                 headers=headers,
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -1878,6 +1883,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 timeout=(
                     warmup_timeout if warmup_timeout > 0 else 1800
                 ),  # because of deep gemm precache is very long if not precache.
+                verify=ssl_verify,
             )
             if res.status_code == 200:
                 logger.info(
@@ -1952,6 +1958,192 @@ def _wait_weights_ready():
     )
 
 
+def _setup_and_run_http_server(
+    server_args: ServerArgs,
+    tokenizer_manager,
+    template_manager,
+    port_args: PortArgs,
+    scheduler_infos: List[Dict],
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """Set up global state, configure middleware, and run uvicorn.
+
+    Called by launch_server after subprocesses have been launched.
+    """
+    # Reserve the HTTP port before launching subprocesses to fail fast if port is unavailable.
+    # This prevents wasting time loading models only to discover port conflicts later.
+    reserved_socket = _prebind_listening_socket(server_args.host, server_args.port)
+    multi_tokenizer_args_shm = None
+
+    try:
+        # Parse info got from the schedulers
+        remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
+
+        # Set global states
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=template_manager,
+                scheduler_info=scheduler_infos[0],
+                remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            )
+        )
+
+        if server_args.enable_metrics:
+            add_prometheus_track_response_middleware(app)
+
+        # Pass additional arguments to the lifespan function.
+        # They will be used for additional initialization setups.
+        if server_args.tokenizer_worker_num == 1:
+            # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+            app.is_single_tokenizer_mode = True
+            app.server_args = server_args
+            app.warmup_thread_kwargs = dict(
+                server_args=server_args,
+                launch_callback=launch_callback,
+                execute_warmup_func=execute_warmup_func,
+            )
+
+            # Add api key authorization
+            # This is only supported in single tokenizer mode.
+            #
+            # Backward compatibility:
+            # - api_key only: behavior matches legacy (all endpoints require api_key)
+            # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+            #   admin_api_key is not configured.
+            if (
+                server_args.api_key
+                or server_args.admin_api_key
+                or app_has_admin_force_endpoints(app)
+            ):
+                from sglang.srt.utils.auth import add_api_key_middleware
+
+                add_api_key_middleware(
+                    app,
+                    api_key=server_args.api_key,
+                    admin_api_key=server_args.admin_api_key,
+                )
+        else:
+            # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+            # for other worker processes to read.
+            app.is_single_tokenizer_mode = False
+            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, scheduler_infos[0]
+            )
+
+        # Update logging configs
+        set_uvicorn_logging_configs(server_args)
+
+        # Delay listen() until uvicorn startup to avoid accepting probe traffic
+        # while model/subprocess initialization is still in progress.
+        reserved_socket.listen(128)
+
+        if server_args.ssl_certfile:
+            logger.info(
+                f"SSL enabled: certfile={server_args.ssl_certfile}, "
+                f"keyfile={server_args.ssl_keyfile}"
+            )
+
+        # Listen for HTTP requests
+        if server_args.tokenizer_worker_num == 1:
+            if server_args.enable_ssl_refresh:
+                # Use Config/Server API for access to the SSLContext.
+                config = uvicorn.Config(
+                    app,
+                    fd=reserved_socket.fileno(),
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+                config.load()  # Creates the SSLContext
+
+                from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
+
+                server = uvicorn.Server(config)
+
+                async def _run_with_ssl_refresh():
+                    refresher = SSLCertRefresher(
+                        config.ssl,
+                        server_args.ssl_keyfile,
+                        server_args.ssl_certfile,
+                        server_args.ssl_ca_certs,
+                    )
+                    logger.info("SSL certificate auto-refresh enabled.")
+                    try:
+                        await server.serve()
+                    finally:
+                        refresher.stop()
+
+                import asyncio
+
+                asyncio.run(_run_with_ssl_refresh())
+            else:
+                # Default case, one tokenizer process
+                uvicorn.run(
+                    app,
+                    fd=reserved_socket.fileno(),
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+        else:
+            # Multiple tokenizer and http processes
+            from uvicorn.config import LOGGING_CONFIG
+
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
+            monkey_patch_uvicorn_multiprocessing()
+
+            if server_args.enable_ssl_refresh:
+                logger.warning(
+                    "--enable-ssl-refresh is not supported with multiple "
+                    "tokenizer workers (--tokenizer-worker-num > 1). "
+                    "SSL refresh will be disabled."
+                )
+
+            uvicorn.run(
+                "sglang.srt.entrypoints.http_server:app",
+                fd=reserved_socket.fileno(),
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                loop="uvloop",
+                workers=server_args.tokenizer_worker_num,
+                ssl_keyfile=server_args.ssl_keyfile,
+                ssl_certfile=server_args.ssl_certfile,
+                ssl_ca_certs=server_args.ssl_ca_certs,
+                ssl_keyfile_password=server_args.ssl_keyfile_password,
+            )
+    finally:
+        # Close the reserved socket after uvicorn exits or on any error
+        # This ensures the port is released even if initialization fails
+        reserved_socket.close()
+
+        if server_args.tokenizer_worker_num > 1:
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+            if _global_state is not None:
+                _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -1976,8 +2168,8 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
-    tokenizer_manager, template_manager, scheduler_infos, port_args = (
-        _launch_subprocesses(
+    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
+        Engine._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=init_tokenizer_manager_func,
             run_scheduler_process_func=run_scheduler_process_func,
@@ -1985,101 +2177,12 @@ def launch_server(
         )
     )
 
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result.scheduler_infos,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
     )
-
-    # Set global states
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-        )
-    )
-
-    if server_args.enable_metrics:
-        add_prometheus_track_response_middleware(app)
-
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
-    if server_args.tokenizer_worker_num == 1:
-        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_kwargs = dict(
-            server_args=server_args,
-            launch_callback=launch_callback,
-            execute_warmup_func=execute_warmup_func,
-        )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            server_args.api_key
-            or server_args.admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
-            )
-    else:
-        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
-        # for other worker processes to read.
-        app.is_single_tokenizer_mode = False
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
-        )
-
-    try:
-        # Update logging configs
-        set_uvicorn_logging_configs(server_args)
-
-        # Listen for HTTP requests
-        if server_args.tokenizer_worker_num == 1:
-            # Default case, one tokenizer process
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-            )
-        else:
-            # Multiple tokenizer and http processes
-            from uvicorn.config import LOGGING_CONFIG
-
-            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            }
-            monkey_patch_uvicorn_multiprocessing()
-
-            uvicorn.run(
-                "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-                workers=server_args.tokenizer_worker_num,
-            )
-    finally:
-        if server_args.tokenizer_worker_num > 1:
-            multi_tokenizer_args_shm.unlink()
-            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()

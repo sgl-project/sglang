@@ -506,6 +506,23 @@ class ModelConfig:
                 scaling_factor = self.hf_config.rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
+        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+            self.head_dim = (
+                self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
+            )
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -665,7 +682,10 @@ class ModelConfig:
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
             # Identify modelopt quantization
-            if "quant_method" not in quant_cfg:
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
                 parsed_cfg = self._parse_modelopt_quant_config(
                     {"quantization": quant_cfg}
                 )
@@ -772,12 +792,34 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            return {"quant_method": "w4afp8"}
+            return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
-            return {"quant_method": "modelopt_fp4"}
+            return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
         elif quant_algo and "FP8" in quant_algo:
-            return {"quant_method": "modelopt_fp8"}
+            return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
         else:
+            return None
+
+    def get_quantization_config_log_str(self) -> Optional[str]:
+        """
+        Get a concise string representation of the quantization config for logging.
+        Returns something like "quant=fp8, fmt=e4m3" or "quant=gptq, bits=4".
+        """
+        try:
+            quant_cfg = self._parse_quant_hf_config()
+            if not quant_cfg:
+                return None
+
+            quant_method = quant_cfg.get("quant_method", "quantized")
+            log_str = f"quant={quant_method}"
+
+            # Append interesting fields if they exist
+            for field in ["bits", "quant_algo", "fmt"]:
+                if field in quant_cfg:
+                    log_str += f", {field}={quant_cfg[field]}"
+
+            return log_str
+        except Exception:
             return None
 
     def _is_already_quantized(self) -> bool:
@@ -1318,6 +1360,7 @@ def is_audio_model(model_architectures: List[str]):
 def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "MllamaForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 

@@ -49,6 +49,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -187,7 +188,17 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
-        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        if recv_req.load_format == "flattened_bucket":
+            flattened_data = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors
+            )
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_data["flattened_tensor"],
+                metadata=flattened_data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
