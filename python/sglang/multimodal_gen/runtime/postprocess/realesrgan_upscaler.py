@@ -327,7 +327,16 @@ class ImageUpscaler:
             return _MODEL_CACHE[resolved_path]
 
         logger.info("Loading Real-ESRGAN weights from %s", resolved_path)
-        state_dict = torch.load(resolved_path, map_location="cpu", weights_only=True)
+        try:
+            state_dict = torch.load(
+                resolved_path, map_location="cpu", weights_only=True
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load Real-ESRGAN checkpoint from '{resolved_path}'. "
+                f"The file may be corrupted or not a valid PyTorch checkpoint. "
+                f"Original error: {e}"
+            ) from e
 
         # Some checkpoints wrap weights under a 'params' or 'params_ema' key
         if "params_ema" in state_dict:
@@ -335,8 +344,16 @@ class ImageUpscaler:
         elif "params" in state_dict:
             state_dict = state_dict["params"]
 
-        net = _build_net_from_state_dict(state_dict)
-        net.load_state_dict(state_dict, strict=True)
+        try:
+            net = _build_net_from_state_dict(state_dict)
+            net.load_state_dict(state_dict, strict=True)
+        except (RuntimeError, KeyError) as e:
+            raise RuntimeError(
+                f"Real-ESRGAN weight file '{resolved_path}' is not compatible "
+                f"with the supported architectures (SRVGGNetCompact / RRDBNet). "
+                f"Please ensure you are using a valid Real-ESRGAN checkpoint. "
+                f"Original error: {e}"
+            ) from e
         net.eval()
 
         device = current_platform.get_local_torch_device()
@@ -383,13 +400,22 @@ def _resolve_model_path(model_path: str) -> str:
     """Return a local .pth file path.
 
     Accepts:
-    - An existing local .pth file (pass-through).
-    - A HuggingFace repo ID → downloads the default filename.
+    - An existing local file path (pass-through).
+    - A HuggingFace ``repo_id`` → downloads the default weight file
+      (``RealESRGAN_x4.pth``).
+    - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
+      allowing users to specify custom weight files hosted on HF.
     """
     if os.path.isfile(model_path):
         return model_path
 
-    # Treat as HF repo ID and download the default .pth file
+    # Parse optional "repo_id:filename" syntax; fall back to default filename.
+    if ":" in model_path and not model_path.startswith("/"):
+        repo_id, filename = model_path.split(":", 1)
+    else:
+        repo_id = model_path
+        filename = _DEFAULT_REALESRGAN_FILENAME
+
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as e:
@@ -400,13 +426,22 @@ def _resolve_model_path(model_path: str) -> str:
 
     logger.info(
         "Downloading Real-ESRGAN weights from HF repo %s (file: %s)",
-        model_path,
-        _DEFAULT_REALESRGAN_FILENAME,
+        repo_id,
+        filename,
     )
-    local_path = hf_hub_download(
-        repo_id=model_path,
-        filename=_DEFAULT_REALESRGAN_FILENAME,
-    )
+    try:
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+        )
+    except Exception as e:
+        raise FileNotFoundError(
+            f"Failed to download Real-ESRGAN weights from HuggingFace repo "
+            f"'{repo_id}' (file: '{filename}'). If you are using a custom "
+            f"model, provide either a local .pth file path or use the "
+            f"'repo_id:filename' format (e.g. 'my-org/my-esrgan:weights.pth'). "
+            f"Original error: {e}"
+        ) from e
     return local_path
 
 
