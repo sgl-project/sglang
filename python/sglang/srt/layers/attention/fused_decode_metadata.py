@@ -102,16 +102,12 @@ def fused_normal_decode_set_metadata(
         BLOCK_SIZE=512,
     )
 
-    cu_seqlens_k[1:].copy_(
-        torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32)
-    )
+    cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
 
     if swa_page_table is not None and token_to_kv_pool is not None:
         page_indices = req_to_token[
             req_pool_indices[:, None],
             strided_indices[:max_seq_pages][None, :],
         ]
-        swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(
-            page_indices
-        )
+        swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
