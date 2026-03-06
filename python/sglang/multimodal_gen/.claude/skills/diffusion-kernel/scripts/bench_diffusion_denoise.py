@@ -251,9 +251,40 @@ def run_benchmark_once(
         try:
             with open(perf_path) as f:
                 perf = json.load(f)
-            metrics["denoise_latency_s"] = perf.get("denoise_latency_s")
-            metrics["e2e_latency_s"] = perf.get("e2e_latency_s")
-            metrics["peak_memory_gb"] = perf.get("peak_memory_gb")
+
+            # e2e latency: total_duration_ms (set by PerformanceLogger.dump_benchmark_report)
+            total_ms = perf.get("total_duration_ms")
+            metrics["e2e_latency_s"] = float(total_ms) / 1000.0 if total_ms is not None else None
+
+            # denoise latency: look in "steps" list for the "DenoisingStage" entry
+            # steps = [{"name": "DenoisingStage", "duration_ms": 1234.5}, ...]
+            denoise_latency_s = None
+            for step in perf.get("steps", []):
+                if step.get("name") == "DenoisingStage" and step.get("duration_ms") is not None:
+                    denoise_latency_s = float(step["duration_ms"]) / 1000.0
+                    break
+
+            # fallback: sum all per-step durations from denoise_steps_ms
+            # denoise_steps_ms = [{"step": 0, "duration_ms": 100.5}, ...]
+            if denoise_latency_s is None:
+                denoise_steps = perf.get("denoise_steps_ms", [])
+                if denoise_steps:
+                    denoise_latency_s = (
+                        sum(s.get("duration_ms", 0.0) for s in denoise_steps) / 1000.0
+                    )
+            metrics["denoise_latency_s"] = denoise_latency_s
+
+            # peak memory: max peak_reserved_mb across all memory checkpoints (→ GB)
+            # memory_checkpoints = {"after_DenoisingStage": {"peak_reserved_mb": 12288.0, ...}}
+            peak_memory_gb = None
+            for snapshot in perf.get("memory_checkpoints", {}).values():
+                peak_mb = snapshot.get("peak_reserved_mb")
+                if peak_mb is not None:
+                    candidate = float(peak_mb) / 1024.0
+                    if peak_memory_gb is None or candidate > peak_memory_gb:
+                        peak_memory_gb = candidate
+            metrics["peak_memory_gb"] = peak_memory_gb
+
         except Exception as e:
             print(f"  Warning: could not parse perf dump: {e}")
 
@@ -314,7 +345,7 @@ def inject_kernels_example():
     import torch.nn as nn
 
     try:
-        from sglang.jit_kernel.diffusion.cuda_rmsnorm import diffusion_rmsnorm
+        from sglang.jit_kernel.diffusion_rmsnorm import diffusion_rmsnorm
     except ImportError:
         print(
             "diffusion_rmsnorm JIT kernel not available. "
