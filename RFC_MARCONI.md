@@ -1,14 +1,17 @@
 # RFC: Marconi Prefix Caching for Hybrid LLMs in SGLang
 
-**Related Paper**: [Marconi: Prefix Caching for the Era of Hybrid LLMs](https://arxiv.org/pdf/2411.19379)
-**Related Code**: [`marconi/radix_cache_hybrid.py`](./radix_cache_hybrid.py)
+Related Paper: [Marconi: Prefix Caching for the Era of Hybrid LLMs](https://arxiv.org/pdf/2411.19379)
+
+Related Code: https://github.com/ruipeterpan/marconi/tree/main 
+
 ---
 
 ## 1. Summary
 
-This RFC proposes integrating Marconi's prefix caching into SGLang's existing `MambaRadixCache`. We extend the SGLang's current support for Hybrid Architecture with Marconi's judicious cache admission and FLOP-aware cache eviction policy.
+This RFC proposes integrating Marconi's prefix caching into SGLang. We extend the SGLang's existing support for Hybrid Architecture with Marconi's cache admission and eviction policy.
 
-**Target Model**: `Qwen/Qwen3-Next-80B-A3B-Instruct`
+Target Model: `Qwen/Qwen3-Next-80B-A3B-Instruct`
+
 ---
 
 ## 2. Existing Hybrid Model Support in SGLang
@@ -17,7 +20,7 @@ SGLang already has a complete prefix caching system for hybrid (attention + SSM)
 
 ### 2.1 TreeNode: Dual-State Radix Tree Node
 
-Each `TreeNode` is shared across the RadixTree and both LRU lists.
+Each `TreeNode` is shared across RadixTree and both LRU lists.
 
 ```python
 class TreeNode:
@@ -56,7 +59,7 @@ class MambaRadixCache(BasePrefixCache):
     mamba_lru_list: LRUList   # LRU list for SSM state cache, can evict any node (including tombstoning)
 ```
 
-The current eviction policy is **pure LRU** for both lists.
+The current eviction policy is pure LRU for both lists.
 We will be replacing this eviction path with Marconi's FLOP-efficiency-weighted scoring.
 
 ### 2.3 GPU Memory Pools
@@ -277,9 +280,12 @@ Metrics to track against baseline LRU:
 
 ## 7. Open Questions
 
-1. **`total_len` estimation**: To compute Marconi's flop efficiency score, we need an estimate of future request length. Currently I'm using a 2*cached prefix length as a default, should we consider tracking a rolling average of the actual request lengths? and should this tracked globally across all requests, or per radix tree node
+1. **KV cache eviction**: Should we also apply Marconi-style scoring to KV cache? 
 
-3. **MoE FLOP treatment**: In the efficiency formula, MoE FFN FLOPs are included. Since MoE FLOPs dominate for large models, should MoE FLOPs be excluded from the efficiency formula?
+2. **eff-weight**: Regarding adaptive config tunning mentioned in the paper, this code seems to be out of scope for sglang? We're adding a cli arg for eff-weight and default it as 0.5, and user can tune this parameter and set it accordingly
 
-4. **KV cache eviction**: Should we also apply Marconi-style scoring to KV cache? 
+3. **`total_len` estimation**: To compute Marconi's flop efficiency score, we need an estimate of future request length. Currently I'm using a 2*cached prefix length as a default, should we consider tracking a rolling average of the actual request lengths? and should this tracked globally across all requests, or per radix tree node
+
+4. **MoE FLOP treatment**: In the efficiency formula, MoE FFN FLOPs are included. Since MoE FLOPs dominate for large models, should MoE FLOPs be excluded from the efficiency formula?
+
 ---
