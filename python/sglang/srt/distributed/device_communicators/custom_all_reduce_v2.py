@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import List, Optional, TypeVar, Union
+from typing import List, Optional, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -8,9 +8,9 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -36,11 +36,9 @@ class CustomAllReduceV2:
     def __init__(
         self,
         group: ProcessGroup,
-        device: Union[int, str, torch.device, None] = None,
+        device: torch.device,
         max_size: Optional[int] = None,
     ) -> None:
-        from sglang.jit_kernel.all_reduce import get_custom_all_reduce_cls
-
         if max_size is None:
             max_size = 16 * 1024 * 1024  # default to 16MB
 
@@ -51,16 +49,15 @@ class CustomAllReduceV2:
         self.world_size = dist.get_world_size(group=self.group)
         self.threshold = THRESHOLD_2_SHOT_MAP[self.world_size]
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
-        if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom allreduce for multi-node case.
-            logger.warning(
-                "Custom allreduce is disabled because this process group"
-                " spans across nodes."
-            )
+        full_nvlink = can_use_custom_all_reduce_with_nvlink(
+            group=group,
+            device=device,
+            supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
+            cls_name="CustomAllReduceV2",
+        )
+        if full_nvlink != True:
             return
+        from sglang.jit_kernel.all_reduce import get_custom_all_reduce_cls
 
         MAX_GRAPH_INPUTS = 131072
         cls = get_custom_all_reduce_cls()
