@@ -435,12 +435,19 @@ class RadioInternVisionModel(nn.Module):
         max_img_size = int(
             round(config.max_img_size / config.patch_size) * config.patch_size
         )
+        num_cls_tokens = 1
+        if getattr(config, "cls_token_per_teacher", False) and getattr(
+            config, "teachers", None
+        ):
+            unique_teachers = list(dict.fromkeys(t["name"] for t in config.teachers))
+            num_cls_tokens = len(unique_teachers)
         self.patch_generator = ViTPatchGenerator(
             config.patch_size,
             config.hidden_size,
             input_dims=self.img_size,
             max_input_dims=max_img_size,
             cls_token=True,
+            num_cls_tokens=num_cls_tokens,
             register_multiple=config.reg_tokens,
         )
 
@@ -487,9 +494,10 @@ class RadioModel(nn.Module):
         self,
         pixel_values: torch.Tensor | None = None,
         pixel_embeds: torch.Tensor | None = None,
+        return_summary: bool = False,
     ) -> torch.FloatTensor:
         y = self.model(pixel_values)
-        return self._extract_final(y)
+        return self._extract_final(y, return_summary=return_summary)
 
     def load_weights(self, weights) -> set[str]:
         remap_substrings = {
@@ -523,10 +531,42 @@ class RadioModel(nn.Module):
 
         return loaded_params
 
-    def _extract_final(self, y: torch.Tensor):
+    def _extract_final(self, y: torch.Tensor, return_summary: bool = False):
         # Remove CLS + REGISTERS tokens
         patch_gen = getattr(self.model, "patch_generator", None)
         if patch_gen is not None:
             all_feat = y[:, patch_gen.num_skip :]
+        else:
+            all_feat = y
 
-        return all_feat
+        if not return_summary:
+            return all_feat
+
+        summary = self._extract_summary(y)
+        return summary, all_feat
+
+    def _extract_summary(self, y: torch.Tensor) -> torch.Tensor:
+        patch_gen = self.model.patch_generator
+        num_cls = patch_gen.num_cls_tokens
+        cls_tokens = y[:, :num_cls]
+
+        if getattr(self.config, "cls_token_per_teacher", False) and getattr(
+            self.config, "teachers", None
+        ):
+            unique_teachers = list(
+                dict.fromkeys(t["name"] for t in self.config.teachers)
+            )
+            summary_idxs = [
+                i
+                for i, name in enumerate(unique_teachers)
+                if any(
+                    t.get("use_summary", False)
+                    for t in self.config.teachers
+                    if t["name"] == name
+                )
+            ]
+            summary = cls_tokens[:, summary_idxs].reshape(y.shape[0], -1)
+        else:
+            summary = cls_tokens.reshape(y.shape[0], -1)
+
+        return summary

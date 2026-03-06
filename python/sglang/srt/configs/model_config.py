@@ -1318,6 +1318,7 @@ multimodal_model_archs = [
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "NemotronParseForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
@@ -1360,6 +1361,7 @@ def is_audio_model(model_architectures: List[str]):
 def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "NemotronParseForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 

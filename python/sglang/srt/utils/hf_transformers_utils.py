@@ -170,6 +170,8 @@ def get_hf_text_config(config: PretrainedConfig):
         return thinker_config
     if hasattr(config, "llm_config"):
         return config.llm_config
+    if hasattr(config, "decoder") and hasattr(config.decoder, "num_attention_heads"):
+        return config.decoder
     else:
         return config
 

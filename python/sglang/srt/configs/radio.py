@@ -76,6 +76,8 @@ class RadioConfig(PretrainedConfig):
         reg_tokens: int | None = None,
         drop_path_rate: float = 0.0,
         dropout: float = 0.0,
+        teachers: list | None = None,
+        cls_token_per_teacher: bool = False,
         **kwargs,
     ):
         self.model_name = model_name
@@ -103,4 +105,6 @@ class RadioConfig(PretrainedConfig):
         self.reg_tokens = reg_tokens
         self.drop_path_rate = drop_path_rate
         self.dropout = dropout
+        self.teachers = teachers
+        self.cls_token_per_teacher = cls_token_per_teacher
         super().__init__(**kwargs)
