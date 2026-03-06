@@ -80,6 +80,17 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
                 or thinking_budget < 0
             ):
                 continue
+
+            if param_dict.pop("_forcing_end", False):
+                logits[i, self.THINKING_END_TOKEN_ID] = -float("inf")
+                continue
+
+            if param_dict.pop("_forcing_newline", False):
+                logits[i, :] = -float("inf")
+                logits[i, self.THINKING_END_TOKEN_ID] = 0.0
+                param_dict["_forcing_end"] = True
+                continue
+
             req: Req = param_dict.get("__req__")
             cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
 
@@ -103,11 +114,13 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             if not req.output_ids or req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
                 logits[i, :] = -float("inf")
                 logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
+                param_dict["_forcing_newline"] = True
                 continue
 
             # Assign highest probability to the thinking end token
             logits[i, :] = -float("inf")
             logits[i, self.THINKING_END_TOKEN_ID] = 0.0
+            param_dict["_forcing_end"] = True
 
         return logits
 
