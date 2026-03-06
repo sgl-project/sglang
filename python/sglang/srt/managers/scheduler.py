@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -813,8 +813,13 @@ class Scheduler(
                     else "cpu"
                 ),
             )
-        # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+
+        # NOTE: preemption is enabled by default for priority scheduling.
+        self.enable_priority_preemption = (
+            self.enable_priority_scheduling
+            and not self.server_args.disable_priority_preemption
+        )
+
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -1105,6 +1110,45 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
+
+    def get_init_info(self) -> Dict[str, Any]:
+        """Return scheduler initialization info for handshake.
+
+        This method provides the initialization info needed by the tokenizer manager
+        and other components to verify the scheduler is ready.
+        """
+        result_dict = {
+            "status": "ready",
+            "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_input_len": self.max_req_input_len,
+        }
+
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            (
+                remote_instance_transfer_engine_session_id,
+                remote_instance_transfer_engine_weights_info_dict,
+            ) = self.get_remote_instance_transfer_engine_info()
+            result_dict.update(
+                {
+                    "tp_rank": self.tp_rank,
+                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
+                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
+                }
+            )
+
+        return result_dict
+
+    def run_event_loop(self) -> None:
+        """Run the scheduler's event loop.
+
+        Sets up the schedule stream and dispatches to the appropriate event loop.
+        The event loop blocks until shutdown.
+        """
+        self.schedule_stream = self.device_module.Stream(priority=0)
+        if self.device == "cpu":
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        with CudaStreamContext(self.schedule_stream):
+            dispatch_event_loop(self)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1994,7 +2038,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.try_preemption:
+        if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
@@ -2004,6 +2048,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
@@ -2012,7 +2057,7 @@ class Scheduler(
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is not None
-            and not self.try_preemption
+            and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
             return None
@@ -2090,8 +2135,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -2174,12 +2220,8 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward
-        new_batch.prefill_stats = PrefillStats(
-            log_input_tokens=adder.log_input_tokens,
-            log_hit_tokens=adder.log_hit_tokens,
-            new_token_ratio=adder.new_token_ratio,
-            running_bs=len(self.running_batch.reqs),
-            num_new_seqs=len(can_run_list),
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            adder, self.running_batch.reqs, self.enable_priority_scheduling
         )
 
         # Mixed-style chunked prefill
@@ -3107,23 +3149,26 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
-def run_scheduler_process(
+def configure_scheduler(
     server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
     tp_rank: int,
     attn_cp_rank: int,
     moe_dp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
-    pipe_writer,
-):
+) -> Optional[int]:
+    """Configure scheduler worker: logging, process title, etc.
+
+    Returns:
+        dp_rank
+    """
     # Generate the logger prefix
-    prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+
+    prefix = ""
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
@@ -3140,12 +3185,32 @@ def run_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
-    kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+
+    return dp_rank
+
+
+def run_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+):
+    dp_rank = configure_scheduler(
+        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    )
+
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
@@ -3180,31 +3245,12 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
-        result_dict = {
-            "status": "ready",
-            "max_total_num_tokens": scheduler.max_total_num_tokens,
-            "max_req_input_len": scheduler.max_req_input_len,
-        }
-        if server_args.remote_instance_weight_loader_use_transfer_engine():
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            result_dict.update(
-                {
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
 
-        pipe_writer.send(result_dict)
+        # Send initialization info back to the parent process
+        pipe_writer.send(scheduler.get_init_info())
 
-        scheduler.schedule_stream = scheduler.device_module.Stream(priority=0)
-        if scheduler.device == "cpu":
-            scheduler.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with CudaStreamContext(scheduler.schedule_stream):
-            dispatch_event_loop(scheduler)
+        # Run the event loop (blocks until shutdown)
+        scheduler.run_event_loop()
 
     except Exception:
         traceback = get_exception_traceback()

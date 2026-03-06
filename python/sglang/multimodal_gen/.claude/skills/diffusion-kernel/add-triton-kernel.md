@@ -366,101 +366,14 @@ python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
 
 ---
 
-## Step 6: Profile with Nsight Compute (optional but recommended)
+## Step 6: Profile with Nsight Compute (required for optimization work)
 
-After the kernel passes correctness tests, use **`nsight-profiler.md`** to measure its hardware-level efficiency. This step requires **Nsight Compute (`ncu`)** to be installed.
+After correctness tests, you must use **ncu (Nsight Compute)** to validate hardware efficiency (bandwidth/throughput/occupancy/bottleneck type).
 
-### Dependency Check
+To avoid duplicating ncu CLI details across multiple skills, this skill does not repeat command flags. Follow the canonical docs:
 
-Before profiling, verify `ncu` is available:
-
-```bash
-ncu --version   # must print a version string, e.g. "NVIDIA Nsight Compute 2024.1.0"
-```
-
-If `ncu` is missing, install it via the CUDA Toolkit package or the standalone [Nsight Compute installer](https://developer.nvidia.com/nsight-compute).
-
-### Quick Kernel Profile
-
-```bash
-# Profile the Triton kernel during the benchmark script
-# --kernel-name: match the Triton-mangled name (check with nsys first if unsure)
-ncu --set full \
-    -o /tmp/triton_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
-```
-
-To profile only the Triton kernel (skip PyTorch reference and warmup launches), add `--launch-skip N --launch-count M`:
-
-```bash
-# Skip first 2 launches (warmup), capture 3 kernel invocations
-ncu --set full --launch-skip 2 --launch-count 3 \
-    -o /tmp/triton_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
-```
-
-### Key Metrics to Check for a Triton Kernel
-
-| Metric | Healthy Range | Action if Low |
-|--------|--------------|---------------|
-| **Achieved Occupancy** | ≥ 50% | Reduce register usage or shared memory; try smaller block sizes |
-| **Memory Throughput** | ≥ 70% of peak BW | Check for non-coalesced access (pass contiguous strides) |
-| **Compute Throughput** | ≥ 50% of peak | Increase arithmetic intensity; fuse more ops per load |
-| **Warp Efficiency (No Stall)** | ≥ 60% | Reduce branch divergence; avoid `tl.atomic_*` on hot paths |
-| **L1/L2 Hit Rate** | L2 ≥ 40% | Reorder loads for locality; check broadcast patterns |
-
-### CLI-Only Analysis Workflow
-
-```bash
-# 1. Collect profile (--csv is NOT valid here; only -o to save .ncu-rep)
-ncu --set full \
-    --launch-skip 2 --launch-count 1 \
-    -o /tmp/prof_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
-
-# 2. Export key metrics to CSV from the saved .ncu-rep (--csv is valid here)
-ncu --import /tmp/prof_<op_name>.ncu-rep \
-    --page details --csv \
-    > /tmp/prof_<op_name>_details.csv
-
-# 3. Quick summary — top bottleneck sections
-python3 - << 'EOF'
-import csv, sys
-rows = list(csv.DictReader(open("/tmp/prof_<op_name>_details.csv")))
-# print section names and their achieved % of peak
-for r in rows:
-    name = r.get("Metric Name", "")
-    val  = r.get("Metric Value", "")
-    if any(k in name for k in ["sol", "Occupancy", "Throughput"]):
-        print(f"{name:60s} {val}")
-EOF
-```
-
-### Compare Two Kernel Versions
-
-```bash
-# Profile baseline
-ncu --set full --launch-skip 2 --launch-count 1 \
-    -o /tmp/baseline python .../bench_<op_name>.py
-
-# Profile optimized version (after your changes)
-ncu --set full --launch-skip 2 --launch-count 1 \
-    -o /tmp/optimized python .../bench_<op_name>.py
-
-# Diff (CSV, no GUI)
-ncu --import /tmp/baseline.ncu-rep \
-    --import /tmp/optimized.ncu-rep \
-    --page diff --csv > /tmp/diff_<op_name>.csv
-
-python3 -c "
-import csv
-rows = list(csv.DictReader(open('/tmp/diff_<op_name>.csv')))
-for r in rows[:30]:
-    print(r.get('Metric Name','')[:55], r.get('Baseline',''), '->', r.get('Comparison',''))
-"
-```
-
-> For a complete guide to Nsight Compute metrics, occupancy analysis, roofline model interpretation, and warp efficiency optimization, refer to **`nsight-profiler.md`** in this directory.
+- `diffusion-benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
+- `nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / warp stalls)
 
 ---
 
