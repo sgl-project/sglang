@@ -11,9 +11,9 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     SGLangSeqId,
     TokenAlignerStepAux,
 )
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
+from sglang.srt.debug_utils.comparator.output_types import InfoLog
 
 # ── plugin ABC ─────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
         will be mishandled. Callers should set dims explicitly for non-zigzag CP.
         """
         if ndim == 1:
-            return "t(cp:zigzag)"
+            return "t[cp:zigzag]"
         raise ValueError(
             f"SGLang: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
         )
@@ -208,9 +208,9 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
         will be mishandled. Callers should set dims explicitly for non-zigzag CP.
         """
         if ndim == 1:
-            return "t(cp:zigzag)"
+            return "t[cp:zigzag]"
         if ndim == 2:
-            return "b s(cp:zigzag)"
+            return "b s[cp:zigzag]"
         raise ValueError(
             f"Megatron: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
         )
@@ -227,8 +227,8 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
             if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
                 return TokenLayout.BS
 
-        warning_sink.add(
-            GeneralWarning(
+        log_sink.add(
+            InfoLog(
                 category="layout_detection_fallback",
                 message=(
                     "Megatron layout detection: no qkv_format or 2D input_ids found, "

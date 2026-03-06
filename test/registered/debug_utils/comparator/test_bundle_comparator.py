@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.bundle_comparator import _load_all_values
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
-from sglang.srt.debug_utils.comparator.warning_sink import WarningSink
+from sglang.srt.debug_utils.comparator.log_sink import LogSink
+from sglang.srt.debug_utils.comparator.output_types import ErrorLog
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)
@@ -32,10 +32,10 @@ class TestLoadAllValues:
         fn0: str = _save_tensor(tmp_path, name="a", rank=0)
         fn1: str = _save_tensor(tmp_path, name="a", rank=1)
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.warning_sink",
+                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(filenames=[fn0, fn1], base_path=tmp_path)
@@ -50,10 +50,10 @@ class TestLoadAllValues:
         fn_bad: str = "step=0___rank=1___dump_index=0___name=a.pt"
         (tmp_path / fn_bad).write_text("not a valid pt file")
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.warning_sink",
+                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(
@@ -62,7 +62,7 @@ class TestLoadAllValues:
 
         assert len(result) == 1
         assert len(warnings) == 1
-        assert isinstance(warnings[0], GeneralWarning)
+        assert isinstance(warnings[0], ErrorLog)
         assert warnings[0].category == "load_failed"
         assert fn_bad in warnings[0].message
 
@@ -73,10 +73,10 @@ class TestLoadAllValues:
         (tmp_path / fn0).write_text("corrupt")
         (tmp_path / fn1).write_text("corrupt")
 
-        sink = WarningSink()
+        sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.warning_sink",
+                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(filenames=[fn0, fn1], base_path=tmp_path)
