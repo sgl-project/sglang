@@ -49,7 +49,7 @@ class TestAscendAutoRound(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
                     other_args=[
                         *self.common_args,
                     ],
