@@ -1,7 +1,7 @@
 name: PR Test (AMD)
 # Dynamic run-name for /rerun-stage commands to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
+run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
   push:
@@ -24,8 +24,29 @@ on:
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
+      target_stage_select:
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-small-1-gpu-amd
+          - stage-b-test-small-1-gpu-amd-nondeterministic
+          - stage-b-test-small-1-gpu-amd-mi35x
+          - stage-b-test-large-1-gpu-amd
+          - stage-b-test-large-2-gpu-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
       target_stage:
-        description: "Specific stage(s) to run, comma-separated (e.g. 'stage-a-test-1-amd,stage-b-test-small-1-gpu-amd')"
+        description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
         type: string
         default: ""
@@ -141,9 +162,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',sgl-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -188,9 +209,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -230,9 +251,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-a-test-1-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -270,9 +291,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',jit-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
@@ -309,9 +330,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -349,9 +370,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -388,9 +409,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -427,9 +448,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -467,9 +488,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -507,9 +528,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -635,9 +656,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -762,9 +783,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-c-test-large-8-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -810,9 +831,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -851,9 +872,9 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
