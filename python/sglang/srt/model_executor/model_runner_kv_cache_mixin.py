@@ -676,11 +676,14 @@ class ModelRunnerKVCacheMixin:
                 )
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
-        max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(pre_model_load_memory)
 
-        if max_num_reqs is None:
+        # Resolve max_num_reqs (per dp worker)
+        max_num_reqs = self.server_args.max_running_requests
+        if max_num_reqs is not None:
+            max_num_reqs = max_num_reqs // self.dp_size
+        else:
             max_num_reqs = min(
                 max(
                     int(
@@ -698,15 +701,6 @@ class ModelRunnerKVCacheMixin:
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
-
-            # for dp attention, we need control the max_num_reqs for speculative decoding mamba space
-            if (
-                not self.spec_algorithm.is_none()
-                and self.server_args.enable_dp_attention
-            ):
-                max_num_reqs = min(
-                    max_num_reqs, self.server_args.max_running_requests // self.dp_size
-                )
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
