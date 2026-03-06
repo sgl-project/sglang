@@ -382,12 +382,12 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
 
-        # LoRA state
+        # LoRA state – supports multiple adapters
         self._lora_loaded: bool = False
         self._lora_fused: bool = False
-        self._lora_nickname: str | None = None
-        self._lora_path: str | None = None
-        self._lora_strength: float = 1.0
+        self._lora_nicknames: list[str] = []
+        self._lora_paths: list[str | None] = []
+        self._lora_strengths: list[float] = []
 
         logger.info("Loading diffusers pipeline from %s", model_path)
         self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
@@ -625,28 +625,71 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: str | list[str],
+        lora_path: str | None | list[str | None] = None,
+        target: str | list[str] = "all",
+        strength: float | list[float] = 1.0,
     ) -> None:
-        """Load and fuse LoRA weights using the native diffusers API."""
-        lora_local_path = maybe_download_lora(lora_path)
+        """Load and fuse LoRA weights using the native diffusers API.
+
+        Supports both single and multiple LoRA adapters.  When lists are
+        provided, each adapter is loaded individually and then all adapters
+        are activated together via ``set_adapters`` with per-adapter scales.
+        """
+        # ── normalise inputs to lists ─────────────────────────────────────
+        nicknames = (
+            [lora_nickname] if isinstance(lora_nickname, str) else list(lora_nickname)
+        )
+        if lora_path is None or isinstance(lora_path, str):
+            paths: list[str | None] = [lora_path] * len(nicknames)
+        else:
+            paths = list(lora_path)
+        if isinstance(strength, (int, float)):
+            strengths = [float(strength)] * len(nicknames)
+        else:
+            strengths = [float(s) for s in strength]
+
+        if len(nicknames) != len(paths):
+            raise ValueError(
+                f"lora_nickname length ({len(nicknames)}) != lora_path length ({len(paths)})"
+            )
+        if len(nicknames) != len(strengths):
+            raise ValueError(
+                f"lora_nickname length ({len(nicknames)}) != strength length ({len(strengths)})"
+            )
+
+        # ── unload previous adapters ──────────────────────────────────────
         if self._lora_loaded:
+            if self._lora_fused and hasattr(self.diffusers_pipe, "unfuse_lora"):
+                self.diffusers_pipe.unfuse_lora()
             self.diffusers_pipe.unload_lora_weights()
             self._lora_loaded = False
             self._lora_fused = False
+            self._lora_nicknames = []
+            self._lora_paths = []
+            self._lora_strengths = []
 
-        self.diffusers_pipe.load_lora_weights(
-            lora_local_path, adapter_name=lora_nickname
-        )
+        # ── load each adapter ─────────────────────────────────────────────
+        for nick, path in zip(nicknames, paths):
+            lora_local_path = maybe_download_lora(path)
+            self.diffusers_pipe.load_lora_weights(lora_local_path, adapter_name=nick)
+            logger.info("Loaded LoRA adapter %s from %s", nick, path)
+
         self._lora_loaded = True
-        self._lora_nickname = lora_nickname
-        self._lora_path = lora_path
-        self._lora_strength = strength
+        self._lora_nicknames = nicknames
+        self._lora_paths = paths
+        self._lora_strengths = strengths
+
+        # ── activate & fuse ───────────────────────────────────────────────
+        if len(nicknames) > 1 and hasattr(self.diffusers_pipe, "set_adapters"):
+            # multi-adapter: activate all with individual scales
+            self.diffusers_pipe.set_adapters(nicknames, adapter_weights=strengths)
 
         if hasattr(self.diffusers_pipe, "fuse_lora"):
-            self.diffusers_pipe.fuse_lora(lora_scale=strength)
+            self.diffusers_pipe.fuse_lora(
+                adapter_names=nicknames,
+                lora_scale=strengths[0] if len(strengths) == 1 else 1.0,
+            )
             self._lora_fused = True
         else:
             logger.warning(
@@ -668,9 +711,12 @@ class DiffusersPipeline(ComposedPipelineBase):
             return
         if self._lora_fused:
             self.diffusers_pipe.unfuse_lora()
-        self.diffusers_pipe.fuse_lora(lora_scale=strength)
+        self.diffusers_pipe.fuse_lora(
+            adapter_names=self._lora_nicknames,
+            lora_scale=strength,
+        )
         self._lora_fused = True
-        self._lora_strength = strength
+        self._lora_strengths = [strength] * len(self._lora_nicknames)
 
     def unmerge_lora_weights(self, target: str = "all") -> None:
         """Unfuse (unmerge) LoRA weights from the model."""
@@ -682,20 +728,22 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def get_lora_status(self) -> dict:
         """Return loaded and active LoRA adapter status (mirrors LoRAPipeline shape)."""
-        loaded = (
-            [{"nickname": self._lora_nickname, "path": self._lora_path}]
-            if self._lora_loaded
-            else []
-        )
+        loaded = [
+            {"nickname": n, "path": p}
+            for n, p in zip(self._lora_nicknames, self._lora_paths)
+        ]
         active = {}
-        if self._lora_fused and self._lora_nickname:
+        if self._lora_fused and self._lora_nicknames:
             active["transformer"] = [
                 {
-                    "nickname": self._lora_nickname,
-                    "path": self._lora_path,
+                    "nickname": n,
+                    "path": p,
                     "merged": True,
-                    "strength": self._lora_strength,
+                    "strength": s,
                 }
+                for n, p, s in zip(
+                    self._lora_nicknames, self._lora_paths, self._lora_strengths
+                )
             ]
         return {"loaded_adapters": loaded, "active": active}
 
