@@ -376,6 +376,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
@@ -887,6 +888,14 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        if self.enable_nan_detection:
+            logger.warning(
+                "--enable-nan-detection is deprecated. "
+                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
+            )
+            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
+            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -3727,6 +3736,11 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
+            "--use-ray",
+            action="store_true",
+            help="Use Ray actors for scheduler process management.",
+        )
+        parser.add_argument(
             "--custom-sigquit-handler",
             help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
@@ -5007,7 +5021,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
         )
         parser.add_argument(
             "--enable-p2p-check",

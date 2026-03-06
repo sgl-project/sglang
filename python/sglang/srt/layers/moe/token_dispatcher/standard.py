@@ -43,7 +43,7 @@ try:
     if is_sm120_supported():
         from flashinfer import fp4_quantize
     else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
     from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
