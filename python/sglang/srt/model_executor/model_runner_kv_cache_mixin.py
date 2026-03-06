@@ -113,8 +113,8 @@ class ModelRunnerKVCacheMixin:
                 )
         return cell_size
 
-    def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
-        available_gpu_memory = get_available_gpu_memory(
+    def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
+        post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -140,7 +140,7 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
 
-        rest_memory = available_gpu_memory - total_gpu_memory * (
+        rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
@@ -675,10 +675,10 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
-    def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
+    def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens = self.profile_max_num_token(pre_model_load_memory)
 
         if max_num_reqs is None:
             max_num_reqs = min(
