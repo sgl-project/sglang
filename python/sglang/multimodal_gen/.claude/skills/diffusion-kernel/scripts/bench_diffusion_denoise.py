@@ -257,13 +257,18 @@ def run_benchmark_once(
 
             # e2e latency: total_duration_ms (set by PerformanceLogger.dump_benchmark_report)
             total_ms = perf.get("total_duration_ms")
-            metrics["e2e_latency_s"] = float(total_ms) / 1000.0 if total_ms is not None else None
+            metrics["e2e_latency_s"] = (
+                float(total_ms) / 1000.0 if total_ms is not None else None
+            )
 
             # denoise latency: look in "steps" list for the "DenoisingStage" entry
             # steps = [{"name": "DenoisingStage", "duration_ms": 1234.5}, ...]
             denoise_latency_s = None
             for step in perf.get("steps", []):
-                if step.get("name") == "DenoisingStage" and step.get("duration_ms") is not None:
+                if (
+                    step.get("name") == "DenoisingStage"
+                    and step.get("duration_ms") is not None
+                ):
                     denoise_latency_s = float(step["duration_ms"]) / 1000.0
                     break
 
