@@ -600,7 +600,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        self.init_memory(min_per_gpu_memory)
 
         # Init max running requests
         self.max_running_requests = min(
