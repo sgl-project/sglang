@@ -13,21 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-
-#include <sgl_kernel/runtime.cuh>
-#include <sgl_kernel/utils.cuh>
-
-#include "nvfp4_quant.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <torch/all.h>
 
-using namespace host;
+#include "nvfp4_quant.cuh"
+#include "utils.h"
 
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, bool UE8M0_SF = false>
-SGL_DEVICE uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
+__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);
@@ -185,57 +182,61 @@ template void invokeFP4Quantization(
     int multiProcessorCount,
     cudaStream_t stream);
 
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return sm_major * 10 + sm_minor;
+inline int getMultiProcessorCount() {
+  static int multi_processor_count = []() {
+    int device_id = 0;
+    int count = 0;
+
+    // Get the current CUDA device ID
+    CHECK_CUDA_SUCCESS(cudaGetDevice(&device_id));
+
+    // Get the number of multiprocessors for the current device
+    CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device_id));
+
+    return count;  // Initialize the static variable
+  }();
+
+  return multi_processor_count;  // Return the cached value on subsequent calls
 }
 
 void scaled_fp4_quant_sm100a_sm120a(
-    tvm::ffi::TensorView output,
-    tvm::ffi::TensorView input,
-    tvm::ffi::TensorView output_sf,
-    tvm::ffi::TensorView input_sf) {
-  RuntimeCheck(input.device().device_type == kDLCUDA, "input must be a CUDA tensor");
-  RuntimeCheck(output.device() == input.device(), "output and input must be on same device");
-  RuntimeCheck(output_sf.device() == input.device(), "output_sf and input must be on same device");
-  RuntimeCheck(input_sf.device() == input.device(), "input_sf and input must be on same device");
-  RuntimeCheck(input.dim() == 2, "input must be a 2D tensor");
-  RuntimeCheck(output.dim() == 2, "output must be a 2D tensor");
-  RuntimeCheck(output_sf.dim() == 2, "output_sf must be a 2D tensor");
-  RuntimeCheck(input_sf.numel() == 1, "input_sf must have exactly one element");
-  RuntimeCheck(host::is_type<uint8_t>(output.dtype()), "output must be uint8");
-  RuntimeCheck(host::is_type<int32_t>(output_sf.dtype()), "output_sf must be int32");
-  RuntimeCheck(host::is_type<float>(input_sf.dtype()), "input_sf must be float32");
-  RuntimeCheck(
-      host::is_type<fp16_t>(input.dtype()) || host::is_type<bf16_t>(input.dtype()), "input dtype must be fp16 or bf16");
+    torch::Tensor const& output,
+    torch::Tensor const& input,
+    torch::Tensor const& output_sf,
+    torch::Tensor const& input_sf) {
+  auto sm_version = getSMVersion();
+  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
 
-  const int device_id = input.device().device_id;
-  const auto sm_version = getSMVersion(device_id);
-  RuntimeCheck(sm_version >= 100, "fp4_quant is only supported on sm100+");
+  int32_t m = input.size(0);
+  int32_t n = input.size(1);
 
-  const int32_t m = static_cast<int32_t>(input.size(0));
-  const int32_t n = static_cast<int32_t>(input.size(1));
+  TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
 
-  RuntimeCheck(output.size(0) == m, "output row size mismatch");
-  RuntimeCheck(output.size(1) == n / 2, "output column size mismatch");
-  RuntimeCheck(n % 16 == 0, "The N dimension must be multiple of 16.");
-
-  const int multiProcessorCount = static_cast<int>(runtime::get_sm_count(device_id));
+  int multiProcessorCount = getMultiProcessorCount();
 
   auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
   auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
   auto output_ptr = static_cast<int64_t*>(output.data_ptr());
-  const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-  constexpr bool useUE8M0 = false;
-  if (host::is_type<fp16_t>(input.dtype())) {
-    auto input_ptr = reinterpret_cast<half const*>(input.data_ptr());
-    invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0, multiProcessorCount, stream);
-  } else {
-    auto input_ptr = reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr());
-    invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0, multiProcessorCount, stream);
+  // We don't support e8m0 scales at this moment.
+  bool useUE8M0 = false;
+
+  switch (input.scalar_type()) {
+    case torch::kHalf: {
+      auto input_ptr = reinterpret_cast<half const*>(input.data_ptr());
+      invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0, multiProcessorCount, stream);
+      break;
+    }
+    case torch::kBFloat16: {
+      auto input_ptr = reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr());
+      invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0, multiProcessorCount, stream);
+      break;
+    }
+    default: {
+      std::cerr << "Observing: " << input.scalar_type() << " for the input datatype which is invalid";
+      throw std::runtime_error("Unsupported input data type for quantize_to_fp4.");
+    }
   }
 }
