@@ -1025,6 +1025,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
+        self.quant_config = quant_config
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
@@ -1357,6 +1358,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                    name = name.replace(r"model.visual.", r"visual.")
 
                 try:
                     # Skip loading extra bias for GPTQ models.

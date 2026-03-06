@@ -1482,6 +1482,18 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            lmsys/sglang-ci-dsv3-test:4
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            lmsys/sglang-ci-dsv3-test:4
+
       - name: Run test
         timeout-minutes: 20
         run: |

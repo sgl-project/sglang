@@ -27,7 +27,7 @@ class SchedulerDllmMixin:
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.try_preemption:
+        if self.enable_priority_preemption:
             self.running_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
@@ -82,7 +82,7 @@ class SchedulerDllmMixin:
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.dllm_manager.is_empty()
-            and not self.try_preemption
+            and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
             return True
@@ -186,12 +186,8 @@ class SchedulerDllmMixin:
         # Record prefill stats for logging after forward
         from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
 
-        new_batch.prefill_stats = PrefillStats(
-            log_input_tokens=self.adder.log_input_tokens,
-            log_hit_tokens=self.adder.log_hit_tokens,
-            new_token_ratio=self.adder.new_token_ratio,
-            running_bs=len(self.running_batch.reqs),
-            num_new_seqs=len(can_run_list),
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            self.adder, self.running_batch.reqs, self.enable_priority_scheduling
         )
 
         return new_batch
@@ -209,8 +205,9 @@ class SchedulerDllmMixin:
 
             # Try preemption if batch is full
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 

@@ -125,6 +125,27 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
+    """Wait for the server to become ready by polling the given URL."""
+    print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
+    start_time = time.perf_counter()
+    headers = get_auth_headers()
+    while True:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                elapsed = time.perf_counter() - start_time
+                print(f"Server ready in {elapsed:.1f}s.")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        elapsed = time.perf_counter() - start_time
+        if elapsed >= timeout_sec:
+            print(f"Server did not become ready within {timeout_sec}s timeout.")
+            return False
+        time.sleep(1)
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -1663,6 +1684,13 @@ def run_benchmark(args_: argparse.Namespace):
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
 
+    # Wait for server to be ready
+    if args.ready_check_timeout_sec > 0:
+        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
+            print(f"Server at {health_url} is not ready. Exiting.")
+            sys.exit(1)
+
     # Get model name
     if args.model is None:
         if args.backend == "truss":
@@ -1787,6 +1815,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=60,
+        help="Maximum time in seconds to wait for the server to be ready before benchmarking. Set to 0 to skip. Default: 60.",
     )
     parser.add_argument(
         "--dataset-name",
