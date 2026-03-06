@@ -5,6 +5,10 @@ description: Index for SGLang Diffusion kernel development skills.
 
 # Diffusion Kernel Skills
 
+## Rule: Follow User Kernel Language Preference
+
+If the user explicitly states a preference for **Triton** or **CUDA**, follow that preference when implementing and optimizing kernels (even if the other option could work). Do not “pick for convenience”.
+
 ## Directory Layout
 
 ```

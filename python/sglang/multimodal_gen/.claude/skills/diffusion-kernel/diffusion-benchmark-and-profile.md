@@ -43,7 +43,27 @@ wget -O /workspace/gen_benchmark/figs/astronaut.jpg \
 
 ## Benchmark Commands
 
-All commands include `--warmup` and `--enable-torch-compile` for real production performance. Add `--perf-dump-path <file>.json` for machine-readable output (see `diffusion-perf` skill for comparison).
+All commands include `--warmup` and `--enable-torch-compile` for real production performance. Add `--perf-dump-path <file>.json` for machine-readable output.
+
+### Perf dump & before/after compare
+
+For every benchmark run, always write a perf dump JSON:
+
+```bash
+sglang generate ... --warmup --perf-dump-path <result>.json
+```
+
+Before/after comparison (outputs a Markdown table suitable for PR descriptions):
+
+```bash
+# Baseline (on main branch or before changes)
+sglang generate ... --warmup --perf-dump-path baseline.json
+
+# New (after changes)
+sglang generate ... --warmup --perf-dump-path new.json
+
+python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+```
 
 ### Qwen-Image-2512 (1024×1024, 50 steps)
 ```bash

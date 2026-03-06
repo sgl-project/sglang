@@ -467,7 +467,7 @@ def main():
 
     print(f"Perf dump JSONs → {output_dir}")
     print(
-        "Use diffusion-perf skill (../diffusion-perf/SKILL.md) to compare across runs."
+        "Compare across runs: follow diffusion-benchmark-and-profile.md → Perf dump & before/after compare."
     )
 
 

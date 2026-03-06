@@ -463,133 +463,17 @@ if __name__ == "__main__":
 
 ---
 
-## Step 8: Profile with Nsight Compute (optional but recommended)
+## Step 8: Profile with Nsight Compute (required)
 
-After the kernel passes correctness tests and benchmarks faster than baseline, use **`nsight-profiler.md`** to measure its hardware-level efficiency. This step requires **Nsight Compute (`ncu`)** to be installed.
+After correctness + benchmarking, you must collect **Nsight Compute (ncu)** data to validate:
 
-### Dependency Check
+- Whether the kernel reaches reasonable bandwidth/throughput (avoid false positives where it is “faster” but under-utilizes hardware)
+- Whether there are clear occupancy / register / shared memory limiters
 
-```bash
-ncu --version   # must print a version string, e.g. "NVIDIA Nsight Compute 2024.1.0"
-```
+Use the canonical docs in this directory (do not duplicate CLI details across multiple skills):
 
-If `ncu` is missing, install it via the CUDA Toolkit package or the standalone [Nsight Compute installer](https://developer.nvidia.com/nsight-compute).
-
-### Quick Kernel Profile
-
-Profile the JIT CUDA kernel during the benchmark script:
-
-```bash
-ncu --set full \
-    -o /tmp/cuda_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-```
-
-**Important for JIT kernels**: the very first launch triggers compilation (slow, not representative). Skip it with `--launch-skip`:
-
-```bash
-# Skip the JIT compilation launch (launch 0) and the warmup launches;
-# capture 3 representative kernel invocations
-ncu --set full --launch-skip 3 --launch-count 3 \
-    -o /tmp/cuda_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-```
-
-To confirm the kernel name (used by `--kernel-name` filter), run without `-o` first:
-
-```bash
-# List all launched CUDA kernels (minimal profiling, no --set)
-ncu python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py 2>&1 \
-  | grep "==PROF== Profiling" | sed 's/.*Profiling "\(.*\)".*/\1/'
-```
-
-Then filter to only your kernel:
-
-```bash
-# e.g., for bf16_t instantiation: rmsnorm_kernel<bf16_t, 8>
-ncu --set full --launch-skip 1 --launch-count 3 \
-    --kernel-name "rmsnorm_kernel" \
-    -o /tmp/cuda_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-```
-
-### Key Metrics to Check for a JIT CUDA Kernel
-
-| Metric | Healthy Range | Action if Low |
-|--------|--------------|---------------|
-| **Achieved Occupancy** | ≥ 50% | Check register count via `--ptxas-options=-v`; try `--maxrregcount=64`; reduce block size |
-| **Memory Throughput** | ≥ 70% of peak BW | Ensure `AlignedVector<T, 16/sizeof(T)>` is used; check all accesses are coalesced |
-| **Compute Throughput** | ≥ 40% of peak | Increase arithmetic intensity; fuse more ops (e.g., norm + scale + shift) |
-| **Warp Efficiency (No Stall)** | ≥ 60% | Reduce branch divergence; check `smsp__warp_issue_stalled_*` breakdown |
-| **L1/L2 Hit Rate** | L2 ≥ 30% | Weight tensor (RMSNorm) should be cached; check access pattern |
-| **Bank Conflicts** | 0 or minimal | Add `[32][33]` padding to shared memory arrays |
-
-**CUDA vs Triton targets**: JIT CUDA kernels using `AlignedVector` can typically achieve **80%+ memory throughput** (vs ~70% for Triton), because vectorized loads are explicit. If you're below 50%, the bottleneck is coalescing or insufficient vectorization.
-
-### CLI-Only Analysis Workflow
-
-```bash
-# 1. Collect profile (-o saves .ncu-rep; do NOT use --csv here)
-ncu --set full \
-    --launch-skip 1 --launch-count 1 \
-    --kernel-name "rmsnorm_kernel" \
-    -o /tmp/prof_<op_name> \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-
-# 2. Export key metrics to CSV from the saved .ncu-rep (--csv valid only with --import)
-ncu --import /tmp/prof_<op_name>.ncu-rep \
-    --page details --csv \
-    > /tmp/prof_<op_name>_details.csv
-
-# 3. Quick summary — bandwidth, occupancy, stall breakdown
-python3 - << 'EOF'
-import csv, sys
-
-rows = list(csv.DictReader(open("/tmp/prof_<op_name>_details.csv")))
-for r in rows:
-    name = r.get("Metric Name", "")
-    val  = r.get("Metric Value", "")
-    if any(k in name for k in ["sol", "Occupancy", "Throughput", "stalled", "bank_conflict"]):
-        print(f"{name:70s} {val}")
-EOF
-```
-
-### Compare Two Kernel Versions (Before / After Optimization)
-
-```bash
-# Profile the current version
-ncu --set full --launch-skip 1 --launch-count 1 \
-    --kernel-name "rmsnorm_kernel" \
-    -o /tmp/baseline \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-
-# Make your optimization (e.g., add vectorization, fix bank conflict)
-# Then profile again
-ncu --set full --launch-skip 1 --launch-count 1 \
-    --kernel-name "rmsnorm_kernel" \
-    -o /tmp/optimized \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
-
-# Diff — export both to CSV, then compare with Python (no GUI needed)
-# Note: --import can only be specified once; --page diff is not valid.
-ncu --import /tmp/baseline.ncu-rep --page details --csv > /tmp/baseline_details.csv
-ncu --import /tmp/optimized.ncu-rep --page details --csv > /tmp/optimized_details.csv
-
-python3 -c "
-import csv
-def load(p):
-    return {r.get('Metric Name',''): r.get('Metric Value','')
-            for r in csv.DictReader(open(p))}
-b = load('/tmp/baseline_details.csv')
-o = load('/tmp/optimized_details.csv')
-for k in sorted(set(b) | set(o)):
-    bv, ov = b.get(k,''), o.get(k,'')
-    if bv != ov:
-        print(f'{k[:60]:<60} {bv} -> {ov}')
-"
-```
-
-> For a complete guide to Nsight Compute metrics, occupancy analysis, roofline model interpretation, and warp efficiency optimization, refer to **`nsight-profiler.md`** in this directory.
+- `diffusion-benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
+- `nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / stall reasons)
 
 ---
 
