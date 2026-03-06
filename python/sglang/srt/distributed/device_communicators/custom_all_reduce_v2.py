@@ -135,7 +135,7 @@ class CustomAllReduceV2:
         self.obj.post_init(result)
 
     def _share_list(self, input: List[T]) -> List[List[T]]:
-        input_tensor = torch.tensor(input, dtype=torch.int32, device="cpu")
+        input_tensor = torch.tensor(input, dtype=torch.int64, device="cpu")
         gather_list = [torch.empty_like(input_tensor) for _ in range(self.world_size)]
         dist.all_gather(gather_list, input_tensor, group=self.group)
         return [g.tolist() for g in gather_list]
