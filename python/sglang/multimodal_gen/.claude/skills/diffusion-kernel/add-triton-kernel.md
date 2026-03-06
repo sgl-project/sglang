@@ -366,9 +366,9 @@ python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
 
 ---
 
-## Step 6: Profile with Nsight Compute (optional but recommended)
+## Step 6: Profile with Nsight Compute (required for optimization work)
 
-After the kernel passes correctness tests, use **`nsight-profiler.md`** to measure its hardware-level efficiency. This step requires **Nsight Compute (`ncu`)** to be installed.
+After the kernel passes correctness tests, use **ncu** (Nsight Compute) to measure hardware-level efficiency. **This step is mandatory when the kernel targets a performance bottleneck** — without ncu data you cannot know if the kernel saturates memory bandwidth, has low occupancy, or is compute-bound. Only skip this for trivial utility kernels that are not on the critical path.
 
 ### Dependency Check
 

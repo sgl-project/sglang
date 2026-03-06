@@ -42,7 +42,7 @@ python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/
 
 - [diffusion-benchmark-and-profile.md](./diffusion-benchmark-and-profile.md)
 
-  Denoise-stage benchmark and profiling guide for SGLang Diffusion models, including latency measurement, per-layer breakdown (torch.profiler + nsys), and a decision guide for choosing Triton vs CUDA JIT kernels to address bottlenecks.
+  Denoise-stage benchmark and profiling guide for SGLang Diffusion models. Three profiling levels: Level 1 (torch.profiler — kernel time ranking), Level 2 (nsys — category breakdown), Level 3 (ncu — per-kernel bandwidth/occupancy/roofline analysis). **ncu is critical for kernel optimization** — always use it when writing or tuning custom kernels to verify hardware saturation.
 
 - [nsight-profiler.md](./nsight-profiler.md)
 
