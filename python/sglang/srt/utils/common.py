@@ -847,46 +847,40 @@ def decode_video_base64(video_base64):
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
-    import soundfile as sf
-    from scipy.signal import resample
+    # Use torchcodec here, since it supports more formats
+    from torchcodec.decoders import AudioDecoder
 
     if sr is None:
         sr = 16000
 
     # Load audio data
     if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
+        pass
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
+        audio_file = BytesIO(pybase64.b64decode(audio_file, validate=True))
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
         audio_file = BytesIO(response.content)
         response.close()
-        audio, original_sr = sf.read(audio_file)
     elif audio_file.startswith("file://"):
         audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+        pass
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
+    
+    audio = AudioDecoder(
+        audio_file,
+        sample_rate=sr,
+        num_channels=1 if mono else None,
+    ).get_all_samples().data
 
-    # Resample audio if the original sample rate is different from the desired sample rate
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
+    if mono:
+        audio = audio.squeeze(0)
 
-    # Convert to mono if requested and audio is stereo
-    if mono and len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
-
-    return audio
+    return audio.numpy()
 
 
 @dataclass
