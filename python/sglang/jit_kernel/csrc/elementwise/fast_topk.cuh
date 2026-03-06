@@ -13,7 +13,7 @@
 
 namespace {
 
-static constexpr int TopK = 2048;
+static constexpr int kTopK = 2048;
 static constexpr int kThreadsPerBlock = 1024;
 static constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB
 
@@ -30,7 +30,7 @@ __device__ void naive_topk_cuda(
     int32_t* __restrict__ indice,
     int32_t length) {
   const auto tid = threadIdx.x;
-  for (int i = tid; i < TopK; i += kThreadsPerBlock) {
+  for (int i = tid; i < kTopK; i += kThreadsPerBlock) {
     indice[i] = (i < length) ? i : -1;
   }
 }
@@ -41,7 +41,7 @@ __device__ void naive_topk_transform(
     int32_t* __restrict__ dst_page_table,
     const int32_t* __restrict__ src_page_table) {
   const auto tid = threadIdx.x;
-  for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+  for (auto i = tid; i < kTopK; i += kThreadsPerBlock) {
     dst_page_table[i] = (i < length) ? src_page_table[i] : -1;
   }
 }
@@ -52,7 +52,7 @@ __device__ void naive_topk_transform_ragged(
     int32_t* __restrict__ topk_indices_ragged,
     int32_t offset) {
   const auto tid = threadIdx.x;
-  for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+  for (auto i = tid; i < kTopK; i += kThreadsPerBlock) {
     topk_indices_ragged[i] =
         (i < length) ? static_cast<int32_t>(i) + offset : -1;
   }
@@ -76,27 +76,27 @@ __device__ void fast_topk_cuda_tl(
     int* __restrict__ index,
     int row_start,
     int length) {
-  int topk = TopK;
-  constexpr auto BLOCK_SIZE = 1024;
-  constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE =
+  int topk = kTopK;
+  constexpr auto kBlockSize = 1024;
+  constexpr auto kRadix = 256;
+  constexpr auto kSmemInputSize =
       static_cast<int>(kSmem / (2 * sizeof(int)));
 
-  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+  alignas(128) __shared__ int s_histogram_buf[2][kRadix + 128];
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
 
   auto& s_histogram = s_histogram_buf[0];
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+  extern __shared__ int s_input_idx[][kSmemInputSize];
 
   const int tx = threadIdx.x;
 
   // stage 1: 8bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  if (tx < kRadix + 1) s_histogram[tx] = 0;
   __syncthreads();
 
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+  for (int idx = tx; idx < length; idx += kBlockSize) {
     const auto bin = convert_to_uint8(input[idx + row_start]);
     ::atomicAdd(&s_histogram[bin], 1);
   }
@@ -105,12 +105,12 @@ __device__ void fast_topk_cuda_tl(
   const auto run_cumsum = [&] {
 #pragma unroll 8
     for (int i = 0; i < 8; ++i) {
-      static_assert(1 << 8 == RADIX);
-      if (__builtin_expect(tx < RADIX, 1)) {
+      static_assert(1 << 8 == kRadix);
+      if (__builtin_expect(tx < kRadix, 1)) {
         const auto j = 1 << i;
         const auto k = i & 1;
         auto value = s_histogram_buf[k][tx];
-        if (tx < RADIX - j) {
+        if (tx < kRadix - j) {
           value += s_histogram_buf[k][tx + j];
         }
         s_histogram_buf[k ^ 1][tx] = value;
@@ -120,7 +120,7 @@ __device__ void fast_topk_cuda_tl(
   };
 
   run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+  if (tx < kRadix && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
     s_threshold_bin_id = tx;
     s_num_input[0] = 0;
     s_counter = 0;
@@ -131,7 +131,7 @@ __device__ void fast_topk_cuda_tl(
   topk -= s_histogram[threshold_bin + 1];
 
   if (topk == 0) {
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    for (int idx = tx; idx < length; idx += kBlockSize) {
       const auto bin =
           static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
@@ -143,12 +143,12 @@ __device__ void fast_topk_cuda_tl(
     return;
   } else {
     __syncthreads();
-    if (tx < RADIX + 1) {
+    if (tx < kRadix + 1) {
       s_histogram[tx] = 0;
     }
     __syncthreads();
 
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    for (int idx = tx; idx < length; idx += kBlockSize) {
       const auto raw_input = input[idx + row_start];
       const auto bin =
           static_cast<int>(convert_to_uint8(raw_input));
@@ -157,7 +157,7 @@ __device__ void fast_topk_cuda_tl(
         index[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
+        if (__builtin_expect(pos < kSmemInputSize, 1)) {
           s_input_idx[0][pos] = idx;
           const auto bin2 = convert_to_uint32(raw_input);
           const auto sub_bin = (bin2 >> 24) & 0xFF;
@@ -175,12 +175,12 @@ __device__ void fast_topk_cuda_tl(
     const auto r_idx = round % 2;
 
     const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE))
+    const auto num_input = (_raw_num_input < int(kSmemInputSize))
                                ? _raw_num_input
-                               : int(SMEM_INPUT_SIZE);
+                               : int(kSmemInputSize);
 
     run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    if (tx < kRadix && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
       s_threshold_bin_id = tx;
       s_num_input[r_idx ^ 1] = 0;
       s_last_remain = topk - s_histogram[tx + 1];
@@ -191,7 +191,7 @@ __device__ void fast_topk_cuda_tl(
     topk -= s_histogram[threshold_bin + 1];
 
     if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+      for (int i = tx; i < num_input; i += kBlockSize) {
         const auto idx = s_input_idx[r_idx][i];
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) &
@@ -205,11 +205,11 @@ __device__ void fast_topk_cuda_tl(
       break;
     } else {
       __syncthreads();
-      if (tx < RADIX + 1) {
+      if (tx < kRadix + 1) {
         s_histogram[tx] = 0;
       }
       __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+      for (int i = tx; i < num_input; i += kBlockSize) {
         const auto idx = s_input_idx[r_idx][i];
         const auto raw_input = input[idx + row_start];
         const auto offset = 24 - round * 8;
@@ -222,11 +222,11 @@ __device__ void fast_topk_cuda_tl(
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
-              index[TopK - pos] = idx;
+              index[kTopK - pos] = idx;
             }
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
+            if (__builtin_expect(pos < kSmemInputSize, 1)) {
               s_input_idx[r_idx ^ 1][pos] = idx;
               const auto bin2 = convert_to_uint32(raw_input);
               const auto sub_bin = (bin2 >> (offset - 8)) & 0xFF;
@@ -246,9 +246,9 @@ void topk_kernel(const FastTopKParams params) {
   const auto row_start =
       params.row_starts == nullptr ? 0 : params.row_starts[bid];
   const auto length = params.lengths[bid];
-  const auto indice = params.indices + bid * TopK;
+  const auto indice = params.indices + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
-  if (length <= TopK) {
+  if (length <= kTopK) {
     return naive_topk_cuda(score, indice, length);
   } else {
     return fast_topk_cuda_tl(score, indice, row_start, length);
@@ -265,15 +265,15 @@ void topk_transform_decode_kernel(
   const auto tid = threadIdx.x;
   const auto length = params.lengths[bid];
   const auto src_page_entry = src_page_table + bid * src_stride;
-  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto dst_page_entry = dst_page_table + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
-  if (length <= TopK) {
+  if (length <= kTopK) {
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
-    __shared__ int s_indices[TopK];
+    __shared__ int s_indices[kTopK];
     fast_topk_cuda_tl(score, s_indices, 0, length);
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
+    static_assert(kTopK % kThreadsPerBlock == 0);
+    static_assert(kTopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     dst_page_entry[idx_0] = src_page_entry[s_indices[idx_0]];
     const auto idx_1 = tid + kThreadsPerBlock;
@@ -294,7 +294,7 @@ void topk_transform_prefill_kernel(
   const auto length = params.lengths[bid];
   const auto row_start =
       params.row_starts == nullptr ? 0 : params.row_starts[bid];
-  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto dst_page_entry = dst_page_table + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
 
   __shared__ const int32_t* s_src_page_entry;
@@ -316,13 +316,13 @@ void topk_transform_prefill_kernel(
   __syncthreads();
   const auto src_page_entry = s_src_page_entry;
 
-  if (length <= TopK) {
+  if (length <= kTopK) {
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
-    __shared__ int s_indices[TopK];
+    __shared__ int s_indices[kTopK];
     fast_topk_cuda_tl(score, s_indices, row_start, length);
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
+    static_assert(kTopK % kThreadsPerBlock == 0);
+    static_assert(kTopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     dst_page_entry[idx_0] = src_page_entry[s_indices[idx_0]];
     const auto idx_1 = tid + kThreadsPerBlock;
@@ -340,17 +340,17 @@ void topk_transform_prefill_ragged_kernel(
   const auto row_start =
       params.row_starts == nullptr ? 0 : params.row_starts[bid];
   const auto length = params.lengths[bid];
-  const auto dst_indices_entry = topk_indices_ragged + bid * TopK;
+  const auto dst_indices_entry = topk_indices_ragged + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
   const auto offset = topk_indices_offset[bid];
 
-  if (length <= TopK) {
+  if (length <= kTopK) {
     return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
   } else {
-    __shared__ int s_indices[TopK];
+    __shared__ int s_indices[kTopK];
     fast_topk_cuda_tl(score, s_indices, row_start, length);
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
+    static_assert(kTopK % kThreadsPerBlock == 0);
+    static_assert(kTopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     dst_indices_entry[idx_0] = s_indices[idx_0] + offset;
     const auto idx_1 = tid + kThreadsPerBlock;
