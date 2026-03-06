@@ -212,10 +212,9 @@ def fused_marlin_moe(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    if intermediate_cache3.numel() > 0:
-        moe_sum_reduce(
-            intermediate_cache3,
-            output,
-            routed_scaling_factor,
-        )
+    moe_sum_reduce(
+        intermediate_cache3,
+        output,
+        routed_scaling_factor,
+    )
     return output
