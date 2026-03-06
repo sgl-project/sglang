@@ -283,9 +283,9 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 
-            _enable_ps = self.enable_priority_scheduling
+            priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, _enable_ps
+                self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -300,19 +300,19 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, _enable_ps
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, _enable_ps
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, _enable_ps
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, _enable_ps
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
             # Others
@@ -436,9 +436,11 @@ class SchedulerMetricsMixin:
 
         logger.info(msg)
         if self.enable_metrics:
-            _enable_ps = self.enable_priority_scheduling
+            priority_enabled = self.enable_priority_scheduling
             # Basics
-            self.stats.num_running_reqs = QueueCount.from_reqs(batch.reqs, _enable_ps)
+            self.stats.num_running_reqs = QueueCount.from_reqs(
+                batch.reqs, priority_enabled
+            )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -449,7 +451,7 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, _enable_ps
+                self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -468,17 +470,17 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, _enable_ps
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, _enable_ps
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, _enable_ps
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, _enable_ps
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]

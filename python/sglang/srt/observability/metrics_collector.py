@@ -758,22 +758,23 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-    def _log_gauge(self, gauge: Gauge, data: Union[int, float, QueueCount]) -> None:
-        # Convenience function for logging to gauge.
-        if isinstance(data, QueueCount):
-            # NOTE: When priority scheduling is enabled, the total is recorded under
-            # priority="" (the default label value). Per-priority breakdowns are recorded
-            # with priority="<int>". Grafana queries should use priority="" for totals.
-            gauge.labels(**self.labels).set(data.total)
-            if data.by_priority is not None:
-                self._known_priorities.update(data.by_priority.keys())
-                for priority in self._known_priorities:
-                    value = data.by_priority.get(priority, 0)
-                    labels = dict(self.labels)
-                    labels["priority"] = str(priority)
-                    gauge.labels(**labels).set(value)
-        else:
-            gauge.labels(**self.labels).set(data)
+    def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging a scalar to gauge.
+        gauge.labels(**self.labels).set(data)
+
+    def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
+        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
+        # NOTE: When priority scheduling is enabled, the total is recorded under
+        # priority="" (the default label value). Per-priority breakdowns are recorded
+        # with priority="<int>". Grafana queries should use priority="" for totals.
+        gauge.labels(**self.labels).set(data.total)
+        if data.by_priority is not None:
+            self._known_priorities.update(data.by_priority.keys())
+            for priority in self._known_priorities:
+                value = data.by_priority.get(priority, 0)
+                labels = dict(self.labels)
+                labels["priority"] = str(priority)
+                gauge.labels(**labels).set(value)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -900,7 +901,7 @@ class SchedulerMetricsCollector:
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
+        self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(
@@ -910,7 +911,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
@@ -924,16 +925,16 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
         # Retract
