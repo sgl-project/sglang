@@ -1861,8 +1861,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
-            print(f"[DEBUG] [Warmup] model_info={model_info}")
-            print(f"[DEBUG] [Warmup] request_name={request_name}")
+            # TODO: Temporarily set request_name = "/generate" to test Qwen 3.5 INT4
             request_name = "/generate"
             json_data = {
                 "sampling_params": {
