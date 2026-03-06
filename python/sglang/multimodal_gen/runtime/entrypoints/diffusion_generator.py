@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
+import dataclasses
 import multiprocessing as mp
 import os
 import time
@@ -165,15 +166,21 @@ class DiffGenerator:
         """
         # 1. prepare requests
         prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
-        sampling_params = SamplingParams.from_user_sampling_params_args(
+        sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
         requests: list[Req] = []
         for p in prompts:
-            sampling_params.prompt = p
+            sampling_params = dataclasses.replace(
+                sampling_params_orig,
+                prompt=p,
+                output_file_name=user_output_file_name,
+            )
+            sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
