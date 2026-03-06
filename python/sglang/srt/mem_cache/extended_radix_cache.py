@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 class ExtendedRadixCache(BasePrefixCache):
-    """RadixCache decorator with external KV storage connector.
-    """
+    """RadixCache decorator with external KV storage connector."""
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -112,7 +112,7 @@ class ExtendedRadixCache(BasePrefixCache):
             return device_match_result
 
         token_mask = torch.zeros(len(key), dtype=torch.bool)
-        token_mask[device_indices.numel():] = True
+        token_mask[device_indices.numel() :] = True
 
         new_hit_length = self._connector.get_new_hit_length(
             token_ids=key.token_ids,
@@ -138,7 +138,9 @@ class ExtendedRadixCache(BasePrefixCache):
 
         host_hit_length = req.host_hit_length
 
-        if host_hit_length <= 0 or (mem_quota is not None and host_hit_length > mem_quota):
+        if host_hit_length <= 0 or (
+            mem_quota is not None and host_hit_length > mem_quota
+        ):
             self._connector.cancel_load_task(req.rid)
             return
 
@@ -169,7 +171,9 @@ class ExtendedRadixCache(BasePrefixCache):
         new_node.key = key
         new_node.value = device_indices
         new_node.parent = last_node
-        last_node.children[self._inner_radixtree.get_child_key_fn(new_node.key)] = new_node
+        last_node.children[self._inner_radixtree.get_child_key_fn(new_node.key)] = (
+            new_node
+        )
         self._inner_radixtree.evictable_size_ += len(device_indices)
         self._inner_radixtree._record_store_event(new_node)
 

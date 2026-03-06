@@ -9,7 +9,6 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
-    Tuple,
     runtime_checkable,
 )
 
