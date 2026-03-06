@@ -137,14 +137,8 @@ def fp4_gemm(
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
-        # Pre-zero the output buffer to work around a CUTLASS SM120 kernel bug
-        # where certain output tiles are intermittently not written, leaving
-        # uninitialized memory (NaN).  See: flashinfer-ai/flashinfer#2708
-        out = torch.zeros(
-            input.shape[0], int(out_features), device=input.device, dtype=out_dtype
-        )
         return flashinfer_fp4_gemm(
-            input, weight, input_sf, weight_sf, alpha, out_dtype, out=out, backend=backend
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
     else:
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
