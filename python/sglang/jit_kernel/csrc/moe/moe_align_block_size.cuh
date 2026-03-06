@@ -180,14 +180,14 @@ void moe_align_block_size(
 
   const int32_t scan_size = static_cast<int32_t>(next_pow2(static_cast<uint32_t>(num_experts)));
 
-  constexpr int threads = 1024;
+  constexpr int kThreads = 1024;
 
-  RuntimeCheck(scan_size <= threads, "moe_align_block_size: num_experts too large for single-pass scan, got ", num_experts);
+  RuntimeCheck(scan_size <= kThreads, "moe_align_block_size: num_experts too large for single-pass scan, got ", num_experts);
 
   const size_t shared_mem_size =
       (num_experts + (num_experts + 1) + scan_size + kWarpSize) * sizeof(int32_t);
 
-  LaunchKernel(dim3(2), dim3(threads), dev, shared_mem_size)(
+  LaunchKernel(dim3(2), dim3(kThreads), dev, shared_mem_size)(
       moe_align_block_size_kernel<int32_t>,
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(sorted_token_ids.data_ptr()),
@@ -201,10 +201,10 @@ void moe_align_block_size(
       scan_size,
       static_cast<int32_t>(max_num_tokens_padded));
 
-  constexpr int block_threads = 256;
-  const int64_t num_blocks_sort = std::min((numel + block_threads - 1) / block_threads, (int64_t)65535);
+  constexpr int kBlockThreads = 256;
+  const int64_t num_blocks_sort = std::min((numel + kBlockThreads - 1) / kBlockThreads, (int64_t)65535);
 
-  LaunchKernel(dim3(static_cast<unsigned>(num_blocks_sort)), dim3(block_threads), dev)(
+  LaunchKernel(dim3(static_cast<unsigned>(num_blocks_sort)), dim3(kBlockThreads), dev)(
       count_and_sort_expert_tokens_kernel<int32_t>,
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(sorted_token_ids.data_ptr()),
