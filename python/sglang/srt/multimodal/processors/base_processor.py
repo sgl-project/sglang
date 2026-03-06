@@ -385,8 +385,7 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
-        # Lazy import because decord is not available on some arm platforms.
-        from decord import VideoReader, cpu
+        from torchcodec.decoders import VideoDecoder
 
         # Before processing inputs
         if not image_data or len(image_data) == 0:
@@ -396,7 +395,7 @@ class BaseMultimodalProcessor(ABC):
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
                 # Estimate frames for the video
-                vr = VideoReader(path, ctx=cpu(0))
+                vr = VideoDecoder(path, dimension_order="NHWC")
                 num_frames = len(vr)
             else:
                 # For images, each contributes one frame

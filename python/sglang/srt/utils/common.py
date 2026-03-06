@@ -97,7 +97,7 @@ from sglang.srt.observability.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
-    from decord import VideoReader
+    from torchcodec.decoders import VideoDecoder
 
     from sglang.srt.server_args import ServerArgs
 
@@ -951,74 +951,44 @@ def get_image_bytes(image_file: Union[str, bytes]):
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
-    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from decord import VideoReader, cpu, gpu
+    if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+        return video_file
+    # We use torchcodec instead of decord here for a more stable video loading
+    from torchcodec.decoders import VideoDecoder
 
-    try:
-        from decord.bridge import decord_bridge
-
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
-    except Exception:
-        ctx = cpu(0)
-
-    tmp_file = None
     vr = None
-    try:
-        if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, str):
-            if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("file://"):
-                video_file = unquote(urlparse(video_file).path)
-                vr = VideoReader(video_file, ctx=ctx)
-            # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(unquote(urlparse(video_file).path)):
-                vr = VideoReader(video_file, ctx=ctx)
-            else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
-            vr = video_file
+    if isinstance(video_file, bytes):
+        pass
+    elif isinstance(video_file, str):
+        if video_file.startswith(("http://", "https://")):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            response = requests.get(video_file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            video_file = response.content
+        elif video_file.startswith("data:"):
+            _, encoded = video_file.split(",", 1)
+            video_file = pybase64.b64decode(encoded, validate=True)
+        elif video_file.startswith("file://"):
+            video_file = unquote(urlparse(video_file).path)
+        # `urlparse` supports file:// paths, and so does VideoDecoder
+        elif os.path.isfile(unquote(urlparse(video_file).path)):
+            pass
         else:
-            raise ValueError(f"Unsupported video input type: {type(video_file)}")
-
-        return vr
-
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+            video_file = pybase64.b64decode(video_file, validate=True)
+    else:
+        raise ValueError(f"Unsupported video input type: {type(video_file)}")
+    vr=VideoDecoder(video_file, dimension_order="NHWC")
+    return vr
 
 
 def sample_video_frames(
-    video: "VideoReader", *, desired_fps: int, max_frames: int
+    video: "VideoDecoder", *, desired_fps: int, max_frames: int
 ) -> list[int]:
     total_frames = len(video)
     assert total_frames > 0, "Video must have at least one frame"
 
-    duration = total_frames / video.get_avg_fps()
-    fps = min(desired_fps, video.get_avg_fps())
+    duration = total_frames / video.metadata.average_fps
+    fps = min(desired_fps, video.metadata.average_fps)
 
     num_frames = math.floor(duration * fps)
     num_frames = min(max_frames, num_frames, total_frames)
@@ -1030,8 +1000,7 @@ def sample_video_frames(
 
 
 def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
+    from torchcodec.decoders import VideoDecoder
 
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
@@ -1045,13 +1014,13 @@ def encode_video(video_path, frame_count_limit=None):
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    vr = VideoDecoder(video_path,dimension_order="NHWC")
+    sample_fps = round(vr.metadata.average_fps / 1)  # FPS
     frame_indices = [i for i in range(0, len(vr), sample_fps)]
     if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
         frame_indices = uniform_sample(frame_indices, frame_count_limit)
 
-    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = vr.get_frames_at(frame_indices).data.asnumpy()
     frames = [Image.fromarray(v.astype("uint8")) for v in frames]
     return frames
 

@@ -7,7 +7,7 @@ from typing import List, Union
 import numpy as np
 import torch
 import torchvision
-from decord import VideoReader
+from torchcodec.decoders import VideoDecoder
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
@@ -156,18 +156,17 @@ async def preprocess_video(
     video_config: dict = {},
 ) -> torch.Tensor:
     # preprocessed video
-    if not isinstance(vr, VideoReader):
+    if not isinstance(vr, VideoDecoder):
         return vr
     entry_time = time.perf_counter()
 
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    total_frames, video_fps = len(vr), vr.metadata.average_fps
     nframes = smart_nframes(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
-    idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
+    idx = np.unique(idx).tolist()
+    video = vr.get_frames_at(idx).data.pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
     nframes, _, height, width = video.shape
