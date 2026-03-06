@@ -74,9 +74,9 @@ try:
         try:
             from flashinfer import fp4_quantize
         except ImportError:
-            from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
     else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
 except ImportError:
     fp4_quantize = None
 
@@ -87,7 +87,7 @@ try:
     enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
-        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+        from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None

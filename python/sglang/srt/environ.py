@@ -422,6 +422,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
+    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
