@@ -258,6 +258,117 @@ EOF
 | `non-gpu-H_D_memops` high | Accidental CPU offload or `.cpu()` calls mid-denoising |
 | `CPU(non-GPU)` high | Python dispatch overhead / torch.compile graph breaks |
 
+### Step 3.5: Per-Kernel Deep Analysis (Level 3 — ncu)
+
+**CRITICAL**: `ncu` (Nsight Compute) is the essential tool for kernel-level optimization. While nsys and torch.profiler tell you **which** kernels are slow, only ncu tells you **why** — memory bandwidth utilization, compute throughput, occupancy limiters, warp stall reasons, and roofline position. **Always use ncu when optimizing or writing custom kernels.**
+
+#### When to use ncu
+
+- After writing a new Triton or CUDA kernel — verify it saturates hardware bandwidth
+- When a kernel shows up as a top bottleneck in Level 1/2 profiling
+- When comparing your fused kernel vs PyTorch baseline or torch.compile output
+- When tuning Triton autotune configs (block sizes, num_warps)
+
+#### Basic ncu workflow
+
+```bash
+# 1. Profile a specific kernel by name (skip warmup launches, collect 3 invocations)
+ncu --kernel-name "_fused_gated_residual_add_kernel" \
+    --launch-skip 10 --launch-count 3 \
+    --set full \
+    -o /workspace/ncu_reports/gated_residual \
+    sglang generate \
+      --model-path=black-forest-labs/FLUX.1-dev \
+      --prompt="test" --width=1024 --height=1024 \
+      --num-inference-steps=5 --seed=42
+
+# 2. Profile all kernels in a short run (use few steps to limit time)
+ncu --launch-skip 50 --launch-count 200 \
+    --set full \
+    -o /workspace/ncu_reports/all_kernels \
+    sglang generate \
+      --model-path=black-forest-labs/FLUX.1-dev \
+      --prompt="test" --width=1024 --height=1024 \
+      --num-inference-steps=3 --seed=42
+
+# 3. For CUDA graph mode, use --graph-profiling=node to profile inside the graph
+ncu --graph-profiling node \
+    --kernel-name "_fused_gated_residual_add_kernel" \
+    --launch-skip 5 --launch-count 3 \
+    --set full \
+    -o /workspace/ncu_reports/gated_residual_cudagraph \
+    sglang generate \
+      --model-path=black-forest-labs/FLUX.1-dev \
+      --prompt="test" --width=1024 --height=1024 \
+      --num-inference-steps=5 --seed=42 \
+      --enable-piecewise-cuda-graph
+```
+
+#### Reading ncu results (CLI, no GUI needed)
+
+```bash
+# Summary of all profiled kernels
+ncu --import /workspace/ncu_reports/gated_residual.ncu-rep --page raw --csv 2>/dev/null | head -50
+
+# Key metrics to extract:
+ncu --import /workspace/ncu_reports/gated_residual.ncu-rep \
+    --page details --csv 2>/dev/null | python3 -c "
+import csv, sys
+reader = csv.DictReader(sys.stdin)
+key_metrics = [
+    'gpu__time_duration.avg',           # Kernel duration
+    'sm__throughput.avg.pct_of_peak_sustained_elapsed',  # SM utilization
+    'dram__throughput.avg.pct_of_peak_sustained_elapsed', # DRAM bandwidth util
+    'l1tex__throughput.avg.pct_of_peak_sustained_elapsed', # L1 throughput
+    'sm__warps_active.avg.pct_of_peak_sustained_active',  # Achieved occupancy
+    'launch__occupancy_limit_registers',   # Occupancy limiter
+    'launch__occupancy_limit_shared_mem',
+]
+for row in reader:
+    name = row.get('Metric Name', '')
+    if any(m in name for m in key_metrics):
+        print(f'{name:<60} {row.get(\"Metric Value\",\"\")}')
+"
+```
+
+#### Interpreting ncu results for kernel optimization
+
+| Metric | Good | Action if bad |
+|--------|------|--------------|
+| DRAM throughput > 80% peak | Memory-bound, near optimal | Already saturating HBM — fuse with adjacent ops to reduce total memory traffic |
+| DRAM throughput < 50% peak | Not saturating memory bandwidth | Check coalescing, increase vector width, tune BLOCK sizes |
+| SM throughput > 60% peak | Compute-bound, near optimal | Reduce arithmetic, use faster instructions (e.g., FMA) |
+| SM throughput < 30% peak | Underutilized compute | Increase occupancy, reduce warp stalls, check instruction mix |
+| Achieved occupancy > 50% | Acceptable for most kernels | — |
+| Achieved occupancy < 25% | Too few active warps | Reduce register pressure or shared memory; increase block size |
+
+#### Comparing before/after with ncu
+
+```bash
+# Profile baseline kernel
+ncu --kernel-name "vectorized_elementwise_kernel" \
+    --launch-skip 10 --launch-count 3 --set full \
+    -o /workspace/ncu_reports/baseline ./program
+
+# Profile optimized kernel
+ncu --kernel-name "_fused_gated_residual_add_kernel" \
+    --launch-skip 10 --launch-count 3 --set full \
+    -o /workspace/ncu_reports/optimized ./program
+
+# Compare key metrics
+for report in baseline optimized; do
+  echo "=== $report ==="
+  ncu --import /workspace/ncu_reports/${report}.ncu-rep \
+      --page details --csv 2>/dev/null | grep -E "time_duration|throughput.*pct|occupancy"
+done
+```
+
+**Decision rule after ncu analysis:**
+- Kernel already at >80% DRAM bandwidth → fuse with neighbors to reduce total traffic
+- Kernel at <50% DRAM bandwidth → tune block sizes, fix coalescing, increase vectorization
+- Kernel compute-bound (SM util high, DRAM low) → reduce FLOPs or switch to a faster algorithm
+- Low occupancy → reduce registers (simplify kernel) or increase block size in autotune configs
+
 ### Step 4: Apply Kernel Optimization
 
 After pinpointing the slow op, choose the right tool:
@@ -309,16 +420,23 @@ TORCH_COMPILE_DEBUG=1 sglang generate ...
    → result.csv category breakdown (gemm / attn / adaln / norm / triton / cpu)
    → confirm where GPU time is concentrated
        ↓
-4. KERNEL OPTIMIZATION
+4. LEVEL 3 PROFILE (ncu — per-kernel deep analysis) ★ CRITICAL
+   → ncu --set full on target kernel(s)
+   → extract DRAM bandwidth util, SM throughput, achieved occupancy
+   → determine if kernel is memory-bound, compute-bound, or latency-bound
+   → for CUDA graph: use --graph-profiling node
+       ↓
+5. KERNEL OPTIMIZATION
    Existing fused kernel?  → use-efficient-diffusion-kernels.md
    New Triton kernel?      → add-triton-kernel.md
    New CUDA JIT kernel?    → add-cuda-kernel.md
+   After writing kernel    → ncu again to verify bandwidth/occupancy ★
        ↓
-5. VERIFY CORRECTNESS
+6. VERIFY CORRECTNESS
    sglang generate --seed=42 --save-output → diff against reference
    If output differs beyond tolerance → reject optimization
        ↓
-6. RE-BENCHMARK
+7. RE-BENCHMARK
    Verify denoise latency improvement; no regression on other models
 ```
 

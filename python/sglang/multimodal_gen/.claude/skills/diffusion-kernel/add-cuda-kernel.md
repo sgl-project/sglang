@@ -498,10 +498,9 @@ ncu --set full --launch-skip 3 --launch-count 3 \
 To confirm the kernel name (used by `--kernel-name` filter), run without `-o` first:
 
 ```bash
-# List all launched CUDA kernels
-ncu --query-metrics-mode trace \
-    python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py 2>&1 \
-  | grep "kernel_name\|rmsnorm_kernel\|silu_gate_kernel"
+# List all launched CUDA kernels (minimal profiling, no --set)
+ncu python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py 2>&1 \
+  | grep "==PROF== Profiling" | sed 's/.*Profiling "\(.*\)".*/\1/'
 ```
 
 Then filter to only your kernel:
@@ -571,16 +570,22 @@ ncu --set full --launch-skip 1 --launch-count 1 \
     -o /tmp/optimized \
     python python/sglang/jit_kernel/benchmark/bench_diffusion_<op_name>.py
 
-# Diff — no GUI needed
-ncu --import /tmp/baseline.ncu-rep \
-    --import /tmp/optimized.ncu-rep \
-    --page diff --csv > /tmp/diff_<op_name>.csv
+# Diff — export both to CSV, then compare with Python (no GUI needed)
+# Note: --import can only be specified once; --page diff is not valid.
+ncu --import /tmp/baseline.ncu-rep --page details --csv > /tmp/baseline_details.csv
+ncu --import /tmp/optimized.ncu-rep --page details --csv > /tmp/optimized_details.csv
 
 python3 -c "
 import csv
-rows = list(csv.DictReader(open('/tmp/diff_<op_name>.csv')))
-for r in rows[:30]:
-    print(r.get('Metric Name','')[:60], r.get('Baseline',''), '->', r.get('Comparison',''))
+def load(p):
+    return {r.get('Metric Name',''): r.get('Metric Value','')
+            for r in csv.DictReader(open(p))}
+b = load('/tmp/baseline_details.csv')
+o = load('/tmp/optimized_details.csv')
+for k in sorted(set(b) | set(o)):
+    bv, ov = b.get(k,''), o.get(k,'')
+    if bv != ov:
+        print(f'{k[:60]:<60} {bv} -> {ov}')
 "
 ```
 

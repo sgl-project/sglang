@@ -366,9 +366,9 @@ python python/sglang/jit_kernel/benchmark/bench_<op_name>.py
 
 ---
 
-## Step 6: Profile with Nsight Compute (optional but recommended)
+## Step 6: Profile with Nsight Compute (required for optimization work)
 
-After the kernel passes correctness tests, use **`nsight-profiler.md`** to measure its hardware-level efficiency. This step requires **Nsight Compute (`ncu`)** to be installed.
+After the kernel passes correctness tests, use **ncu** (Nsight Compute) to measure hardware-level efficiency. **This step is mandatory when the kernel targets a performance bottleneck** — without ncu data you cannot know if the kernel saturates memory bandwidth, has low occupancy, or is compute-bound. Only skip this for trivial utility kernels that are not on the critical path.
 
 ### Dependency Check
 
@@ -447,16 +447,22 @@ ncu --set full --launch-skip 2 --launch-count 1 \
 ncu --set full --launch-skip 2 --launch-count 1 \
     -o /tmp/optimized python .../bench_<op_name>.py
 
-# Diff (CSV, no GUI)
-ncu --import /tmp/baseline.ncu-rep \
-    --import /tmp/optimized.ncu-rep \
-    --page diff --csv > /tmp/diff_<op_name>.csv
+# Diff — export both to CSV, then compare with Python (no GUI needed)
+# Note: --import can only be specified once; --page diff is not valid.
+ncu --import /tmp/baseline.ncu-rep --page details --csv > /tmp/baseline_details.csv
+ncu --import /tmp/optimized.ncu-rep --page details --csv > /tmp/optimized_details.csv
 
 python3 -c "
 import csv
-rows = list(csv.DictReader(open('/tmp/diff_<op_name>.csv')))
-for r in rows[:30]:
-    print(r.get('Metric Name','')[:55], r.get('Baseline',''), '->', r.get('Comparison',''))
+def load(p):
+    return {r.get('Metric Name',''): r.get('Metric Value','')
+            for r in csv.DictReader(open(p))}
+b = load('/tmp/baseline_details.csv')
+o = load('/tmp/optimized_details.csv')
+for k in sorted(set(b) | set(o)):
+    bv, ov = b.get(k,''), o.get(k,'')
+    if bv != ov:
+        print(f'{k[:55]:<55} {bv} -> {ov}')
 "
 ```
 
