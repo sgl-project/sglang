@@ -112,6 +112,4 @@ def test_awq_marlin_moe_repack_shape(
 
 
 if __name__ == "__main__":
-    import subprocess
-
-    subprocess.call(["pytest", "--tb=short", str(__file__)])
+    pytest.main([__file__, "-v", "-s"])

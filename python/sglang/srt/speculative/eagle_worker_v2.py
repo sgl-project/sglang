@@ -44,10 +44,11 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
+    maybe_detect_nan,
+    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -387,6 +388,9 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
@@ -427,10 +431,15 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -447,6 +456,12 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -465,6 +480,7 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -498,7 +514,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
+        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -556,6 +575,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
 
+        maybe_detect_nan(
+            draft_logits_output.next_token_logits,
+            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+        )
+
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
@@ -598,7 +622,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -668,6 +691,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         model_worker_batch,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
+                        batch_output.logits_output.mm_input_embeds,
                     )
                 )
                 return batch_output
@@ -777,14 +801,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
+
+        # Update mamba state for hybrid GDN models after verification
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+        ):
+            self._mamba_verify_update(
+                batch, verify_input, accept_length, accept_index, bs
+            )
+
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
@@ -814,6 +847,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _mamba_verify_update(
+        self,
+        batch: ModelWorkerBatch,
+        verify_input: EagleVerifyInput,
+        accept_length: torch.Tensor,
+        accept_index: torch.Tensor,
+        bs: int,
+    ):
+        """Update mamba state for hybrid GDN models after verification."""
+        # Calculate accepted_steps for mamba state update
+        # Include the bonus token (+1)
+        accepted_length_with_bonus = accept_length
+        if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+            if verify_input.topk != 1:
+                raise ValueError("Spec v2 currently only supports topk = 1.")
+
+            accepted_indices_offset = torch.arange(
+                0,
+                bs * self.speculative_num_draft_tokens,
+                step=self.speculative_num_draft_tokens,
+                dtype=accepted_length_with_bonus.dtype,
+                device=accepted_length_with_bonus.device,
+            )
+            accepted_steps = accepted_length_with_bonus - 1
+
+            if batch.mamba_track_indices is not None:
+                # If after verify, the request's seq_lens has crossed a mamba track interval,
+                # we need to update the mamba state for the request at the crossing point.
+                seq_lens_pre_verify = batch.seq_lens
+                seq_lens_post_verify = batch.seq_lens + accepted_length_with_bonus
+                mamba_track_interval = self.server_args.mamba_track_interval
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                ).to(torch.int64)
+                req_idx = torch.arange(
+                    bs,
+                    dtype=torch.int64,
+                    device=accepted_length_with_bonus.device,
+                )
+                candidate_track_steps = (
+                    accept_index[req_idx, to_track_ith] - accepted_indices_offset
+                )
+                mamba_steps_to_track = torch.where(
+                    to_track_mask,
+                    candidate_track_steps,
+                    torch.full_like(candidate_track_steps, -1),
+                )
+            else:
+                mamba_steps_to_track = None
+
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_steps=accepted_steps,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=self.target_worker.model_runner.model,
+            )
 
     def move_accepted_tokens_to_target_kvcache(
         self,
