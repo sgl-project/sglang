@@ -17,9 +17,13 @@ class FluxSamplingParams(SamplingParams):
     def __post_init__(self):
         default_sample_size = 128
         vae_scale_factor = 8
-        # FIXME
-        # self.height = default_sample_size * vae_scale_factor
-        # self.width = default_sample_size * vae_scale_factor
+        if self.height is None:
+            self.height_not_provided = True
+            self.height = default_sample_size * vae_scale_factor
+        if self.width is None:
+            self.width_not_provided = True
+            self.width = default_sample_size * vae_scale_factor
+        super().__post_init__()
 
 
 @dataclass

@@ -50,3 +50,5 @@ class DiffusersGenericSamplingParams(SamplingParams):
         if self.height is None:
             self.height_not_provided = True
             self.height = 1024
+        
+        super().__post_init__()
