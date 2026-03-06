@@ -868,6 +868,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or (
                 self.server_args.enable_hierarchical_cache
                 and self.server_args.hicache_storage_backend == "mooncake"
+                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
             )
             or (
                 self.server_args.encoder_only
