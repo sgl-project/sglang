@@ -336,9 +336,9 @@ class ModelRunnerKVCacheMixin:
             f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
         )
 
-    def _calculate_mamba_ratio(self: ModelRunner) -> float:
+    def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
-            return 1.0
+            return 1
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
