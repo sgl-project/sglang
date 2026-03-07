@@ -81,6 +81,7 @@ class LayerwiseOffloadManager:
         except Exception:
             return None
 
+    @torch.compiler.disable
     def _get_placeholder(self, dtype: torch.dtype) -> torch.Tensor:
         placeholder = self._offload_placeholders.get(dtype)
         if placeholder is None:
