@@ -1,8 +1,7 @@
 """
 Benchmark: Streaming Session Inter-Turn Latency
 
-Measures per-turn latency across three modes as context grows:
-  - no_session:        re-send full context each turn (radix tree prefix match)
+Measures per-turn latency across two session modes as context grows:
   - regular_session:   session append (radix tree insert + match)
   - streaming_session: session append (O(1) KV direct transfer)
 
@@ -10,9 +9,9 @@ Each mode runs NUM_CONCURRENT parallel sessions, each doing NUM_TURNS sequential
 requests (16 input / 8 output per turn).
 
 Usage:
-    python -m pytest bench_session_latency.py -s
-    python -m unittest bench_session_latency.BenchSessionLatency.test_streaming_session
-    python -m unittest bench_session_latency.BenchSessionLatency
+    python -m pytest test_session_latency.py -s
+    python -m unittest test_session_latency.BenchSessionLatency.test_streaming_session
+    python -m unittest test_session_latency.BenchSessionLatency
 """
 
 import time
@@ -130,38 +129,8 @@ def _record_turn(
 
 
 # ---------------------------------------------------------------------------
-# Single-session runners (called by worker threads)
+# Single-session runner (called by worker threads)
 # ---------------------------------------------------------------------------
-
-
-def _run_one_no_session(
-    base_url: str, tokenizer, chunks: List[List[int]]
-) -> ModeResult:
-    result = ModeResult(mode="no_session")
-    accumulated_ids: List[int] = []
-
-    for turn_idx, chunk_ids in enumerate(chunks):
-        accumulated_ids.extend(chunk_ids)
-
-        t0 = time.perf_counter()
-        response = _send_generate(
-            base_url,
-            {"input_ids": accumulated_ids, "sampling_params": SAMPLING_PARAMS},
-        )
-        client_lat = (time.perf_counter() - t0) * 1000
-
-        meta = response["meta_info"]
-        result.turns.append(
-            _record_turn(turn_idx, len(accumulated_ids), meta, client_lat)
-        )
-        result.outputs.append(response["text"])
-
-        output_ids = tokenizer.encode(response["text"])
-        if output_ids and output_ids[0] == tokenizer.bos_token_id:
-            output_ids = output_ids[1:]
-        accumulated_ids.extend(output_ids)
-
-    return result
 
 
 def _run_one_session(
@@ -337,18 +306,6 @@ class BenchSessionLatency(CustomTestCase):
             _print_summary(cls.all_results)
         kill_process_tree(cls.process.pid)
 
-    def _run_concurrent_no_session(self) -> List[ModeResult]:
-        requests.post(self.base_url + "/flush_cache")
-
-        def run_one(session_idx):
-            chunks = _generate_input_chunks(
-                self.tokenizer, NUM_TURNS, INPUT_LEN, offset=session_idx
-            )
-            return _run_one_no_session(self.base_url, self.tokenizer, chunks)
-
-        with ThreadPoolExecutor(max_workers=NUM_CONCURRENT) as pool:
-            return list(pool.map(run_one, range(NUM_CONCURRENT)))
-
     def _run_concurrent_session(self, streaming: bool = False) -> List[ModeResult]:
         requests.post(self.base_url + "/flush_cache")
 
@@ -365,11 +322,6 @@ class BenchSessionLatency(CustomTestCase):
     # Test methods
     # ------------------------------------------------------------------
 
-    def test_no_session(self):
-        results = self._run_concurrent_no_session()
-        self.__class__.all_results["no_session"] = results
-        _print_mode_table(results[0], label="session 0")
-
     def test_regular_session(self):
         results = self._run_concurrent_session(streaming=False)
         self.__class__.all_results["regular_session"] = results
@@ -382,6 +334,15 @@ class BenchSessionLatency(CustomTestCase):
 
         reg_list = self.__class__.all_results.get("regular_session")
         if reg_list:
+            reg_out = reg_list[0].outputs
+            stm_out = results[0].outputs
+            mismatches = sum(1 for a, b in zip(reg_out, stm_out) if a != b)
+            self.assertEqual(
+                mismatches,
+                0,
+                f"regular vs streaming (session 0): {mismatches}/{len(reg_out)} turns differ",
+            )
+
             reg_tail = _avg(_collect_latencies(reg_list, last_n=TAIL_TURNS))
             stm_tail = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
             speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
