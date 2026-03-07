@@ -32,6 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import uvloop
 import zmq
 import zmq.asyncio
@@ -683,7 +684,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
-            input_embeds = obj.input_embeds
+            # ndarray: faster pickle IPC + tensor construction downstream
+            input_embeds = np.asarray(obj.input_embeds, dtype=np.float32)
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
@@ -932,7 +934,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
         input_ids: List[int],
-        input_embeds: Optional[Union[List[float], None]] = None,
+        input_embeds: Optional[np.ndarray] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:

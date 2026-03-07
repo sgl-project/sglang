@@ -499,7 +499,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
-        input_embeds: Optional[List[List[float]]] = None,
+        input_embeds: Optional[np.ndarray] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
@@ -1513,8 +1513,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # If req.input_embeds is already a list, append its content directly
-                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+                # Collect per-request arrays; concatenate once at the end
+                input_embeds.append(req.input_embeds)
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1616,9 +1616,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
-            torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
+            torch.tensor(
+                np.concatenate([np.asarray(e, dtype=np.float32) for e in input_embeds]),
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
             if input_embeds
             else None
         )
