@@ -878,7 +878,9 @@ class SamplingParams:
             type=str,
             default=SamplingParams.frame_interpolation_model_path,
             help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
-            "(default: elfgum/RIFE-4.22.lite, downloaded automatically).",
+            "(default: elfgum/RIFE-4.22.lite, downloaded automatically). "
+            "Only RIFE 4.22.lite architecture is supported; other RIFE versions or "
+            "frame interpolation models are not compatible.",
         )
         parser.add_argument(
             "--enable-upscaling",
@@ -891,6 +893,8 @@ class SamplingParams:
             default=SamplingParams.upscaling_model_path,
             help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
             "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
+            "Only RRDBNet (e.g. RealESRGAN_x4plus) and SRVGGNetCompact (e.g. realesr-animevideov3) "
+            "architectures are supported; other super-resolution models are not compatible. "
             "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
         )
         parser.add_argument(

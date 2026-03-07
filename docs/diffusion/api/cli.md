@@ -41,83 +41,12 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
-**Frame Interpolation** (video only)
+**Post-Processing** (frame interpolation & upscaling)
 
-Frame interpolation is a post-processing step that synthesizes new frames
-between each pair of consecutive generated frames, producing smoother
-motion without re-running the diffusion model. The `--frame-interpolation-exp`
-flag controls how many rounds of interpolation to apply: each round inserts one
-new frame into every gap between adjacent frames, so the output frame count
-follows the formula **(N − 1) × 2^exp + 1** (e.g. 5 original frames with
-`exp=1` → 4 gaps × 1 new frame + 5 originals = **9** frames; with `exp=2` →
-**17** frames).
-
-- `--enable-frame-interpolation`: Enable frame interpolation. Model weights are downloaded automatically on first use.
-- `--frame-interpolation-exp {EXP}`: Interpolation exponent — `1` = 2× temporal resolution, `2` = 4×, etc. (default: `1`)
-- `--frame-interpolation-scale {SCALE}`: RIFE inference scale; use `0.5` for high-resolution inputs to save memory (default: `1.0`)
-- `--frame-interpolation-model-path {PATH}`: Local directory or HuggingFace repo ID containing RIFE `flownet.pkl` weights (default: `elfgum/RIFE-4.22.lite`, downloaded automatically)
-
-Example — generate a 5-frame video and interpolate to 9 frames ((5 − 1) × 2¹ + 1 = 9):
-
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --prompt "A dog running through a park" \
-  --num-frames 5 \
-  --enable-frame-interpolation \
-  --frame-interpolation-exp 1 \
-  --save-output
-```
-
-**Upscaling** (image and video)
-
-Upscaling is a post-processing step that increases the spatial resolution of
-generated images or video frames using [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN).
-The model weights are downloaded automatically on first use and cached for
-subsequent runs.
-
-- `--enable-upscaling`: Enable post-generation upscaling using Real-ESRGAN.
-- `--upscaling-scale {SCALE}`: Desired upscaling factor (default: `4`). The 4× model is used internally; if a different scale is requested, a bicubic resize is applied after the network output.
-- `--upscaling-model-path {PATH}`: Local `.pth` file, HuggingFace repo ID, or `repo_id:filename` for Real-ESRGAN weights (default: `ai-forever/Real-ESRGAN` with `RealESRGAN_x4.pth`, downloaded automatically). Use the `repo_id:filename` format to specify a custom weight file from a HuggingFace repo (e.g. `my-org/my-esrgan:weights.pth`).
-
-Example — generate a 1024×1024 image and upscale to 4096×4096:
-
-```bash
-sglang generate \
-  --model-path black-forest-labs/FLUX.2-dev \
-  --prompt "A cat sitting on a windowsill" \
-  --output-size 1024x1024 \
-  --enable-upscaling \
-  --save-output
-```
-
-Example — generate a video and upscale each frame by 4×:
-
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-  --prompt "A curious raccoon" \
-  --enable-upscaling \
-  --upscaling-scale 4 \
-  --save-output
-```
-
-Frame interpolation and upscaling can be combined in a single run. Interpolation
-is applied first (increasing the frame count), then upscaling is applied to every
-frame (increasing the spatial resolution). Example — generate 5 frames,
-interpolate to 9 frames, and upscale each frame by 4×:
-
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-  --prompt "A curious raccoon" \
-  --num-frames 5 \
-  --enable-frame-interpolation \
-  --frame-interpolation-exp 1 \
-  --enable-upscaling \
-  --upscaling-scale 4 \
-  --save-output
-```
+SGLang diffusion supports optional post-processing steps — frame interpolation
+(RIFE) for smoother video and upscaling (Real-ESRGAN) for higher resolution.
+See the dedicated **[Post-Processing](post_processing.md)** page for full
+details, supported models, and examples.
 
 **Output Options**
 
