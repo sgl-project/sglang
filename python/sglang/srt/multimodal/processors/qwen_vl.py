@@ -33,7 +33,7 @@ from sglang.utils import logger
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
+IMAGE_MAX_PIXELS_FALLBACK = envs.SGLANG_IMAGE_MAX_PIXELS.default
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
 if envs.SGLANG_RESIZE_RESAMPLE.is_set() and RESIZE_RESAMPLE is None:
@@ -53,12 +53,32 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 
 
+def configure_processor_max_pixels(processor) -> int:
+    """Resolve the effective max_pixels and write it back to the HF processor.
+
+    Priority: env var > HF preprocessor_config > SGLang fallback.
+    """
+    if envs.SGLANG_IMAGE_MAX_PIXELS.is_set():
+        max_pixels = envs.SGLANG_IMAGE_MAX_PIXELS.get()
+    else:
+        ip = getattr(processor, "image_processor", None)
+        max_pixels = getattr(ip, "max_pixels", None)
+        if max_pixels is None:
+            max_pixels = IMAGE_MAX_PIXELS_FALLBACK
+
+    # Write back so HF internals also use the resolved value.
+    ip = getattr(processor, "image_processor", None)
+    if ip is not None:
+        ip.max_pixels = max_pixels
+    return max_pixels
+
+
 def smart_resize(
     height: int,
     width: int,
     factor: int = IMAGE_FACTOR,
     min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
+    max_pixels: int = IMAGE_MAX_PIXELS_FALLBACK,
 ) -> tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
@@ -247,6 +267,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.image_max_pixels = configure_processor_max_pixels(self._processor)
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
