@@ -346,7 +346,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         workspace_buffer = None
         if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
-            if torch.cuda.is_available() and (not _is_npu()):
+            if torch.cuda.is_available() and (not _is_npu):
                 ws_device = torch.device("cuda", torch.cuda.current_device())
             else:
                 ws_device = self.device
@@ -732,7 +732,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if _is_npu():
+            if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
@@ -801,7 +801,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             sequence_lengths = None
             cu_seqlens = torch.from_numpy(token_cu_seqlens)
-            if not _is_npu():
+            if not _is_npu:
                 cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
             else:
                 cu_seqlens = cu_seqlens.to("cpu")
