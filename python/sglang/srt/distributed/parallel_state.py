@@ -2349,6 +2349,10 @@ class RankParallelismConfig:
     attn_tp_rank: int = 0
     attn_dp_size: int = 1
     attn_dp_rank: int = 0
+    attn_cp_size: int = 1
+    attn_cp_rank: int = 0
+    moe_dp_size: int = 1
+    moe_dp_rank: int = 0
 
     world_size: int = 1
     global_rank: int = 0
@@ -2363,6 +2367,16 @@ class RankParallelismConfig:
     def has_expert_parallelism(self) -> bool:
         """Check if expert parallelism is enabled."""
         return self.ep_size > 1
+
+    @property
+    def has_context_parallelism(self) -> bool:
+        """Check if context parallelism is enabled."""
+        return self.attn_cp_size > 1
+
+    @property
+    def has_moe_data_parallelism(self) -> bool:
+        """Check if MoE data parallelism is enabled."""
+        return self.moe_dp_size > 1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -2385,6 +2399,8 @@ class RankParallelismConfig:
 
         # Import dp_attention lazily to avoid circular imports
         from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
             get_attention_dp_rank,
             get_attention_dp_size,
             get_attention_tp_rank,
@@ -2404,6 +2420,10 @@ class RankParallelismConfig:
             attn_tp_rank=get_attention_tp_rank(),
             attn_dp_size=get_attention_dp_size(),
             attn_dp_rank=get_attention_dp_rank(),
+            attn_cp_size=get_attention_cp_size(),
+            attn_cp_rank=get_attention_cp_rank(),
+            moe_dp_size=get_moe_data_parallel_world_size(),
+            moe_dp_rank=get_moe_data_parallel_rank(),
             world_size=(
                 torch.distributed.get_world_size()
                 if torch.distributed.is_initialized()
@@ -2428,6 +2448,10 @@ class RankParallelismConfig:
         if self.has_dp_attention:
             parts.append(f"AttnTP={self.attn_tp_rank}/{self.attn_tp_size}")
             parts.append(f"AttnDP={self.attn_dp_rank}/{self.attn_dp_size}")
+        if self.has_context_parallelism:
+            parts.append(f"AttnCP={self.attn_cp_rank}/{self.attn_cp_size}")
+        if self.has_moe_data_parallelism:
+            parts.append(f"MoE-DP={self.moe_dp_rank}/{self.moe_dp_size}")
         parts.append(f"Global={self.global_rank}/{self.world_size}")
         return f"RankParallelismConfig({', '.join(parts)})"
 
@@ -2483,6 +2507,9 @@ class ParallelismContext:
         self._original_globals["_PP"] = getattr(parallel_state, "_PP", None)
         self._original_globals["_MOE_EP"] = getattr(parallel_state, "_MOE_EP", None)
         self._original_globals["_MOE_TP"] = getattr(parallel_state, "_MOE_TP", None)
+        self._original_globals["_ATTN_TP"] = getattr(parallel_state, "_ATTN_TP", None)
+        self._original_globals["_ATTN_CP"] = getattr(parallel_state, "_ATTN_CP", None)
+        self._original_globals["_MOE_DP"] = getattr(parallel_state, "_MOE_DP", None)
         self._original_globals["_ATTN_TP_RANK"] = getattr(
             dp_attention, "_ATTN_TP_RANK", None
         )
@@ -2504,12 +2531,18 @@ class ParallelismContext:
         mock_pp_group = self._create_mock_group(conf.pp_size, conf.pp_rank)
         mock_ep_group = self._create_mock_group(conf.ep_size, conf.ep_rank)
         mock_moe_tp_group = self._create_mock_group(conf.moe_tp_size, conf.moe_tp_rank)
+        mock_attn_tp_group = self._create_mock_group(conf.attn_tp_size, conf.attn_tp_rank)
+        mock_attn_cp_group = self._create_mock_group(conf.attn_cp_size, conf.attn_cp_rank)
+        mock_moe_dp_group = self._create_mock_group(conf.moe_dp_size, conf.moe_dp_rank)
 
         # Set the global group objects directly on parallel_state module
         parallel_state._TP = mock_tp_group
         parallel_state._PP = mock_pp_group
         parallel_state._MOE_EP = mock_ep_group
         parallel_state._MOE_TP = mock_moe_tp_group
+        parallel_state._ATTN_TP = mock_attn_tp_group
+        parallel_state._ATTN_CP = mock_attn_cp_group
+        parallel_state._MOE_DP = mock_moe_dp_group
 
         # Set dp_attention globals directly
         dp_attention._ATTN_TP_RANK = conf.attn_tp_rank
@@ -2524,7 +2557,9 @@ class ParallelismContext:
             f"PP={conf.pp_rank}/{conf.pp_size}, EP={conf.ep_rank}/{conf.ep_size}, "
             f"MoE-TP={conf.moe_tp_rank}/{conf.moe_tp_size}, "
             f"AttnTP={conf.attn_tp_rank}/{conf.attn_tp_size}, "
-            f"AttnDP={conf.attn_dp_rank}/{conf.attn_dp_size}"
+            f"AttnDP={conf.attn_dp_rank}/{conf.attn_dp_size}, "
+            f"AttnCP={conf.attn_cp_rank}/{conf.attn_cp_size}, "
+            f"MoE-DP={conf.moe_dp_rank}/{conf.moe_dp_size}"
         )
         return self
 
@@ -2537,6 +2572,9 @@ class ParallelismContext:
         parallel_state._PP = self._original_globals.get("_PP")
         parallel_state._MOE_EP = self._original_globals.get("_MOE_EP")
         parallel_state._MOE_TP = self._original_globals.get("_MOE_TP")
+        parallel_state._ATTN_TP = self._original_globals.get("_ATTN_TP")
+        parallel_state._ATTN_CP = self._original_globals.get("_ATTN_CP")
+        parallel_state._MOE_DP = self._original_globals.get("_MOE_DP")
 
         # Restore original dp_attention globals
         dp_attention._ATTN_TP_RANK = self._original_globals.get("_ATTN_TP_RANK")

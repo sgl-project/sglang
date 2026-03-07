@@ -355,6 +355,8 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -380,6 +382,8 @@ class TpModelWorker(BaseTpWorker):
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     draft_model_idx=i,
+                    attn_cp_rank=self.attn_cp_rank,
+                    moe_dp_rank=self.moe_dp_rank,
                 )
             )
 
