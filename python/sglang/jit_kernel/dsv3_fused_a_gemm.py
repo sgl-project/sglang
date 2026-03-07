@@ -10,6 +10,7 @@ from sglang.jit_kernel.utils import (
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
+    require_cuda_arch_at_least,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_dsv3_fused_a_gemm_module() -> Module:
+    require_cuda_arch_at_least("dsv3_fused_a_gemm", 9, 0)
+
     # Keep JIT PDL gating consistent with AOT behavior:
     # enable PDL only when the architecture supports it and TRTLLM_ENABLE_PDL=1.
     # This avoids mismatched benchmark/runtime paths between JIT and AOT.
@@ -28,7 +31,7 @@ def _jit_dsv3_fused_a_gemm_module() -> Module:
         "dsv3_fused_a_gemm",
         *args,
         cuda_files=["gemm/dsv3_fused_a_gemm.cuh"],
-        cuda_wrappers=[("dsv3_fused_a_gemm", f"dsv3_fused_a_gemm_kernel<{args}>::run")],
+        cuda_wrappers=[("dsv3_fused_a_gemm", f"DSV3FusedAGEMMKernel<{args}>::run")],
     )
 
 

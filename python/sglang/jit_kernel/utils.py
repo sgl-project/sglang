@@ -183,6 +183,23 @@ def is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
+def require_cuda_arch_at_least(
+    kernel_name: str,
+    min_major: int,
+    min_minor: int = 0,
+) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{kernel_name} requires CUDA SM{min_major}{min_minor}+ but CUDA is not available."
+        )
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) < (min_major, min_minor):
+        raise RuntimeError(
+            f"{kernel_name} requires CUDA SM{min_major}{min_minor}+ but got SM{major}{minor} on cuda:{device}."
+        )
+
+
 @cache_once
 def _get_cuda_arch_list() -> str:
     """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""

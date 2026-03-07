@@ -10,6 +10,7 @@ from sglang.jit_kernel.utils import (
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
+    require_cuda_arch_at_least,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -23,6 +24,8 @@ def _jit_dsv3_router_gemm_module(
     num_experts: int,
     num_tokens: int,
 ) -> Module:
+    require_cuda_arch_at_least("dsv3_router_gemm", 9, 0)
+
     if out_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(f"Unsupported output dtype for dsv3_router_gemm: {out_dtype}")
 
@@ -34,10 +37,9 @@ def _jit_dsv3_router_gemm_module(
         "dsv3_router_gemm",
         *args,
         cuda_files=[
-            "gemm/dsv3_router_gemm_entry.cuh",
-            "gemm/dsv3_router_gemm_kernel.cuh",
+            "gemm/dsv3_router_gemm.cuh",
         ],
-        cuda_wrappers=[("dsv3_router_gemm", f"dsv3_router_gemm_kernel<{args}>::run")],
+        cuda_wrappers=[("dsv3_router_gemm", f"DSV3RouterGEMMKernel<{args}>::run")],
     )
 
 

@@ -18,12 +18,22 @@
  * limitations under the License.
  */
 
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-namespace dsv3_router_jit {
+#include <cuda_runtime.h>
+#include <type_traits>
+
+namespace {
+
+static constexpr int kDefaultNumExperts = 256;
+static constexpr int kKimiK2NumExperts = 384;
+static constexpr int kDefaultHiddenDim = 7168;
 
 template <
     typename T,
@@ -40,7 +50,6 @@ __global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel(OutT* out, T
   constexpr int kElemsPerKIter = VPT * kBlockSize;
   static_assert(kHiddenDim % kElemsPerKIter == 0, "hidden_dim must be divisible by one K iteration");
   constexpr int kIters = kHiddenDim / kElemsPerKIter;
-  // For kNumWarps=4, bank conflicts start when token lanes exceed 8.
   constexpr int kSmReductionPad = (kNumTokens > 8) ? 1 : 0;
   static_assert(kSmReductionPad == 0 || kSmReductionPad == 1, "kSmReductionPad only supports 0 or 1");
 
@@ -85,7 +94,6 @@ __global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel(OutT* out, T
 
   __syncthreads();
 
-  // Final reduction across warps - each lane in warp 0 handles one token
   if (warp_id == 0 && lane_id < kNumTokens) {
     float final_sum = 0.0f;
 #pragma unroll
@@ -108,4 +116,61 @@ void invokeRouterGemm(OutT* output, T const* mat_a, T const* mat_b, cudaStream_t
   host::LaunchKernel(dim3(kNumExperts), dim3(kBlockSize), stream).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
 }
 
-}  // namespace dsv3_router_jit
+template <bool kUsePDL, typename OutDType, int kNumExperts, int kNumTokens>
+struct DSV3RouterGEMMKernel {
+  static_assert(std::is_same_v<OutDType, bf16_t> || std::is_same_v<OutDType, fp32_t>);
+  static_assert(
+      kNumExperts == kDefaultNumExperts || kNumExperts == kKimiK2NumExperts,
+      "required num_experts == 256 or num_experts == 384");
+  static_assert(kNumTokens >= 1 && kNumTokens <= 16, "required 1 <= kNumTokens <= 16");
+
+  static void
+  run(const tvm::ffi::TensorView output, const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b) {
+    using namespace host;
+
+    auto num_tokens_sym = SymbolicSize{"num_tokens"};
+    auto num_experts_sym = SymbolicSize{"num_experts"};
+    auto hidden_dim_sym = SymbolicSize{"hidden_dim"};
+
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({num_tokens_sym, hidden_dim_sym})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(mat_a);
+
+    TensorMatcher({num_experts_sym, hidden_dim_sym})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(mat_b);
+
+    TensorMatcher({num_tokens_sym, num_experts_sym})  //
+        .with_dtype<OutDType>()
+        .with_device(device)
+        .verify(output);
+
+    const auto num_tokens = static_cast<int>(num_tokens_sym.unwrap());
+    const auto num_experts = static_cast<int>(num_experts_sym.unwrap());
+    const auto hidden_dim = static_cast<int>(hidden_dim_sym.unwrap());
+
+    RuntimeCheck(num_tokens == kNumTokens, "required num_tokens == ", kNumTokens);
+    RuntimeCheck(num_experts == kNumExperts, "required num_experts == ", kNumExperts);
+    RuntimeCheck(hidden_dim == kDefaultHiddenDim, "required hidden_dim == 7168");
+
+    auto cc_major = runtime::get_cc_major(device.unwrap().device_id);
+    RuntimeCheck(cc_major >= 9, "required CUDA ARCH >= SM_90");
+
+    DLDevice dl_device = device.unwrap();
+    cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
+
+    auto* output_ptr = static_cast<OutDType*>(output.data_ptr());
+    auto* mat_a_ptr = static_cast<bf16_t const*>(mat_a.data_ptr());
+    auto* mat_b_ptr = static_cast<bf16_t const*>(mat_b.data_ptr());
+
+    invokeRouterGemm<bf16_t, OutDType, kNumTokens, kNumExperts, kDefaultHiddenDim, kUsePDL>(
+        output_ptr, mat_a_ptr, mat_b_ptr, stream);
+  }
+};
+
+}  // namespace

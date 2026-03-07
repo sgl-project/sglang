@@ -22,7 +22,6 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/runtime.cuh>
-#include <sgl_kernel/utils.cuh>
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,11 +30,8 @@
 
 namespace {
 
-using bf16_t = __nv_bfloat16;
-
-__device__ void hmma_16_8_16_f32acc_bf16ab(
+SGL_DEVICE void hmma_16_8_16_f32acc_bf16ab(
     float (&d_reg)[4], const bf16_t (&a_reg)[8], const bf16_t (&b_reg)[4], float const (&c_reg)[4]) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t a0 = *reinterpret_cast<uint32_t const*>(a_reg + 0);
   uint32_t a1 = *reinterpret_cast<uint32_t const*>(a_reg + 2);
   uint32_t a2 = *reinterpret_cast<uint32_t const*>(a_reg + 4);
@@ -59,32 +55,27 @@ __device__ void hmma_16_8_16_f32acc_bf16ab(
         "f"(d_reg[1]),
         "f"(d_reg[2]),
         "f"(d_reg[3]));
-#endif
 }
 
 extern "C" {
-__device__ uint32_t __nvvm_get_smem_pointer(void*);
+SGL_DEVICE uint32_t __nvvm_get_smem_pointer(void*);
 }
 
-__device__ void ldgsts_128(void const* gPtr, void* sPtr, uint32_t pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void ldgsts_128(void const* gPtr, void* sPtr, uint32_t pred) {
   if (pred) {
     uint32_t smemPtrAsUint32 = __nvvm_get_smem_pointer(sPtr);
     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(smemPtrAsUint32), "l"(gPtr), "n"(16));
   }
-#endif
 }
 
-__device__ void ldsm_x4(void* smem_ptr, uint32_t* reg_ptr) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void ldsm_x4(void* smem_ptr, uint32_t* reg_ptr) {
   asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(reg_ptr[0]), "=r"(reg_ptr[1]), "=r"(reg_ptr[2]), "=r"(reg_ptr[3])
                : "r"(__nvvm_get_smem_pointer(smem_ptr)));
-#endif
 }
 
 template <class Type>
-__device__ int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_) {
+SGL_DEVICE int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_) {
   uint32_t row_idx = *reinterpret_cast<uint32_t*>(&row_idx_);
   uint32_t col_idx = *reinterpret_cast<uint32_t*>(&col_idx_);
   row_idx = row_idx % 8;
@@ -93,15 +84,12 @@ __device__ int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_) {
   return *reinterpret_cast<int*>(&col_idx);
 }
 
-__device__ void initialize_barrier(uint64_t* smem_barrier, int thread_count = 1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void initialize_barrier(uint64_t* smem_barrier, int thread_count = 1) {
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_int_ptr), "r"(thread_count));
-#endif
 }
 
-__device__ void wait_barrier(uint64_t* smem_barrier, int phase_bit) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void wait_barrier(uint64_t* smem_barrier, int phase_bit) {
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile(
       "{\n"
@@ -113,11 +101,9 @@ __device__ void wait_barrier(uint64_t* smem_barrier, int phase_bit) {
       "DONE:\n"
       "}\n" ::"r"(smem_int_ptr),
       "r"(phase_bit));
-#endif
 }
 
-__device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit) {
   uint32_t wait_complete;
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_ptr);
   asm volatile(
@@ -129,26 +115,20 @@ __device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit) {
       : "=r"(wait_complete)
       : "r"(smem_int_ptr), "r"(phase_bit));
   return static_cast<bool>(wait_complete);
-#endif
-  return false;
 }
 
-__device__ void arrive_barrier(uint64_t* smem_barrier) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void arrive_barrier(uint64_t* smem_barrier) {
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile(
       "{\n"
       ".reg .b64 state; \n"
       "mbarrier.arrive.shared::cta.b64   state, [%0];\n"
       "}\n" ::"r"(smem_int_ptr));
-#endif
 }
 
-__device__ void ldgsts_arrive(uint64_t* smem_barrier) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+SGL_DEVICE void ldgsts_arrive(uint64_t* smem_barrier) {
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" : : "r"(smem_int_ptr));
-#endif
 }
 
 template <int gemm_k, int tile_m, int tile_k, int stage_cnt>
@@ -167,16 +147,15 @@ struct GmemLoaderA {
   static constexpr int k_each_chunk = gemm_k / mma_warp_cnt;
 
  private:
-  __device__ int k_project(int tile_k_idx) {
+  SGL_DEVICE int k_project(int tile_k_idx) {
     return (tile_k_idx / per_mma_warp_k * k_each_chunk) + (tile_k_idx % per_mma_warp_k);
   }
 
  public:
-  __device__ GmemLoaderA(bf16_t const* gmem_a_local_, bf16_t* smem_a_, uint64_t* smem_barrier_)
+  SGL_DEVICE GmemLoaderA(bf16_t const* gmem_a_local_, bf16_t* smem_a_, uint64_t* smem_barrier_)
       : gmem_a(gmem_a_local_), smem_a(smem_a_), smem_barrier(smem_barrier_), local_tid(threadIdx.x % thread_cnt) {}
 
-  __device__ void prepare() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void prepare() {
 #pragma unroll
     for (int i = 0; i < a_inst_cnt_per_iter; i++) {
       int linear_idx = local_tid * vec_elems + i * thread_cnt * vec_elems;
@@ -185,11 +164,9 @@ struct GmemLoaderA {
       k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
       a_smem_offsets[i] = m_idx * tile_k + k_idx;
     }
-#endif
   }
 
-  __device__ void issue_mainloop() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void issue_mainloop() {
 #pragma unroll 1
     for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
       if (need_wait) {
@@ -217,7 +194,6 @@ struct GmemLoaderA {
       phase_bit = next_phase_bit;
       gmem_a += per_mma_warp_k;
     }
-#endif
   }
 
   bf16_t const* gmem_a;
@@ -246,20 +222,19 @@ struct GmemLoaderB {
   static constexpr int k_each_chunk = gemm_k / mma_warp_cnt;
 
  private:
-  __device__ int k_project(int tile_k_idx) {
+  SGL_DEVICE int k_project(int tile_k_idx) {
     return (tile_k_idx / per_mma_warp_k * k_each_chunk) + (tile_k_idx % per_mma_warp_k);
   }
 
  public:
-  __device__ GmemLoaderB(bf16_t const* gmem_b_local_, bf16_t* smem_b_, uint64_t* smem_barrier_, int gemm_n_)
+  SGL_DEVICE GmemLoaderB(bf16_t const* gmem_b_local_, bf16_t* smem_b_, uint64_t* smem_barrier_, int gemm_n_)
       : gmem_b(gmem_b_local_),
         smem_b(smem_b_),
         smem_barrier(smem_barrier_),
         gemm_n(gemm_n_),
         local_tid(threadIdx.x % thread_cnt) {}
 
-  __device__ void prepare() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void prepare() {
 #pragma unroll
     for (int i = 0; i < b_inst_cnt_per_iter; i++) {
       int linear_idx = local_tid * vec_elems + i * thread_cnt * vec_elems;
@@ -269,11 +244,9 @@ struct GmemLoaderB {
       b_smem_offsets[i] = n_idx * tile_k + k_idx;
       preds[i] = n_idx < gemm_n;
     }
-#endif
   }
 
-  __device__ void issue_mainloop() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void issue_mainloop() {
     device::PDLWaitPrimary<kUsePDL>();
 #pragma unroll 1
     for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
@@ -302,7 +275,6 @@ struct GmemLoaderB {
       phase_bit = next_phase_bit;
       gmem_b += per_mma_warp_k;
     }
-#endif
   }
 
   bf16_t const* gmem_b;
@@ -331,7 +303,7 @@ struct MmaComputer {
   static_assert(m_iter_cnt == 1);
   static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
-  __device__ MmaComputer(
+  SGL_DEVICE MmaComputer(
       bf16_t* gmem_c_local_, bf16_t* smem_a_, bf16_t* smem_b_, uint64_t* smem_barrier_, int warp_idx_, int gemm_n_)
       : gmem_c(gmem_c_local_),
         smem_a(smem_a_),
@@ -341,7 +313,7 @@ struct MmaComputer {
         gemm_n(gemm_n_) {}
 
  private:
-  __device__ constexpr int internal_b_atom_func(int tid) {
+  SGL_DEVICE constexpr int internal_b_atom_func(int tid) {
     if constexpr (tile_n < 8) {
       return (tid % tile_n) + ((tid % 8) / tile_n * 0) + tid / 8 * 8 * tile_n;
     } else {
@@ -350,8 +322,7 @@ struct MmaComputer {
   }
 
  public:
-  __device__ void prepare() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void prepare() {
 #pragma unroll
     for (int i = 0; i < k_phase_cnt; i++) {
       int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
@@ -371,11 +342,9 @@ struct MmaComputer {
         b_smem_offsets[n_iter_idx][i] = n_idx * tile_k + k_idx;
       }
     }
-#endif
   }
 
-  __device__ void issue_mainloop() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void issue_mainloop() {
 #pragma unroll 1
     for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
       wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);
@@ -407,11 +376,9 @@ struct MmaComputer {
       phase_bit = stage_idx == stage_cnt ? phase_bit ^ 1 : phase_bit;
       stage_idx = stage_idx == stage_cnt ? 0 : stage_idx;
     }
-#endif
   }
 
-  __device__ void epi() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  SGL_DEVICE void epi() {
     asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
     constexpr int thread_m = 2;
     constexpr int thread_n = 2 * n_iter_cnt;
@@ -466,7 +433,6 @@ struct MmaComputer {
         }
       }
     }
-#endif
   }
 
   bf16_t* gmem_c;
@@ -492,7 +458,6 @@ struct MmaComputer {
 template <int batch_size, int gemm_m, int gemm_k, int tile_m, int tile_n, int tile_k, int stage_cnt, bool kUsePDL>
 __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     bf16_t* output, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   constexpr int load_thread_cnt = 128;
   constexpr int compute_thread_cnt = 128;
   constexpr int thread_cnt = load_thread_cnt + compute_thread_cnt;
@@ -546,7 +511,6 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     mma_computer.epi();
   }
   device::PDLTriggerSecondary<kUsePDL>();
-#endif
 }
 
 template <typename T, int kHdIn, int kHdOut, int kTileN, bool kUsePDL>
@@ -580,7 +544,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
 }
 
 template <bool kUsePDL>
-struct dsv3_fused_a_gemm_kernel {
+struct DSV3FusedAGEMMKernel {
   static void
   run(const tvm::ffi::TensorView output, const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b) {
     using namespace host;
@@ -592,18 +556,21 @@ struct dsv3_fused_a_gemm_kernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    // mat_a: [num_tokens, hd_in], row-major
-    TensorMatcher({num_tokens_sym, hd_in_sym}).with_dtype<bf16_t>().with_device(device).verify(mat_a);
+    TensorMatcher({num_tokens_sym, hd_in_sym})  // mat_a: [num_tokens, hd_in], row-major
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(mat_a);
 
-    // mat_b: [hd_in, hd_out], column-major
-    TensorMatcher({hd_in_sym, hd_out_sym})
+    TensorMatcher({hd_in_sym, hd_out_sym})  // mat_b: [hd_in, hd_out], column-major
         .with_strides({1, hd_in_sym})
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(mat_b);
 
-    // output: [num_tokens, hd_out], row-major
-    TensorMatcher({num_tokens_sym, hd_out_sym}).with_dtype<bf16_t>().with_device(device).verify(output);
+    TensorMatcher({num_tokens_sym, hd_out_sym})  // output: [num_tokens, hd_out], row-major
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
 
     const auto num_tokens = static_cast<int>(num_tokens_sym.unwrap());
     const auto hd_in = static_cast<int>(hd_in_sym.unwrap());
