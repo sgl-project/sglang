@@ -166,12 +166,19 @@ class DiffGenerator:
         """
         # 1. prepare requests
         prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
+
+        if len(prompts) > 1 and user_output_file_name is not None:
+            raise ValueError(
+                "Cannot use multiple prompts with a fixed output_file_name. "
+                "Either remove --output-file-name or use a single prompt."
+            )
+
         sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
-        user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
         requests: list[Req] = []
         for p in prompts:

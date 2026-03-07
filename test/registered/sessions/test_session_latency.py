@@ -35,7 +35,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(
+    est_time=100,
+    suite="stage-b-test-large-1-gpu",
+    disabled="Flaky: streaming vs regular session 1/300 turns differ. See https://github.com/sgl-project/sglang/actions/runs/22790998325/job/66117795513",
+)
 
 NUM_TURNS = 300
 INPUT_LEN = 16

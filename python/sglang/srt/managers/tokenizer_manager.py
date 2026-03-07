@@ -1612,6 +1612,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
+                # Ensure first_token_time is set before computing decode_throughput.
+                # Without this, requests that finish on their first output batch
+                # would have first_token_time=0.0, producing bogus throughput.
+                if state.time_stats.first_token_time == 0.0:
+                    state.time_stats.set_first_token_time()
                 state.time_stats.trace_ctx.trace_set_root_attrs(
                     self.convert_to_span_attrs(state, recv_obj, i)
                 )

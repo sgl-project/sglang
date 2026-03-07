@@ -51,7 +51,6 @@ from sgl_kernel.gemm import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
-    scaled_fp4_experts_quant,
     scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
@@ -79,7 +78,6 @@ from sgl_kernel.mamba import (
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
-    cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_qk_norm_rope,
     kimi_k2_moe_fused_gate,
