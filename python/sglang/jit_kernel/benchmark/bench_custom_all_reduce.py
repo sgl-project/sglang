@@ -41,6 +41,7 @@ MESSAGE_SIZES_BYTES = [
     7 * 128 * 1024,  # 896K
     1 * 1024 * 1024,  # 1M
     2 * 1024 * 1024,  # 2M
+    3 * 1024 * 1024,  # 2M
     4 * 1024 * 1024,  # 4M
     8 * 1024 * 1024,  # 8M
     16 * 1024 * 1024,  # 16M
@@ -100,12 +101,12 @@ class AOTAllReduceBackend:
 class JITAllReduceBackend:
     """JIT custom all-reduce (v2)."""
 
-    def __init__(self, group: dist.ProcessGroup, device: torch.device, shot: int):
+    def __init__(self, group: dist.ProcessGroup, device: torch.device, shot):
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
 
-        self.name = f"JIT-CAR-{shot}shot"
+        self.name = f"JIT-CAR-{shot}shot" if shot is not None else "JIT-CAR"
         max_size = max(MESSAGE_SIZES_BYTES)
         self.comm = CustomAllReduceV2(group=group, device=device, max_size=max_size)
         self.comm.override_shot(shot)
@@ -297,10 +298,13 @@ def main():
     # Instantiate backends.
     backends = [
         NCCLBackend(nccl_group),
-        AOTAllReduceBackend(cpu_group, device),
+        JITAllReduceBackend(cpu_group, device, None),
         JITAllReduceBackend(cpu_group, device, 1),
         JITAllReduceBackend(cpu_group, device, 2),
     ]
+
+    if world_size in [2, 4, 6, 8]:
+        backends.insert(1, AOTAllReduceBackend(cpu_group, device))
 
     # Run benchmarks.
     all_results: Dict[str, Dict[int, float]] = {}

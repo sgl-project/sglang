@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import List, Optional, TypeVar
+from typing import Dict, List, Optional, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +21,7 @@ INF = 1 << 60
 
 
 # NOTE(dark): This is tuned on hopper GPUs, also need tuning on blackwell/ampere
-THRESHOLD_2_SHOT_MAP = {
-    2: INF,
-    3: 512 * 1024,  # 512KB
-    4: 256 * 1024,  # 256KB
-    5: 256 * 1024,  # 256KB
-    6: 256 * 1024,  # 256KB
-    7: 192 * 1024,  # 192KB
-    8: 192 * 1024,  # 192KB
-}
+THRESHOLD_2_SHOT_MAP: Dict[int, int]
 
 
 class CustomAllReduceV2:
@@ -42,12 +34,13 @@ class CustomAllReduceV2:
         if max_size is None:
             max_size = 16 * 1024 * 1024  # default to 16MB
 
+        _init_config()
         self.max_size = max_size
         self.group = group
         self.disabled = True
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        self.threshold = THRESHOLD_2_SHOT_MAP[self.world_size]
+        self.override_shot(None)
 
         full_nvlink = can_use_custom_all_reduce_with_nvlink(
             group=group,
@@ -66,8 +59,12 @@ class CustomAllReduceV2:
         self.disabled = False
         log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
 
-    def override_shot(self, shot: int):
-        self.threshold = INF if shot == 1 else 0
+    def override_shot(self, shot: int | None):
+        if shot is None:
+            self.threshold = THRESHOLD_2_SHOT_MAP[self.world_size]
+        else:
+            assert shot in (1, 2)
+            self.threshold = INF if shot == 1 else 0
 
     @contextmanager
     def capture(self):
@@ -142,3 +139,28 @@ class CustomAllReduceV2:
 
     def __del__(self):
         self.close()
+
+
+def _init_config():
+    global THRESHOLD_2_SHOT_MAP
+    KB, MB = 1024, 1024 * 1024
+    THRESHOLD_2_SHOT_MAP = {
+        2: INF,
+        3: 512 * KB,
+        4: 256 * KB,
+        5: 256 * KB,
+        6: 256 * KB,
+        7: 192 * KB,
+        8: 192 * KB,
+    }
+
+    if is_sm100_supported:
+        THRESHOLD_2_SHOT_MAP = {
+            2: INF,
+            3: 4 * MB,
+            4: 2 * MB,
+            5: int(1.5 * MB),
+            6: 1 * MB,
+            7: 7 * 128 * KB,
+            8: 6 * 128 * KB,
+        }
