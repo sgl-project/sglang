@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -380,6 +381,10 @@ class TestMamba(unittest.TestCase):
             mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
+
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+        tree.sanity_check()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ import asyncio
 import os
 import pickle
 from collections import deque
-from copy import deepcopy
 from typing import Any, List
 
 import zmq
@@ -233,7 +232,7 @@ class Scheduler:
                         height=height,
                         prompt="",
                     )
-                req.set_as_warmup()
+                req.set_as_warmup(self.server_args.warmup_steps)
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -253,8 +252,7 @@ class Scheduler:
         # only the very first req through server's lifetime will be warmed up
         identity, req = recv_reqs[0]
         if isinstance(req, Req):
-            warmup_req = deepcopy(req)
-            warmup_req.set_as_warmup()
+            warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
             self._warmup_processed = 0
@@ -395,12 +393,12 @@ class Scheduler:
                         if self._warmup_total > 0:
                             logger.info(
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                         else:
                             logger.info(
                                 f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                     else:
                         if self._warmup_total > 0:

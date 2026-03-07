@@ -208,7 +208,7 @@ class CaptureHiddenMode(IntEnum):
 
 
 def compute_local_num_token_non_padded(
-    global_num_token_non_padded: torch.Tensor | int,
+    global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
@@ -219,10 +219,6 @@ def compute_local_num_token_non_padded(
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
-    # Make sure global_num_token_non_padded is tensor so torch.clamp doesn't break
-    if isinstance(global_num_token_non_padded, int):
-        global_num_token_non_padded = torch.tensor(global_num_token_non_padded)
 
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
@@ -342,6 +338,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -377,6 +374,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For dumper: request IDs for cross-step sequence tracking
+    rids: Optional[List[str]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -405,6 +405,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
+            all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
@@ -421,6 +422,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
 
@@ -542,7 +544,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded_cpu,
+            global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
@@ -652,10 +654,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len: int,
     ) -> torch.Tensor:
         # doing below compute on cpu to avoid frequent small kernels
-        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
-        mrope_positions = (
-            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
-        )
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
+                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        mrope_positions = mm_input.mrope_position_delta_repeated_cache + seq_len
         return mrope_positions
 
     def _compute_mrope_positions(
@@ -682,7 +685,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         mm_input, self.seq_lens_cpu[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend():
+            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
