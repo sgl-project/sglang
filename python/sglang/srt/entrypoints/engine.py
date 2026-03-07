@@ -97,6 +97,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
@@ -1193,17 +1194,10 @@ def _wait_for_scheduler_ready(
 def _sync_scheduler_infos_across_nodes(
     server_args: ServerArgs,
     local_scheduler_infos: List[Dict],
+    max_retries: int = 30,
+    retry_delay: float = 2.0,
 ) -> List[Dict]:
-    """
-    Gather scheduler_infos from all nodes using StatelessProcessGroup.
-    Returns merged list containing scheduler info from all ranks across all nodes.
-
-    Uses StatelessProcessGroup (TCPStore-based) instead of dist.init_process_group
-    to avoid polluting/destroying the global process group state, which would break
-    gloo groups used by co-located training actors.
-    """
-    from sglang.srt.distributed.utils import StatelessProcessGroup
-
+    """Sync scheduler_infos across nodes via StatelessProcessGroup all_gather."""
     METADATA_SYNC_PORT_OFFSET = 10000
     dist_host, dist_port = server_args.dist_init_addr.rsplit(":", 1)
     sync_port = int(dist_port) + METADATA_SYNC_PORT_OFFSET
@@ -1213,32 +1207,40 @@ def _sync_scheduler_infos_across_nodes(
         f"(node_rank={server_args.node_rank}, local_ranks={len(local_scheduler_infos)})"
     )
 
-    try:
-        pg = StatelessProcessGroup.create(
-            host=dist_host,
-            port=sync_port,
-            rank=server_args.node_rank,
-            world_size=server_args.nnodes,
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            pg = StatelessProcessGroup.create(
+                host=dist_host,
+                port=sync_port,
+                rank=server_args.node_rank,
+                world_size=server_args.nnodes,
+            )
 
-        all_node_infos = pg.all_gather_obj(local_scheduler_infos)
+            all_node_infos = pg.all_gather_obj(local_scheduler_infos)
 
-        merged_scheduler_infos = []
-        for node_infos in all_node_infos:
-            if node_infos:
-                merged_scheduler_infos.extend(node_infos)
+            merged_scheduler_infos = []
+            for node_infos in all_node_infos:
+                if node_infos:
+                    merged_scheduler_infos.extend(node_infos)
 
-        logger.info(
-            f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
-        )
-        return merged_scheduler_infos
+            logger.info(
+                f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
+            )
+            return merged_scheduler_infos
 
-    except Exception as e:
-        logger.error(
-            f"Failed to sync scheduler_infos across nodes: {e}. "
-            f"Only local ranks will be available."
-        )
-        return local_scheduler_infos
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(
+                    f"Scheduler info sync attempt {attempt}/{max_retries} failed: {e}. "
+                    f"Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.error(
+                    f"Failed to sync scheduler_infos after {max_retries} attempts: {e}. "
+                    f"Only local ranks will be available."
+                )
+                return local_scheduler_infos
 
 
 def _calculate_rank_ranges(
