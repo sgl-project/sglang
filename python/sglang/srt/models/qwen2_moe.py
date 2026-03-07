@@ -324,7 +324,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            # In-place add is required to keep final_hidden_states in the
+            # symmetric memory pool (when --enable-symm-mem is used).
+            # An out-of-place add would allocate a new tensor outside symm
+            # memory, breaking subsequent symmetric collective operations.
+            final_hidden_states += shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -570,7 +574,7 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -638,7 +642,7 @@ class Qwen2MoeModel(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if get_global_server_args().enable_piecewise_cuda_graph
+                    if not get_global_server_args().disable_piecewise_cuda_graph
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
