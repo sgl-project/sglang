@@ -5,7 +5,7 @@ Tests that ParallelismContext can instantiate models with correct tensor paralle
 sharding by comparing parameter names and sizes against a running sglang server.
 
 Run with:
-    pytest test/srt/test_parallelism_context_integration.py -v
+    pytest test/registered/distributed/test_parallelism_context_integration.py -v
 
 Full test suite (non-CI):
     - TP=2 small model (Qwem2.5-1.5B-Instruct)

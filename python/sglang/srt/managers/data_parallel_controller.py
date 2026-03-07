@@ -591,7 +591,6 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
-                # Include all scheduler infos for endpoints like /get_parallelism_config
                 "_dp_scheduler_infos": controller.scheduler_infos,
             }
         )
