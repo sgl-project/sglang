@@ -70,6 +70,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -96,6 +97,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
+    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -106,7 +108,6 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -390,8 +391,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
-        # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
+        # Get available memory before model loading
+        pre_model_load_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -412,7 +413,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # Initialize the model runner
-        self.initialize(min_per_gpu_memory)
+        self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
 
         if self.is_multimodal:
@@ -446,7 +447,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def initialize(self, min_per_gpu_memory: float):
+    def initialize(self, pre_model_load_memory: float):
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -493,6 +494,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+
+        # Load the expert backup client
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
+            )
+            else None
+        )
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
@@ -589,14 +600,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        self.init_memory_pool(pre_model_load_memory)
 
         # Init max running requests
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests // (self.dp_size)
+                else server_args.max_running_requests // self.dp_size
             ),
             self.req_to_token_pool.size,
         )
@@ -815,7 +826,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-        min_per_gpu_memory = get_available_gpu_memory(
+        pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -828,9 +839,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
-            if min_per_gpu_memory < local_gpu_memory * 0.9:
+            if pre_model_load_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                 if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
                     raise RuntimeError(msg)
                 else:
@@ -840,7 +851,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
-        return min_per_gpu_memory
+        return pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         """
@@ -857,6 +868,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or (
                 self.server_args.enable_hierarchical_cache
                 and self.server_args.hicache_storage_backend == "mooncake"
+                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
             )
             or (
                 self.server_args.encoder_only
@@ -865,6 +877,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
             )
         )
 
@@ -1027,11 +1043,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        # Get quantization config from ModelConfig
+        # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
+        quant_str = self.model_config.get_quantization_config_log_str()
+
         logger.info(
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
+            f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
@@ -1046,6 +1066,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if dumper.may_enable:
+            dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
@@ -1087,6 +1108,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
+                self.expert_backup_client.update_weights()
+                return
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
@@ -1111,7 +1139,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)
@@ -1633,32 +1661,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.hybrid_lightning_config
         )
 
-    def can_run_piecewise_cuda_graph(self):
-        if self.is_draft_worker:
-            return False
-
-        if self.server_args.enable_torch_compile:
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph has conflict with torch compile",
-            )
-            return False
-        if self.pp_size > 1:
-            # TODO(yuwei): support PP
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
-            )
-            return False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            # TODO(yuwei): fix the compilation errors for MOE A2A backend
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph due to existing compilation errors",
-            )
-            return False
-        return True
-
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -1741,9 +1743,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_new_workspace=init_new_workspace,
             )
 
-        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
-            self.server_args.get_attention_backends()
-        )
+        (
+            self.prefill_attention_backend_str,
+            self.decode_attention_backend_str,
+        ) = self.server_args.get_attention_backends()
 
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
@@ -1889,6 +1892,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_bs
+
+        if require_gathered_buffer(self.server_args):
+            attn_tp_size = get_attention_tp_size()
+            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
+                num_tokens = num_tokens // attn_tp_size * attn_tp_size
+                batch_size = num_tokens // num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
 
@@ -2159,10 +2168,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
-        if (
-            not self.server_args.enable_piecewise_cuda_graph
-            or not self.can_run_piecewise_cuda_graph()
-        ):
+        if self.server_args.disable_piecewise_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
+            )
+            return
+
+        # Disable piecewise CUDA graph for non-language models
+        if not hasattr(self.model, "model"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model is not a language model"
+            )
+            return
+
+        # Disable piecewise CUDA graph for non capture size
+        if not self.server_args.piecewise_cuda_graph_tokens:
+            logger.warning(
+                "Disable piecewise CUDA graph because the capture size is not set"
+            )
             return
 
         # Collect attention layers and moe layers from the model

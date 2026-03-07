@@ -296,4 +296,4 @@ def test_cutedsl_gdn_performance(B: int):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", "-s"])

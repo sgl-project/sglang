@@ -199,13 +199,6 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input);
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
-void cutlass_scaled_fp4_mm(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -226,8 +219,6 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
-void scaled_fp4_quant(
-    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
@@ -380,35 +371,6 @@ void fused_qk_norm_rope(
     double attention_factor,
     int64_t rotary_dim);
 
-void cutlass_fp4_group_mm(
-    torch::Tensor& output,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& a_blockscale,
-    const torch::Tensor& b_blockscales,
-    const torch::Tensor& alphas,
-    const torch::Tensor& ab_strides,
-    const torch::Tensor& c_strides,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& sf_offsets);
-
-void scaled_fp4_experts_quant(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts);
-
-void silu_and_mul_scaled_fp4_experts_quant(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& mask,
-    bool use_silu_and_mul);
-
 /*
  * From csrc/moe/cutlass_moe/w4a8
  */
@@ -437,37 +399,6 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk);
-/*
- * From csrc/moe/marlin_moe_wna16
- */
-torch::Tensor moe_wna16_marlin_gemm(
-    torch::Tensor& a,
-    std::optional<torch::Tensor> const& c_or_none,
-    torch::Tensor& b_q_weight,
-    std::optional<torch::Tensor> const& b_bias_or_none,
-    torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& global_scale_or_none,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    torch::Tensor& workspace,
-    torch::Tensor& sorted_token_ids,
-    torch::Tensor& expert_ids,
-    torch::Tensor& num_tokens_past_padded,
-    torch::Tensor& topk_weights,
-    int64_t moe_block_size,
-    int64_t top_k,
-    bool mul_topk_weights,
-    bool is_ep,
-    sglang::ScalarTypeId const& b_q_type_id,
-    int64_t size_m,
-    int64_t size_n,
-    int64_t size_k,
-    bool is_k_full,
-    bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float);
-
 /*
  * From csrc/speculative
  */

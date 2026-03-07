@@ -125,6 +125,27 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
+    """Wait for the server to become ready by polling the given URL."""
+    print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
+    start_time = time.perf_counter()
+    headers = get_auth_headers()
+    while True:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                elapsed = time.perf_counter() - start_time
+                print(f"Server ready in {elapsed:.1f}s.")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        elapsed = time.perf_counter() - start_time
+        if elapsed >= timeout_sec:
+            print(f"Server did not become ready within {timeout_sec}s timeout.")
+            return False
+        time.sleep(1)
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -709,6 +730,14 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 # stop_profile doesn't need any parameters
                 body = {}
             print(f"async_request_profile {api_url=} {body=}")
+            # Add optional profiling parameters if provided
+            if (
+                hasattr(args, "profile_start_step")
+                and args.profile_start_step is not None
+            ):
+                body["start_step"] = str(args.profile_start_step)
+            if hasattr(args, "profile_steps") and args.profile_steps is not None:
+                body["num_steps"] = str(args.profile_steps)
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -1291,8 +1320,10 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
-    # Stop profiler
-    if profile:
+    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
+    if profile and not (
+        hasattr(args, "profile_steps") and args.profile_steps is not None
+    ):
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
@@ -1663,6 +1694,13 @@ def run_benchmark(args_: argparse.Namespace):
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
 
+    # Wait for server to be ready
+    if args.ready_check_timeout_sec > 0:
+        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
+            print(f"Server at {health_url} is not ready. Exiting.")
+            sys.exit(1)
+
     # Get model name
     if args.model is None:
         if args.backend == "truss":
@@ -1787,6 +1825,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=60,
+        help="Maximum time in seconds to wait for the server to be ready before benchmarking. Set to 0 to skip. Default: 60.",
     )
     parser.add_argument(
         "--dataset-name",
@@ -1982,7 +2026,20 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER"],
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help="Start profiling after this many forward steps. Useful for warmup.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Number of steps to profile. If specified, profiling stops automatically after this many steps.",
     )
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)
