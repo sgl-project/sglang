@@ -109,9 +109,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         param = params_dict[param_name]
         weight_loader = getattr(param, "weight_loader")
         chunk = loaded_weight.shape[0] // 3
-        weight_loader(param, loaded_weight[:chunk], 0)          # Q
-        weight_loader(param, loaded_weight[chunk:2 * chunk], 1)  # K
-        weight_loader(param, loaded_weight[2 * chunk:], 2)       # V
+        weight_loader(param, loaded_weight[:chunk], 0)  # Q
+        weight_loader(param, loaded_weight[chunk : 2 * chunk], 1)  # K
+        weight_loader(param, loaded_weight[2 * chunk :], 2)  # V
         loaded_params.add(param_name)
         return True
 
@@ -807,7 +807,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(name, loaded_weight, params_dict, loaded_params):
+            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+                name, loaded_weight, params_dict, loaded_params
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -931,7 +933,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(name, loaded_weight, params_dict, loaded_params):
+            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+                name, loaded_weight, params_dict, loaded_params
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1095,7 +1099,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(name, loaded_weight, params_dict, loaded_params):
+            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+                name, loaded_weight, params_dict, loaded_params
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1241,7 +1247,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(name, loaded_weight, params_dict, loaded_params):
+            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+                name, loaded_weight, params_dict, loaded_params
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
