@@ -309,12 +309,13 @@ class CommonKVManager(BaseKVManager):
         return socket
 
     def get_mha_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], dst_non_draft_kv_data_lens: int,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
+        dst_non_draft_num_total_layers = dst_non_draft_kv_data_lens // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
         if num_kv_layers == dst_num_total_layers:
@@ -323,6 +324,7 @@ class CommonKVManager(BaseKVManager):
         elif (
             num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0
+            and self.kv_args.prefill_pp_size == 1
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
@@ -336,7 +338,7 @@ class CommonKVManager(BaseKVManager):
             # Decode pp size should be equal to prefill pp size or 1
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                dst_non_draft_num_total_layers + start_layer : dst_non_draft_num_total_layers + end_layer
             ]
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage

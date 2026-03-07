@@ -1218,6 +1218,8 @@ class HybridLinearKVPool(KVCache):
         head_num: int,
         head_dim: int,
         full_attention_layer_ids: List[int],
+        total_mamba_layer_ids: List[int],
+        mamba_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
@@ -1226,14 +1228,18 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        start_layer: int = None,
+        end_layer: int = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.total_mamba_layer_ids = total_mamba_layer_ids
+        self.mamba_layer_ids = mamba_layer_ids
         self.page_size = page_size
-        # TODO support pp?
-        self.start_layer = 0
+        self.start_layer = start_layer
+        self.end_layer = end_layer
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool

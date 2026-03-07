@@ -137,6 +137,8 @@ class PrefillBootstrapQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.total_mamba_layer_ids = self.token_to_kv_pool.total_mamba_layer_ids
+        kv_args.mamba_layer_ids = self.token_to_kv_pool.mamba_layer_ids
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
