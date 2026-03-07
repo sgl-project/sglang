@@ -588,6 +588,23 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             upscaling_scale=4,
         ),
     ),
+    # Combined: Frame interpolation (2×) + Upscaling (4×)
+    # Verifies that both post-processing steps compose correctly.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=1,
+            enable_upscaling=True,
+            upscaling_scale=4,
+        ),
+    ),
     # LoRA test case for single transformer + merge/unmerge API test
     # Note: Uses dynamic_lora_path instead of lora_path to test LayerwiseOffload + set_lora interaction
     # Server starts WITHOUT LoRA, then set_lora is called after startup (Wan models auto-enable layerwise offload)
