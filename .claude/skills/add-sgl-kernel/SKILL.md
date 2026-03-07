@@ -198,8 +198,9 @@ Then re-export it from `sgl-kernel/python/sgl_kernel/__init__.py` following the 
 Create `sgl-kernel/tests/test_scale.py`:
 ```python
 import pytest
-import sgl_kernel
+
 import torch
+import sgl_kernel
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("size", [128, 1024, 4096, 65536])

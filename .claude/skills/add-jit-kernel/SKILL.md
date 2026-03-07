@@ -109,7 +109,7 @@ const DLDevice dev = device.unwrap();
 #include <sgl_kernel/vec.cuh>
 ```
 
-- **`device::AlignedVector<T, N>`** — Aligned storage for N elements of type T. N must be a power of two, `sizeof(T)*N <= 32`. Enables vectorized loads/stores for bandwidth efficiency (commonly 128-bit, up to 256-bit depending on `T` and `N`).
+- **`device::AlignedVector<T, N>`** — Aligned storage for N elements of type T. N must be a power of two, `sizeof(T)*N <= 32`. Enables vectorized loads/stores for bandwidth efficiency. In terms of API/codegen constraints, the upper bound is 256-bit; in practice, 128-bit is the portable default, while 256-bit vectorization is typically only viable on `SM100+` and should be gated by an architecture check when needed.
   - `.load(ptr, offset)` — vectorized load from `ptr[offset]`
   - `.store(ptr, offset)` — vectorized store to `ptr[offset]`
   - `.fill(value)` — fill all lanes
