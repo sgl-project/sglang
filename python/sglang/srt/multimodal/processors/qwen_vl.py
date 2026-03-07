@@ -58,16 +58,15 @@ def configure_processor_max_pixels(processor) -> int:
 
     Priority: env var > HF preprocessor_config > SGLang fallback.
     """
+    ip = getattr(processor, "image_processor", None)
     if envs.SGLANG_IMAGE_MAX_PIXELS.is_set():
         max_pixels = envs.SGLANG_IMAGE_MAX_PIXELS.get()
     else:
-        ip = getattr(processor, "image_processor", None)
         max_pixels = getattr(ip, "max_pixels", None)
         if max_pixels is None:
             max_pixels = IMAGE_MAX_PIXELS_FALLBACK
 
     # Write back so HF internals also use the resolved value.
-    ip = getattr(processor, "image_processor", None)
     if ip is not None:
         ip.max_pixels = max_pixels
     return max_pixels
