@@ -2065,12 +2065,12 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "cuda:{}".format(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "xpu"
         return "xpu:{}".format(device_id)
 
     if is_npu():
-        if device_id == None:
+        if device_id is None:
             return "npu"
         return "npu:{}".format(device_id)
 
@@ -2079,16 +2079,16 @@ def get_device(device_id: Optional[int] = None) -> str:
             import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
-                if device_id == None:
+                if device_id is None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
     if is_musa():
-        if device_id == None:
+        if device_id is None:
             return "musa"
         return "musa:{}".format(device_id)
 
