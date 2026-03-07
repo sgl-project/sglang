@@ -88,6 +88,25 @@ namespace device {
 /// \brief Macro: forced-inline device function qualifier.
 #define SGL_DEVICE __forceinline__ __device__
 
+// Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
+// available in both host and device compilation passes, whereas __CUDA_ARCH__
+// is only defined by nvcc during the device pass.
+#if !defined(USE_ROCM)
+#if defined(__CUDA_ARCH__)
+#define SGL_TARGET_CUDA_ARCH __CUDA_ARCH__
+#elif defined(SGL_CUDA_ARCH)
+#define SGL_TARGET_CUDA_ARCH SGL_CUDA_ARCH
+#endif
+#endif
+
+#ifdef SGL_TARGET_CUDA_ARCH
+#define SGL_ARCH_HOPPER_OR_GREATER (SGL_TARGET_CUDA_ARCH >= 900)
+#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_TARGET_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#else
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#endif
+
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
@@ -102,7 +121,7 @@ inline constexpr auto kFullMask = 0xffffffffu;
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -117,7 +136,7 @@ SGL_DEVICE void PDLWaitPrimary() {
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
