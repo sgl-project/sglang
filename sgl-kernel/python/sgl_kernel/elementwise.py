@@ -1,8 +1,73 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
+
+try:
+    import flashinfer.norm as _flashinfer_norm
+
+    _has_flashinfer = True
+except ImportError:
+    _has_flashinfer = False
+
+
+def _rmsnorm_internal(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: Optional[torch.Tensor],
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(input)
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
+    return out
+
+
+def _fused_add_rmsnorm_internal(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
+        input, residual, weight, eps, enable_pdl
+    )
+
+
+def _gemma_rmsnorm_internal(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: Optional[torch.Tensor],
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(input)
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
+    return out
+
+
+def _gemma_fused_add_rmsnorm_internal(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
+        input, residual, weight, eps, enable_pdl
+    )
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -38,12 +103,10 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    if out is None:
-        out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
-    return out
+    if input.device.type == "musa" or not _has_flashinfer:
+        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
+    else:
+        return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
 
 
 def fused_add_rmsnorm(
@@ -76,11 +139,10 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    if input.device.type == "musa" or not _has_flashinfer:
+        _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
+    else:
+        _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 def gemma_rmsnorm(
@@ -114,12 +176,10 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if out is None:
-        out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
-    return out
+    if input.device.type == "musa" or not _has_flashinfer:
+        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
+    else:
+        return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
 
 
 def gemma_fused_add_rmsnorm(
@@ -152,11 +212,12 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    if input.device.type == "musa" or not _has_flashinfer:
+        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
+    else:
+        _flashinfer_norm.gemma_fused_add_rmsnorm(
+            input, residual, weight, eps, enable_pdl
+        )
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
