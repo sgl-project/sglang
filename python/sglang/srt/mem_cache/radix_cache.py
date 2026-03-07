@@ -1029,10 +1029,10 @@ class RadixCache(BasePrefixCache):
             logger.debug(f"Protecting node near root: {start_node}")
             return
 
-        logger.info(f"Starting pruning from node: {start_node}")
+        logger.debug(f"Starting pruning from node: {start_node}")
         node = start_node
         pruned_count = 0
-        
+
         while node is not None and node != self.root_node:
             # Re-check existence (node might have been deleted by another concurrent prune)
             if not self._node_exists(node):
@@ -1041,12 +1041,12 @@ class RadixCache(BasePrefixCache):
 
             # Pitfall 2: Stop if node is locked (other active requests depend on it)
             if node.lock_ref > 0:
-                logger.info(f"Stopping pruning at node with lock_ref={node.lock_ref}")
+                logger.debug(f"Stopping pruning at node with lock_ref={node.lock_ref}")
                 break
 
             # Pitfall 2: Stop if node has children (protects active branches)
             if len(node.children) > 0:
-                logger.info(f"Stopping pruning at node with {len(node.children)} children")
+                logger.debug(f"Stopping pruning at node with {len(node.children)} children")
                 break
 
             # Safe to delete this leaf node
@@ -1063,8 +1063,8 @@ class RadixCache(BasePrefixCache):
             
             # Move to parent
             node = parent
-        
-        logger.info(f"Pruning complete. Pruned {pruned_count} nodes.")
+
+        logger.debug(f"Pruning complete. Pruned {pruned_count} nodes.")
 
     def take_events(self):
         """Atomically takes all events and clears the queue.

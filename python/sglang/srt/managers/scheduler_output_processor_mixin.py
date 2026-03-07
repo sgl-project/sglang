@@ -132,9 +132,9 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         semantic_event = getattr(req, 'semantic_event', None)
                         if semantic_event == 'reset':
-                            logger.info(f"Request {req.rid} already finished with semantic_event=reset")
+                            logger.debug(f"Request {req.rid} already finished with semantic_event=reset")
                             if hasattr(req, 'last_node') and req.last_node is not None:
-                                logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                                logger.debug(f"Collecting for deferred pruning: {req.last_node}")
                                 reset_requests_to_prune.append((req, req.last_node))
                             else:
                                 logger.warning(f"No last_node found for already finished request {req.rid}")
@@ -152,15 +152,15 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         # Handle semantic events - don't insert reset requests into cache
                         semantic_event = getattr(req, 'semantic_event', None)
-                        logger.info(f"Request {req.rid} finished. semantic_event={semantic_event}")
+                        logger.debug(f"Request {req.rid} finished. semantic_event={semantic_event}")
                         is_insert = not (semantic_event == 'reset')
-                        logger.info(f"Request {req.rid} is_insert={is_insert}")
-                        
+                        logger.debug(f"Request {req.rid} is_insert={is_insert}")
+
                         # Phase 2: Release KV cache (decrement lock_ref)
                         # For reset requests, we defer pruning to Phase 3
                         if semantic_event == 'reset':
                             if hasattr(req, 'last_node') and req.last_node is not None:
-                                logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                                logger.debug(f"Collecting for deferred pruning: {req.last_node}")
                                 reset_requests_to_prune.append((req, req.last_node))
                             else:
                                 logger.warning(f"No last_node found for request {req.rid}")
@@ -267,11 +267,11 @@ class SchedulerOutputProcessorMixin:
             # Phase 3: Prune all collected reset requests after all locks are released
             # This ensures proper pruning when multiple reset requests share nodes
             if reset_requests_to_prune:
-                logger.info(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests")
+                logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests")
                 for req, node in reset_requests_to_prune:
-                    logger.info(f"Pruning cache for reset request {req.rid}")
+                    logger.debug(f"Pruning cache for reset request {req.rid}")
                     self.tree_cache.prune_from_node(node)
-                logger.info(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests")
+                logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests")
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -456,15 +456,15 @@ class SchedulerOutputProcessorMixin:
 
                 # Handle semantic events - don't insert reset requests into cache
                 semantic_event = getattr(req, 'semantic_event', None)
-                logger.info(f"Request {req.rid} finished in decode. semantic_event={semantic_event}")
+                logger.debug(f"Request {req.rid} finished in decode. semantic_event={semantic_event}")
                 is_insert = not (semantic_event == 'reset')
-                logger.info(f"Request {req.rid} is_insert={is_insert}")
+                logger.debug(f"Request {req.rid} is_insert={is_insert}")
 
                 # Phase 2: Release KV cache (decrement lock_ref)
                 # For reset requests, we defer pruning to Phase 3
                 if semantic_event == 'reset':
                     if hasattr(req, 'last_node') and req.last_node is not None:
-                        logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                        logger.debug(f"Collecting for deferred pruning: {req.last_node}")
                         reset_requests_to_prune.append((req, req.last_node))
                     else:
                         logger.warning(f"No last_node found for request {req.rid}")
@@ -526,11 +526,11 @@ class SchedulerOutputProcessorMixin:
         # Phase 3: Prune all collected reset requests after all locks are released
         # This ensures proper pruning when multiple reset requests share nodes
         if reset_requests_to_prune:
-            logger.info(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (decode)")
+            logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (decode)")
             for req, node in reset_requests_to_prune:
-                logger.info(f"Pruning cache for reset request {req.rid}")
+                logger.debug(f"Pruning cache for reset request {req.rid}")
                 self.tree_cache.prune_from_node(node)
-            logger.info(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (decode)")
+            logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (decode)")
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
