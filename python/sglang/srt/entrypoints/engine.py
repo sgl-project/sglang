@@ -1194,8 +1194,8 @@ def _wait_for_scheduler_ready(
 def _sync_scheduler_infos_across_nodes(
     server_args: ServerArgs,
     local_scheduler_infos: List[Dict],
-    max_retries: int = 30,
-    retry_delay: float = 2.0,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
 ) -> List[Dict]:
     """Sync scheduler_infos across nodes via StatelessProcessGroup all_gather."""
     METADATA_SYNC_PORT_OFFSET = 10000
@@ -1230,10 +1230,6 @@ def _sync_scheduler_infos_across_nodes(
 
         except Exception as e:
             if attempt < max_retries:
-                logger.warning(
-                    f"Scheduler info sync attempt {attempt}/{max_retries} failed: {e}. "
-                    f"Retrying in {retry_delay}s..."
-                )
                 time.sleep(retry_delay)
             else:
                 logger.error(
