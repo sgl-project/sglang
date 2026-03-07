@@ -5,6 +5,7 @@
 /python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
+/python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064

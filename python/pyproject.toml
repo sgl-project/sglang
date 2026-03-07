@@ -121,6 +121,10 @@ diffusion = [
   "xatlas",
 ]
 
+ray = [
+  "ray[default]>=2.54.0",
+]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",

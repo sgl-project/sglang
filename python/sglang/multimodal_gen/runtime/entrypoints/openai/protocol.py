@@ -35,6 +35,8 @@ class ImageGenerationsRequest(BaseModel):
     output_format: Optional[str] = None  # png | jpeg | webp
     user: Optional[str] = None
     # SGLang extensions
+    width: Optional[int] = None
+    height: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     true_cfg_scale: Optional[float] = (

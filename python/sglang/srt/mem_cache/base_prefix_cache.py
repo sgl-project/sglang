@@ -97,6 +97,7 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
+        last_host_backup_node: The deepest backuped node for prefetch from storage.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -107,6 +108,7 @@ class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
+    last_host_backup_node: Any = None
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
 
