@@ -29,7 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -69,6 +69,19 @@ def mamba_v2_sharded_weight_loader(
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 
+        # Calculate padding size for CPU when TP odd size
+        if is_cpu():
+            full_dim_sum = 0
+            full_dim_list = []
+            weight_full_dim_list = []
+            for full_dim, _, _ in shard_spec:
+                full_dim_sum = full_dim_sum + full_dim
+                full_dim_list.append(full_dim)
+            for full_dim in full_dim_list:
+                weight_full_dim_list.append(
+                    int(full_dim / full_dim_sum * loaded_weight.size(0))
+                )
+
         # - iterate over the shard specs
         for full_dim, extra, duplicate_groups in shard_spec:
             # - full dim is the model dim (before TP).
@@ -94,6 +107,33 @@ def mamba_v2_sharded_weight_loader(
 
             # - take these many dims from the loaded weight.
             take = min(shard_size, full_dim - extra - loaded_skip)
+
+            # CPU logic of padding size for qwen3-next
+            # TODO : make this common for all mamba.
+            if is_cpu() and loaded_weight.size(0) % tp_size != 0:
+                import copy
+
+                loaded_weight_ = copy.deepcopy(loaded_weight)
+                q, k, v = torch.split(
+                    loaded_weight_,
+                    weight_full_dim_list,
+                    dim=0,
+                )
+                pad_qk = torch.zeros(
+                    full_dim_list[0] - weight_full_dim_list[0],
+                    loaded_weight.size(1),
+                    loaded_weight.size(2),
+                ).to(loaded_weight.dtype)
+                pad_v = torch.zeros(
+                    full_dim_list[2] - weight_full_dim_list[2],
+                    loaded_weight.size(1),
+                    loaded_weight.size(2),
+                ).to(loaded_weight.dtype)
+                q = torch.cat((q, pad_qk), dim=0)
+                k = torch.cat((k, pad_qk), dim=0)
+                v = torch.cat((v, pad_v), dim=0)
+                loaded_weight_qk = torch.cat((q, k), dim=0)
+                loaded_weight = torch.cat((loaded_weight_qk, v), dim=0)
 
             # - always shard on dim 0
             # - the ignore is for a mundane mypy error as it does not
@@ -534,6 +574,9 @@ class MambaMixer2(torch.nn.Module):
                     layer_cache, MambaPool.SpeculativeState
                 ), "layer_cache must be SpeculativeState for speculative decoding"
                 draft_token_num = metadata.draft_token_num
+                self.intermediate_state_indices = torch.arange(
+                    num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
+                )
 
                 # Reshape for batch processing
                 hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(
@@ -548,6 +591,7 @@ class MambaMixer2(torch.nn.Module):
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
                     intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+                    intermediate_state_indices=self.intermediate_state_indices,
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
@@ -621,6 +665,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
+                    intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
                 selective_state_update(

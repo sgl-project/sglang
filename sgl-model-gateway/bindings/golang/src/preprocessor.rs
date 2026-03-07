@@ -115,7 +115,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
     };
 
     // Tokenize the processed text
-    let encoding = match tokenizer.encode(&processed_messages.text) {
+    let encoding = match tokenizer.encode(&processed_messages.text, false) {
         Ok(enc) => enc,
         Err(e) => {
             set_error_message(error_out, &format!("Tokenization failed: {}", e));
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
     };
 
     // Tokenize the processed text
-    let encoding = match tokenizer.encode(&processed_messages.text) {
+    let encoding = match tokenizer.encode(&processed_messages.text, false) {
         Ok(enc) => enc,
         Err(e) => {
             set_error_message(error_out, &format!("Tokenization failed: {}", e));

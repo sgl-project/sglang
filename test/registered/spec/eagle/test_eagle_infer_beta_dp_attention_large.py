@@ -73,7 +73,13 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(
+            True
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -89,8 +95,7 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
         metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
 
         self.assertGreater(metrics["accuracy"], 0.94)
-        # TODO: Update accept len to 2.04 once the bug is fixed
-        self.assertGreater(avg_spec_accept_length, 1.4)
+        self.assertGreater(avg_spec_accept_length, 2.7)
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"

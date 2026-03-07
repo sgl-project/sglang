@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
-    @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
@@ -44,7 +43,6 @@ class QuantizeMethodBase(ABC):
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -84,7 +82,6 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -96,7 +93,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
-    @abstractmethod
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -230,7 +226,9 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
-    def apply_sglang_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):  # noqa: B027
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
         """
         Interface for models to update module names referenced in
         quantization configs in order to reflect the sglang model structure

@@ -30,7 +30,9 @@ class Timer(StageProfiler):
     """
 
     def __init__(self, name="Stage"):
-        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
+        super().__init__(
+            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
+        )
 
 
 class PipelineExecutor(ABC):

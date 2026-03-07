@@ -14,6 +14,7 @@
 
 import json
 import os
+from typing import Dict, Optional
 
 from huggingface_hub import snapshot_download
 
@@ -21,19 +22,33 @@ from huggingface_hub import snapshot_download
 class LoRAConfig:
     def __init__(
         self,
-        path: str,
+        path: Optional[str] = None,
+        config_dict: Optional[Dict] = None,
+        added_tokens_config: Optional[Dict] = None,
     ) -> None:
         self.path = path
-        self.hf_config = self.get_lora_config()
-        self.target_modules = self.hf_config["target_modules"]
 
+        if config_dict is not None:
+            self.hf_config = config_dict
+            self.added_tokens_config = added_tokens_config
+        else:
+            self.hf_config = self.get_lora_config()
+            self.added_tokens_config = self.get_added_tokens_config()
+
+        self.target_modules = self.hf_config["target_modules"]
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
-
-        self.added_tokens_config = self.get_added_tokens_config()
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
+
+    @classmethod
+    def from_dict(
+        cls,
+        config_dict: Dict,
+        added_tokens_config: Optional[Dict] = None,
+    ) -> "LoRAConfig":
+        return cls(config_dict=config_dict, added_tokens_config=added_tokens_config)
 
     def get_lora_config(self, dummy=False):
         if dummy:

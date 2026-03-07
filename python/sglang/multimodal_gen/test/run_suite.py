@@ -10,21 +10,39 @@ Example:
 
 import argparse
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
+
+import tabulate
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
+    "FLUX.2-klein-base-4B",
+    "Qwen-Image",
+)
+
 SUITES = {
+    # no GPU required; safe to run on any CPU-only runner
+    "unit": [
+        "../unit/test_sampling_params_validate.py",
+        "../unit/test_storage.py",
+        "../unit/test_lora_format_adapter.py",
+        "../unit/test_server_args_unit.py",
+        # add new unit tests here
+    ],
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
-        "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -33,6 +51,19 @@ SUITES = {
         # add new 2-gpu test files here
     ],
 }
+
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ],
+    "2-npu": [
+        "ascend/test_server_2_npu.py",
+        # add new 2-npu test files here
+    ],
+}
+
+SUITES.update(suites_ascend)
 
 
 def parse_args():
@@ -79,12 +110,7 @@ def parse_args():
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
+    """Collect test item node IDs from the given files using pytest --collect-only."""
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])
@@ -151,8 +177,10 @@ def run_pytest(files, filter_expr=None):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
-        else:
-            cmd.extend(files)
+        # Always include files to constrain test discovery scope
+        # This prevents pytest from scanning the entire rootdir and
+        # discovering unrelated tests that may have missing dependencies
+        cmd.extend(files)
 
         if i > 0:
             print(
@@ -215,6 +243,27 @@ def run_pytest(files, filter_expr=None):
     return returncode
 
 
+def _is_in_ci() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
+    if not _is_in_ci():
+        return
+    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
+        return
+    if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
+        print(
+            f"Using preset {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}="
+            f"{os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV]}"
+        )
+        return
+
+    selected_pair = random.choice(_UPDATE_WEIGHTS_MODEL_PAIR_IDS)
+    os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV] = selected_pair
+    print(f"Selected {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}={selected_pair} for this CI run")
+
+
 def main():
     args = parse_args()
 
@@ -229,6 +278,7 @@ def main():
 
     # 2. get files from suite
     suite_files_rel = SUITES[args.suite]
+    _maybe_pin_update_weights_model_pair(suite_files_rel)
 
     suite_files_abs = []
     for f_rel in suite_files_rel:
@@ -256,6 +306,15 @@ def main():
         if i % args.total_partitions == args.partition_id
     ]
 
+    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
+    partition_info = f"{args.partition_id + 1}/{args.total_partitions} (0-based id={args.partition_id})"
+    headers = ["Suite", "Partition"]
+    rows = [[args.suite, partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Enabled {len(my_items)} test(s):\n"
+    for item in my_items:
+        msg += f"  - {item}\n"
+    print(msg, flush=True)
     print(
         f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions}"
     )
@@ -271,6 +330,14 @@ def main():
 
     # 4. execute with the specific test items
     exit_code = run_pytest(my_items)
+
+    # Print tests again at the end for visibility
+    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Executed {len(my_items)} test(s):\n"
+    for item in my_items:
+        msg += f"  - {item}\n"
+    print(msg, flush=True)
+
     sys.exit(exit_code)
 
 

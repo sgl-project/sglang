@@ -5,6 +5,8 @@ from statistics import mean
 
 from transformers import AutoTokenizer
 
+from sglang.srt.utils.patch_tokenizer import patch_tokenizer
+
 
 def main():
     args = parse_args()
@@ -15,13 +17,16 @@ def main():
     print(f"Functions: {', '.join(args.function)}")
     print(f"Tokens per prompt: {args.num_tokens}")
     print(f"Number of runs per batch size: {args.num_runs}")
-    print(f"Skip batch: {args.no_batch}")
+    print(f"Batch mode: {', '.join(args.batch_mode)}")
     print("-" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    tokenizer = patch_tokenizer(tokenizer)
     max_batch_size = max(args.batch_sizes)
 
-    token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
+    token_ids = generate_random_token_ids(
+        num_prompts=max_batch_size, num_tokens=args.num_tokens, tokenizer=tokenizer
+    )
 
     if "encode" in args.function:
         prompts = [
@@ -35,7 +40,7 @@ def main():
             batch_fn=lambda batch: tokenizer(batch),
             batch_sizes=args.batch_sizes,
             num_runs=args.num_runs,
-            skip_batch=args.no_batch,
+            batch_mode=args.batch_mode,
         )
 
     if "decode" in args.function:
@@ -53,82 +58,116 @@ def main():
             batch_fn=lambda batch: tokenizer.batch_decode(batch, **decode_kwargs),
             batch_sizes=args.batch_sizes,
             num_runs=args.num_runs,
-            skip_batch=args.no_batch,
+            batch_mode=args.batch_mode,
         )
 
 
 def run_benchmark(
-    name, data, sequential_fn, batch_fn, batch_sizes, num_runs, skip_batch
+    *, name, data, sequential_fn, batch_fn, batch_sizes, num_runs, batch_mode
 ):
     print("\n" + "=" * 60)
     print(f"{name.upper()} BENCHMARK")
     print("=" * 60)
 
     results = [
-        benchmark(data, bs, sequential_fn, batch_fn, num_runs, skip_batch)
+        benchmark(
+            data=data,
+            batch_size=bs,
+            sequential_fn=sequential_fn,
+            batch_fn=batch_fn,
+            num_runs=num_runs,
+            batch_mode=batch_mode,
+        )
         for bs in batch_sizes
     ]
-    print_results(results, name, skip_batch)
+    print_results(results=results, func_name=name, batch_mode=batch_mode)
 
 
-def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, skip_batch):
+def benchmark(*, data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode):
     batch_data = data[:batch_size]
-    sequential_times = measure_times(lambda: sequential_fn(batch_data), num_runs)
-    avg_seq = mean(sequential_times)
+    run_single = "single" in batch_mode
+    run_batch = "batch" in batch_mode
 
-    out = {
-        "batch_size": batch_size,
-        "avg_sequential_ms": avg_seq,
-        "sequential_runs": sequential_times,
-    }
+    out = {"batch_size": batch_size}
 
-    if not skip_batch:
-        batch_times = measure_times(lambda: batch_fn(batch_data), num_runs)
-        avg_batch = mean(batch_times)
+    if run_single:
+        sequential_times = measure_times(
+            fn=lambda: sequential_fn(batch_data), num_runs=num_runs
+        )
         out |= {
-            "avg_batch_ms": avg_batch,
-            "speedup_factor": avg_seq / avg_batch if avg_batch > 0 else 0,
+            "avg_sequential_ms": mean(sequential_times),
+            "sequential_runs": sequential_times,
+        }
+
+    if run_batch:
+        batch_times = measure_times(fn=lambda: batch_fn(batch_data), num_runs=num_runs)
+        out |= {
+            "avg_batch_ms": mean(batch_times),
             "batch_runs": batch_times,
         }
+
+    if run_single and run_batch:
+        out["speedup_factor"] = (
+            out["avg_sequential_ms"] / out["avg_batch_ms"]
+            if out["avg_batch_ms"] > 0
+            else 0
+        )
 
     return out
 
 
-def print_results(results, func_name, skip_batch):
+def print_results(*, results, func_name, batch_mode):
+    run_single = "single" in batch_mode
+    run_batch = "batch" in batch_mode
+
     for r in results:
         print(f"\nBatch size: {r['batch_size']}")
-        print_runs(
-            f"Sequential {func_name}", r["sequential_runs"], r["avg_sequential_ms"]
-        )
-        if not skip_batch:
-            print_runs(f"Batch {func_name}", r["batch_runs"], r["avg_batch_ms"])
+        if run_single:
+            print_runs(
+                label=f"Sequential {func_name}",
+                runs=r["sequential_runs"],
+                avg=r["avg_sequential_ms"],
+            )
+        if run_batch:
+            print_runs(
+                label=f"Batch {func_name}", runs=r["batch_runs"], avg=r["avg_batch_ms"]
+            )
+        if run_single and run_batch:
             print(f"  Speedup factor: {r['speedup_factor']:.2f}x")
 
     print("\n" + "=" * 60)
     print(f"SUMMARY: {func_name.upper()}")
     print("=" * 60)
 
-    headers = ["Batch Size", "Sequential (ms)"]
-    if not skip_batch:
-        headers += ["Batch (ms)", "Speedup"]
+    headers = ["Batch Size"]
+    if run_single:
+        headers.append("Sequential (ms)")
+    if run_batch:
+        headers.append("Batch (ms)")
+    if run_single and run_batch:
+        headers.append("Speedup")
     print("".join(f"{h:<18}" for h in headers))
     print("-" * (18 * len(headers)))
 
     for r in results:
-        row = [f"{r['batch_size']}", f"{r['avg_sequential_ms']:.2f} ms"]
-        if not skip_batch:
-            row += [f"{r['avg_batch_ms']:.2f} ms", f"{r['speedup_factor']:.2f}x"]
+        row = [f"{r['batch_size']}"]
+        if run_single:
+            row.append(f"{r['avg_sequential_ms']:.2f} ms")
+        if run_batch:
+            row.append(f"{r['avg_batch_ms']:.2f} ms")
+        if run_single and run_batch:
+            row.append(f"{r['speedup_factor']:.2f}x")
         print("".join(f"{v:<18}" for v in row))
 
 
-def print_runs(label, runs, avg):
+def print_runs(*, label, runs, avg):
     print(f"  {label}:")
     for i, t in enumerate(runs):
         print(f"    Run {i+1}: {t:.2f} ms")
     print(f"    Average: {avg:.2f} ms")
 
 
-def measure_times(fn, num_runs):
+def measure_times(*, fn, num_runs):
     times = []
     for _ in range(num_runs):
         start = time.perf_counter()
@@ -137,7 +176,7 @@ def measure_times(fn, num_runs):
     return times
 
 
-def generate_random_token_ids(num_prompts, num_tokens, tokenizer):
+def generate_random_token_ids(*, num_prompts, num_tokens, tokenizer):
     vocab_size = tokenizer.vocab_size
     print(f"Generating {num_prompts} random sequences with {num_tokens} tokens each...")
     return [
@@ -178,9 +217,11 @@ def parse_args():
         help="Batch sizes to test (default: 1 2 4 8)",
     )
     parser.add_argument(
-        "--no-batch",
-        action="store_true",
-        help="Skip batch benchmark, only run sequential",
+        "--batch-mode",
+        nargs="+",
+        choices=["single", "batch"],
+        default=["single", "batch"],
+        help="Benchmark modes to run (default: single batch)",
     )
     parser.add_argument(
         "--num-runs",
