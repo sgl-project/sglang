@@ -1194,11 +1194,10 @@ def _wait_for_scheduler_ready(
 def _sync_scheduler_infos_across_nodes(
     server_args: ServerArgs,
     local_scheduler_infos: List[Dict],
-    max_retries: int = 3,
-    retry_delay: float = 5.0,
 ) -> List[Dict]:
     """Sync scheduler_infos across nodes via StatelessProcessGroup all_gather."""
     METADATA_SYNC_PORT_OFFSET = 10000
+    SYNC_TIMEOUT_SECONDS = 900  # 15 minutes for slow node startup
     dist_host, dist_port = server_args.dist_init_addr.rsplit(":", 1)
     sync_port = int(dist_port) + METADATA_SYNC_PORT_OFFSET
 
@@ -1207,36 +1206,33 @@ def _sync_scheduler_infos_across_nodes(
         f"(node_rank={server_args.node_rank}, local_ranks={len(local_scheduler_infos)})"
     )
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            pg = StatelessProcessGroup.create(
-                host=dist_host,
-                port=sync_port,
-                rank=server_args.node_rank,
-                world_size=server_args.nnodes,
-            )
+    try:
+        pg = StatelessProcessGroup.create(
+            host=dist_host,
+            port=sync_port,
+            rank=server_args.node_rank,
+            world_size=server_args.nnodes,
+            timeout_seconds=SYNC_TIMEOUT_SECONDS,
+        )
 
-            all_node_infos = pg.all_gather_obj(local_scheduler_infos)
+        all_node_infos = pg.all_gather_obj(local_scheduler_infos)
 
-            merged_scheduler_infos = []
-            for node_infos in all_node_infos:
-                if node_infos:
-                    merged_scheduler_infos.extend(node_infos)
+        merged_scheduler_infos = []
+        for node_infos in all_node_infos:
+            if node_infos:
+                merged_scheduler_infos.extend(node_infos)
 
-            logger.info(
-                f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
-            )
-            return merged_scheduler_infos
+        logger.info(
+            f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
+        )
+        return merged_scheduler_infos
 
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-            else:
-                logger.error(
-                    f"Failed to sync scheduler_infos after {max_retries} attempts: {e}. "
-                    f"Only local ranks will be available."
-                )
-                return local_scheduler_infos
+    except Exception as e:
+        logger.error(
+            f"Failed to sync scheduler_infos across nodes: {e}. "
+            f"Only local ranks will be available."
+        )
+        return local_scheduler_infos
 
 
 def _calculate_rank_ranges(

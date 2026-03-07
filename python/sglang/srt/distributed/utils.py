@@ -5,6 +5,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
+import datetime
 import logging
 import os
 import pickle
@@ -199,6 +200,7 @@ class StatelessProcessGroup:
         rank: int,
         world_size: int,
         data_expiration_seconds: int = 3600,
+        timeout_seconds: int = 300,
     ) -> "StatelessProcessGroup":
         """A replacement for `torch.distributed.init_process_group` that does not
         pollute the global state.
@@ -220,6 +222,7 @@ class StatelessProcessGroup:
             port=port,
             world_size=world_size,
             is_master=(rank == 0),
+            timeout=datetime.timedelta(seconds=timeout_seconds),
         )
 
         return StatelessProcessGroup(
