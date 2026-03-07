@@ -57,7 +57,6 @@ SGL_DEVICE T exp(T a) {
 }
 
 /// \brief Returns sin(a).
-
 template <typename T>
 SGL_DEVICE T sin(T a) {
   return dtype_trait<T>::sin(a);
