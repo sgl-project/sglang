@@ -61,7 +61,7 @@ You can find additional accuracy eval examples in:
 - [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
-Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
+Refer to [Benchmark and Profiling](so ../developer_guide/benchmark_and_profiling.md).
 
 ## Requesting a review for merge
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
