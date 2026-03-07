@@ -26,6 +26,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import SkipValidation
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -126,7 +127,10 @@ class GenerateReqInput(BaseReq):
     # The token ids for text; one can specify either text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # SkipValidation: pydantic Union resolution is O(n) in float count (~200ms for large payloads).
+    input_embeds: SkipValidation[
+        Optional[Union[List[List[List[float]]], List[List[float]]]]
+    ] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -310,12 +314,18 @@ class GenerateReqInput(BaseReq):
                 self.batch_size = len(self.input_ids)
             self.input_embeds = None
         else:
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
+            try:
+                first = self.input_embeds[0][0]
+            except (TypeError, IndexError, KeyError) as e:
+                raise ValueError(
+                    "input_embeds must be list[list[float]] or list[list[list[float]]] for batch"
+                ) from e
+            if isinstance(first, list):
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
+            else:
+                self.is_single = True
+                self.batch_size = 1
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
