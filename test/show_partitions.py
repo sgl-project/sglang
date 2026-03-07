@@ -34,15 +34,15 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
 }
 
-# Regex to extract run_suite.py invocations from pr-test.yml
-# Matches: python3 run_suite.py --hw <hw> --suite <suite> [--auto-partition-size <N>]
+# Regex to detect run_suite.py invocations from pr-test.yml.
+# Uses lookaheads so --hw and --suite can appear in any order.
 _RUN_SUITE_RE = re.compile(
     r"^\s*(?:\w+=\S+\s+)?"  # optional env prefix (e.g. IS_BLACKWELL=1)
-    r"python3\s+run_suite\.py"
-    r"\s+--hw\s+(?P<hw>\S+)"
-    r"\s+--suite\s+(?P<suite>\S+)"
-    r"(?:.*--auto-partition-size\s+(?P<size>\d+))?"
+    r"python3\s+run_suite\.py\b"
+    r"(?=.*\s--hw\s+(?P<hw>\S+))"
+    r"(?=.*\s--suite\s+(?P<suite>\S+))"
 )
+_PARTITION_SIZE_RE = re.compile(r"--auto-partition-size\s+(\d+)")
 
 
 def parse_stage_configs(workflow_path):
@@ -60,7 +60,8 @@ def parse_stage_configs(workflow_path):
                 continue
             hw = m.group("hw")
             suite = m.group("suite")
-            size = int(m.group("size")) if m.group("size") else 1
+            size_match = _PARTITION_SIZE_RE.search(line)
+            size = int(size_match.group(1)) if size_match else 1
             key = (hw, suite)
             if key not in seen:
                 seen.add(key)
