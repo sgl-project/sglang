@@ -710,6 +710,42 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        """Return (input_dim, output_dim) for LoRA buffer allocation.
+
+        The default get_hidden_dim in lora/utils.py doesn't account for
+        Qwen3.5's attn_output_gate, which doubles the Q projection output
+        (Q + output gate are fused into qkv_proj). Without this override
+        the LoRA buffer for qkv_proj is undersized, causing a shape mismatch
+        at weight-load time.
+        """
+        config = self.config
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
+        attn_output_gate = getattr(config, "attn_output_gate", False)
+        q_heads_multiplier = 2 if attn_output_gate else 1
+        if module_name == "qkv_proj":
+            return (
+                config.hidden_size,
+                head_dim
+                * (
+                    config.num_attention_heads * q_heads_multiplier
+                    + config.num_key_value_heads * 2
+                ),
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            return config.hidden_size, config.intermediate_size * 2
+        elif module_name == "down_proj":
+            return config.intermediate_size, config.hidden_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -1045,6 +1081,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        # Delegate to the inner language model so the LoRA manager (which
+        # checks get_hidden_dim on this outer entry-point class) uses the
+        # correct dimensions that account for attn_output_gate.
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -1136,6 +1178,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        # Delegate to the inner language model so the LoRA manager (which
+        # checks get_hidden_dim on this outer entry-point class) uses the
+        # correct dimensions that account for attn_output_gate.
+        return self.model.get_hidden_dim(module_name, layer_idx)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
