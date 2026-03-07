@@ -189,23 +189,46 @@ def get_token_ids_logprobs_batch_optimized(
 
     Uses a single GPU kernel call for the entire batch instead of multiple
     separate calls, significantly improving performance for large batches.
+
+    Args:
+        logprobs: Log probabilities tensor [batch_size, vocab_size]
+        token_ids_logprobs: List of token IDs to extract logprobs for
+
+    Example:
+        # Input: batch_size=3, vocab_size=5
+        logprobs = torch.tensor([
+            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
+            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
+            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
+        ])
+        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
+
+        # Output:
+        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+        # indices = [[1, 3], [2], [0, 2, 4]]
     """
     batch_size = len(token_ids_logprobs)
     device = logprobs.device
 
+    # Step 1: Calculate lengths for each request, treating None as empty list
+    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
     token_lengths = torch.tensor(
         [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
     )
-    total_tokens = int(token_lengths.sum().item())
+    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
 
+    # Handle edge case where no tokens are requested
     if total_tokens == 0:
         return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
             [] for _ in token_ids_logprobs
         ]
 
+    # Step 2: Build flattened indices using torch operations
+    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
     row_indices = torch.repeat_interleave(
         torch.arange(batch_size, device=device), token_lengths
     )
+    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
     col_indices = torch.tensor(
         [
             token_id
@@ -216,12 +239,21 @@ def get_token_ids_logprobs_batch_optimized(
         dtype=torch.long,
     )
 
+    # Step 3: Single vectorized gather operation
+    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
     gathered_logprobs = logprobs[row_indices, col_indices]
 
+    # Step 4: Split results back per request using torch operations
+    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
     split_logprobs = torch.split_with_sizes(
         gathered_logprobs, token_lengths.tolist(), dim=0
     )
 
+    # Step 5: Format output to match expected return structure
+    # Example: Convert split tensors back to list format with proper empty handling
+    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
+    # i=1: [2] -> append split_logprobs[1] and [2]
+    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
 
