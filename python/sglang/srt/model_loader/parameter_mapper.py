@@ -230,7 +230,9 @@ class ParameterMapper:
 
     @classmethod
     def from_model(cls, model) -> "ParameterMapper":
-        """Create a ParameterMapper from a model instance."""
+        """Create a ParameterMapper from a model instance; currently supports
+        DeepseekV2ForCausalLM, Glm4ForCausalLM, Glm4MoeForCausalLM, LlamaForCausalLM,
+        Qwen2ForCausalLM, Qwen3ForCausalLM, Qwen3MoeForCausalLM."""
         stacked_mapping = list(getattr(model, "stacked_params_mapping", []) or [])
         expert_mapping = list(getattr(model, "expert_params_mapping", []) or [])
 
