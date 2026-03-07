@@ -166,6 +166,17 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -191,6 +202,17 @@ class RMSNorm(MultiPlatformOp):
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
