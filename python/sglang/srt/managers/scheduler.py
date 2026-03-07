@@ -1158,6 +1158,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
@@ -1212,6 +1213,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
@@ -2363,7 +2365,7 @@ class Scheduler(
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx:
+                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
@@ -2439,7 +2441,7 @@ class Scheduler(
 
             if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
-                with self.forward_stream_ctx:
+                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
