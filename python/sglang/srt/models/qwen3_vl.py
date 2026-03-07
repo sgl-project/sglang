@@ -76,10 +76,13 @@ from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
+graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
         ViTNpuGraphRunner,
     )
+
+    graph_runners_dict["npu"] = ViTNpuGraphRunner
 
 
 logger = logging.getLogger(__name__)
@@ -397,12 +400,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         self.tp_size = (
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        graph_runners_dict = defaultdict(
-            lambda: ViTCudaGraphRunner,
-            {
-                "npu": ViTNpuGraphRunner,
-            },
         )
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
