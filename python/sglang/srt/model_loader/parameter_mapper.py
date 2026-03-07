@@ -186,8 +186,13 @@ class ParameterMapper:
 
         if "scale" in name:
             if self._custom_scale_remap is not None:
-                name = self._custom_scale_remap(name)
-            name = self._apply_scale_remap(name)
+                remapped = self._custom_scale_remap(name)
+                if remapped != name:
+                    name = remapped
+                else:
+                    name = self._apply_scale_remap(name)
+            else:
+                name = self._apply_scale_remap(name)
 
         for hf_pattern, (
             sglang_name,
