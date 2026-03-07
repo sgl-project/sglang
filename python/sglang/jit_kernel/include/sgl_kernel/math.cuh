@@ -33,4 +33,19 @@ SGL_DEVICE T rsqrt(T a) {
   return dtype_trait<T>::rsqrt(a);
 }
 
+template <typename T>
+SGL_DEVICE T exp(T a) {
+  return dtype_trait<T>::exp(a);
+}
+
+template <typename T>
+SGL_DEVICE T sin(T a) {
+  return dtype_trait<T>::sin(a);
+}
+
+template <typename T>
+SGL_DEVICE T cos(T a) {
+  return dtype_trait<T>::cos(a);
+}
+
 }  // namespace device::math

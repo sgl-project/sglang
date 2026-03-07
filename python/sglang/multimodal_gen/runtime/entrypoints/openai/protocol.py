@@ -43,6 +43,8 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     negative_prompt: Optional[str] = None
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
@@ -71,6 +73,7 @@ class VideoResponse(BaseModel):
 class VideoGenerationsRequest(BaseModel):
     prompt: str
     input_reference: Optional[str] = None
+    reference_url: Optional[str] = None
     model: Optional[str] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
@@ -87,6 +90,13 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    # Frame interpolation
+    enable_frame_interpolation: Optional[bool] = False
+    frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×
+    frame_interpolation_scale: Optional[float] = 1.0
+    frame_interpolation_model_path: Optional[str] = None
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
@@ -98,6 +108,42 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+# Mesh API protocol models
+class MeshResponse(BaseModel):
+    id: str
+    object: str = "mesh"
+    model: str = ""
+    status: str = "queued"
+    progress: int = 0
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    format: str = "glb"
+    url: Optional[str] = None
+    completed_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class MeshGenerationsRequest(BaseModel):
+    prompt: str = "generate 3d mesh"
+    input_image: Optional[str] = None
+    model: Optional[str] = None
+    seed: Optional[int] = None
+    generator_device: Optional[str] = "cuda"
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    negative_prompt: Optional[str] = None
+    output_format: Optional[str] = "glb"
+
+
+class MeshListResponse(BaseModel):
+    data: List[MeshResponse]
+    object: str = "list"
 
 
 @dataclass

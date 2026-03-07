@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -30,6 +32,10 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -53,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PinPrefixReqInput,
+    PinPrefixReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -202,6 +210,15 @@ class TokenizerCommunicatorMixin:
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.attach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.detach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.pin_prefix_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -221,6 +238,9 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
         self.get_loads_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -282,6 +302,18 @@ class TokenizerCommunicatorMixin:
                     self.clear_hicache_storage_communicator.handle_recv,
                 ),
                 (
+                    AttachHiCacheStorageReqOutput,
+                    self.attach_hicache_storage_communicator.handle_recv,
+                ),
+                (
+                    DetachHiCacheStorageReqOutput,
+                    self.detach_hicache_storage_communicator.handle_recv,
+                ),
+                (
+                    PinPrefixReqOutput,
+                    self.pin_prefix_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -313,18 +345,90 @@ class TokenizerCommunicatorMixin:
                     GetLoadsReqOutput,
                     self.get_loads_communicator.handle_recv,
                 ),
+                (
+                    DumperControlReqOutput,
+                    self.dumper_control_communicator.handle_recv,
+                ),
             ]
         )
 
     async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
+        self.auto_create_handle_loop()
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
+        self.auto_create_handle_loop()
         # Delegate to the scheduler to handle HiCacheStorage clearing
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
         ]
+
+    async def attach_hicache_storage(
+        self: TokenizerManager,
+        hicache_storage_backend: str,
+        hicache_storage_backend_extra_config_json: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
+    ) -> AttachHiCacheStorageReqOutput:
+        """Attach (enable) HiCache storage backend at runtime."""
+        self.auto_create_handle_loop()
+        results = await self.attach_hicache_storage_communicator(
+            AttachHiCacheStorageReqInput(
+                hicache_storage_backend=hicache_storage_backend,
+                hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
+                hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+                hicache_write_policy=hicache_write_policy,
+            )
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            # Keep tokenizer side server_info consistent with scheduler side.
+            self.server_args.hicache_storage_backend = hicache_storage_backend
+            if hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    hicache_storage_backend_extra_config_json
+                )
+            if hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    hicache_storage_prefetch_policy
+                )
+            if hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = hicache_write_policy
+        return out
+
+    async def detach_hicache_storage(
+        self: TokenizerManager,
+    ) -> DetachHiCacheStorageReqOutput:
+        """Detach (disable) HiCache storage backend at runtime."""
+        self.auto_create_handle_loop()
+        results = await self.detach_hicache_storage_communicator(
+            DetachHiCacheStorageReqInput()
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+        return out
+
+    async def pin_prefix(
+        self: TokenizerManager, token_ids: List[int], ttl_seconds: int = 300
+    ) -> PinPrefixReqOutput:
+        """Pin a prefix by token_ids to resist eviction."""
+        results = await self.pin_prefix_communicator(
+            PinPrefixReqInput(token_ids=token_ids, ttl_seconds=ttl_seconds)
+        )
+        all_success, all_message = _Communicator.merge_results(results)
+        total = sum(r.nodes_pinned for r in results)
+        return PinPrefixReqOutput(
+            success=all_success, nodes_pinned=total, message=all_message
+        )
 
     async def start_profile(
         self: TokenizerManager,
@@ -402,7 +506,7 @@ class TokenizerCommunicatorMixin:
         return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
-        self,
+        self: TokenizerManager,
         obj: DestroyWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -445,7 +549,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def init_weights_send_group_for_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -460,7 +564,7 @@ class TokenizerCommunicatorMixin:
         return result.success, result.message
 
     async def send_weights_to_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: SendWeightsToRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -503,7 +607,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def update_weights_from_ipc(
-        self,
+        self: TokenizerManager,
         obj: UpdateWeightsFromIPCReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -777,6 +881,7 @@ class TokenizerCommunicatorMixin:
         await self.slow_down_communicator(obj)
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
@@ -787,12 +892,20 @@ class TokenizerCommunicatorMixin:
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
+        self.auto_create_handle_loop()
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
         return [res.updated for res in responses]
 
+    async def dumper_control(
+        self: TokenizerManager, obj: DumperControlReqInput
+    ) -> List[DumperControlReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.dumper_control_communicator(obj)
+
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
+        self.auto_create_handle_loop()
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
 
@@ -811,6 +924,7 @@ class TokenizerCommunicatorMixin:
         Returns:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
+        self.auto_create_handle_loop()
         req = GetLoadsReqInput(
             include=include if include else ["all"],
             dp_rank=dp_rank,
@@ -824,9 +938,26 @@ class TokenizerCommunicatorMixin:
         return results
 
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: OpenSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if obj.streaming:
+            if not self.server_args.enable_streaming_session:
+                raise ValueError(
+                    "Streaming sessions are disabled. "
+                    "Please relaunch with --enable-streaming-session."
+                )
+            if (
+                self.server_args.speculative_algorithm is not None
+                and not self.server_args.disable_overlap_schedule
+            ):
+                raise ValueError(
+                    "Streaming sessions are incompatible with speculative decoding v2 "
+                    "(overlap + speculative). Use --disable-overlap-schedule or "
+                    "disable speculative decoding."
+                )
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
@@ -841,11 +972,15 @@ class TokenizerCommunicatorMixin:
         return session_id
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: CloseSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+    def _update_weight_version_if_provided(
+        self: TokenizerManager, weight_version: Optional[str]
+    ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version

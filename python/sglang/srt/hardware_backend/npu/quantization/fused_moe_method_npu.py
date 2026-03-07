@@ -118,7 +118,7 @@ def npu_fused_moe_without_routing_weights_bf16(
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
+        weight=[layer.w13_weight],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
@@ -129,7 +129,7 @@ def npu_fused_moe_without_routing_weights_bf16(
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
+        weight=[layer.w2_weight],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
@@ -137,6 +137,85 @@ def npu_fused_moe_without_routing_weights_bf16(
         output_dtype=output_dtype,
     )[0]
     return hidden_states
+
+
+def fused_moe_npu(
+    x,
+    w1,
+    w2,
+    topk_output,
+    moe_runner_config,
+):
+    # TODO: reuse the codes of UnquantizedFusedMoEMethod-forward_npu
+    topk_weights, topk_ids, _ = topk_output
+    original_dtype = x.dtype
+    num_tokens = x.shape[0]
+    topk_weights = topk_weights.to(x.dtype)
+    topk_ids = topk_ids.to(torch.int32)
+    num_experts = w1.shape[0]
+    top_k = topk_weights.shape[-1]
+    row_idx_len = num_tokens * top_k
+    row_idx = (
+        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
+        .view(top_k, -1)
+        .permute(1, 0)
+        .contiguous()
+    )
+
+    hidden_states, expanded_row_idx, expanded_expert_idx = (
+        torch.ops.npu.npu_moe_init_routing(
+            x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        )
+    )
+
+    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
+        expanded_expert_idx, num_experts
+    )
+
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    # gmm1: gate_up_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w1.permute(0, 2, 1)],
+        bias=None,
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    # act_fn:
+    if moe_runner_config.activation == "silu":
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    else:
+        from sglang.srt.layers.activation import GeluAndMul
+
+        hidden_states = GeluAndMul()(hidden_states)
+
+    # gmm2: down_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2.permute(0, 2, 1)],
+        bias=None,
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+    )
+    return final_hidden_states
 
 
 class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
@@ -150,41 +229,26 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 
 class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
-    def _release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight_data = self._release_weight_cache(layer.w13_weight.data)
-        layer.w13_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
-        weight_data = self._release_weight_cache(layer.w2_weight.data)
-        layer.w2_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
         layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
-            requires_grad=False,
+            layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
-                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w13_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
         if hasattr(layer, "w2_weight_offset"):
             layer.w2_weight_offset = torch.nn.Parameter(
-                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
-
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
     def apply(
         self,

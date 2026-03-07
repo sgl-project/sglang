@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 DEEPSEEK_R1_MODEL_PATH = "amd/DeepSeek-R1-MXFP4-Preview"
-SERVER_LAUNCH_TIMEOUT = 1200
+SERVER_LAUNCH_TIMEOUT = 1800
 
 
 class TestDeepseekR1MXFP4(CustomTestCase):

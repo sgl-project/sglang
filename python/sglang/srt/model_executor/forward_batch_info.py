@@ -45,6 +45,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -95,7 +96,7 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
-    # Used in diffusion LLM inference
+    # Used in dLLM
     DLLM_EXTEND = auto()
 
     def is_prefill(self):
@@ -207,7 +208,7 @@ class CaptureHiddenMode(IntEnum):
 
 
 def compute_local_num_token_non_padded(
-    global_num_token_non_padded: torch.Tensor | int,
+    global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
@@ -218,10 +219,6 @@ def compute_local_num_token_non_padded(
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
-    # Make sure global_num_token_non_padded is tensor so torch.clamp doesn't break
-    if isinstance(global_num_token_non_padded, int):
-        global_num_token_non_padded = torch.tensor(global_num_token_non_padded)
 
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
@@ -341,6 +338,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -350,6 +348,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 
     # For padding
@@ -374,6 +373,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For dumper: request IDs for cross-step sequence tracking
+    rids: Optional[List[str]] = None
 
     @classmethod
     def init_new(
@@ -403,6 +405,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
+            all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
@@ -419,6 +422,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
 
@@ -518,6 +522,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init lora information
         if model_runner.server_args.enable_lora:
+            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
+            # as a batch, right before running the batch
+            if not model_runner.server_args.enable_lora_overlap_loading:
+                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
@@ -535,7 +544,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded_cpu,
+            global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
@@ -645,10 +654,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len: int,
     ) -> torch.Tensor:
         # doing below compute on cpu to avoid frequent small kernels
-        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
-        mrope_positions = (
-            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
-        )
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
+                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        mrope_positions = mm_input.mrope_position_delta_repeated_cache + seq_len
         return mrope_positions
 
     def _compute_mrope_positions(
@@ -675,7 +685,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         mm_input, self.seq_lens_cpu[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend():
+            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
@@ -743,6 +753,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
+        # make sure that each rank has the same number of tokens to do collective communication.
+        attn_cp_size = get_attention_cp_size()
+        for i in range(sync_group_size):
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
@@ -794,7 +809,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
-                        num_tokens // self.spec_info.num_tokens_per_batch
+                        num_tokens // self.spec_info.num_tokens_per_req
                     )
                 else:
                     bs = self.batch_size = num_tokens
@@ -855,7 +870,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
+            self.mrope_positions = torch.cat(
+                [
+                    self.mrope_positions,
+                    self.mrope_positions.new_zeros(
+                        3, num_tokens - self.mrope_positions.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
@@ -922,7 +945,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
-                bs = bs * self.spec_info.num_tokens_per_batch
+                bs = bs * self.spec_info.num_tokens_per_req
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
