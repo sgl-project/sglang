@@ -17,6 +17,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
+
 #include <hipcub/hipcub.hpp>
 
 #include "pytorch_extension_utils_rocm.h"
@@ -246,8 +247,7 @@ void tree_speculative_sampling_target_only(
     throw std::runtime_error("Expected 'uniform_samples' to be of type float (torch.float32).");
   }
   if (uniform_samples_for_final_sampling.scalar_type() != at::kFloat) {
-    throw std::runtime_error(
-        "Expected 'uniform_samples_for_final_sampling' to be of type float (torch.float32).");
+    throw std::runtime_error("Expected 'uniform_samples_for_final_sampling' to be of type float (torch.float32).");
   }
   if (target_probs.scalar_type() != at::kFloat) {
     throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
@@ -292,8 +292,5 @@ void tree_speculative_sampling_target_only(
       capped_threshold_acc);
 
   auto status = hipGetLastError();
-  TORCH_CHECK(
-      status == hipSuccess,
-      "TreeSpecSamplingTargetOnlyKernel failed with error: ",
-      hipGetErrorString(status));
+  TORCH_CHECK(status == hipSuccess, "TreeSpecSamplingTargetOnlyKernel failed with error: ", hipGetErrorString(status));
 }
