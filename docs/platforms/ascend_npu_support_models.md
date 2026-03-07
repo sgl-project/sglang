@@ -9,17 +9,17 @@ You are welcome to enable various models based on your business requirements.
 | Models                                     | Model Family                   |               A2 Supported               |               A3 Supported               |
 |--------------------------------------------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
 | DeepSeek V3/V3.1                           | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| vllm-ascend/DeepSeek-V3.2-Exp-W8A8         | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| vllm-ascend/DeepSeek-R1-0528-W8A8          | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| vllm-ascend/DeepSeek-V2-Lite-W8A8          | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| DeepSeek-V3.2-Exp-W8A8                     | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| DeepSeek-R1-0528-W8A8                      | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| DeepSeek-V2-Lite-W8A8                      | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-30B-A3B-Instruct-2507           | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-32B                             | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-0.6B                            | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| vllm-ascend/Qwen3-235B-A22B-W8A8           | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Qwen3-235B-A22B-W8A8                       | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-Next-80B-A3B-Instruct           | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen2.5-7B-Instruct                   | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| vllm-ascend/QWQ-32B-W8A8                   | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| QWQ-32B-W8A8                               | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | meta-llama/Llama-4-Scout-17B-16E-Instruct  | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | AI-ModelScope/Llama-3.1-8B-Instruct        | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LLM-Research/llama-2-7b                    | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |

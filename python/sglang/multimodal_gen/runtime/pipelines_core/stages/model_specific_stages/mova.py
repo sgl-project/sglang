@@ -349,6 +349,11 @@ class MOVADenoisingStage(PipelineStage):
         self._manage_device_placement(current_model, model_to_offload, server_args)
         return current_model
 
+    def _ensure_shared_models_on_device(self, server_args: ServerArgs):
+        """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
+        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
+
     def _apply_guidance_rescale(
         self,
         noise_pred,
@@ -378,7 +383,7 @@ class MOVADenoisingStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         self._maybe_compile_dits(server_args)
-        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._ensure_shared_models_on_device(server_args)
 
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
