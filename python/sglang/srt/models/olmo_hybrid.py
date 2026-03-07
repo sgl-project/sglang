@@ -72,7 +72,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.conv1d = MergedColumnParallelLinear(
             input_size=self.conv_kernel_size,
             output_sizes=[self.key_dim, self.key_dim, self.value_dim],
-            bias=True,
+            bias=False,
             quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -149,7 +149,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
 
         self.o_norm = RMSNormGated(
             self.head_v_dim,
-            eps=self.layer_norm_epsilon,
+            eps=1e-5,
             group_size=None,
             norm_before_gate=True,
             activation="silu",
@@ -159,7 +159,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
             self.hidden_size,
             bias=False,
             input_is_parallel=True,
-            reduce_results=False,
+            reduce_results=True,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -280,8 +280,8 @@ class OlmoHybridLinearAttentionDecoderLayer(nn.Module):
         hidden_states = hidden_states + residual
 
         residual = hidden_states
-        hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
