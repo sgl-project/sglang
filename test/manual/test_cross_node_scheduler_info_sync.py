@@ -36,7 +36,6 @@ from typing import List
 import requests
 
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
 )
 
@@ -83,7 +82,7 @@ TEST_CASES = {
 }
 
 TEST_CASE_MODELS = {
-    "tp4_nodes2": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    "tp4_nodes2": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     "dp2_single_node": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     "dp2_tp2_nodes2": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
 }
@@ -183,7 +182,7 @@ def main():
 
     test_case = TEST_CASES[args.test_case]
     model_path = args.model_path or TEST_CASE_MODELS.get(
-        args.test_case, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        args.test_case, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT
     )
 
     if args.test_only:

@@ -640,8 +640,10 @@ class Engine(EngineBase):
             scheduler_init_result.wait_for_ready()
 
             if server_args.nnodes > 1:
-                _sync_scheduler_infos_across_nodes(
-                    server_args, scheduler_init_result.scheduler_infos
+                scheduler_init_result.scheduler_infos[:] = (
+                    _sync_scheduler_infos_across_nodes(
+                        server_args, scheduler_init_result.scheduler_infos
+                    )
                 )
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -694,8 +696,10 @@ class Engine(EngineBase):
         ]
 
         if server_args.nnodes > 1:
-            _sync_scheduler_infos_across_nodes(
-                server_args, scheduler_init_result.scheduler_infos
+            scheduler_init_result.scheduler_infos[:] = (
+                _sync_scheduler_infos_across_nodes(
+                    server_args, scheduler_init_result.scheduler_infos
+                )
             )
 
         return (
