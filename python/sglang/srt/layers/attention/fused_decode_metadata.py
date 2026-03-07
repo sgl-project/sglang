@@ -1,9 +1,8 @@
-"""Fused Triton kernel for normal_decode_set_metadata.
+"""
+Fused Triton kernel for normal_decode_set_metadata (add+copy, gather, div+copy). cumsum kept separate.
 
-Fuses the add+copy, gather, and integer-division+copy operations into a
-single kernel launch.  The cumulative-sum (cu_seqlens_k) is kept as a
-separate torch.cumsum call because it is a reduction that is already
-efficient on small vectors (batch-size elements).
+Note: `strided_indices` is only used in the SWA path. The non-SWA kernel
+computes equivalent offsets internally via `offsets * page_size`.
 """
 
 from __future__ import annotations
@@ -48,12 +47,12 @@ def _fused_decode_metadata_kernel(
         offsets = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offsets < max_seq_pages
 
-        # strided_indices[j] == j * page_size  (precomputed arange with step)
         token_offsets = offsets.to(tl.int64) * page_size
 
         vals = tl.load(
             req_to_token_ptr + base_addr + token_offsets,
             mask=mask,
+            other=0,  # avoid undefined values in masked lanes
         )
 
         page_vals = (vals // page_size).to(tl.int32)
@@ -78,15 +77,27 @@ def fused_normal_decode_set_metadata(
     swa_page_table: Optional[torch.Tensor] = None,
     token_to_kv_pool: Optional[SWAKVPool] = None,
 ):
-    """Drop-in replacement for normal_decode_set_metadata using a fused Triton kernel.
+    """Fused Triton kernel replacing ~5 CUDA launches with 2 (kernel + cumsum). SWA path falls back to PyTorch."""
 
-    Reduces ~5 CUDA kernel launches to 2 (one Triton kernel + one cumsum).
-    The SWA (Sliding Window Attention) path is handled with standard PyTorch
-    ops as a fallback since it requires a Python-level lookup table.
-    """
     bs = seq_lens.shape[0]
     if bs == 0:
         return
+
+    # Validate that max_seq_pages fits within the allocated page_table.
+    # The Triton kernel has no bounds checking, so this prevents silent
+    # out-of-bounds memory writes.
+    if max_seq_pages > page_table.shape[1]:
+        raise ValueError(
+            f"max_seq_pages ({max_seq_pages}) exceeds page_table capacity "
+            f"({page_table.shape[1]}). This would cause out-of-bounds memory "
+            f"access in the Triton kernel."
+        )
+
+    # swa_page_table and token_to_kv_pool are co-dependent; reject partial input.
+    if (swa_page_table is None) != (token_to_kv_pool is None):
+        raise ValueError(
+            "swa_page_table and token_to_kv_pool must both be provided or both be None."
+        )
 
     _fused_decode_metadata_kernel[(bs,)](
         cache_seqlens_int32,
