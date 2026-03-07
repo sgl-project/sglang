@@ -119,6 +119,8 @@ async def generations(
             request_id,
             prompt=request.prompt,
             size=request.size,
+            width=request.width,
+            height=request.height,
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,

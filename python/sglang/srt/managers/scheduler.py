@@ -694,9 +694,20 @@ class Scheduler(
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
-                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                if self.is_hybrid_ssm:
+                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
+                        HiMambaRadixCache,
+                    )
 
-                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                    self.tree_cache = HiMambaRadixCache(
+                        params=params, server_args=server_args
+                    )
+                else:
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    self.tree_cache = HiRadixCache(
+                        params=params, server_args=server_args
+                    )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -1707,22 +1718,25 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
-                last_hash = req.last_host_node.get_last_hash_value()
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            last_host_node = (
+                req.last_host_backup_node
+                if req.last_host_backup_node is not None
+                else req.last_host_node
+            )
+            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
-                    req.last_node.get_prefix_hash_values(req.last_node.parent)
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    req.last_host_node,
+                    last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
