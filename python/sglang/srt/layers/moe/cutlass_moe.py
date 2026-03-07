@@ -463,7 +463,6 @@ def cutlass_moe_fp4(
         w1_blockscale,
         w1_alphas,
         out_dtype,
-        device,
         params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
@@ -488,7 +487,6 @@ def cutlass_moe_fp4(
         w2_blockscale,
         w2_alphas,
         out_dtype,
-        device,
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale

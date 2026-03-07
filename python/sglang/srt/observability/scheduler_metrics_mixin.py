@@ -31,7 +31,7 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -117,7 +117,6 @@ class SchedulerMetricsMixin:
         self.current_scheduler_metrics_enabled = (
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
         )
-
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
                 engine_type = "prefill"
@@ -151,6 +150,9 @@ class SchedulerMetricsMixin:
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
                     reporter=self.metrics_collector.increment_gpu_execution_seconds,
+                )
+                self.bubble_timer = GapTimer(
+                    reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
                 )
 
         if self.enable_kv_cache_events:
@@ -189,43 +191,46 @@ class SchedulerMetricsMixin:
         self.last_prefill_tokens = prefill_stats.log_input_tokens
 
         # TODO: generalize this for various memory pools
+        msg_parts = []
+        num_used = token_usage = full_token_usage = None
+
         if self.is_hybrid_swa:
-            (
-                full_num_used,
-                swa_num_used,
-                full_token_usage,
-                swa_token_usage,
-                _,
-                _,
-                _,
-                _,
-            ) = self._get_swa_token_info()
+            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
+                self._get_swa_token_info()
+            )
             num_used = max(full_num_used, swa_num_used)
-            token_usage = max(full_token_usage, swa_token_usage)
-            token_usage_msg = (
-                f"full token usage: {full_token_usage:.2f}, "
-                f"swa token usage: {swa_token_usage:.2f}, "
+            token_usage = max(full_tok, swa_token_usage)
+            full_token_usage = full_tok
+            msg_parts += [
+                f"full token usage: {full_tok:.2f}",
+                f"swa token usage: {swa_token_usage:.2f}",
+            ]
+
+        if self.is_hybrid_ssm:
+            num_used_m, _, full_tok_m, mamba_usage, *_ = self._get_mamba_token_info()
+            num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
+            token_usage = (
+                max(token_usage, mamba_usage)
+                if token_usage is not None
+                else max(full_tok_m, mamba_usage)
             )
-        elif self.is_hybrid_ssm:
-            (
-                full_num_used,
-                _,
-                full_token_usage,
-                mamba_usage,
-                _,
-                _,
-                _,
-                _,
-            ) = self._get_mamba_token_info()
-            num_used = full_num_used
-            token_usage = full_token_usage
-            token_usage_msg = (
-                f"full token usage: {full_token_usage:.2f}, "
-                f"mamba usage: {mamba_usage:.2f}, "
-            )
-        else:
-            num_used, token_usage, _, _ = self._get_token_info()
-            token_usage_msg = f"token usage: {token_usage:.2f}, "
+            if full_token_usage is None:
+                full_token_usage = full_tok_m
+                msg_parts.append(f"full token usage: {full_tok_m:.2f}")
+            msg_parts.append(f"mamba usage: {mamba_usage:.2f}")
+
+        if full_token_usage is None:
+            num_used, tok, _, _ = self._get_token_info()
+            full_token_usage = tok
+            token_usage = tok
+            msg_parts.append(f"token usage: {tok:.2f}")
+
+        assert (
+            num_used is not None
+            and token_usage is not None
+            and full_token_usage is not None
+        )
+        token_usage_msg = ", ".join(msg_parts) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
@@ -247,7 +252,10 @@ class SchedulerMetricsMixin:
         else:
             msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
-        if self.server_args.language_only:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
         graph_backend = defaultdict(
             lambda: "cuda graph",
@@ -278,14 +286,15 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
+            self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 
-            _enable_ps = self.enable_priority_scheduling
+            priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, _enable_ps
+                self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -300,19 +309,19 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, _enable_ps
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, _enable_ps
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, _enable_ps
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, _enable_ps
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
             # Others
@@ -337,47 +346,56 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
+        msg_parts = []
+        num_used = token_usage = full_token_usage = None
+
         if self.is_hybrid_swa:
-            (
-                full_num_used,
-                swa_num_used,
-                full_token_usage,
-                swa_token_usage,
-                _,
-                _,
-                _,
-                _,
-            ) = self._get_swa_token_info()
+            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
+                self._get_swa_token_info()
+            )
             num_used = max(full_num_used, swa_num_used)
-            token_usage = max(full_token_usage, swa_token_usage)
-            token_usage_msg = (
-                f"#full token: {full_num_used}, "
-                f"full token usage: {full_token_usage:.2f}, "
-                f"#swa token: {swa_num_used}, "
-                f"swa token usage: {swa_token_usage:.2f}, "
+            token_usage = max(full_tok, swa_token_usage)
+            full_token_usage = full_tok
+            msg_parts += [
+                f"#full token: {full_num_used}",
+                f"full token usage: {full_tok:.2f}",
+                f"#swa token: {swa_num_used}",
+                f"swa token usage: {swa_token_usage:.2f}",
+            ]
+
+        if self.is_hybrid_ssm:
+            num_used_m, mamba_num, full_tok_m, mamba_usage, *_ = (
+                self._get_mamba_token_info()
             )
-        elif self.is_hybrid_ssm:
-            (
-                full_num_used,
-                mamba_used,
-                full_token_usage,
-                mamba_usage,
-                _,
-                _,
-                _,
-                _,
-            ) = self._get_mamba_token_info()
-            num_used = full_num_used
-            token_usage = full_token_usage
-            token_usage_msg = (
-                f"#full token: {full_num_used}, "
-                f"full token usage: {full_token_usage:.2f}, "
-                f"mamba num: {mamba_used}, "
-                f"mamba usage: {mamba_usage:.2f}, "
+            num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
+            token_usage = (
+                max(token_usage, mamba_usage)
+                if token_usage is not None
+                else max(full_tok_m, mamba_usage)
             )
-        else:
-            num_used, token_usage, _, _ = self._get_token_info()
-            token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
+            if full_token_usage is None:
+                full_token_usage = full_tok_m
+                msg_parts += [
+                    f"#full token: {num_used_m}",
+                    f"full token usage: {full_tok_m:.2f}",
+                ]
+            msg_parts += [
+                f"mamba num: {mamba_num}",
+                f"mamba usage: {mamba_usage:.2f}",
+            ]
+
+        if full_token_usage is None:
+            num_used, tok, _, _ = self._get_token_info()
+            full_token_usage = tok
+            token_usage = tok
+            msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")
+
+        assert (
+            num_used is not None
+            and token_usage is not None
+            and full_token_usage is not None
+        )
+        token_usage_msg = ", ".join(msg_parts) + ", "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -418,7 +436,10 @@ class SchedulerMetricsMixin:
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-        if self.server_args.language_only:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 
         graph_backend = defaultdict(
@@ -436,12 +457,17 @@ class SchedulerMetricsMixin:
 
         logger.info(msg)
         if self.enable_metrics:
-            _enable_ps = self.enable_priority_scheduling
+            priority_enabled = self.enable_priority_scheduling
             # Basics
-            self.stats.num_running_reqs = QueueCount.from_reqs(batch.reqs, _enable_ps)
+            self.stats.num_running_reqs = QueueCount.from_reqs(
+                batch.reqs, priority_enabled
+            )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
+            # maximum usage of all pools
             self.stats.token_usage = token_usage
+            # usage of full attention
+            self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
@@ -449,7 +475,7 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, _enable_ps
+                self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -468,17 +494,17 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, _enable_ps
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, _enable_ps
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, _enable_ps
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, _enable_ps
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
@@ -808,3 +834,22 @@ class SchedulerMetricsMixin:
             ),
         ):
             yield
+
+    @contextmanager
+    def record_bubble_metrics(self: Scheduler, batch: ScheduleBatch):
+        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+            yield
+            return
+
+        category = "forward_" + batch.forward_mode.name.lower()
+        with self.bubble_timer.wrap(
+            metadata=dict(
+                category=category,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            ),
+        ):
+            yield
+
+    def cancel_bubble_timer(self: Scheduler):
+        if self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER:
+            self.bubble_timer.cancel()
