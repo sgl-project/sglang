@@ -46,6 +46,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
@@ -97,7 +98,6 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
