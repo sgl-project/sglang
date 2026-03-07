@@ -982,8 +982,30 @@ class RadixCache(BasePrefixCache):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
 
+    def _node_exists(self, node: TreeNode) -> bool:
+        """Check if a node is still in the tree (not deleted).
+        
+        A node exists if:
+        - It is the root node, OR
+        - It has a parent (deleted nodes have parent=None after _delete_leaf)
+        
+        Args:
+            node: The node to check
+            
+        Returns:
+            True if node exists in tree, False otherwise
+        """
+        if node is None:
+            return False
+        return node == self.root_node or node.parent is not None
+
     def prune_from_node(self, start_node: TreeNode):
         """Prune nodes starting from start_node up to nodes with lock_ref > 0.
+        
+        This method implements deferred batch pruning with safety checks:
+        1. Node existence check (prevents double-free)
+        2. Root protection (prevents system prompt deletion)
+        3. Child constraint check (prevents breaking active branches)
         
         Args:
             start_node: The node to start pruning from
@@ -992,28 +1014,55 @@ class RadixCache(BasePrefixCache):
             logger.warning(f"Pruning skipped: disable={self.disable}, start_node={start_node}")
             return
 
+        # Pitfall 1: Check if node still exists (avoid double-free from concurrent pruning)
+        if not self._node_exists(start_node):
+            logger.debug(f"Node {start_node} already deleted, skipping")
+            return
+
+        # Pitfall 3: Protect root node (never delete root)
+        if start_node == self.root_node:
+            logger.warning(f"Attempted to prune root node, skipping")
+            return
+
+        # Protect immediate children of root (system prompt protection)
+        if start_node.parent == self.root_node:
+            logger.debug(f"Protecting node near root: {start_node}")
+            return
+
         logger.info(f"Starting pruning from node: {start_node}")
         node = start_node
         pruned_count = 0
+        
         while node is not None and node != self.root_node:
-            # Stop if node has lock_ref > 0 (other requests depend on it)
+            # Re-check existence (node might have been deleted by another concurrent prune)
+            if not self._node_exists(node):
+                logger.debug(f"Node was deleted during pruning, stopping")
+                break
+
+            # Pitfall 2: Stop if node is locked (other active requests depend on it)
             if node.lock_ref > 0:
                 logger.info(f"Stopping pruning at node with lock_ref={node.lock_ref}")
                 break
 
-            # Check if node is a leaf (no children)
-            if len(node.children) == 0:
-                # Free the KV cache memory
-                if node.value is not None:
-                    self.token_to_kv_pool_allocator.free(node.value)
-                    self._record_remove_event(node)
-                    pruned_count += 1
-                
-                # Delete the leaf node
-                self._delete_leaf(node)
+            # Pitfall 2: Stop if node has children (protects active branches)
+            if len(node.children) > 0:
+                logger.info(f"Stopping pruning at node with {len(node.children)} children")
+                break
+
+            # Safe to delete this leaf node
+            parent = node.parent  # Save parent before deletion
+            
+            # Free the KV cache memory
+            if node.value is not None:
+                self.token_to_kv_pool_allocator.free(node.value)
+                self._record_remove_event(node)
+                pruned_count += 1
+            
+            # Delete the leaf node
+            self._delete_leaf(node)
             
             # Move to parent
-            node = node.parent
+            node = parent
         
         logger.info(f"Pruning complete. Pruned {pruned_count} nodes.")
 

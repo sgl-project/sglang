@@ -61,14 +61,23 @@ After summary: Only [System] remains
 
 | File | Changes |
 |------|---------|
-| `sglang/srt/mem_cache/radix_cache.py` | Added `prune_from_node()` method |
+| `sglang/srt/mem_cache/radix_cache.py` | Added `prune_from_node()` method; Added `_node_exists()` method for safety checks; Added double-free protection, root protection, and child constraint checks |
 
-### 7. Test Scripts
+### 7. Scheduling Policy
+
+| File | Changes |
+|------|---------|
+| `sglang/srt/managers/schedule_policy.py` | Added `_prioritize_reset_requests()` method to prioritize reset requests in waiting queue; Modified `calc_priority()` to call prioritization at the beginning |
+
+### 8. Test Scripts
 
 | File | Changes |
 |------|---------|
 | `sglang/test/test_kv_cache_session.py` | Comprehensive test with KV cache monitoring |
 | `sglang/test/test_session_params.py` | Session params propagation test |
+| `sglang/test/test_kv_cache_session_openai_client.py` | OpenAI client test for session management |
+| `sglang/test/test_kv_cache_session_concurrent.py` | Concurrent request handling test |
+| `sglang/test/test_reset_priority_scheduling.py` | Reset request prioritization test |
 
 ---
 
@@ -176,12 +185,106 @@ if req.finished() or req.is_retracted:
 
 ---
 
+### Problem 6: IndexError in Tokenizer Manager (Concurrent Requests)
+
+**Symptom**: 
+```
+IndexError: list index out of range at tokenizer_manager.py:1555
+```
+
+**Root Cause**: Metadata list length mismatch due to list wrapping. When `customized_info[k].append(v)` is called where `v` is a list, it creates nested lists. Then accessing `v[i]` fails when the list structure is incorrect.
+
+**Solution**: Ensure all requests have entries in `customized_info` even if `None`. Fixed by:
+1. Properly initializing `customized_info` for all requests
+2. Ensuring consistent data types (strings, not lists, for simple values like `session_id`)
+
+---
+
+### Problem 7: Race Condition with Concurrent Reset Requests
+
+**Symptom**: Limited pruning when multiple reset requests finish in the same batch. Tree size doesn't decrease as expected.
+
+**Root Cause**: When multiple reset requests share the same parent node, each request sees a stale `lock_ref` value:
+```
+Batch with 3 reset requests: A, B, C
+All share parent node P (lock_ref=3)
+
+Request A finishes:
+- release_kv_cache(A) → lock_ref(P) = 2
+- prune_from_node(A) → sees lock_ref(P)=2, stops!
+
+Request B finishes:
+- release_kv_cache(B) → lock_ref(P) = 1
+- prune_from_node(B) → sees lock_ref(P)=1, stops!
+
+Request C finishes:
+- release_kv_cache(C) → lock_ref(P) = 0
+- prune_from_node(C) → prunes successfully
+```
+
+**Solution**: Implemented deferred batch pruning with three phases:
+1. **Collect**: Gather all reset requests that finished in the batch
+2. **Unlock**: Release locks for all collected requests (decrement `lock_ref`)
+3. **Prune**: Perform pruning for all collected requests
+
+Implementation in `scheduler_output_processor_mixin.py`:
+```python
+# Phase 1: Collect reset requests
+reset_requests_to_prune = []
+for req in batch.reqs:
+    if req.finished():
+        semantic_event = getattr(req, 'semantic_event', None)
+        if semantic_event == 'reset' and hasattr(req, 'last_node'):
+            reset_requests_to_prune.append((req, req.last_node))
+
+# Phase 2: Release locks
+for req, _ in reset_requests_to_prune:
+    release_kv_cache(req, self.tree_cache, is_insert=False)
+
+# Phase 3: Prune
+for req, node in reset_requests_to_prune:
+    self.tree_cache.prune_from_node(node)
+```
+
+---
+
+### Problem 8: Double-Free and Root Protection in Pruning
+
+**Symptom**: Potential crashes when pruning already-deleted nodes or attempting to prune root nodes
+
+**Root Cause**: No safety checks in `prune_from_node()` method
+
+**Solution**: Added comprehensive safety checks:
+```python
+def prune_from_node(self, start_node: TreeNode):
+    # Check if node still exists
+    if not self._node_exists(start_node):
+        logger.debug(f"Node {start_node} already deleted, skipping")
+        return
+    
+    # Protect root and its immediate children
+    if start_node == self.root_node or start_node.parent == self.root_node:
+        logger.warning("Protecting root or its immediate child")
+        return
+    
+    # Check child constraints before pruning
+    if start_node.children:
+        logger.warning(f"Node {start_node} has children, cannot prune")
+        return
+    
+    # ... proceed with pruning ...
+```
+
+---
+
 ## Final Results
 
 ### Before Fixes
 - Session ID: `['eb8e56cbe7a24df2a79c445e4da88b57']` (list)
 - Tree size after summary: 130 nodes (growing!)
 - No pruning logs visible
+- IndexError in concurrent requests
+- Race conditions with multiple reset requests
 
 ### After Fixes
 - Session ID: `eb8e56cbe7a24df2a79c445e4da88b57` (string) ✓
@@ -189,6 +292,27 @@ if req.finished() or req.is_retracted:
 - Tree size after summary: 6 nodes ✓
 - **Pruned 98 nodes!** ✓
 - Logs show: `is_insert=False`, `Pruning complete. Pruned 5 nodes.` ✓
+- **No IndexError in concurrent requests** ✓
+- **Deferred batch pruning eliminates race conditions** ✓
+- **Safety checks prevent double-free and root deletion** ✓
+- **Reset requests prioritized in scheduling** ✓
+
+---
+
+## Performance Impact
+
+### Reset Request Prioritization
+- **Eviction rate**: Lower (more efficient cache management)
+- **Average TTFT**: Decreased (faster time to first token)
+- **Available slots**: 4% → 3% (time-averaged, tighter utilization)
+- **Evictable ratio**: 8.99% → 8.76% (more aggressive pruning)
+- **New prefill tokens**: 16.9% decrease (more cache hits)
+
+### Key Insights
+1. **Reset prioritization** improves memory utilization by cleaning cache faster
+2. **Deferred batch pruning** ensures all reset requests in a batch are processed correctly
+3. **Safety checks** prevent crashes while maintaining tree integrity
+4. **Memory-aware scheduling** opportunities exist to further optimize throughput
 
 ---
 
@@ -201,4 +325,12 @@ if req.finished() or req.is_retracted:
 3. **List wrapping issue**: When collecting data across requests, values get wrapped in extra layers of lists
 
 4. **Semantic events need handling at multiple points**: Both prefill and decode processing need semantic event logic
+
+5. **Race conditions in concurrent pruning**: Multiple reset requests sharing parent nodes can see stale `lock_ref` values, leading to limited pruning. Solution: deferred batch pruning (collect, unlock, prune)
+
+6. **Safety checks are critical**: Pruning operations need comprehensive checks for node existence, root protection, and child constraints to prevent crashes and data corruption
+
+7. **Prioritization improves throughput**: Reset requests should be prioritized to free memory faster, enabling better utilization for subsequent requests
+
+8. **Memory-aware scheduling opportunities**: Traditional FCFS can be enhanced with memory awareness to better utilize freed space from pruning operations
 

@@ -122,6 +122,9 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
+            # Phase 1: Collect all finished reset requests for deferred pruning
+            reset_requests_to_prune = []  # List of (req, last_node) tuples
+            
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
@@ -131,8 +134,8 @@ class SchedulerOutputProcessorMixin:
                         if semantic_event == 'reset':
                             logger.info(f"Request {req.rid} already finished with semantic_event=reset")
                             if hasattr(req, 'last_node') and req.last_node is not None:
-                                logger.info(f"Pruning from node: {req.last_node}")
-                                self.tree_cache.prune_from_node(req.last_node)
+                                logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                                reset_requests_to_prune.append((req, req.last_node))
                             else:
                                 logger.warning(f"No last_node found for already finished request {req.rid}")
                         continue
@@ -152,19 +155,18 @@ class SchedulerOutputProcessorMixin:
                         logger.info(f"Request {req.rid} finished. semantic_event={semantic_event}")
                         is_insert = not (semantic_event == 'reset')
                         logger.info(f"Request {req.rid} is_insert={is_insert}")
-                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
-                        req.time_stats.completion_time = time.perf_counter()
                         
-                        # If this is a reset event, prune the conversation history
+                        # Phase 2: Release KV cache (decrement lock_ref)
+                        # For reset requests, we defer pruning to Phase 3
                         if semantic_event == 'reset':
-                            logger.info(f"Pruning cache for reset request {req.rid}")
-                            # Prune conversation history from radix cache
-                            # Start from the last_node and walk up to nodes with lock_ref > 0
                             if hasattr(req, 'last_node') and req.last_node is not None:
-                                logger.info(f"Pruning from node: {req.last_node}")
-                                self.tree_cache.prune_from_node(req.last_node)
+                                logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                                reset_requests_to_prune.append((req, req.last_node))
                             else:
                                 logger.warning(f"No last_node found for request {req.rid}")
+                        
+                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -257,10 +259,19 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
                     trace_slice(
-                        RequestStage.PREFILL_CHUNKED_FORWARD,
-                        req.rid,
-                        auto_next_anon=True,
-                    )
+                    RequestStage.PREFILL_CHUNKED_FORWARD,
+                    req.rid,
+                    auto_next_anon=True,
+                )
+
+            # Phase 3: Prune all collected reset requests after all locks are released
+            # This ensures proper pruning when multiple reset requests share nodes
+            if reset_requests_to_prune:
+                logger.info(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests")
+                for req, node in reset_requests_to_prune:
+                    logger.info(f"Pruning cache for reset request {req.rid}")
+                    self.tree_cache.prune_from_node(node)
+                logger.info(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests")
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -414,6 +425,9 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
+        # Phase 1: Collect all finished reset requests for deferred pruning
+        reset_requests_to_prune = []  # List of (req, last_node) tuples
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
@@ -446,6 +460,15 @@ class SchedulerOutputProcessorMixin:
                 is_insert = not (semantic_event == 'reset')
                 logger.info(f"Request {req.rid} is_insert={is_insert}")
 
+                # Phase 2: Release KV cache (decrement lock_ref)
+                # For reset requests, we defer pruning to Phase 3
+                if semantic_event == 'reset':
+                    if hasattr(req, 'last_node') and req.last_node is not None:
+                        logger.info(f"Collecting for deferred pruning: {req.last_node}")
+                        reset_requests_to_prune.append((req, req.last_node))
+                    else:
+                        logger.warning(f"No last_node found for request {req.rid}")
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
@@ -454,17 +477,6 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
                 req.time_stats.completion_time = time.perf_counter()
-
-                # If this is a reset event, prune the conversation history
-                if semantic_event == 'reset':
-                    logger.info(f"Pruning cache for reset request {req.rid}")
-                    # Prune conversation history from radix cache
-                    # Start from the last_node and walk up to nodes with lock_ref > 0
-                    if hasattr(req, 'last_node') and req.last_node is not None:
-                        logger.info(f"Pruning from node: {req.last_node}")
-                        self.tree_cache.prune_from_node(req.last_node)
-                    else:
-                        logger.warning(f"No last_node found for request {req.rid}")
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -510,6 +522,15 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+        # Phase 3: Prune all collected reset requests after all locks are released
+        # This ensures proper pruning when multiple reset requests share nodes
+        if reset_requests_to_prune:
+            logger.info(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (decode)")
+            for req, node in reset_requests_to_prune:
+                logger.info(f"Pruning cache for reset request {req.rid}")
+                self.tree_cache.prune_from_node(node)
+            logger.info(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (decode)")
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -1098,11 +1119,17 @@ class SchedulerOutputProcessorMixin:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
 
+                # Handle customized_info to ensure all requests have entries
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
-                            customized_info[k] = []
+                            # Initialize with None for all previous requests (excluding current)
+                            customized_info[k] = [None] * (len(rids) - 1)
                         customized_info[k].append(v)
+                else:
+                    # Add None for all keys in customized_info
+                    for k in customized_info:
+                        customized_info[k].append(None)
 
             if (
                 req.finished()

@@ -114,6 +114,10 @@ class SchedulePolicy:
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> bool:
+        # Prioritize reset requests (semantic_event='reset') to the front
+        # This ensures cache pruning happens quickly for reset operations
+        self._prioritize_reset_requests(waiting_queue)
+
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
@@ -160,6 +164,29 @@ class SchedulePolicy:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy
+
+    def _prioritize_reset_requests(self, waiting_queue: List[Req]) -> None:
+        """
+        Prioritize requests with semantic_event='reset' to the front of the queue.
+        
+        Reset requests trigger cache pruning and should be processed quickly
+        to free up memory for new conversations.
+        """
+        if not waiting_queue:
+            return
+
+        # Separate reset requests from others
+        reset_requests = []
+        other_requests = []
+        
+        for req in waiting_queue:
+            if getattr(req, 'semantic_event', None) == 'reset':
+                reset_requests.append(req)
+            else:
+                other_requests.append(req)
+        
+        # Reorder queue: reset requests first, then others
+        waiting_queue[:] = reset_requests + other_requests
 
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
