@@ -24,6 +24,7 @@ _spec.loader.exec_module(_ci_register)
 
 CIRegistry = _ci_register.CIRegistry
 HWBackend = _ci_register.HWBackend
+auto_partition = _ci_register.auto_partition
 collect_tests = _ci_register.collect_tests
 
 HW_MAPPING = {
@@ -65,25 +66,6 @@ def parse_stage_configs(workflow_path):
                 seen.add(key)
                 configs.append((hw, suite, size))
     return configs
-
-
-def auto_partition(files, size):
-    """Partition files into `size` sublists using LPT heuristic.
-    Returns all partitions as a list of lists.
-    """
-    if not files or size <= 0:
-        return [[] for _ in range(size)]
-
-    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
-    partitions = [[] for _ in range(size)]
-    partition_sums = [0.0] * size
-
-    for file in sorted_files:
-        min_sum_idx = min(range(size), key=partition_sums.__getitem__)
-        partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.est_time
-
-    return partitions
 
 
 def main():
@@ -143,11 +125,10 @@ def main():
             out()
             continue
 
-        partitions = auto_partition(enabled, partition_count)
-
         out("| Partition | Tests | Est Time | Files |")
         out("|-----------|-------|----------|-------|")
-        for rank, part_tests in enumerate(partitions):
+        for rank in range(partition_count):
+            part_tests = auto_partition(enabled, rank, partition_count)
             part_time = sum(t.est_time for t in part_tests)
             file_list = ", ".join(
                 f"`{t.filename}` ({t.est_time:.0f}s)" for t in part_tests
