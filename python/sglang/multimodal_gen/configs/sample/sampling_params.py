@@ -624,8 +624,9 @@ class SamplingParams:
         parser.add_argument(
             "--prompt",
             type=str,
+            nargs="+",
             default=SamplingParams.prompt,
-            help="Text prompt for generation",
+            help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
         parser.add_argument(
             "--negative-prompt",
