@@ -16,7 +16,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -61,6 +61,9 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+# Models
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -68,8 +71,6 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-
-# Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
@@ -725,6 +726,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -759,7 +763,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
+        aux_hidden_states = []
         for layer_idx in range(self.start_layer, self.end_layer):
+            if layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -798,7 +808,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1071,6 +1084,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     @property
     def start_layer(self) -> int:
         return getattr(getattr(self, "model", None), "start_layer", 0)
@@ -1083,6 +1099,55 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return end_layer
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
+        ):
+            if self.is_mrope_enabled:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}"
+                )
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.model,
+            multimodal_model=self,
+            positions=positions,
+            use_deepstack=self.use_deepstack,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        else:
+            return hidden_states
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -1098,6 +1163,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1180,6 +1257,58 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
+        ):
+            if self.is_mrope_enabled:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}"
+                )
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.model,
+            multimodal_model=self,
+            positions=positions,
+            use_deepstack=self.use_deepstack,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        else:
+            return hidden_states
+
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
@@ -1194,6 +1323,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
