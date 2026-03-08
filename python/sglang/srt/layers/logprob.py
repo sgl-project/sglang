@@ -469,10 +469,8 @@ class OutputLogprobProcessor(nn.Module):
         temperature: Optional[torch.Tensor] = None,
     ) -> LogprobResult:
         """Compute logprobs from logits and extract results."""
-        if temperature is not None:
-            logprobs = torch.nn.functional.log_softmax(logits / temperature, dim=-1)
-        else:
-            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        # Compute logprobs
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         if next_token_ids is not None:
             return self.from_logprobs(
@@ -485,8 +483,12 @@ class OutputLogprobProcessor(nn.Module):
             top_val, top_idx = get_top_logprobs(logprobs, top_logprobs_nums)
 
         tid_val = tid_idx = None
-        needs_tid = any(x is not None and len(x) > 0 for x in token_ids_logprobs)
-        if needs_tid:
+        # Check if any requests actually need logprobs computation
+        needs_token_ids_logprobs = any(
+            token_ids is not None and len(token_ids) > 0
+            for token_ids in token_ids_logprobs
+        )
+        if needs_token_ids_logprobs:
             tid_val, tid_idx = get_token_ids_logprobs_batch_optimized(
                 logprobs, token_ids_logprobs
             )
