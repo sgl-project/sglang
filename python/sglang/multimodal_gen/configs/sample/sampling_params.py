@@ -14,7 +14,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
@@ -123,11 +123,14 @@ class SamplingParams:
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
+
+    # Subclasses can set these to provide model-specific default resolutions.
+    # The base __post_init__ will apply them when height/width are not provided.
+    _default_height: ClassVar[int | None] = None
+    _default_width: ClassVar[int | None] = None
+
     height: int | None = None
     width: int | None = None
-    # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
-    height_not_provided: bool = False
-    width_not_provided: bool = False
     fps: int = 24
 
     # Resolution validation
@@ -217,10 +220,10 @@ class SamplingParams:
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
 
-        if self.width is None:
-            self.width_not_provided = True
-        if self.height is None:
-            self.height_not_provided = True
+        if self.width is None and self._default_width is not None:
+            self.width = self._default_width
+        if self.height is None and self._default_height is not None:
+            self.height = self._default_height
 
         # Handle output_quality to output_compression conversion
         if self.output_compression is None and self.output_quality is not None:
@@ -895,8 +898,6 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        args.height_not_provided = False
-        args.width_not_provided = False
         return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
@@ -927,8 +928,6 @@ class SamplingParams:
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
-        self.height_not_provided = user_params.height_not_provided
-        self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
 
     @property
