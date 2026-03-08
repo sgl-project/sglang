@@ -4,17 +4,16 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang.srt.models.llama import LlamaMLP as JambaMLP
 from sglang.srt.configs.jamba import ATTENTION, MOE, JambaConfig
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba1AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba1 import MambaMixer1
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -34,9 +33,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llama import LlamaMLP as JambaMLP
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
-
 
 
 class JambaMoE(nn.Module):
@@ -48,7 +47,7 @@ class JambaMoE(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        
+
         if config.num_experts > 1:
             self.router = ReplicatedLinear(
                 config.hidden_size,
@@ -137,7 +136,10 @@ class JambaAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -281,7 +283,6 @@ class JambaAttentionDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-
 class JambaModel(nn.Module):
     def __init__(
         self,
@@ -327,7 +328,6 @@ class JambaModel(nn.Module):
             self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.final_layernorm = PPMissingLayer(return_tuple=True)
-
 
     def forward(
         self,

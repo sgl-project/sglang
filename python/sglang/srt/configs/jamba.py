@@ -215,7 +215,9 @@ class JambaConfig(PretrainedConfig):
         return MLP
 
     def get_layer_types(self, layer_idx: int) -> tuple:
-        return self._get_layer_block_type(layer_idx), self._get_layer_ffn_type(layer_idx)
+        return self._get_layer_block_type(layer_idx), self._get_layer_ffn_type(
+            layer_idx
+        )
 
     @property
     def mamba_layer_ids(self) -> List[int]:

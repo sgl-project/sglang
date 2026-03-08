@@ -730,9 +730,7 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
-        self.forward_metadata = Mamba1Metadata.prepare_mixed(
-            metadata, forward_batch
-        )
+        self.forward_metadata = Mamba1Metadata.prepare_mixed(metadata, forward_batch)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -788,7 +786,6 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
         raise NotImplementedError(
             "Mamba1AttnBackend.forward is called directly instead of forward_extend"
         )
-
 
 
 class HybridLinearAttnBackend(AttentionBackend):

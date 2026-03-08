@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 from packaging import version
-
 from sgl_kernel import selective_scan_fwd
 
 PAD_SLOT_ID = -1
@@ -537,8 +536,17 @@ def selective_scan_fn(
     z_t = z.transpose(1, 2).contiguous() if z is not None else None
 
     results = selective_scan_fwd(
-        u_t, delta_t, A, B_t, C_t, D, z_t, delta_bias,
-        initial_state, delta_softplus, True,
+        u_t,
+        delta_t,
+        A,
+        B_t,
+        C_t,
+        D,
+        z_t,
+        delta_bias,
+        initial_state,
+        delta_softplus,
+        True,
     )
 
     out = results[0].transpose(1, 2)

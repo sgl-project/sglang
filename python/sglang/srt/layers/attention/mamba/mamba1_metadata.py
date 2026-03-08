@@ -52,7 +52,7 @@ class Mamba1Metadata(ForwardMetadata):
         if forward_batch.extend_prefix_lens is not None:
             prefix_lens = forward_batch.extend_prefix_lens
             if prefix_lens.any():
-                has_initial_states = (prefix_lens > 0)
+                has_initial_states = prefix_lens > 0
 
         return Mamba1Metadata(
             query_start_loc=forward_metadata.query_start_loc[: num_prefills + 1],

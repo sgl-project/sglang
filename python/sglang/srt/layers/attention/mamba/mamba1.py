@@ -133,9 +133,7 @@ class MambaMixer1(nn.Module):
             (dt, B, C, A) after all transformations.
         """
         x_dbc, _ = self.x_proj(x)
-        dt, B, C = x_dbc.split(
-            [self.dt_rank, self.state_size, self.state_size], dim=-1
-        )
+        dt, B, C = x_dbc.split([self.dt_rank, self.state_size, self.state_size], dim=-1)
 
         if self.use_dt_bc_layernorm:
             dt = self.dt_layernorm(dt)
