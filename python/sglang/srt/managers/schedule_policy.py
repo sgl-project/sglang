@@ -411,6 +411,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        freed_tokens_from_pruning: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -420,6 +421,7 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+        self.freed_tokens_from_pruning = freed_tokens_from_pruning
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -492,7 +494,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-        return available_and_evictable - self.rem_total_token_offset
+        return available_and_evictable - self.rem_total_token_offset + self.freed_tokens_from_pruning
 
     @property
     def cur_rem_tokens(self):
@@ -514,7 +516,7 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
 
-        return available_and_evictable - self.cur_rem_token_offset
+        return available_and_evictable - self.cur_rem_token_offset + self.freed_tokens_from_pruning
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size

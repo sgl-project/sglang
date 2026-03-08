@@ -728,6 +728,8 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+        # Track memory freed from semantic pruning for memory-aware scheduling
+        self.last_pruning_freed_tokens: int = 0
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -2015,7 +2017,11 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            freed_tokens_from_pruning=self.last_pruning_freed_tokens,
         )
+        
+        # Reset freed tokens after using them for batch selection
+        self.last_pruning_freed_tokens = 0
 
         if self.dllm_config is not None:
             assert (
