@@ -84,6 +84,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
+  m.def("new_gelu(Tensor! out, Tensor input) -> ()");
+  m.impl("new_gelu", torch::kCUDA, &new_gelu);
+
   m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"

@@ -34,6 +34,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
+  m.def("new_gelu(Tensor! out, Tensor input) -> ()");
+  m.impl("new_gelu", torch::kCUDA, &new_gelu);
+
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
 
