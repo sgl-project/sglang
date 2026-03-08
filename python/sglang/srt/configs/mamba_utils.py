@@ -46,7 +46,7 @@ class MambaStateDType:
 
 def mamba_state_dtype(config=None) -> MambaStateDType:
     """
-    Get mamba2 state dtype from config or environment variable.
+    Get mamba state dtype from config or environment variable.
 
     Priority (from highest to lowest):
     1. Environment variable SGLANG_MAMBA_SSM_DTYPE
@@ -58,7 +58,7 @@ def mamba_state_dtype(config=None) -> MambaStateDType:
                 mamba_ssm_dtype from it. For VL models, reads from text_config.
 
     Returns:
-        Mamba2StateDType with conv and temporal dtypes
+        MambaStateDType with conv and temporal dtypes
     """
     dtype_map = {
         "float32": torch.float32,
@@ -102,7 +102,7 @@ def mamba_state_dtype(config=None) -> MambaStateDType:
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
 
-    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+    logger.debug(f"Mamba state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
     return MambaStateDType(conv=conv_dtype, temporal=ssm_dtype)
 
