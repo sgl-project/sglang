@@ -233,17 +233,9 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
-    # TeaCache acceleration
-    enable_teacache: bool = False
-
-    # Frame interpolation
-    enable_frame_interpolation: bool = False
-    frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
-
-    # Upscaling
-    enable_upscaling: bool = False
-    upscaling_model_path: str | None = None
-    upscaling_scale: int = 4
+    # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
+    # merged directly into the OpenAI extra_body dict.
+    extras: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -509,8 +501,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="Doraemon is eating dorayaki",
             output_size="1024x1024",
-            enable_upscaling=True,
-            upscaling_scale=4,
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
 ]
@@ -555,7 +546,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_teacache=True,
+            extras={"enable_teacache": True},
         ),
     ),
     # Frame interpolation (2× / exp=1)
@@ -569,8 +560,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_frame_interpolation=True,
-            frame_interpolation_exp=1,
+            extras={"enable_frame_interpolation": True, "frame_interpolation_exp": 1},
         ),
     ),
     # Upscaling (Real-ESRGAN 4×)
@@ -584,8 +574,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_upscaling=True,
-            upscaling_scale=4,
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
     # Combined: Frame interpolation (2×) + Upscaling (4×)
@@ -599,10 +588,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_frame_interpolation=True,
-            frame_interpolation_exp=1,
-            enable_upscaling=True,
-            upscaling_scale=4,
+            extras={
+                "enable_frame_interpolation": True,
+                "frame_interpolation_exp": 1,
+                "enable_upscaling": True,
+                "upscaling_scale": 4,
+            },
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
