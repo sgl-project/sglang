@@ -16,8 +16,10 @@ class TestCLOCKStrategyPriority:
     def test_unreferenced_sorts_before_referenced(self):
         strategy = CLOCKStrategy()
         old_unreferenced = self._make_node(referenced=False, last_access=1.0)
-        new_referenced   = self._make_node(referenced=True,  last_access=2.0)
-        assert strategy.get_priority(old_unreferenced) < strategy.get_priority(new_referenced)
+        new_referenced = self._make_node(referenced=True, last_access=2.0)
+        assert strategy.get_priority(old_unreferenced) < strategy.get_priority(
+            new_referenced
+        )
 
     def test_same_ref_bit_falls_back_to_lru(self):
         strategy = CLOCKStrategy()
@@ -36,8 +38,10 @@ class TestCLOCKStrategyPriority:
 
 class TestRadixCacheCLOCKIntegration:
     def test_clock_policy_registered(self):
-        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from unittest.mock import MagicMock
+
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
         mock_alloc = MagicMock()
         mock_alloc.device = "cpu"
         params = CacheInitParams(
@@ -53,7 +57,12 @@ class TestRadixCacheCLOCKIntegration:
 
     def test_referenced_bit_set_on_match(self):
         import torch
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+
         cache = RadixCache.create_simulated(disable=False, page_size=1)
         key_ids = list(range(4))
         value = torch.zeros(4, dtype=torch.int32)
@@ -61,13 +70,14 @@ class TestRadixCacheCLOCKIntegration:
         cache.match_prefix(MatchPrefixParams(key=key_ids))
 
         all_nodes = []
+
         def _collect(node):
             for child in node.children.values():
                 all_nodes.append(child)
                 _collect(child)
+
         _collect(cache.root_node)
         assert any(n.referenced for n in all_nodes)
-
 
     def test_second_chance_eviction_order(self):
         """Referenced node survives one eviction round; unreferenced node is evicted first."""
@@ -107,7 +117,6 @@ class TestRadixCacheCLOCKIntegration:
         value_b = torch.ones(4, dtype=torch.int32)
         cache.insert(InsertParams(key=key_b, value=value_b))
 
-        # Collect leaf nodes
         all_nodes = []
 
         def _collect(node):
@@ -120,7 +129,6 @@ class TestRadixCacheCLOCKIntegration:
         node_a = next(n for n in all_nodes if n.referenced)
         node_b = next(n for n in all_nodes if not n.referenced)
 
-        # Evict 4 tokens — node B should go first, node A gets second chance
         cache.evict(EvictParams(num_tokens=4))
 
         assert node_a.referenced == False
