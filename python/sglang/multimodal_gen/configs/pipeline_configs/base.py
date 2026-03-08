@@ -492,7 +492,7 @@ class PipelineConfig:
             type=str,
             dest=f"{prefix_with_dot.replace('-', '_')}text_encoder_precisions",
             default=PipelineConfig.DEFAULT_TEXT_ENCODER_PRECISIONS,
-            choices=["fp32", "fp16", "bf16"],
+            choices=["fp32", "fp16", "bf16", "fp8"],
             help="Precision for each text encoder",
         )
 
@@ -502,7 +502,7 @@ class PipelineConfig:
             type=str,
             dest=f"{prefix_with_dot.replace('-', '_')}image_encoder_precision",
             default=PipelineConfig.image_encoder_precision,
-            choices=["fp32", "fp16", "bf16"],
+            choices=["fp32", "fp16", "bf16", "fp8"],
             help="Precision for image encoder",
         )
 

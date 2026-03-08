@@ -58,7 +58,11 @@ PRECISION_TO_TYPE = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
 }
+
+# dtypes that can be passed to torch.set_default_dtype
+_DEFAULT_DTYPE_COMPATIBLE = {torch.float32, torch.float64, torch.float16, torch.bfloat16}
 
 STR_BACKEND_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
 STR_ATTN_CONFIG_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_CONFIG"

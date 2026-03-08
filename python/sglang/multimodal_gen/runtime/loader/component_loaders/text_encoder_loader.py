@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, _DEFAULT_DTYPE_COMPATIBLE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
@@ -198,7 +198,6 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
-        # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
             encoder_config,
@@ -224,7 +223,11 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        target_dtype = PRECISION_TO_TYPE[dtype]
+        # fp8 can't be used as default dtype; init in bf16, then cast after loading
+        init_dtype = target_dtype if target_dtype in _DEFAULT_DTYPE_COMPATIBLE else torch.bfloat16
+
+        with set_default_torch_dtype(init_dtype):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
@@ -242,6 +245,17 @@ class TextEncoderLoader(ComponentLoader):
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
+
+            # Cast to target dtype if init dtype was different (e.g. fp8).
+            # Convert per-parameter/buffer in-place to avoid holding both
+            # full bf16 and fp8 copies in memory at the same time.
+            if target_dtype != init_dtype:
+                for p in model.parameters():
+                    if p.is_floating_point():
+                        p.data = p.data.to(target_dtype)
+                for b in model.buffers():
+                    if b.is_floating_point():
+                        b.data = b.data.to(target_dtype)
 
             # Explicitly move model to target device after loading weights
             if not should_offload:
