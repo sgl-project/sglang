@@ -306,17 +306,12 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-        if self.current_scheduler_metrics_enabled:
-            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-            if self.enable_metrics:
-                self.metrics_collector.increment_prefill_cuda_graph_pass(
-                    value=can_run_cuda_graph
-                )
-            self.log_prefill_stats(
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        self.report_prefill_stats(
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -485,12 +480,11 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if self.current_scheduler_metrics_enabled:
-            if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
-                self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-            self.log_decode_stats_every_iteration(
-                batch, num_accepted_tokens=result.num_accepted_tokens
-            )
+        self.report_decode_stats(
+            can_run_cuda_graph,
+            running_batch=batch,
+            num_accepted_tokens=result.num_accepted_tokens,
+        )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
