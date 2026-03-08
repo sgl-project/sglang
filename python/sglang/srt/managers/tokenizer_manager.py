@@ -1611,6 +1611,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 }
 
             state.finished = recv_obj.finished_reasons[i] is not None
+
+            # Collect metrics BEFORE the safety net sets first_token_time,
+            # so that TTFT is recorded even for single-batch requests.
+            if self.enable_metrics and state.obj.log_metrics:
+                self.collect_metrics(state, recv_obj, i)
+
             if state.finished:
                 # Ensure first_token_time is set before computing decode_throughput.
                 # Without this, requests that finish on their first output batch
@@ -1651,9 +1657,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.out_list.append(out_dict)
             state.event.set()
 
-            # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
