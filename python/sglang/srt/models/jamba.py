@@ -1,36 +1,11 @@
-# Copyright 2023-2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Inference-only Jamba model.
-
-Jamba is AI21's hybrid Transformer-Mamba1-MoE model.
-This implementation uses period-based layer selection:
-- Attention layers: every attn_layer_period layers (default: 8)
-- MoE layers: every expert_layer_period layers (default: 2)
-- Mamba1 layers: all non-attention layers
-
-Mamba1 uses selective_scan_fn from mamba-ssm for prefill and a custom
-triton kernel for decode.
-"""
-
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from torch import nn
 
 from sglang.srt.models.llama import LlamaMLP as JambaMLP
-from sglang.srt.configs.jamba import ATTENTION, MAMBA, MLP, MOE, JambaConfig
+from sglang.srt.configs.jamba import ATTENTION, MOE, JambaConfig
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba1AttnBackend,
@@ -40,10 +15,8 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -67,8 +40,6 @@ from sglang.utils import logger
 
 
 class JambaMoE(nn.Module):
-    """Jamba Sparse MoE layer with top-k routing."""
-
     def __init__(
         self,
         config: JambaConfig,
@@ -114,8 +85,6 @@ class JambaMoE(nn.Module):
 
 
 class JambaAttention(nn.Module):
-    """Jamba attention layer with GQA and RoPE."""
-
     def __init__(
         self,
         config: JambaConfig,
@@ -168,7 +137,7 @@ class JambaAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -178,8 +147,6 @@ class JambaAttention(nn.Module):
 
 
 class JambaMambaDecoderLayer(nn.Module):
-    """Jamba decoder layer with Mamba1 mixer and MLP/MoE FFN."""
-
     def __init__(
         self,
         config: JambaConfig,
@@ -188,7 +155,6 @@ class JambaMambaDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
         self.layer_idx = layer_idx
 
         self.mamba = MambaMixer1(
@@ -233,14 +199,12 @@ class JambaMambaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Pre-norm for Mamba
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Use Mamba1AttnBackend for forward pass (output tensor pattern)
         attn_backend = forward_batch.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba1AttnBackend)
@@ -251,18 +215,13 @@ class JambaMambaDecoderLayer(nn.Module):
             output=output,
             layer_id=self.layer_idx,
         )
-        # Pre-norm for FFN (fused residual add in float32 + normalize)
         hidden_states, residual = self.pre_ff_layernorm(output, residual)
-
-        # FFN
         hidden_states = self.feed_forward(hidden_states)
 
         return hidden_states, residual
 
 
 class JambaAttentionDecoderLayer(nn.Module):
-    """Jamba decoder layer with attention and MLP/MoE FFN."""
-
     def __init__(
         self,
         config: JambaConfig,
@@ -271,10 +230,8 @@ class JambaAttentionDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
         self.layer_idx = layer_idx
 
-        # Attention
         self.self_attn = JambaAttention(
             config,
             layer_idx,
@@ -282,7 +239,6 @@ class JambaAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        # FFN: MLP or MoE based on layer pattern
         _, ffn_type = config.get_layer_types(layer_idx)
         if ffn_type == MOE:
             self.feed_forward = JambaMoE(
@@ -311,32 +267,22 @@ class JambaAttentionDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Pre-norm for attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Attention
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
 
-        # Pre-norm for FFN (fused residual add in float32 + normalize)
         hidden_states, residual = self.pre_ff_layernorm(hidden_states, residual)
-
-        # FFN
         hidden_states = self.feed_forward(hidden_states)
 
         return hidden_states, residual
 
 
-# Type aliases
-JambaDecoderLayer = Union[JambaMambaDecoderLayer, JambaAttentionDecoderLayer]
-
 
 class JambaModel(nn.Module):
-    """Jamba model backbone."""
-
     def __init__(
         self,
         *,
@@ -382,11 +328,6 @@ class JambaModel(nn.Module):
         else:
             self.final_layernorm = PPMissingLayer(return_tuple=True)
 
-        # Track which layers are Mamba layers for state management
-        self.mamba_layer_indices = [
-            i for i in range(self.start_layer, self.end_layer)
-            if config._get_layer_block_type(i) == MAMBA
-        ]
 
     def forward(
         self,
@@ -426,8 +367,6 @@ class JambaModel(nn.Module):
 
 
 class JambaForCausalLM(nn.Module):
-    """Jamba model for causal language modeling."""
-
     stacked_params_mapping = [
         ("qkv_proj", "q_proj", "q"),
         ("qkv_proj", "k_proj", "k"),
