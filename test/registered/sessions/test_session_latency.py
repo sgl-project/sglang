@@ -410,7 +410,6 @@ class TestSessionLatency(CustomTestCase):
             reg_tail = _avg(_collect_latencies(reg_list, last_n=TAIL_TURNS))
             stm_tail = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
             speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
-            print(f"Speed up={speedup}x (Streaming v.s. Regular)")
             self.assertGreaterEqual(
                 speedup,
                 2.0,
