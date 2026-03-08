@@ -380,10 +380,10 @@ def selective_state_update(
         out = out.unsqueeze(1)
     if out.dim() == 3:
         out = out.unsqueeze(1)
-    
+
     _, nheads, dim, dstate = state.shape
     batch, T, _, _ = x.shape
-    
+
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
     assert A.shape == (nheads, dim, dstate)
@@ -523,26 +523,37 @@ def selective_scan_fn(
         delta_bias: (dim,) - optional delta bias
         delta_softplus: whether to apply softplus to delta
         return_last_state: whether to return the final state
-        initial_state: (batch, dim, dstate) - optional initial state for prefix caching
+        initial_state: (batch, dim, dstate)
 
     Returns:
         out: (batch, seqlen, dim) - output
         last_state: (batch, dim, dstate) - final state (if return_last_state)
     """
-    u_t = u.transpose(1, 2).contiguous()
-    delta_t = delta.transpose(1, 2).contiguous()
-    B_t = B.transpose(1, 2).unsqueeze(1).contiguous()
-    C_t = C.transpose(1, 2).unsqueeze(1).contiguous()
-    z_t = z.transpose(1, 2).contiguous() if z is not None else None
+    u = u.transpose(1, 2)
+    if u.stride(-1) != 1:
+        u = u.contiguous()
+    delta = delta.transpose(1, 2)
+    if delta.stride(-1) != 1:
+        delta = delta.contiguous()
+    B = B.transpose(1, 2).unsqueeze(1)
+    if B.stride(-1) != 1:
+        B = B.contiguous()
+    C = C.transpose(1, 2).unsqueeze(1)
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    if z is not None:
+        z = z.transpose(1, 2)
+        if z.stride(-1) != 1:
+            z = z.contiguous()
 
     results = selective_scan_fwd(
-        u_t,
-        delta_t,
+        u,
+        delta,
         A,
-        B_t,
-        C_t,
+        B,
+        C,
         D,
-        z_t,
+        z,
         delta_bias,
         initial_state,
         delta_softplus,
