@@ -167,7 +167,7 @@ class JambaConfig(PretrainedConfig):
         self.expert_layer_period = expert_layer_period
         self.expert_layer_offset = expert_layer_offset
 
-        # Mamba1 configuration
+        # Mamba configuration
         self.use_mamba_kernels = use_mamba_kernels
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
@@ -195,7 +195,6 @@ class JambaConfig(PretrainedConfig):
 
     @property
     def mamba_dt_rank_value(self) -> int:
-        """Get the actual dt_rank value, computing if 'auto'."""
         if self.mamba_dt_rank == "auto":
             import math
 
@@ -228,7 +227,6 @@ class JambaConfig(PretrainedConfig):
 
     @property
     def attention_layer_ids(self) -> List[int]:
-        """Get list of layer indices that use attention."""
         return [
             i
             for i in range(self.num_hidden_layers)
@@ -236,22 +234,12 @@ class JambaConfig(PretrainedConfig):
         ]
 
     @property
-    def moe_layer_ids(self) -> List[int]:
-        """Get list of layer indices that use MoE."""
-        return [
-            i
-            for i in range(self.num_hidden_layers)
-            if self._get_layer_ffn_type(i) == MOE
-        ]
-
-    @property
     def full_attention_layer_ids(self) -> List[int]:
-        """Alias for attention_layer_ids (for compatibility with HybridLinearAttnBackend)."""
+        """Alias for attention_layer_ids"""
         return self.attention_layer_ids
 
     @property
     def mamba_cache_params(self) -> Mamba1CacheParams:
-        """Create Mamba1 cache parameters for this config."""
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba1StateShape.create(
