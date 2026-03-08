@@ -687,35 +687,38 @@ class ModelRunnerKVCacheMixin:
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{profiled_tokens}. Use the profiled value instead."
                 )
-            profiled_tokens = min(profiled_tokens, user_limit)
+            capacity = min(profiled_tokens, user_limit)
+        else:
+            capacity = profiled_tokens
 
         # Align to page boundary
         page_size = self.server_args.page_size
-        profiled_tokens = profiled_tokens // page_size * page_size
+        capacity = capacity // page_size * page_size
 
         # Sync across PP ranks (each may have different layer counts)
         if self.pp_size > 1:
-            tensor = torch.tensor(profiled_tokens, dtype=torch.int64)
+            tensor = torch.tensor(capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
             )
-            profiled_tokens = tensor.item()
+            capacity = tensor.item()
 
-        return profiled_tokens
+        return capacity
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        # Estimate pool size (used as upper bound when user specifies max_running_requests)
+        estimated = int(token_capacity / self.model_config.context_len * 512)
+        estimated = max(min(estimated, 4096), 2048)
+
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = max_num_reqs // self.dp_size
+            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
         else:
-            estimated = int(token_capacity / self.model_config.context_len * 512)
-            max_num_reqs = max(min(estimated, 4096), 2048)
-            # When not explicitly set, cap at half the token capacity
-            max_num_reqs = min(max_num_reqs, token_capacity // 2)
+            max_num_reqs = min(estimated, token_capacity // 2)
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
