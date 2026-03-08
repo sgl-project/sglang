@@ -568,7 +568,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            num_frames=8,
         ),
     ),
     # NOTE(mick): flaky

@@ -719,6 +719,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.language_model.end_layer
+
     def forward(
         self,
         input_ids: torch.Tensor,

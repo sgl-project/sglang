@@ -1,15 +1,19 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
-#include <torch/all.h>
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
 
 #include "nvfp4_quant.cuh"
-#include "utils.h"
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+
+using namespace host;
 
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
+SGL_DEVICE uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);
@@ -62,11 +66,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
-    }
+    fp2Vals[i] = device::cast<float2>(vec.elts[i]);
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
   }
@@ -81,30 +81,22 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
-__device__ __forceinline__ float silu(const float& val) {
+SGL_DEVICE float silu(const float& val) {
   return val / (1.0f + __expf(-val));
 }
 
 template <class Type>
-inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
+SGL_DEVICE void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
   float2 x[CVT_FP4_ELTS_PER_THREAD / 2];
   float2 y[CVT_FP4_ELTS_PER_THREAD / 2];
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      x[i] = __half22float2(x_vec.elts[i]);
-      y[i] = __half22float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22half2_rn(x[i]);
-    } else {
-      x[i] = __bfloat1622float2(x_vec.elts[i]);
-      y[i] = __bfloat1622float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
-    }
+    x[i] = device::cast<float2>(x_vec.elts[i]);
+    y[i] = device::cast<float2>(y_vec.elts[i]);
+    x[i].x = silu(x[i].x) * y[i].x;
+    x[i].y = silu(x[i].y) * y[i].y;
+    x_vec.elts[i] = device::cast<packed_t<Type>>(x[i]);
   }
 }
 
@@ -541,77 +533,69 @@ void quant_impl(
   }
 }
 
-// Avoid redefinition warnings
-#undef CHECK_CONTIGUOUS
-#undef CHECK_TH_CUDA
-#undef CHECK_INPUT
-
-/*Quantization entry for fp4 experts quantization*/
-#define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
-#define CHECK_INPUT(x, m) \
-  CHECK_TH_CUDA(x, m);    \
-  CHECK_CONTIGUOUS(x, m);
-
-// constexpr auto FP8 = at::ScalarType::Float8_e4m3fn;
-constexpr auto HALF = at::ScalarType::Half;
-constexpr auto BF16 = at::ScalarType::BFloat16;
-constexpr auto FLOAT = at::ScalarType::Float;
-constexpr auto INT = at::ScalarType::Int;
-constexpr auto UINT8 = at::ScalarType::Byte;
+inline int getSMVersion(int device_id) {
+  int sm_major = 0;
+  int sm_minor = 0;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+  return sm_major * 10 + sm_minor;
+}
 
 void scaled_fp4_experts_quant_sm100a(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts) {
-  auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView input_global_scale,
+    tvm::ffi::TensorView input_offset_by_experts,
+    tvm::ffi::TensorView output_scale_offset_by_experts) {
+  auto MTopK = SymbolicSize{"m_topk"};
+  auto K = SymbolicSize{"k"};
+  auto OutputCols = SymbolicSize{"output_cols"};
+  auto OutputScaleRows = SymbolicSize{"output_scale_rows"};
+  auto OutputScaleCols = SymbolicSize{"output_scale_cols"};
+  auto NExperts = SymbolicSize{"n_experts"};
+  auto OffsetSize = SymbolicSize{"offset_size"};
+  auto device = SymbolicDevice{};
 
-  CHECK_INPUT(output, "output must be a CUDA tensor");
-  CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
-  CHECK_INPUT(input, "input must be a CUDA tensor");
-  CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
-  CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts must be a CUDA tensor");
-  CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA tensor");
+  TensorMatcher({MTopK, K})  //
+      .with_dtype<fp16_t, bf16_t>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
+  TensorMatcher({MTopK, OutputCols})  //
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({OutputScaleRows, OutputScaleCols})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(output_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(input_global_scale);
+  TensorMatcher({OffsetSize})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(input_offset_by_experts)
+      .verify(output_scale_offset_by_experts);
 
-  TORCH_CHECK(output.dim() == 2);
-  TORCH_CHECK(output_scale.dim() == 2);
-  TORCH_CHECK(input.dim() == 2);
-  TORCH_CHECK(input_global_scale.dim() == 1);
-  TORCH_CHECK(input_offset_by_experts.dim() == 1);
-  TORCH_CHECK(output_scale_offset_by_experts.dim() == 1);
-
-  TORCH_CHECK(input.scalar_type() == HALF || input.scalar_type() == BF16);
-  TORCH_CHECK(input_global_scale.scalar_type() == FLOAT);
-  TORCH_CHECK(input_offset_by_experts.scalar_type() == INT);
-  TORCH_CHECK(output_scale_offset_by_experts.scalar_type() == INT);
-  // output is uint8 (two nvfp4 values are packed into one uint8)
-  // output_scale is int32 (four fp8 values are packed into one int32)
-  TORCH_CHECK(output.scalar_type() == UINT8);
-  TORCH_CHECK(output_scale.scalar_type() == INT);
+  const int device_id = input.device().device_id;
+  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
-  auto m_topk = input.size(0);
-  auto k = input.size(1);
-  TORCH_CHECK(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
-  auto n_experts = input_global_scale.size(0);
-  TORCH_CHECK(input_offset_by_experts.size(0) == n_experts + 1);
-  TORCH_CHECK(output_scale_offset_by_experts.size(0) == n_experts + 1);
-  TORCH_CHECK(output.size(0) == m_topk);
-  TORCH_CHECK(output.size(1) == k / 2);
-  int scales_k = k / BLOCK_SIZE;
-  // 4 means the swizzle requirement by nvidia nvfp4.
-  int padded_k = (scales_k + (4 - 1)) / 4 * 4;
-  // 4 means 4 fp8 values are packed into one int32
-  TORCH_CHECK(output_scale.size(1) * 4 == padded_k);
+  const auto m_topk = static_cast<int>(MTopK.unwrap());
+  const auto k = static_cast<int>(K.unwrap());
+  RuntimeCheck(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
+  const auto n_experts = static_cast<int>(NExperts.unwrap());
+  const auto offset_size = static_cast<int>(OffsetSize.unwrap());
+  RuntimeCheck(offset_size == n_experts + 1, "input/output offset size mismatch");
+  RuntimeCheck(static_cast<int>(OutputCols.unwrap()) == k / 2, "output second dim mismatch");
+  const int scales_k = k / BLOCK_SIZE;
+  const int padded_k = (scales_k + 3) / 4 * 4;
+  RuntimeCheck(static_cast<int>(OutputScaleCols.unwrap()) * 4 == padded_k, "output_scale second dim mismatch");
 
-  auto in_dtype = input.dtype();
-  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
-  if (in_dtype == at::ScalarType::Half) {
+  const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
+  if (host::is_type<fp16_t>(input.dtype())) {
     quant_impl<half>(
         output.data_ptr(),
         output_scale.data_ptr(),
@@ -625,7 +609,7 @@ void scaled_fp4_experts_quant_sm100a(
         k,
         n_experts,
         stream);
-  } else if (in_dtype == at::ScalarType::BFloat16) {
+  } else {
     quant_impl<__nv_bfloat16>(
         output.data_ptr(),
         output_scale.data_ptr(),
@@ -639,62 +623,64 @@ void scaled_fp4_experts_quant_sm100a(
         k,
         n_experts,
         stream);
-  } else {
-    TORCH_CHECK(false, "Expected input data type to be half or bfloat16");
   }
 }
 
 void silu_and_mul_scaled_fp4_experts_quant_sm100a(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& mask,
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView input_global_scale,
+    tvm::ffi::TensorView mask,
     bool use_silu_and_mul) {
-  auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
+  auto MTopK = SymbolicSize{"m_topk"};
+  auto KBy2 = SymbolicSize{"k_by_2"};
+  auto OutputCols = SymbolicSize{"output_cols"};
+  auto OutputScaleRows = SymbolicSize{"output_scale_rows"};
+  auto OutputScaleCols = SymbolicSize{"output_scale_cols"};
+  auto NExperts = SymbolicSize{"n_experts"};
+  auto device = SymbolicDevice{};
 
-  CHECK_INPUT(output, "output must be a CUDA tensor");
-  CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
-  CHECK_INPUT(input, "input must be a CUDA tensor");
-  CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
-  CHECK_INPUT(mask, "mask must be a CUDA tensor");
+  TensorMatcher({MTopK, KBy2})  //
+      .with_dtype<fp16_t, bf16_t>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
+  TensorMatcher({MTopK, OutputCols})  //
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({OutputScaleRows, OutputScaleCols})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(output_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(input_global_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(mask);
 
-  TORCH_CHECK(output.dim() == 2);
-  TORCH_CHECK(output_scale.dim() == 2);
-  TORCH_CHECK(input.dim() == 2);
-  TORCH_CHECK(input_global_scale.dim() == 1);
-
-  TORCH_CHECK(input.scalar_type() == HALF || input.scalar_type() == BF16);
-  TORCH_CHECK(input_global_scale.scalar_type() == FLOAT);
-  TORCH_CHECK(mask.scalar_type() == INT);
-  // output is uint8 (two nvfp4 values are packed into one uint8)
-  // output_scale is int32 (four fp8 values are packed into one int32)
-  TORCH_CHECK(output.scalar_type() == UINT8);
-  TORCH_CHECK(output_scale.scalar_type() == INT);
+  const int device_id = input.device().device_id;
+  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
-  auto m_topk = input.size(0);
-  auto k_by_2 = input.size(1);
-  auto k = k_by_2;
+  const auto m_topk = static_cast<int>(MTopK.unwrap());
+  const auto k_by_2 = static_cast<int>(KBy2.unwrap());
+  int k = k_by_2;
   if (use_silu_and_mul) {
-    TORCH_CHECK(k_by_2 % 2 == 0, "k must be a multiple of 2");
+    RuntimeCheck(k_by_2 % 2 == 0, "k must be a multiple of 2");
     k = k_by_2 / 2;
   }
-  auto n_experts = input_global_scale.size(0);
-  TORCH_CHECK(mask.size(0) == n_experts);
-  TORCH_CHECK(output.size(0) == m_topk);
-  TORCH_CHECK(output.size(1) == k / 2);
-  int scales_k = k / BLOCK_SIZE;
-  // 4 means the swizzle requirement by nvidia nvfp4.
-  int padded_k = (scales_k + (4 - 1)) / 4 * 4;
-  // 4 means 4 fp8 values are packed into one int32
-  TORCH_CHECK(output_scale.size(1) * 4 == padded_k);
+  const auto n_experts = static_cast<int>(NExperts.unwrap());
+  RuntimeCheck(static_cast<int>(OutputCols.unwrap()) == k / 2, "output second dim mismatch");
+  const int scales_k = k / BLOCK_SIZE;
+  const int padded_k = (scales_k + 3) / 4 * 4;
+  RuntimeCheck(static_cast<int>(OutputScaleCols.unwrap()) * 4 == padded_k, "output_scale second dim mismatch");
 
-  auto in_dtype = input.dtype();
-  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
-  if (in_dtype == at::ScalarType::Half) {
+  const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
+  if (host::is_type<fp16_t>(input.dtype())) {
     quant_impl<half>(
         output.data_ptr(),
         output_scale.data_ptr(),
@@ -708,7 +694,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         k,
         n_experts,
         stream);
-  } else if (in_dtype == at::ScalarType::BFloat16) {
+  } else {
     quant_impl<__nv_bfloat16>(
         output.data_ptr(),
         output_scale.data_ptr(),
@@ -722,7 +708,5 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         k,
         n_experts,
         stream);
-  } else {
-    TORCH_CHECK(false, "Expected input data type to be half or bfloat16");
   }
 }

@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
@@ -442,7 +442,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         routing_logits=router_logits,
         routing_bias=correction_bias,
         hidden_states=hs_fp4,
-        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+            *hs_scale_linear.shape[:-1], -1
+        ),
         gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
         gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
             torch.float8_e4m3fn
