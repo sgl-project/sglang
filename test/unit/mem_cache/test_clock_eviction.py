@@ -1,7 +1,5 @@
 """Unit tests for the CLOCK (second-chance) eviction policy."""
 
-import pytest
-
 from sglang.srt.mem_cache.evict_policy import CLOCKStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
