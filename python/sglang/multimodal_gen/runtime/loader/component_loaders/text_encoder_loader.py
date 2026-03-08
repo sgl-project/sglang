@@ -198,6 +198,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+        # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
             encoder_config,

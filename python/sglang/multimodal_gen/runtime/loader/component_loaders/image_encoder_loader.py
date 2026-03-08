@@ -47,6 +47,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         encoder_config.update_model_arch(model_config)
 
         # Always start with local device; load_model will adjust for offload if needed
+        # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
             encoder_config,
