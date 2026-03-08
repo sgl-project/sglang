@@ -743,14 +743,14 @@ class ModelRunnerKVCacheMixin:
         self.max_total_num_tokens = token_capacity
         self.max_running_requests = self._resolve_max_num_reqs(token_capacity)
 
-        # Draft model config override
+        # HACK: spec decode uses server_args as a mutable channel to pass
+        # resolved values between target and draft workers. Target writes first,
+        # draft reads later. Should be replaced with an explicit handoff.
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
-                # Draft worker uses pre-configured values from target worker
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.max_running_requests = self.server_args.max_num_reqs
             else:
-                # Target worker propagates SWA-adjusted values for draft worker
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
                 self.server_args.max_num_reqs = self.max_running_requests
 
