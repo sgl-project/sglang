@@ -383,7 +383,7 @@ def selective_state_update(
     
     _, nheads, dim, dstate = state.shape
     batch, T, _, _ = x.shape
-
+    
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
     assert A.shape == (nheads, dim, dstate)
