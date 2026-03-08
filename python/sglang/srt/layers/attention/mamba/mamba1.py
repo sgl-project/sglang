@@ -124,6 +124,33 @@ class MambaMixer1(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
 
+    def _ssm_transform(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project through x_proj, split into dt/B/C, apply layernorm and dt_proj.
+
+        Returns:
+            (dt, B, C, A) after all transformations.
+        """
+        x_dbc, _ = self.x_proj(x)
+        dt, B, C = x_dbc.split(
+            [self.dt_rank, self.state_size, self.state_size], dim=-1
+        )
+
+        if self.use_dt_bc_layernorm:
+            dt = self.dt_layernorm(dt)
+            B = self.b_layernorm(B)
+            C = self.c_layernorm(C)
+
+        dt, _ = self.dt_proj(dt)
+        A = -torch.exp(self.A_log.float())
+        return dt, B, C, A
+
+    def _time_proj_bias(self) -> Optional[torch.Tensor]:
+        if hasattr(self.dt_proj, "bias") and self.dt_proj.bias is not None:
+            return self.dt_proj.bias.float()
+        return None
+
     def forward(
         self,
         *,
@@ -139,8 +166,7 @@ class MambaMixer1(nn.Module):
         num_prefills = metadata.num_prefills
         num_decodes = metadata.num_decodes
 
-        num_tokens = hidden_states.shape[0]
-        num_prefill_tokens = num_tokens - num_decodes
+        num_prefill_tokens = metadata.num_prefill_tokens
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
 
@@ -175,19 +201,8 @@ class MambaMixer1(nn.Module):
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
 
-            x_dbc, _ = self.x_proj(x_conv)
-            dt, B, C = x_dbc.split(
-                [self.dt_rank, self.state_size, self.state_size], dim=-1
-            )
-
-            if self.use_dt_bc_layernorm:
-                dt = self.dt_layernorm(dt)
-                B = self.b_layernorm(B)
-                C = self.c_layernorm(C)
-
-            dt, dt_proj_bias = self.dt_proj(dt)
-            A = -torch.exp(self.A_log.float())
-            delta_bias = dt_proj_bias.float() if dt_proj_bias is not None else None
+            dt, B, C, A = self._ssm_transform(x_conv)
+            delta_bias = self._time_proj_bias()
 
             # Process per-sequence for selective scan
             batch_sizes = (query_start_loc_p[1:] - query_start_loc_p[:-1]).tolist()
@@ -242,19 +257,8 @@ class MambaMixer1(nn.Module):
                 conv_state_indices=state_indices_d,
             )
 
-            x_dbc, _ = self.x_proj(x_conv)
-            dt, B, C = x_dbc.split(
-                [self.dt_rank, self.state_size, self.state_size], dim=-1
-            )
-
-            if self.use_dt_bc_layernorm:
-                dt = self.dt_layernorm(dt)
-                B = self.b_layernorm(B)
-                C = self.c_layernorm(C)
-
-            dt, dt_proj_bias = self.dt_proj(dt)
-            A = -torch.exp(self.A_log.float())
-            delta_bias = dt_proj_bias.float() if dt_proj_bias is not None else None
+            dt, B, C, A = self._ssm_transform(x_conv)
+            delta_bias = self._time_proj_bias()
 
             selective_state_update(
                 ssm_state,
@@ -272,7 +276,8 @@ class MambaMixer1(nn.Module):
             )
 
         # 4. Output projection
-        output[:num_tokens], _ = self.out_proj(ssm_output)
+        num_actual_tokens = num_prefill_tokens + num_decodes
+        output[:num_actual_tokens], _ = self.out_proj(ssm_output)
 
     @property
     def mamba_type(self) -> str:
