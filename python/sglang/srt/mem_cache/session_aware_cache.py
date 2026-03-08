@@ -270,7 +270,7 @@ class SessionAwareCache(BasePrefixCache):
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(1 for s in self.slots.values() if s.is_holding_kv)
+        return sum(s.is_holding_kv for s in self.slots.values())
 
     # -- Pass-through methods --
 
