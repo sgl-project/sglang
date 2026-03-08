@@ -2,28 +2,21 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+from typing import ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclass
 class FluxSamplingParams(SamplingParams):
+    _default_height: ClassVar[int] = 128 * 8  # default_sample_size * vae_scale_factor
+    _default_width: ClassVar[int] = 128 * 8
+
     num_frames: int = 1
     # Denoising stage
     guidance_scale: float = 1.0
     negative_prompt: str = None
     num_inference_steps: int = 50
-
-    def __post_init__(self):
-        default_sample_size = 128
-        vae_scale_factor = 8
-        if self.height is None:
-            self.height_not_provided = True
-            self.height = default_sample_size * vae_scale_factor
-        if self.width is None:
-            self.width_not_provided = True
-            self.width = default_sample_size * vae_scale_factor
-        super().__post_init__()
 
 
 @dataclass
