@@ -721,7 +721,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
 
 class Mamba1AttnBackend(MambaAttnBackendBase):
-    """Attention backend wrapper for Mamba1 mixer kernels."""
+    """Attention backend wrapper for Mamba1Mixer kernels."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -770,14 +770,6 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
         output: torch.Tensor,
         layer_id: int,
     ):
-        """Forward pass through Mamba1 mixer.
-
-        Args:
-            mixer: MambaMixer1 instance
-            hidden_states: Input tensor (num_tokens, hidden_size)
-            output: Preallocated output tensor (num_tokens, hidden_size)
-            layer_id: Layer index
-        """
         assert isinstance(self.forward_metadata, Mamba1Metadata)
         layer_cache = self.req_to_token_pool.mamba_layer_cache(layer_id)
         return mixer.forward(
