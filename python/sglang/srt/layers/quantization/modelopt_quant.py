@@ -106,6 +106,14 @@ except ImportError:
         Relu2 = 6
 
 
+try:
+    from flashinfer import CuteDslMoEWrapper
+    from flashinfer import fp4_quantize as flashinfer_fp4_quantize_cutedsl
+except ImportError:
+    CuteDslMoEWrapper = None
+    flashinfer_fp4_quantize_cutedsl = None
+
+
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 _cutedsl_logged_scalarize: set = set()
@@ -1847,6 +1855,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
 
+            if self.enable_flashinfer_cutedsl_moe:
+                layer._cutedsl_standard_scales = _resolve_cutedsl_standard_scales(layer)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS/CuteDSL kernels assume [Up, Gate] Proj as W13.
@@ -1868,24 +1879,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         standard_combine_input_cls: type[StandardCombineInput],
     ) -> StandardCombineInput:
         """Standard-path FlashInfer CuteDSL (moe_a2a=none): quantize x, run wrapper."""
-        try:
-            from flashinfer import CuteDslMoEWrapper
-            from flashinfer import fp4_quantize as flashinfer_fp4_quantize
-        except ImportError as e:
+        if CuteDslMoEWrapper is None or flashinfer_fp4_quantize_cutedsl is None:
             raise ImportError(
                 "Can't import CuteDslMoEWrapper from flashinfer. "
                 "Please check flashinfer version to use flashinfer_cutedsl backend "
                 "on standard MoE path."
-            ) from e
+            )
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int32)
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
 
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            _resolve_cutedsl_standard_scales(layer)
-        )
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = getattr(
+            layer, "_cutedsl_standard_scales", None
+        ) or _resolve_cutedsl_standard_scales(layer)
 
-        x_fp4, x_sf = flashinfer_fp4_quantize(
+        x_fp4, x_sf = flashinfer_fp4_quantize_cutedsl(
             x,
             used_input_scale,
             16,  # sf_vec_size
