@@ -11,20 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Jamba model configuration
-
-Jamba is AI21's hybrid Transformer-Mamba1-MoE model.
-Unlike NemotronH which uses Mamba2, Jamba uses Mamba1 for SSM layers.
-
-Key differences from NemotronH/Mamba2:
-- Mamba1: 2D temporal state (intermediate_size/tp, state_size), no groups/heads
-- Mamba2: 3D temporal state (num_heads/tp, head_dim, state_size), uses n_groups
-
-Layer pattern (default Jamba 1.5):
-- Attention layer every 8 layers (attn_layer_period=8, offset=4)
-- MoE layer every 2 layers (expert_layer_period=2, offset=1)
-- Rest are Mamba1 + dense MLP layers
-"""
+"""Jamba model configuration"""
 
 from typing import List, Union
 
@@ -39,7 +26,6 @@ from sglang.srt.configs.mamba_utils import (
 
 logger = logging.get_logger(__name__)
 
-# Layer type constants
 MAMBA = "mamba"
 ATTENTION = "attention"
 MLP = "mlp"
@@ -48,13 +34,19 @@ MOE = "moe"
 
 class JambaConfig(PretrainedConfig):
     r"""
-    Configuration class for Jamba model (AI21's hybrid Transformer-Mamba1-MoE).
+    This is the configuration class to store the configuration of a [`JambaModel`]. It is used to instantiate a
+    Jamba model according to the specified arguments, defining the model architecture. Jamba is a hybrid architecture
+    combining Mamba1 layers with attention layers, developed by AI21 Labs.
+
+    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PretrainedConfig`] for more information.
 
     Args:
         vocab_size (`int`, *optional*, defaults to 65536):
-            Vocabulary size of the Jamba model.
+            Vocabulary size of the Jamba model. Defines the number of different tokens that can be represented by
+            the `inputs_ids` passed when calling [`JambaModel`].
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie input and output embeddings.
+            Whether the model's input and output word embeddings should be tied.
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 14336):
@@ -64,51 +56,51 @@ class JambaConfig(PretrainedConfig):
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer.
         num_key_value_heads (`int`, *optional*, defaults to 8):
-            Number of key-value heads for GQA.
-        hidden_act (`str`, *optional*, defaults to "silu"):
-            Activation function for MLP layers.
+            This is the number of key_value heads that should be used to implement Grouped Query Attention.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) in the decoder.
         initializer_range (`float`, *optional*, defaults to 0.02):
-            Standard deviation for weight initialization.
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
-            Epsilon for RMS normalization.
+            The epsilon used by the rms normalization layers.
         use_cache (`bool`, *optional*, defaults to `True`):
-            Whether to use KV cache.
+            Whether or not the model should return the last key/values attentions.
         pad_token_id (`int`, *optional*, defaults to 0):
-            Padding token ID.
+            The id of the padding token.
         bos_token_id (`int`, *optional*, defaults to 1):
-            Beginning of sequence token ID.
+            The id of the "beginning-of-sequence" token.
         eos_token_id (`int`, *optional*, defaults to 2):
-            End of sequence token ID.
+            The id of the "end-of-sequence" token.
         max_position_embeddings (`int`, *optional*, defaults to 262144):
-            Maximum sequence length.
+            Max cached sequence length for the model.
         attention_dropout (`float`, *optional*, defaults to 0.0):
-            Dropout ratio for attention.
+            The dropout ratio for the attention probabilities.
         attn_layer_period (`int`, *optional*, defaults to 8):
-            Insert attention layer every N layers.
+            Insert an attention layer every N layers.
         attn_layer_offset (`int`, *optional*, defaults to 4):
-            Offset for first attention layer.
+            Offset for the first attention layer.
         expert_layer_period (`int`, *optional*, defaults to 2):
-            Insert MoE layer every N layers.
+            Insert a MoE layer every N layers.
         expert_layer_offset (`int`, *optional*, defaults to 1):
-            Offset for first MoE layer.
+            Offset for the first MoE layer.
         use_mamba_kernels (`bool`, *optional*, defaults to `True`):
             Whether to use fast Mamba kernels.
         mamba_d_state (`int`, *optional*, defaults to 16):
-            SSM state dimension for Mamba1.
+            The dimension of the mamba state space latents.
         mamba_d_conv (`int`, *optional*, defaults to 4):
-            Convolution kernel size for Mamba1.
+            The size of the mamba convolution kernel.
         mamba_expand (`int`, *optional*, defaults to 2):
-            Expansion factor for Mamba1 intermediate size.
-        mamba_dt_rank (`int` or `str`, *optional*, defaults to "auto"):
-            Rank of dt projection. "auto" sets it to ceil(hidden_size / 16).
+            Expanding factor (relative to hidden_size) used to determine the mamba intermediate size.
+        mamba_dt_rank (`int` or `str`, *optional*, defaults to `"auto"`):
+            Rank of the dt projection. `"auto"` sets it to ceil(hidden_size / 16).
         mamba_conv_bias (`bool`, *optional*, defaults to `True`):
-            Whether to use bias in Mamba convolution.
+            Flag indicating whether or not to use bias in the convolution layer of the mamba mixer block.
         mamba_proj_bias (`bool`, *optional*, defaults to `False`):
-            Whether to use bias in Mamba projections.
+            Flag indicating whether or not to use bias in the input and output projections of the mamba mixer block.
         num_experts (`int`, *optional*, defaults to 16):
             Number of experts in MoE layers.
         num_experts_per_tok (`int`, *optional*, defaults to 2):
-            Number of experts activated per token (top-k).
+            Number of experts to use per token in MoE layers.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
             Auxiliary loss coefficient for load balancing.
     """
@@ -134,12 +126,10 @@ class JambaConfig(PretrainedConfig):
         eos_token_id: int = 2,
         max_position_embeddings: int = 262144,
         attention_dropout: float = 0.0,
-        # Layer pattern configuration
         attn_layer_period: int = 8,
         attn_layer_offset: int = 4,
         expert_layer_period: int = 2,
         expert_layer_offset: int = 1,
-        # Mamba1 configuration
         use_mamba_kernels: bool = True,
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
@@ -147,7 +137,6 @@ class JambaConfig(PretrainedConfig):
         mamba_dt_rank: Union[int, str] = "auto",
         mamba_conv_bias: bool = True,
         mamba_proj_bias: bool = False,
-        # MoE configuration
         num_experts: int = 16,
         num_experts_per_tok: int = 2,
         router_aux_loss_coef: float = 0.001,
@@ -202,7 +191,6 @@ class JambaConfig(PretrainedConfig):
 
     @property
     def mamba_intermediate_size(self) -> int:
-        """Compute Mamba1 intermediate size from hidden_size and expand factor."""
         return self.hidden_size * self.mamba_expand
 
     @property
@@ -215,13 +203,11 @@ class JambaConfig(PretrainedConfig):
         return self.mamba_dt_rank
 
     def _get_layer_block_type(self, layer_idx: int) -> str:
-        """Determine if layer is attention or mamba."""
         if (layer_idx - self.attn_layer_offset) % self.attn_layer_period == 0:
             return ATTENTION
         return MAMBA
 
     def _get_layer_ffn_type(self, layer_idx: int) -> str:
-        """Determine if layer uses MoE or dense MLP."""
         if (
             self.num_experts > 1
             and (layer_idx - self.expert_layer_offset) % self.expert_layer_period == 0
@@ -230,12 +216,10 @@ class JambaConfig(PretrainedConfig):
         return MLP
 
     def get_layer_types(self, layer_idx: int) -> tuple:
-        """Get (block_type, ffn_type) for a given layer index."""
         return self._get_layer_block_type(layer_idx), self._get_layer_ffn_type(layer_idx)
 
     @property
     def mamba_layer_ids(self) -> List[int]:
-        """Get list of layer indices that use Mamba1."""
         return [
             i
             for i in range(self.num_hidden_layers)
@@ -267,6 +251,7 @@ class JambaConfig(PretrainedConfig):
 
     @property
     def mamba_cache_params(self) -> Mamba1CacheParams:
+        """Create Mamba1 cache parameters for this config."""
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba1StateShape.create(

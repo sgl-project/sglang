@@ -192,7 +192,7 @@ class JambaMambaDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
 
         self.mamba = MambaMixer1(
-            cache_params=config.mamba1_cache_params,
+            cache_params=config.mamba_cache_params,
             hidden_size=config.hidden_size,
             dt_rank=config.mamba_dt_rank_value,
             use_conv_bias=config.mamba_conv_bias,
