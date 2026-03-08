@@ -1,7 +1,5 @@
 // clang-format off
 // Adapted from https://github.com/state-spaces/mamba/blob/main/csrc/selective_scan/selective_scan_fwd_kernel.cuh
-// Copyright (c) 2023, Tri Dao.
-// Modified by SGLang Team: added initial_state support for prefix caching.
 
 #pragma once
 
@@ -241,11 +239,9 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 // Initialize running total
                 scan_t running_prefix;
                 if constexpr (!kIsComplex) {
-                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
                     if (chunk > 0 && threadIdx.x % 32 == 0) {
                         running_prefix = smem_running_prefix[state_idx + r * MAX_DSTATE];
                     } else if (chunk == 0 && threadIdx.x % 32 == 0 && params.initial_state_ptr != nullptr) {
-                        // SGLang extension: load initial state for prefix caching
                         float initial_h = reinterpret_cast<float *>(params.initial_state_ptr)
                             [batch_id * params.dim * params.dstate + (dim_id * kNRows + r) * params.dstate + state_idx];
                         running_prefix = make_float2(1.f, initial_h);

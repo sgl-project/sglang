@@ -1,28 +1,3 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Generic Mamba1 mixer layer.
-
-This is the Mamba1 equivalent of MambaMixer2 in mamba.py. It provides a
-reusable mixer that can be used by any Mamba1-based hybrid model (e.g., Jamba).
-
-Key differences from MambaMixer2:
-- 2D temporal state (intermediate_size/tp, state_size), no groups/heads
-- Uses dt_proj to project dt_rank -> intermediate_size
-- Uses x_proj to compute dt, B, C from conv output
-- Uses selective_scan_fwd for prefill, shared selective_state_update for decode
-"""
-
 from typing import Optional
 
 import torch
@@ -62,8 +37,6 @@ class MambaMixer1(nn.Module):
     Compute delta, A, B, C, and D the state space parameters and compute
     the contextualized states. A, D are input independent.
     delta, B, C are input-dependent (selective).
-
-    This is the Mamba1 equivalent of MambaMixer2.
     """
 
     def __init__(
@@ -91,10 +64,8 @@ class MambaMixer1(nn.Module):
         self.use_dt_bc_layernorm = use_dt_bc_layernorm
         self.activation = activation
 
-        # Intermediate size after TP sharding
         self.intermediate_size_tp = self.intermediate_size // self.tp_size
 
-        # Input projection: hidden -> (x, z) where x goes through conv+SSM, z is gate
         self.in_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.intermediate_size, self.intermediate_size],
@@ -121,8 +92,6 @@ class MambaMixer1(nn.Module):
             prefix=f"{prefix}.dt_proj",
         )
 
-        # x_proj: x -> (dt, B, C) projections
-        # Input is already sharded across TP, need all-reduce for correct output
         self.x_proj = RowParallelLinear(
             self.intermediate_size,
             dt_rank + 2 * self.state_size,
@@ -133,23 +102,19 @@ class MambaMixer1(nn.Module):
             prefix=f"{prefix}.x_proj",
         )
 
-        # Optional layer norms for dt, B, C (used by Jamba for numerical stability)
         if use_dt_bc_layernorm:
             self.dt_layernorm = RMSNorm(dt_rank, eps=rms_norm_eps)
             self.b_layernorm = RMSNorm(self.state_size, eps=rms_norm_eps)
             self.c_layernorm = RMSNorm(self.state_size, eps=rms_norm_eps)
 
-        # A parameter (stored as log, -exp applied during forward)
         self.A_log = nn.Parameter(
             torch.empty(self.intermediate_size_tp, self.state_size)
         )
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
 
-        # D parameter (skip connection)
         self.D = nn.Parameter(torch.empty(self.intermediate_size_tp))
         set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
 
-        # Output projection
         self.out_proj = RowParallelLinear(
             self.intermediate_size,
             hidden_size,
@@ -167,14 +132,6 @@ class MambaMixer1(nn.Module):
         layer_cache: MambaPool.State,
         metadata: Mamba1Metadata,
     ):
-        """Forward pass for Mamba1 mixer.
-
-        Args:
-            hidden_states: (num_tokens, hidden_size) input tensor
-            output: (num_tokens, hidden_size) preallocated output tensor
-            layer_cache: MambaPool.State with conv[0] and temporal states
-            metadata: Mamba1Metadata with cache indices and batch counts
-        """
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
         state_indices = metadata.mamba_cache_indices
@@ -184,12 +141,13 @@ class MambaMixer1(nn.Module):
 
         num_tokens = hidden_states.shape[0]
         num_prefill_tokens = num_tokens - num_decodes
+        has_prefill = num_prefills > 0
+        has_decode = num_decodes > 0
 
         # 1. Input projection
         projected, _ = self.in_proj(hidden_states)
         x, z = projected.chunk(2, dim=-1)
 
-        # Split by prefill/decode
         x_p, x_d = x[:num_prefill_tokens], x[num_prefill_tokens:]
         z_p, z_d = z[:num_prefill_tokens], z[num_prefill_tokens:]
         state_indices_p = state_indices[:num_prefills]
@@ -197,15 +155,14 @@ class MambaMixer1(nn.Module):
 
         # Prepare intermediate output tensor (intermediate_size_tp dim)
         ssm_output = torch.empty_like(x)
+        conv_weight = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
 
         # 2. Process prefill requests
-        if num_prefills > 0 and num_prefill_tokens > 0:
-            conv_weight = self.conv1d.weight.view(
-                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            )
-
+        if has_prefill:
             has_initial_states = metadata.has_initial_states
-            prep_initial_states = metadata.prep_initial_states
 
             x_conv = causal_conv1d_fn(
                 x_p.transpose(0, 1),
@@ -215,7 +172,7 @@ class MambaMixer1(nn.Module):
                 conv_states=conv_state,
                 has_initial_state=has_initial_states,
                 cache_indices=state_indices_p,
-                query_start_loc=query_start_loc,
+                query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
 
             x_dbc, _ = self.x_proj(x_conv)
@@ -233,7 +190,7 @@ class MambaMixer1(nn.Module):
             delta_bias = dt_proj_bias.float() if dt_proj_bias is not None else None
 
             # Process per-sequence for selective scan
-            batch_sizes = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
+            batch_sizes = (query_start_loc_p[1:] - query_start_loc_p[:-1]).tolist()
             x_batched = torch.split(x_conv, batch_sizes, dim=0)
             dt_batched = torch.split(dt, batch_sizes, dim=0)
             B_batched = torch.split(B, batch_sizes, dim=0)
@@ -251,11 +208,9 @@ class MambaMixer1(nn.Module):
                 C_i = C_i.unsqueeze(0).float()
                 z_i = z_i.unsqueeze(0).float()
 
-                # Load initial state for extending sequences (prefix caching)
                 initial_state = None
-                if has_initial_states is not None and prep_initial_states:
-                    if has_initial_states[i]:
-                        initial_state = ssm_state[state_indices_p[i]].unsqueeze(0).float()
+                if has_initial_states is not None:
+                    initial_state = ssm_state[state_indices_p[i]].unsqueeze(0).float()
 
                 y_i, final_state = selective_scan_fn(
                     x_i,
@@ -277,11 +232,7 @@ class MambaMixer1(nn.Module):
             ssm_output[:num_prefill_tokens] = torch.cat(outputs_p, dim=0)
 
         # 3. Process decode requests
-        if num_decodes > 0:
-            conv_weight = self.conv1d.weight.view(
-                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            )
-
+        if has_decode:
             x_conv = causal_conv1d_update(
                 x_d,
                 conv_state,
