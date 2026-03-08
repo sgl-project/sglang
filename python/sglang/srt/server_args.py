@@ -3157,6 +3157,16 @@ class ServerArgs:
 
     def _handle_default_custom_logit_processor(self):
         """Validate and prepare the default custom logit processor if specified."""
+        self._parsed_default_custom_params = None
+
+        if (
+            self.default_custom_params is not None
+            and self.default_custom_logit_processor is None
+        ):
+            raise ValueError(
+                "--default-custom-params requires --default-custom-logit-processor."
+            )
+
         if self.default_custom_logit_processor is not None:
             # Automatically enable custom logit processor
             self.enable_custom_logit_processor = True
@@ -3164,12 +3174,26 @@ class ServerArgs:
             # Ensure default_custom_params is at least '{}' so that
             # schedule_batch.py injects __req__ into custom_params
             if self.default_custom_params is None:
-                self.default_custom_params = '{}'
+                self.default_custom_params = "{}"
+
+            if isinstance(self.default_custom_params, str):
+                self._parsed_default_custom_params = json.loads(
+                    self.default_custom_params
+                )
+            elif isinstance(self.default_custom_params, dict):
+                self._parsed_default_custom_params = self.default_custom_params
+            else:
+                raise ValueError(
+                    "--default-custom-params must be a JSON object string or dict."
+                )
+
+            if not isinstance(self._parsed_default_custom_params, dict):
+                raise ValueError(
+                    "--default-custom-params must decode to a JSON object."
+                )
 
             # Import and validate the class from the provided import path
-            module_path, class_name = self.default_custom_logit_processor.rsplit(
-                ".", 1
-            )
+            module_path, class_name = self.default_custom_logit_processor.rsplit(".", 1)
             module = importlib.import_module(module_path)
             cls = getattr(module, class_name)
 
@@ -3186,7 +3210,6 @@ class ServerArgs:
 
             # Serialize to dill string for downstream pipeline use
             self._default_custom_logit_processor_str = cls.to_str()
-
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
@@ -5127,16 +5150,16 @@ class ServerArgs:
             type=str,
             default=None,
             help="Python import path to a CustomLogitProcessor subclass "
-                 "(e.g., 'mypackage.MyProcessor'). Applied to ALL requests "
-                 "that don't provide their own custom_logit_processor. "
-                 "Automatically enables --enable-custom-logit-processor.",
+            "(e.g., 'mypackage.MyProcessor'). Applied to ALL requests "
+            "that don't provide their own custom_logit_processor. "
+            "Automatically enables --enable-custom-logit-processor.",
         )
         parser.add_argument(
             "--default-custom-params",
             type=str,
             default=None,
             help="JSON string of default custom_params for the default custom logit processor. "
-                 "Applied to requests that don't provide their own custom_params.",
+            "Applied to requests that don't provide their own custom_params.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

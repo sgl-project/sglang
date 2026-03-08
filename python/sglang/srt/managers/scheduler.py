@@ -13,7 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import json
+import copy
 import faulthandler
 import logging
 import os
@@ -1542,10 +1542,11 @@ class Scheduler(
             # Inject default custom_params if not provided by client
             if (
                 recv_req.sampling_params.custom_params is None
-                and self.server_args.default_custom_params is not None
+                and getattr(self.server_args, "_parsed_default_custom_params", None)
+                is not None
             ):
-                recv_req.sampling_params.custom_params = json.loads(
-                    self.server_args.default_custom_params
+                recv_req.sampling_params.custom_params = copy.deepcopy(
+                    self.server_args._parsed_default_custom_params
                 )
 
             req = Req(
