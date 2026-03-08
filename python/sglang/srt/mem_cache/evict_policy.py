@@ -44,3 +44,18 @@ class PriorityStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
         # Return (priority, last_access_time) so lower priority nodes are evicted first
         return (node.priority, node.last_access_time)
+
+
+class CLOCKStrategy(EvictionStrategy):
+    """Second-chance (CLOCK) approximate-LRU eviction.
+
+    Each node carries a boolean ``referenced`` flag that is set to ``True``
+    on every cache hit. When the CLOCK hand visits a node it checks that flag:
+    * referenced=True  -> clear the flag and skip (give it a second chance).
+    * referenced=False -> evict immediately.
+    """
+
+    def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
+        # (0, t) sorts before (1, t): unreferenced nodes evicted first.
+        ref_bit = 1 if getattr(node, "referenced", False) else 0
+        return (ref_bit, node.last_access_time)
