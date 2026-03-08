@@ -115,7 +115,7 @@ class SchedulerMetricsMixin:
 
         # Metrics
         self.enable_metrics = self.server_args.enable_metrics
-        self.should_log_stats = self.attn_tp_rank == 0
+        self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
             self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
@@ -187,7 +187,10 @@ class SchedulerMetricsMixin:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
-        if not self.should_log_stats and not self.current_scheduler_metrics_enabled:
+        if (
+            not self.is_stats_logging_rank
+            and not self.current_scheduler_metrics_enabled
+        ):
             return
 
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
@@ -272,7 +275,7 @@ class SchedulerMetricsMixin:
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
 
-        if self.should_log_stats:
+        if self.is_stats_logging_rank:
             logger.info(msg)
 
         if self.current_scheduler_metrics_enabled:
@@ -363,7 +366,10 @@ class SchedulerMetricsMixin:
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.server_args.decode_log_interval != 0:
             return
-        if not self.should_log_stats and not self.current_scheduler_metrics_enabled:
+        if (
+            not self.is_stats_logging_rank
+            and not self.current_scheduler_metrics_enabled
+        ):
             return
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
@@ -484,7 +490,7 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-        if self.should_log_stats:
+        if self.is_stats_logging_rank:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.enable_priority_scheduling
