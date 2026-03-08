@@ -67,3 +67,53 @@ class TestRadixCacheCLOCKIntegration:
                 _collect(child)
         _collect(cache.root_node)
         assert any(n.referenced for n in all_nodes)
+
+
+    def test_second_chance_eviction_order(self):
+        """Referenced node survives one eviction round; unreferenced node is evicted first."""
+        import torch
+        from unittest.mock import MagicMock
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams, EvictParams
+
+        mock_alloc = MagicMock()
+        mock_alloc.device = "cpu"
+        freed = []
+        mock_alloc.free = lambda v: freed.append(v)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_alloc,
+            page_size=1,
+            enable_kv_cache_events=False,
+            eviction_policy="clock",
+        )
+        cache = RadixCache(params)
+
+        # Insert node A — will be marked referenced
+        key_a = list(range(4))
+        value_a = torch.zeros(4, dtype=torch.int32)
+        cache.insert(InsertParams(key=key_a, value=value_a))
+        cache.match_prefix(MatchPrefixParams(key=key_a))
+
+        # Insert node B — unreferenced
+        key_b = list(range(4, 8))
+        value_b = torch.ones(4, dtype=torch.int32)
+        cache.insert(InsertParams(key=key_b, value=value_b))
+
+        # Collect leaf nodes
+        all_nodes = []
+        def _collect(node):
+            for child in node.children.values():
+                all_nodes.append(child)
+                _collect(child)
+        _collect(cache.root_node)
+
+        node_a = next(n for n in all_nodes if n.referenced)
+        node_b = next(n for n in all_nodes if not n.referenced)
+
+        # Evict 4 tokens — node B should go first, node A gets second chance
+        cache.evict(EvictParams(num_tokens=4))
+
+        assert node_a.referenced == False
+        assert len(freed) > 0
