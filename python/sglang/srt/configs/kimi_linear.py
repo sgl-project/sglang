@@ -148,7 +148,7 @@ class KimiLinearConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
 
     @property
-    def mamba2_cache_params(self) -> KimiLinearCacheParams:
+    def mamba_cache_params(self) -> KimiLinearCacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = KimiLinearStateShape.create(

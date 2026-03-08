@@ -162,7 +162,7 @@ class ModelRunnerKVCacheMixin:
                 self.dp_size if server_args.enable_dp_attention else 1
             )
             mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
+                config.mamba_cache_params.mamba_cache_per_req
                 * max_running_requests
                 * server_args.speculative_num_draft_tokens
             )
@@ -185,7 +185,7 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            assert config.mamba_cache_params.mamba_cache_per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
@@ -199,12 +199,12 @@ class ModelRunnerKVCacheMixin:
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+                // config.mamba_cache_params.mamba_cache_per_req
             )
 
         mamba_state_memory = (
             server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * config.mamba_cache_params.mamba_cache_per_req
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
@@ -373,7 +373,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
+                        cache_params=config.mamba_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -398,7 +398,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
+                    cache_params=config.mamba_cache_params,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,

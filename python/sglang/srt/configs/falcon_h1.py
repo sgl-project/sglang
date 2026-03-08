@@ -298,7 +298,7 @@ class FalconH1Config(PretrainedConfig):
         return range(self.num_hidden_layers)
 
     @property
-    def mamba2_cache_params(self):
+    def mamba_cache_params(self):
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(

@@ -55,7 +55,7 @@ class JetNemotronConfig(PretrainedConfig):
         ]
 
     @property
-    def mamba2_cache_params(self) -> Mamba2CacheParams:
+    def mamba_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         jet_block_config = JetBlockConfig(**self.efficient_attention_config["jet"])

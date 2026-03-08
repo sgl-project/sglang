@@ -378,7 +378,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_idx
         self.mixer = MambaMixer2(
-            cache_params=config.mamba2_cache_params,
+            cache_params=config.mamba_cache_params,
             hidden_size=config.hidden_size,
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,

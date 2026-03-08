@@ -49,5 +49,5 @@ class JetVLMConfig(PretrainedConfig):
         return self.text_config.linear_layer_ids
 
     @property
-    def mamba2_cache_params(self) -> Mamba2CacheParams:
-        return self.text_config.mamba2_cache_params
+    def mamba_cache_params(self) -> Mamba2CacheParams:
+        return self.text_config.mamba_cache_params

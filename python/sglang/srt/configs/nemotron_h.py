@@ -390,7 +390,7 @@ class NemotronHConfig(PretrainedConfig):
         ]
 
     @property
-    def mamba2_cache_params(self) -> Mamba2CacheParams:
+    def mamba_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(

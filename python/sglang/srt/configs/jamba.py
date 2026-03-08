@@ -266,14 +266,12 @@ class JambaConfig(PretrainedConfig):
         return self.attention_layer_ids
 
     @property
-    def mamba1_cache_params(self) -> Mamba1CacheParams:
-        """Create Mamba1 cache parameters for this config."""
+    def mamba_cache_params(self) -> Mamba1CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
-        intermediate_size = self.mamba_intermediate_size
         shape = Mamba1StateShape.create(
             tp_world_size=get_attention_tp_size(),
-            intermediate_size=intermediate_size,
+            intermediate_size=self.mamba_intermediate_size,
             state_size=self.mamba_d_state,
             conv_kernel=self.mamba_d_conv,
         )
@@ -283,12 +281,3 @@ class JambaConfig(PretrainedConfig):
             layers=self.mamba_layer_ids,
             dtype=mamba_state_dtype(self),
         )
-
-    @property
-    def mamba2_cache_params(self) -> Mamba1CacheParams:
-        """Alias for mamba1_cache_params (for compatibility with HybridReqToTokenPool).
-
-        Note: Jamba uses Mamba1, not Mamba2. This alias exists because the existing
-        memory pool infrastructure uses `mamba2_cache_params` as the property name.
-        """
-        return self.mamba1_cache_params

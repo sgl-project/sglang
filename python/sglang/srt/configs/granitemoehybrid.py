@@ -285,7 +285,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
         return self.attention_layer_ids
 
     @property
-    def mamba2_cache_params(self):
+    def mamba_cache_params(self):
         """Returns the Mamba2 cache parameters for this configuration."""
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 

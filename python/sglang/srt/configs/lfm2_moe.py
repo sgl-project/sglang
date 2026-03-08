@@ -143,7 +143,7 @@ class Lfm2MoeConfig(PretrainedConfig):
         return 1
 
     @property
-    def mamba2_cache_params(self) -> Optional[Mamba2CacheParams]:
+    def mamba_cache_params(self) -> Optional[Mamba2CacheParams]:
         """
         Get cache params for HybridReqToTokenPool initialization.
 
