@@ -412,6 +412,12 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            if (
+                self.server_args.disaggregation_decode_enable_offload_kvcache
+                and not req.finished()
+            ):
+                self.decode_offload_manager.offload_kv_cache(req)
+
             if req.finished():
                 # delete feature to save memory
                 if req.multimodal_inputs is not None:
@@ -425,7 +431,7 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
                     release_kv_cache(req, self.tree_cache)
 
