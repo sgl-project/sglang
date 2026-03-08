@@ -29,6 +29,7 @@ class TestQwen35(unittest.TestCase):
             "--reasoning-parser=qwen3",
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
+            "--enable-flashinfer-allreduce-fusion",
         ]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
