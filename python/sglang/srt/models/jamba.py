@@ -53,7 +53,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
@@ -110,6 +109,7 @@ class JambaMoE(nn.Module):
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -157,14 +157,6 @@ class JambaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=10000,
-            is_neox_style=True,
-        )
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -180,7 +172,6 @@ class JambaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -418,8 +409,6 @@ class JambaModel(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            # Both Mamba and Attention layers share the same forward signature
-            # The Mamba1AttnBackend handles state management internally
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
