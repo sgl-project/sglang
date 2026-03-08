@@ -268,14 +268,16 @@ class SchedulerOutputProcessorMixin:
             # This ensures proper pruning when multiple reset requests share nodes
             if reset_requests_to_prune:
                 tree_size_before = self.tree_cache.total_size()
-                logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (tree size: {tree_size_before})")
+                available_size_before = self.token_to_kv_pool_allocator.available_size()
+                logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (tree size: {tree_size_before}, available size: {available_size_before})")
                 for req, node in reset_requests_to_prune:
                     logger.debug(f"Pruning cache for reset request {req.rid}")
                     self.tree_cache.prune_from_node(node)
                 tree_size_after = self.tree_cache.total_size()
+                available_size_after = self.token_to_kv_pool_allocator.available_size()
                 freed_tokens = tree_size_before - tree_size_after
                 self.last_pruning_freed_tokens = freed_tokens
-                logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (tree: {tree_size_before} → {tree_size_after}, freed: {freed_tokens} tokens)")
+                logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (tree: {tree_size_before} → {tree_size_after}, freed: {freed_tokens} tokens, available: {available_size_before} → {available_size_after}, change: +{available_size_after - available_size_before})")
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -531,14 +533,16 @@ class SchedulerOutputProcessorMixin:
         # This ensures proper pruning when multiple reset requests share nodes
         if reset_requests_to_prune:
             tree_size_before = self.tree_cache.total_size()
-            logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (decode) (tree size: {tree_size_before})")
+            available_size_before = self.token_to_kv_pool_allocator.available_size()
+            logger.debug(f"Starting deferred pruning for {len(reset_requests_to_prune)} reset requests (decode) (tree size: {tree_size_before}, available size: {available_size_before})")
             for req, node in reset_requests_to_prune:
                 logger.debug(f"Pruning cache for reset request {req.rid}")
                 self.tree_cache.prune_from_node(node)
             tree_size_after = self.tree_cache.total_size()
+            available_size_after = self.token_to_kv_pool_allocator.available_size()
             freed_tokens = tree_size_before - tree_size_after
             self.last_pruning_freed_tokens = freed_tokens
-            logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (decode) (tree: {tree_size_before} → {tree_size_after}, freed: {freed_tokens} tokens)")
+            logger.debug(f"Deferred pruning complete for {len(reset_requests_to_prune)} requests (decode) (tree: {tree_size_before} → {tree_size_after}, freed: {freed_tokens} tokens, available: {available_size_before} → {available_size_after}, change: +{available_size_after - available_size_before})")
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
