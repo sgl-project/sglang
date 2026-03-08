@@ -114,8 +114,9 @@ class SchedulerMetricsMixin:
         self.stats = SchedulerStats()
 
         # Metrics
-        self.current_scheduler_metrics_enabled = (
-            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        self.enable_metrics = self.server_args.enable_metrics
+        self.current_scheduler_metrics_enabled = self.enable_metrics and (
+            self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:

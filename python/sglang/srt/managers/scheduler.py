@@ -310,10 +310,6 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
-        self.enable_metrics = server_args.enable_metrics
-        self.enable_metrics_for_all_schedulers = (
-            server_args.enable_metrics_for_all_schedulers
-        )
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
