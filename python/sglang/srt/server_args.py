@@ -3161,6 +3161,11 @@ class ServerArgs:
             # Automatically enable custom logit processor
             self.enable_custom_logit_processor = True
 
+            # Ensure default_custom_params is at least '{}' so that
+            # schedule_batch.py injects __req__ into custom_params
+            if self.default_custom_params is None:
+                self.default_custom_params = '{}'
+
             # Import and validate the class from the provided import path
             module_path, class_name = self.default_custom_logit_processor.rsplit(
                 ".", 1
