@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.evict_policy import (
+    CLOCKStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -128,6 +129,7 @@ class TreeNode:
             0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
         )
         self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
+        self.referenced: bool = False  # CLOCK second-chance bit; set on hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -318,6 +320,8 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FIFOStrategy()
         elif self.eviction_policy == "mru":
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
+        elif self.eviction_policy == "clock":
+            self.eviction_strategy: EvictionStrategy = CLOCKStrategy()
         elif self.eviction_policy == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
@@ -586,10 +590,18 @@ class RadixCache(BasePrefixCache):
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        is_clock = isinstance(self.eviction_strategy, CLOCKStrategy)
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+
+            if is_clock and x.referenced:
+                x.referenced = False
+                heapq.heappush(
+                    eviction_heap, (self.eviction_strategy.get_priority(x), x)
+                )
+                continue
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -600,7 +612,6 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
-
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
@@ -668,6 +679,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            child.referenced = True  # CLOCK: mark as recently used
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
