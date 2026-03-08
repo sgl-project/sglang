@@ -3631,16 +3631,16 @@ class ServerArgs:
             help="Disable the hybrid SWA memory pool.",
         )
         parser.add_argument(
+            "--disable-hybrid-swa-memory",
+            action="store_true",
+            help="Disable the hybrid SWA memory pool.",
+        )
+        parser.add_argument(
             "--radix-eviction-policy",
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            viction policy of r
-        )
-        parser.add_argument(
-            "--enable-prefill-delayer",
-            action="store_true",
-            help="Enable prefill delayer for DP attention to reduce idle time.",
+            help="The eviction policy of radix trees. 'lru' = Least Recently Used; 'lfu' = Least Frequently Used; 'clock' = Second-Chance (CLOCK) approximate-LRU.",
         )
         parser.add_argument(
             "--prefill-delayer-max-delay-passes",
