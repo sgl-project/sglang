@@ -71,10 +71,16 @@ class TestRadixCacheCLOCKIntegration:
 
     def test_second_chance_eviction_order(self):
         """Referenced node survives one eviction round; unreferenced node is evicted first."""
-        import torch
         from unittest.mock import MagicMock
+
+        import torch
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams, EvictParams
 
         mock_alloc = MagicMock()
         mock_alloc.device = "cpu"
@@ -103,10 +109,12 @@ class TestRadixCacheCLOCKIntegration:
 
         # Collect leaf nodes
         all_nodes = []
+
         def _collect(node):
             for child in node.children.values():
                 all_nodes.append(child)
                 _collect(child)
+
         _collect(cache.root_node)
 
         node_a = next(n for n in all_nodes if n.referenced)
