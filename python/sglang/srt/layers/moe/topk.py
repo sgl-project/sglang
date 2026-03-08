@@ -79,7 +79,37 @@ if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
     try:
-        from flashinfer.fused_moe import fused_topk_deepseek
+        from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
+
+        from sglang.srt.utils.custom_op import register_custom_op
+
+        @register_custom_op(
+            op_name="fused_topk_deepseek",
+            mutates_args=["topk_weights", "topk_ids"],
+        )
+        def fused_topk_deepseek(
+            gating_output: torch.Tensor,
+            correction_bias: torch.Tensor,
+            num_expert_group: int,
+            topk_group: int,
+            topk: int,
+            scaling_factor: float,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            renormalize: bool,
+        ) -> None:
+            _fused_topk_deepseek(
+                gating_output,
+                correction_bias,
+                num_expert_group,
+                topk_group,
+                topk,
+                scaling_factor,
+                topk_weights,
+                topk_ids,
+                renormalize,
+            )
+
     except ImportError:
         fused_topk_deepseek = None
 

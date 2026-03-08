@@ -436,6 +436,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}resolution",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}resolution",
+            default=None,
+            help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
 
         # DiT configuration
         parser.add_argument(
@@ -539,7 +546,7 @@ class PipelineConfig:
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
         """
-        Load PipelineConfig from kwargs Dictionary.
+        Load PipelineConfig from kwargs Dictionary, as part of the ServerArg initialization process
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
@@ -583,7 +590,11 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+                model_info = get_model_info(
+                    model_path,
+                    backend=kwargs.get("backend"),
+                    model_id=kwargs.get("model_id"),
+                )
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -599,7 +610,11 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+            model_info = get_model_info(
+                model_path,
+                backend=kwargs.get("backend"),
+                model_id=kwargs.get("model_id"),
+            )
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "

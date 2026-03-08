@@ -450,4 +450,4 @@ def test_reference_writes_nonzero():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    pytest.main([__file__, "-v", "-s"])

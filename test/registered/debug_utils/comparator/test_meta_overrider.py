@@ -33,14 +33,14 @@ class TestMetaOverrideRule:
 
     def test_side_baseline(self) -> None:
         """side='baseline' is accepted."""
-        rule = MetaOverrideRule(match="logits", dims="b s v(tp)", side="baseline")
-        assert rule.dims == "b s v(tp)"
+        rule = MetaOverrideRule(match="logits", dims="b s v[tp]", side="baseline")
+        assert rule.dims == "b s v[tp]"
         assert rule.side == "baseline"
 
     def test_side_target(self) -> None:
         """side='target' is accepted."""
-        rule = MetaOverrideRule(match="logits", dims="b s v(ep)", side="target")
-        assert rule.dims == "b s v(ep)"
+        rule = MetaOverrideRule(match="logits", dims="b s v[ep]", side="target")
+        assert rule.dims == "b s v[ep]"
         assert rule.side == "target"
 
     def test_invalid_side_rejected(self) -> None:
@@ -228,8 +228,8 @@ class TestFromArgsAndConfig:
         """--override-baseline-dims and --override-target-dims produce separate rules with side field."""
         overrider = MetaOverrider.from_args_and_config(
             override_dims=[],
-            override_baseline_dims=["hidden:b s h(tp)"],
-            override_target_dims=["hidden:b s h(ep)"],
+            override_baseline_dims=["hidden:b s h[tp]"],
+            override_target_dims=["hidden:b s h[ep]"],
             override_config=None,
         )
 
@@ -243,8 +243,8 @@ class TestFromArgsAndConfig:
             meta={"dims": "old"},
             side="target",
         )
-        assert baseline["dims"] == "b s h(tp)"
-        assert target["dims"] == "b s h(ep)"
+        assert baseline["dims"] == "b s h[tp]"
+        assert target["dims"] == "b s h[ep]"
 
 
 # ──────────────────── Unit: _load_yaml_rules ────────────────────
@@ -261,14 +261,14 @@ class TestLoadYamlRules:
               - match: "hidden"
                 dims: "b s h d"
               - match: "logits"
-                dims: "b s v(tp)"
+                dims: "b s v[tp]"
                 side: baseline
         """))
         rules = _load_yaml_rules(yaml_path)
         assert len(rules) == 2
         assert rules[0].dims == "b s h d"
         assert rules[0].side == "both"
-        assert rules[1].dims == "b s v(tp)"
+        assert rules[1].dims == "b s v[tp]"
         assert rules[1].side == "baseline"
 
     def test_empty_yaml(self, tmp_path: Path) -> None:

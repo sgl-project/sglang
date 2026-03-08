@@ -24,15 +24,15 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
     TokenLayout,
     apply_dim_names,
     resolve_dim_names,
 )
 from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
-from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
+from sglang.srt.debug_utils.comparator.log_sink import log_sink
+from sglang.srt.debug_utils.comparator.output_types import ErrorLog, InfoLog
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta, filter_rows
 
 # re-export for existing callers
@@ -181,8 +181,8 @@ def _load_non_tensor_aux(
         first_value = loaded[0].value
         for i, item in enumerate(loaded[1:], start=1):
             if item.value != first_value:
-                warning_sink.add(
-                    GeneralWarning(
+                log_sink.add(
+                    ErrorLog(
                         category=f"{name}_mismatch",
                         message=(
                             f"{name} mismatch across ranks: rank 0 has {first_value}, "
@@ -240,12 +240,14 @@ def _load_and_align_aux_tensor(
             dim_names: list[str] = resolve_dim_names(dims_str)
             tensors = [apply_dim_names(t, dim_names) for t in tensors]
 
-        result, _replicated_checks = execute_sub_plans(tensors=tensors, plans=sub_plans)
-        assert result is not None
-        return result.rename(None)  # strip named dims before returning to plugin
+        sub_result = execute_sub_plans(tensors=tensors, plans=sub_plans)
+        assert sub_result.tensor is not None
+        return sub_result.tensor.rename(
+            None
+        )  # strip named dims before returning to plugin
 
-    warning_sink.add(
-        GeneralWarning(
+    log_sink.add(
+        InfoLog(
             category="aux_no_dims",
             message=(
                 f"aux tensor '{name}' has {len(tensors)} ranks "

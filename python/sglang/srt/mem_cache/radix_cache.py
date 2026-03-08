@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
+    SLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 
@@ -124,6 +125,10 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
+        self.pin_expiry: float = (
+            0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
+        )
+        self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -318,9 +323,12 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
+        elif self.eviction_policy == "slru":
+            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
+
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
             )
 
         self.evictable_leaves = set()
@@ -443,13 +451,14 @@ class RadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         priority = params.priority
+        chunked = params.chunked
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority)
+        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -684,6 +693,7 @@ class RadixCache(BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        new_node.hit_count = child.hit_count
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -701,7 +711,22 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
+        # Skip the hit count update for chunked requests to avoid self-referencing
+        # inflation where a chunked request increments hit_count on nodes it created
+        # in previous chunks.
+        if chunked:
+            return
+        node.hit_count += 1
+
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ):
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -726,10 +751,11 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
+                self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-
+                self._inc_hit_count(node, chunked)
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
@@ -738,6 +764,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

@@ -17,6 +17,34 @@ or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on 
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.
 
+## Platform Compatibility
+
+The following table summarizes quantization method support across NVIDIA and AMD GPUs.
+
+| Method | NVIDIA GPUs | AMD GPUs (MI300X/MI325X/MI350X) | Notes |
+|--------|:-----------:|:-------------------------------:|-------|
+| `fp8` | Yes | Yes | Aiter or Triton backend on AMD |
+| `mxfp4` | Yes | Yes | Requires CDNA3/CDNA4 with MXFP support; uses Aiter |
+| `blockwise_int8` | Yes | Yes | Triton-based, works on both platforms |
+| `w8a8_int8` | Yes | Yes | |
+| `w8a8_fp8` | Yes | Yes | Aiter or Triton FP8 on AMD |
+| `awq` | Yes | Yes | Uses Triton dequantize on AMD (vs. optimized CUDA kernels on NVIDIA) |
+| `gptq` | Yes | Yes | Uses Triton or vLLM kernels on AMD |
+| `compressed-tensors` | Yes | Yes | Aiter paths for FP8/MoE on AMD |
+| `quark` | Yes | Yes | AMD Quark quantization; Aiter GEMM paths on AMD |
+| `auto-round` | Yes | Yes | Platform-agnostic (Intel auto-round) |
+| `quark_int4fp8_moe` | No | Yes | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
+| `awq_marlin` | Yes | No | Marlin kernels are CUDA-only |
+| `gptq_marlin` | Yes | No | Marlin kernels are CUDA-only |
+| `gguf` | Yes | No | CUDA-only kernels in sgl-kernel |
+| `modelopt` / `modelopt_fp8` | Yes | No | NVIDIA ModelOpt, requires NVIDIA hardware |
+| `modelopt_fp4` | Yes (Blackwell) | No | NVIDIA Blackwell only |
+| `petit_nvfp4` | Yes (Blackwell) | No | NVIDIA NvFP4, Blackwell only |
+| `bitsandbytes` | Yes | Experimental | Depends on bitsandbytes ROCm support |
+| `torchao` (`int4wo`, etc.) | Yes | Partial | `int4wo` not supported on AMD; other methods may work |
+
+On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
+
 ## Offline Quantization
 
 To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline,
