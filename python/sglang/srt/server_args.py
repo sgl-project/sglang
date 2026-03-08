@@ -3612,9 +3612,11 @@ class ServerArgs:
             help="The number of tokens in a page.",
         )
         parser.add_argument(
-            "--hybrid-kvcache-ratio",
-            action=DeprecatedAction,
-            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
+            "--radix-eviction-policy",
+            type=str,
+            choices=RADIX_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.radix_eviction_policy,
+            help="The eviction policy of radix trees. 'lru' = Least Recently Used; 'lfu' = Least Frequently Used; 'clock' = Second-Chance (CLOCK) approximate-LRU.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
