@@ -201,11 +201,15 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
         input_vec_x[j] = cast<DType2, fp32x2_t>({out_x0, out_x1});
         input_vec_y[j] = cast<DType2, fp32x2_t>({out_y0, out_y1});
       }
-      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-      const auto output_x = load_q ? input : k_out;
-      store_as<InputStorage>(output_x, input_vec_x, lane_id);
-      const auto output_y = pointer::offset(output_x, (kRopeDim / 2) * sizeof(DType));
-      store_as<InputStorage>(output_y, input_vec_y, lane_id);
+      store_as<InputStorage>(input, input_vec_x, lane_id);
+      const auto input_y_out = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
+      store_as<InputStorage>(input_y_out, input_vec_y, lane_id);
+      if (!load_q) {
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+        store_as<InputStorage>(k_out, input_vec_x, lane_id);
+        const auto k_out_y = pointer::offset(k_out, (kRopeDim / 2) * sizeof(DType));
+        store_as<InputStorage>(k_out_y, input_vec_y, lane_id);
+      }
     } else {
       using CacheStorage = AlignedVector<float, kVecSize>;
       auto input_vec = load_as<InputStorage>(input, lane_id);
@@ -220,9 +224,11 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
         const auto out_y = x * sin + y * cos;
         input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
       }
-      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-      const auto output = load_q ? input : k_out;
-      store_as<InputStorage>(output, input_vec, lane_id);
+      store_as<InputStorage>(input, input_vec, lane_id);
+      if (!load_q) {
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+        store_as<InputStorage>(k_out, input_vec, lane_id);
+      }
     }
   }
 
