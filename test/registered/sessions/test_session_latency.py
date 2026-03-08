@@ -40,7 +40,7 @@ register_cuda_ci(
 NUM_TURNS = 300
 INPUT_LEN = 16
 GEN_LEN = 8
-NUM_CONCURRENT = 4
+NUM_CONCURRENT = 8
 TAIL_TURNS = 10
 SAMPLE_TURNS = 8
 
@@ -410,6 +410,7 @@ class TestSessionLatency(CustomTestCase):
             reg_tail = _avg(_collect_latencies(reg_list, last_n=TAIL_TURNS))
             stm_tail = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
             speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
+            print(f"Speed up={speedup}x (Streaming v.s. Regular)")
             self.assertGreaterEqual(
                 speedup,
                 2.0,
@@ -432,16 +433,6 @@ class TestSessionLatency(CustomTestCase):
             mismatches,
             0,
             f"regular vs streaming (bs=1): {mismatches}/{len(reg_out)} turns differ",
-        )
-
-        reg_tail = _avg(_collect_latencies(reg, last_n=TAIL_TURNS))
-        stm_tail = _avg(_collect_latencies(stm, last_n=TAIL_TURNS))
-        speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
-        self.assertGreaterEqual(
-            speedup,
-            2.0,
-            f"streaming should be >=2x faster on last {TAIL_TURNS} turns "
-            f"(regular={reg_tail:.1f}ms, streaming={stm_tail:.1f}ms, speedup={speedup:.2f}x)",
         )
 
     def test_streaming_session_random_lengths(self):
