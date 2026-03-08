@@ -27,9 +27,6 @@ class Mamba1Metadata(ForwardMetadata):
         return Mamba1Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
-            retrieve_next_token=forward_metadata.retrieve_next_token,
-            retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
-            retrieve_parent_token=forward_metadata.retrieve_parent_token,
             num_prefills=0,
             num_prefill_tokens=0,
             num_decodes=len(seq_lens),
@@ -57,9 +54,6 @@ class Mamba1Metadata(ForwardMetadata):
         return Mamba1Metadata(
             query_start_loc=forward_metadata.query_start_loc[: num_prefills + 1],
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
-            retrieve_next_token=forward_metadata.retrieve_next_token,
-            retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
-            retrieve_parent_token=forward_metadata.retrieve_parent_token,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

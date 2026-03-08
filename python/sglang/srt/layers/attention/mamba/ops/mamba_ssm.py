@@ -376,13 +376,13 @@ def selective_state_update(
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
 
-    _, nheads, dim, dstate = state.shape
-    batch, T, _, _ = x.shape
-
     if out.dim() == 2:
         out = out.unsqueeze(1)
     if out.dim() == 3:
         out = out.unsqueeze(1)
+    
+    _, nheads, dim, dstate = state.shape
+    batch, T, _, _ = x.shape
 
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
