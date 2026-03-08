@@ -15,6 +15,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+from sglang.srt.utils import get_bool_env_var
 
 
 class ModelSlimW8A8Int8(ModelSlimLinearScheme):
@@ -28,7 +29,8 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         self.is_dynamic = (
             self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
         )
-        if self.is_dynamic:
+        self.force_dynamic_quant = get_bool_env_var("FORCE_DYNAMIC_QUANT", "false")
+        if self.is_dynamic or self.force_dynamic_quant:
             self.kernel = NPUW8A8Int8DynamicLinearMethod()
         else:
             self.kernel = NPUW8A8Int8LinearMethod()
