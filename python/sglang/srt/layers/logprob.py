@@ -304,24 +304,32 @@ def get_top_logprobs_chunk(
     next_split_pruned_len = 0
     for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
         if n == 0:
+            # For the first sequence, adjust the pruned length
             pruned_len -= split_pruned_len
         else:
+            # After the first sequence, no split in the middle
             split_pruned_len = 0
 
         if pruned_len <= 0:
+            # if pruned length is less than or equal to 0,
+            # there is no top-k logprobs to process
             input_top_logprobs_val.append([])
             input_top_logprobs_idx.append([])
             continue
 
+        # Get the top-k logprobs
         val = []
         idx = []
         for j in range(pruned_len):
+            # Handle remaining tokens in next chunk if any
             if pt + j >= len(values):
                 next_split_pruned_len = split_pruned_len + j
                 break
+            # Append the top-k logprobs
             val.append(values[pt + j][:k])
             idx.append(indices[pt + j][:k])
 
+        # Append or extend based on whether the sequence was split across chunks
         if len(val) > 0:
             if split_pruned_len > 0:
                 input_top_logprobs_val[-1].extend(val)
@@ -368,19 +376,24 @@ def get_token_ids_logprobs_chunk(
             pruned_lens,
         )
     ):
+        # Adjust pruned length for first sequence
         if n == 0:
             pruned_len -= split_pruned_len
         else:
             split_pruned_len = 0
 
         if pruned_len <= 0:
+            # if pruned length is less than or equal to 0,
+            # there is no token ids logprobs to process
             input_token_ids_logprobs_val.append([])
             input_token_ids_logprobs_idx.append([])
             continue
 
+        # Get the token ids logprobs
         val = []
         idx = []
         for j in range(pruned_len):
+            # Handle remaining tokens in next chunk if any
             if pt + j >= logprobs.shape[0]:
                 next_split_pruned_len = split_pruned_len + j
                 break
@@ -388,6 +401,7 @@ def get_token_ids_logprobs_chunk(
                 val.append(logprobs[pt + j, token_ids].tolist())
                 idx.append(token_ids)
 
+        # Append or extend based on whether the sequence was split across chunks
         if len(val) > 0:
             if split_pruned_len > 0:
                 input_token_ids_logprobs_val[-1].extend(val)
@@ -688,6 +702,7 @@ def add_output_logprobs_for_spec_v1(
     res: Union[EagleVerifyOutput, NgramVerifyInput],
     logits_output: Optional[LogitsProcessorOutput] = None,
 ):
+    # Extract args
     if logits_output is None:
         logits_output = res.logits_output
 
@@ -704,11 +719,21 @@ def add_output_logprobs_for_spec_v1(
 
     temperatures = batch.sampling_info.temperatures
     num_draft_tokens = batch.spec_info.draft_token_num
+    # acceptance indices are the indices in a "flattened" batch.
+    # dividing it to num_draft_tokens will yield the actual batch index.
     temperatures = temperatures[accepted_indices // num_draft_tokens]
-
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits, dim=-1
+        )
+    else:
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits / temperatures, dim=-1
+        )
     batch_next_token_ids = res.verified_id
     num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
 
+    # We should repeat top_logprobs_nums to match num_tokens_per_req.
     top_logprobs_nums_repeat_interleaved = [
         num
         for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req)
@@ -721,24 +746,33 @@ def add_output_logprobs_for_spec_v1(
         for _ in range(num_tokens)
     ]
 
-    processor = OutputLogprobProcessor()
-    result = processor(
-        logits=logits_output.next_token_logits,
-        top_logprobs_nums=top_logprobs_nums_repeat_interleaved,
-        token_ids_logprobs=token_ids_logprobs_repeat_interleaved,
-        next_token_ids=batch_next_token_ids,
-        temperature=(
-            temperatures if not envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get() else None
-        ),
-    )
+    # Extract logprobs
+    should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+    should_token_ids_logprobs = any(x is not None for x in token_ids_logprobs)
+    if should_top_logprobs:
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = get_top_logprobs(
+            logprobs,
+            top_logprobs_nums_repeat_interleaved,
+        )
 
-    logits_output.next_token_logprobs = result.token_logprobs
-    logits_output.next_token_top_logprobs_val = result.top_logprobs_val
-    logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
-    logits_output.next_token_token_ids_logprobs_val = result.token_ids_logprobs_val
-    logits_output.next_token_token_ids_logprobs_idx = result.token_ids_logprobs_idx
+    if should_token_ids_logprobs:
+        (
+            logits_output.next_token_token_ids_logprobs_val,
+            logits_output.next_token_token_ids_logprobs_idx,
+        ) = get_token_ids_logprobs(
+            logprobs,
+            token_ids_logprobs_repeat_interleaved,
+        )
 
-    # Add output logprobs to each request
+    logits_output.next_token_logprobs = logprobs[
+        torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
+        batch_next_token_ids,
+    ]
+
+    # Add output logprobs to the request
     pt = 0
     next_token_logprobs = logits_output.next_token_logprobs.tolist()
     verified_ids = batch_next_token_ids.tolist()
@@ -751,7 +785,6 @@ def add_output_logprobs_for_spec_v1(
                 req.output_token_logprobs_val.append(next_token_logprobs[pt])
                 req.output_token_logprobs_idx.append(verified_ids[pt])
                 if req.top_logprobs_num > 0:
-                    should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
                     assert (
                         should_top_logprobs
                     ), "Inconsistent state: should_top_logprobs is False"
