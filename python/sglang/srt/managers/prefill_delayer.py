@@ -153,7 +153,7 @@ class PrefillDelayer:
 
             max_running_requests = kwargs.get("max_running_requests", 0)
             if not self.enable_dp_attention:
-                max_running_requests = (max_running_requests + self.dp_size - 1 ) // self.dp_size
+                max_running_requests = (max_running_requests + self.dp_size - 1) // self.dp_size
             if (
                 max_running_requests - global_running_batch.max().item()
                 < global_max_prefill_bs.max().item()
