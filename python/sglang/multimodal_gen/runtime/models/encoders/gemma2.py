@@ -15,7 +15,7 @@
 # Adapted from the Gemma3 text model implementation in this codebase.
 
 import logging
-from typing import Any, Iterable, Set, Tuple
+from typing import Any, Iterable
 
 import torch
 from torch import nn
@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
@@ -119,7 +122,6 @@ class Gemma2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = arch.query_pre_attn_scalar**-0.5
-        self.attn_logit_softcapping = arch.attn_logit_softcapping
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -288,11 +290,7 @@ class Gemma2DecoderLayer(nn.Module):
 
 
 class Gemma2Model(nn.Module):
-    """Gemma2 text encoder model for SANA pipeline.
-
-    This is a standalone text encoder (no vision components) that produces
-    hidden states from input tokens, used by SANA for text conditioning.
-    """
+    """Gemma2 text encoder model for SANA pipeline."""
 
     _fsdp_shard_conditions = []
 
@@ -301,10 +299,6 @@ class Gemma2Model(nn.Module):
         self.config = config
         arch = config.arch_config
         self.quant_config = None
-
-        from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-        )
 
         self.vocab_size = arch.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -341,6 +335,11 @@ class Gemma2Model(nn.Module):
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> BaseEncoderOutput:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -375,9 +374,9 @@ class Gemma2Model(nn.Module):
             hidden_states=all_hidden_states,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
 
         stacked_params_mapping = getattr(
             self.config.arch_config, "stacked_params_mapping", None

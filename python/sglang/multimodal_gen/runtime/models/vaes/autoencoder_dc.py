@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Iterable, Optional, Set, Tuple
+from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -12,12 +12,7 @@ logger = init_logger(__name__)
 
 
 class AutoencoderDC(nn.Module):
-    """Deep Compression Autoencoder wrapper for sglang.
-
-    Wraps diffusers' AutoencoderDC to conform to the framework's VAE interface.
-    The inner model is created lazily on first use, which allows the wrapper to
-    be instantiated before weights are available.
-    """
+    """Deep Compression Autoencoder wrapper with 32x spatial compression."""
 
     def __init__(self, config: SanaVAEConfig = None, **kwargs):
         super().__init__()
@@ -25,7 +20,7 @@ class AutoencoderDC(nn.Module):
         self._inner_model = None
         self._loaded_state_dict: dict[str, torch.Tensor] = {}
 
-    def _ensure_inner_model(self, state_dict: Optional[Dict[str, torch.Tensor]] = None):
+    def _ensure_inner_model(self, state_dict: dict[str, torch.Tensor] | None = None):
         if self._inner_model is not None:
             return
 
@@ -58,6 +53,10 @@ class AutoencoderDC(nn.Module):
                 logger.warning(
                     "AutoencoderDC missing keys when loading: %d keys", len(missing)
                 )
+                if len(missing) > 10:
+                    logger.debug("First 10 missing keys: %s", list(missing)[:10])
+                else:
+                    logger.debug("Missing keys: %s", list(missing))
             if unexpected:
                 logger.debug(
                     "AutoencoderDC unexpected keys when loading: %d keys",
@@ -101,20 +100,20 @@ class AutoencoderDC(nn.Module):
 
     def load_state_dict(
         self,
-        state_dict: Dict[str, torch.Tensor],
+        state_dict: dict[str, torch.Tensor],
         strict: bool = True,
         assign: bool = False,
     ):
         """Intercept load_state_dict to route weights into the inner diffusers model."""
         self._ensure_inner_model(state_dict=state_dict)
 
-    def state_dict(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+    def state_dict(self, *args, **kwargs) -> dict[str, torch.Tensor]:
         self._ensure_inner_model()
         return self._inner_model.state_dict(*args, **kwargs)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Buffer weights for deferred loading. The inner model is built lazily."""
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, weight in weights:
             self._loaded_state_dict[name] = weight
             loaded_params.add(name)

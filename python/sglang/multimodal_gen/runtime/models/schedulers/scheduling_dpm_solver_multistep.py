@@ -17,9 +17,6 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -92,6 +89,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self.order = solver_order
         self._flow_shift = flow_shift
         self._begin_index: int | None = None
+        BaseScheduler.__init__(self)
 
     def set_shift(self, shift: float) -> None:
         self._flow_shift = shift
