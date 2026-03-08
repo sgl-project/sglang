@@ -1,9 +1,12 @@
 from typing import Optional
 
 import torch
+import torch._C._distributed_c10d as c10d
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 # RMSNorm-fp32
@@ -618,3 +621,419 @@ def rms_norm_fn(
         out,
         residual_out,
     )
+
+
+# Adapted from https://github.com/ModelTC/LightX2V/blob/main/lightx2v/common/ops/norm/triton_ops.py#L905-L956
+@triton.jit
+def _rms_norm_tiled_onepass(
+    y_ptr,
+    x_ptr,
+    w_ptr,
+    SEQ: tl.constexpr,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE_SEQ: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    seq_blk_id = tl.program_id(0)
+    seq_id = seq_blk_id * BLOCK_SIZE_SEQ
+
+    seq_offset = seq_id + tl.arange(0, BLOCK_SIZE_SEQ)[:, None]
+    s_mask = seq_offset < SEQ
+    d_offset = tl.arange(0, BLOCK_SIZE_DIM)[None, :]
+    d_mask = d_offset < DIM
+    y_blk = y_ptr + seq_offset * DIM + d_offset
+    x_blk = x_ptr + seq_offset * DIM + d_offset
+    mask = s_mask & d_mask
+
+    x = tl.load(x_blk, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(x * x, axis=1, keep_dims=True) / DIM
+    rstd = tl.math.rsqrt(mean_square + EPS)
+    w = tl.load(w_ptr + d_offset, mask=d_mask)
+    tl.store(y_blk, x * rstd * w, mask=mask)
+
+
+def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+    shape = x.shape
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    x_view = x.reshape(-1, shape[-1])
+    y_view = y.reshape(-1, shape[-1])
+    S, D = x_view.shape
+
+    BLOCK_SIZE_SEQ = min(16, triton.next_power_of_2(max(1, S // 512)))
+    grid = (triton.cdiv(S, BLOCK_SIZE_SEQ),)
+
+    with torch.cuda.device(x.device):
+        torch.library.wrap_triton(_rms_norm_tiled_onepass)[grid](
+            y_view,
+            x_view,
+            w,
+            S,
+            D,
+            eps,
+            BLOCK_SIZE_DIM=triton.next_power_of_2(D),
+            BLOCK_SIZE_SEQ=BLOCK_SIZE_SEQ,
+        )
+    return y
+
+
+################################################################################
+# Fused RMSNorm + Interleaved RoPE kernels for MOVA DiT
+################################################################################
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": 256}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=8),
+        triton.Config({"BLOCK_D": 1024}, num_warps=8),
+    ],
+    key=["D"],
+)
+@triton.jit
+def _fused_rmsnorm_rope_kernel(
+    out_ptr,
+    x_ptr,
+    weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    M,  # total rows (B * S)
+    D: tl.constexpr,  # hidden dimension
+    seq_len,  # sequence length (for cos/sin indexing)
+    head_dim_half: tl.constexpr,  # head_dim // 2
+    eps,
+    stride_x_row,
+    stride_out_row,
+    stride_cos_row,
+    BLOCK_D: tl.constexpr,
+):
+    """Fused RMSNorm + interleaved RoPE kernel (TP=1).
+
+    Two-pass algorithm:
+      Pass 1: accumulate sum-of-squares over the row to compute rstd.
+      Pass 2: normalize with weight, then apply interleaved RoPE in pairs.
+    """
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    x_row_ptr = x_ptr + row * stride_x_row
+    out_row_ptr = out_ptr + row * stride_out_row
+
+    # Token index within the sequence (for cos/sin lookup)
+    token_idx = row % seq_len
+
+    # --- Pass 1: compute rstd = rsqrt(mean(x^2) + eps) ---
+    sum_sq = tl.zeros([], dtype=tl.float32)
+    for block_start in range(0, D, BLOCK_D):
+        offsets = block_start + tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        x_vals = tl.load(x_row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        sum_sq += tl.sum(x_vals * x_vals, axis=0)
+
+    rstd = tl.math.rsqrt(sum_sq / D + eps)
+
+    # --- Pass 2: fused normalize + RoPE (process in pairs) ---
+    # Total number of pairs = D // 2
+    num_pairs: tl.constexpr = D // 2
+    BLOCK_PAIRS: tl.constexpr = BLOCK_D // 2
+
+    for block_start in range(0, num_pairs, BLOCK_PAIRS):
+        pair_offsets = block_start + tl.arange(0, BLOCK_PAIRS)
+        pair_mask = pair_offsets < num_pairs
+
+        # Element indices for even/odd of each pair
+        even_offsets = 2 * pair_offsets
+        odd_offsets = 2 * pair_offsets + 1
+
+        # Load input pairs
+        x_even = tl.load(x_row_ptr + even_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+        x_odd = tl.load(x_row_ptr + odd_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        # Load weights
+        w_even = tl.load(weight_ptr + even_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+        w_odd = tl.load(weight_ptr + odd_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        # Normalize
+        xn_even = x_even * rstd * w_even
+        xn_odd = x_odd * rstd * w_odd
+
+        # RoPE index: wraps every head_dim_half pairs
+        rope_idx = pair_offsets % head_dim_half
+
+        # Load cos/sin
+        cos_row_ptr = cos_ptr + token_idx * stride_cos_row
+        sin_row_ptr = sin_ptr + token_idx * stride_cos_row
+        cos_vals = tl.load(cos_row_ptr + rope_idx, mask=pair_mask, other=1.0).to(
+            tl.float32
+        )
+        sin_vals = tl.load(sin_row_ptr + rope_idx, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        # Interleaved RoPE: (even', odd') = R(theta) * (even, odd)
+        o_even = xn_even * cos_vals - xn_odd * sin_vals
+        o_odd = xn_even * sin_vals + xn_odd * cos_vals
+
+        # Store
+        tl.store(out_row_ptr + even_offsets, o_even, mask=pair_mask)
+        tl.store(out_row_ptr + odd_offsets, o_odd, mask=pair_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": 256}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=8),
+        triton.Config({"BLOCK_D": 1024}, num_warps=8),
+    ],
+    key=["D"],
+)
+@triton.jit
+def _compute_local_mean_sq_kernel(
+    mean_sq_ptr,
+    x_ptr,
+    M,
+    D: tl.constexpr,
+    stride_x_row,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute per-row mean of squares for TP>1 RMSNorm (phase 1)."""
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    x_row_ptr = x_ptr + row * stride_x_row
+
+    sum_sq = tl.zeros([], dtype=tl.float32)
+    for block_start in range(0, D, BLOCK_D):
+        offsets = block_start + tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        x_vals = tl.load(x_row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        sum_sq += tl.sum(x_vals * x_vals, axis=0)
+
+    tl.store(mean_sq_ptr + row, sum_sq / D)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": 256}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=4),
+        triton.Config({"BLOCK_D": 512}, num_warps=8),
+        triton.Config({"BLOCK_D": 1024}, num_warps=8),
+    ],
+    key=["D"],
+)
+@triton.jit
+def _fused_apply_norm_rope_kernel(
+    out_ptr,
+    x_ptr,
+    weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    rstd_ptr,
+    M,
+    D: tl.constexpr,
+    seq_len,
+    head_dim_half: tl.constexpr,
+    stride_x_row,
+    stride_out_row,
+    stride_cos_row,
+    BLOCK_D: tl.constexpr,
+):
+    """Apply normalization (with precomputed rstd) + interleaved RoPE (TP>1 phase 3)."""
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    x_row_ptr = x_ptr + row * stride_x_row
+    out_row_ptr = out_ptr + row * stride_out_row
+    token_idx = row % seq_len
+
+    rstd = tl.load(rstd_ptr + row).to(tl.float32)
+
+    num_pairs: tl.constexpr = D // 2
+    BLOCK_PAIRS: tl.constexpr = BLOCK_D // 2
+
+    for block_start in range(0, num_pairs, BLOCK_PAIRS):
+        pair_offsets = block_start + tl.arange(0, BLOCK_PAIRS)
+        pair_mask = pair_offsets < num_pairs
+
+        even_offsets = 2 * pair_offsets
+        odd_offsets = 2 * pair_offsets + 1
+
+        x_even = tl.load(x_row_ptr + even_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+        x_odd = tl.load(x_row_ptr + odd_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        w_even = tl.load(weight_ptr + even_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+        w_odd = tl.load(weight_ptr + odd_offsets, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        xn_even = x_even * rstd * w_even
+        xn_odd = x_odd * rstd * w_odd
+
+        rope_idx = pair_offsets % head_dim_half
+
+        cos_row_ptr = cos_ptr + token_idx * stride_cos_row
+        sin_row_ptr = sin_ptr + token_idx * stride_cos_row
+        cos_vals = tl.load(cos_row_ptr + rope_idx, mask=pair_mask, other=1.0).to(
+            tl.float32
+        )
+        sin_vals = tl.load(sin_row_ptr + rope_idx, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
+
+        o_even = xn_even * cos_vals - xn_odd * sin_vals
+        o_odd = xn_even * sin_vals + xn_odd * cos_vals
+
+        tl.store(out_row_ptr + even_offsets, o_even, mask=pair_mask)
+        tl.store(out_row_ptr + odd_offsets, o_odd, mask=pair_mask)
+
+
+def fused_rmsnorm_rope(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    eps: float,
+) -> torch.Tensor:
+    """Fused RMSNorm + interleaved RoPE for TP=1.
+
+    Args:
+        x: Input tensor [B, S, D] or [*, D] (bf16/fp16).
+        weight: RMSNorm weight [D] (any dtype, cast to fp32 internally).
+        cos: Precomputed cosine [S, head_dim//2] float32.
+        sin: Precomputed sine [S, head_dim//2] float32.
+        head_dim: Per-head dimension (e.g. 128).
+        eps: RMSNorm epsilon.
+
+    Returns:
+        Output tensor, same shape and dtype as x.
+    """
+    orig_shape = x.shape
+    seq_len = cos.shape[0]
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    M, D = x_2d.shape
+    assert D % 2 == 0, f"Hidden dim must be even, got {D}"
+
+    out = torch.empty_like(x_2d)
+    head_dim_half = head_dim // 2
+
+    grid = (M,)
+    _fused_rmsnorm_rope_kernel[grid](
+        out,
+        x_2d,
+        weight,
+        cos,
+        sin,
+        M,
+        D,
+        seq_len,
+        head_dim_half,
+        eps,
+        x_2d.stride(0),
+        out.stride(0),
+        cos.stride(0),
+    )
+    return out.view(orig_shape)
+
+
+def fused_rmsnorm_rope_tp(
+    x: torch.Tensor,
+    norm_module,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    tp_rank: int,
+    tp_size: int,
+    tp_group,
+) -> torch.Tensor:
+    """Fused RMSNorm + interleaved RoPE for TP>1.
+
+    Three-phase:
+      1. Compute local mean-of-squares via Triton kernel.
+      2. All-reduce mean_sq across TP group.
+      3. Apply normalization (with global rstd) + RoPE via Triton kernel.
+
+    Args:
+        x: Local input tensor [B, S, D_local] (bf16/fp16).
+        norm_module: RMSNorm module (has .weight [D_full] and .variance_epsilon).
+        cos: Precomputed cosine [S, head_dim//2] float32.
+        sin: Precomputed sine [S, head_dim//2] float32.
+        head_dim: Per-head dimension (e.g. 128).
+        tp_rank: Current TP rank.
+        tp_size: TP world size.
+        tp_group: TP process group (has .all_reduce method).
+
+    Returns:
+        Output tensor, same shape and dtype as x.
+    """
+    orig_shape = x.shape
+    seq_len = cos.shape[0]
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    M, D_local = x_2d.shape
+    assert D_local % 2 == 0, f"Local hidden dim must be even, got {D_local}"
+
+    head_dim_half = head_dim // 2
+    weight_local = norm_module.weight.tensor_split(tp_size)[tp_rank].float()
+    eps = norm_module.variance_epsilon
+
+    # Phase 1: compute local mean-of-squares
+    mean_sq = torch.empty(M, dtype=torch.float32, device=x.device)
+    grid = (M,)
+    _compute_local_mean_sq_kernel[grid](
+        mean_sq,
+        x_2d,
+        M,
+        D_local,
+        x_2d.stride(0),
+    )
+
+    # Phase 2: all-reduce mean_sq across TP ranks
+    mean_sq = tp_group.all_reduce(mean_sq, op=c10d.ReduceOp.AVG)
+
+    # Phase 3: rstd from global mean_sq, then fused norm + RoPE
+    rstd = torch.rsqrt(mean_sq + eps)
+
+    out = torch.empty_like(x_2d)
+    _fused_apply_norm_rope_kernel[grid](
+        out,
+        x_2d,
+        weight_local,
+        cos,
+        sin,
+        rstd,
+        M,
+        D_local,
+        seq_len,
+        head_dim_half,
+        x_2d.stride(0),
+        out.stride(0),
+        cos.stride(0),
+    )
+    return out.view(orig_shape)
+
+
+if current_platform.is_npu():
+    from .npu_fallback import fused_rmsnorm_rope_native, fused_rmsnorm_rope_tp_native
+
+    fused_rmsnorm_rope = fused_rmsnorm_rope_native
+    fused_rmsnorm_rope_tp = fused_rmsnorm_rope_tp_native

@@ -34,10 +34,22 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_is_cuda = current_platform.is_cuda()
+if _is_cuda:
+    from sglang.jit_kernel.diffusion.triton.norm import (
+        fused_rmsnorm_rope,
+        fused_rmsnorm_rope_tp,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_tensor_model_parallel_rank,
+        get_tp_group,
+    )
 
 
 # @torch.compile(fullgraph=True)
@@ -169,17 +181,62 @@ class SelfAttention(nn.Module):
         k, _ = self.k(x)
         v, _ = self.v(x)
 
-        # RMSNorm over sharded hidden dimension.
-        if self.tp_size > 1:
-            q = tensor_parallel_rms_norm(q, self.norm_q)
-            k = tensor_parallel_rms_norm(k, self.norm_k)
-        else:
-            q = self.norm_q(q)
-            k = self.norm_k(k)
+        if _is_cuda and q.is_cuda:
+            # Fused path: RMSNorm + RoPE in one/few kernel(s)
+            cos = freqs.real.squeeze(1).float().contiguous()  # [S, head_dim//2]
+            sin = freqs.imag.squeeze(1).float().contiguous()  # [S, head_dim//2]
 
-        # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
+            if self.tp_size > 1:
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_group = get_tp_group()
+                q = fused_rmsnorm_rope_tp(
+                    q,
+                    self.norm_q,
+                    cos,
+                    sin,
+                    self.head_dim,
+                    tp_rank,
+                    self.tp_size,
+                    tp_group,
+                )
+                k = fused_rmsnorm_rope_tp(
+                    k,
+                    self.norm_k,
+                    cos,
+                    sin,
+                    self.head_dim,
+                    tp_rank,
+                    self.tp_size,
+                    tp_group,
+                )
+            else:
+                q = fused_rmsnorm_rope(
+                    q,
+                    self.norm_q.weight,
+                    cos,
+                    sin,
+                    self.head_dim,
+                    self.norm_q.variance_epsilon,
+                )
+                k = fused_rmsnorm_rope(
+                    k,
+                    self.norm_k.weight,
+                    cos,
+                    sin,
+                    self.head_dim,
+                    self.norm_k.variance_epsilon,
+                )
+        else:
+            # Fallback: separate RMSNorm + RoPE
+            if self.tp_size > 1:
+                q = tensor_parallel_rms_norm(q, self.norm_q)
+                k = tensor_parallel_rms_norm(k, self.norm_k)
+            else:
+                q = self.norm_q(q)
+                k = self.norm_k(k)
+
+            q = rope_apply_head_dim(q, freqs, self.head_dim)
+            k = rope_apply_head_dim(k, freqs, self.head_dim)
 
         # USPAttention expects [B, S_local, H, D] format
         q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
