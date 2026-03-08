@@ -90,5 +90,25 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # encoder_attention_mask: batch stores list-of-tensors; diffusers' SanaTransformer
+        # expects a single tensor (sglang's has list handling). Override with [0].
+        out = {}
+        m = batch.prompt_attention_mask
+        if isinstance(m, (list, tuple)):
+            out["encoder_attention_mask"] = m[0] if m else None
+        elif m is not None:
+            out["encoder_attention_mask"] = m
+        return out
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        out = {}
+        m = batch.negative_attention_mask
+        if isinstance(m, (list, tuple)):
+            out["encoder_attention_mask"] = m[0] if m else None
+        elif m is not None:
+            out["encoder_attention_mask"] = m
+        return out
+
     def post_denoising_loop(self, latents, batch):
         return latents
