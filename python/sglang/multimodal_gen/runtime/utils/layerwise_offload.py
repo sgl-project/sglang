@@ -81,7 +81,7 @@ class LayerwiseOffloadManager:
         except Exception:
             return None
 
-    def _get_placeholder(self, dtype: torch.dtype) -> torch.Tensor:
+    def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
         placeholder = self._offload_placeholders.get(dtype)
         if placeholder is None:
             placeholder = torch.empty((1,), device=self.device, dtype=dtype)
@@ -134,7 +134,7 @@ class LayerwiseOffloadManager:
                         "shape": weight.shape,
                     }
 
-                    weight.data = self._get_placeholder(dtype)
+                    weight.data = self._get_shared_empty_tensor(dtype)
 
                     current_offset += numel
 
@@ -226,7 +226,7 @@ class LayerwiseOffloadManager:
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
             # Wraparound prefetch will reload the layer when it is needed again
-            target.data = self._get_placeholder(meta["dtype"])
+            target.data = self._get_shared_empty_tensor(meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
 
