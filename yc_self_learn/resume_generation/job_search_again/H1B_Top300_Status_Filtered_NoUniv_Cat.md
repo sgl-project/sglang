@@ -42,15 +42,15 @@
 
 ### 8. DELOITTE CONSULTING LLP
 - **公司类别**: 其他
-- **投递状态码**: 0
+- **投递状态码**: 5
 
 ### 9. AMAZON WEB SERVICES INC
 - **公司类别**: 科技公司
-- **投递状态码**: 0
+- **投递状态码**: 10
 
 ### 10. ORACLE AMERICA INC
 - **公司类别**: 科技公司
-- **投递状态码**: 0
+- **投递状态码**: 10
 
 ### 11. ERNST AND YOUNG U S LLP
 - **公司类别**: 其他

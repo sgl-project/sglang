@@ -1,0 +1,464 @@
+% !TEX program = xelatex
+% ===========================================================
+% Yanda Cheng -- 西门子CT临床科研支持专员 双语简历
+% Siemens Healthineers CT Clinical Research Support -- Bilingual Resume
+%
+% 编译方式 / Compile with: XeLaTeX (必须 / required)
+% 中文版 Chinese version: 第 1-2 页 / Pages 1-2
+% 英文版 English version: 第 3-4 页 / Pages 3-4
+% 中文字体 Chinese font: Microsoft YaHei (Windows 内置 / built-in)
+% Overleaf 用户请将 Microsoft YaHei 替换为 Noto Sans CJK SC
+% ===========================================================
+
+\documentclass[letterpaper,10pt]{article}
+
+% ---------- Packages ----------
+\usepackage{iftex}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=3pt, left=1.5em}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage{tabularx}
+
+% ---------- Engine compatibility ----------
+% This resume contains Chinese and requires either XeLaTeX or LuaLaTeX.
+% pdfLaTeX will NOT work.
+\ifPDFTeX
+  \errmessage{This file requires XeLaTeX or LuaLaTeX (not pdfLaTeX). Please change the compiler to XeLaTeX or LuaLaTeX.}
+\fi
+
+\ifXeTeX
+  \usepackage{fontspec}
+  \usepackage{xeCJK}
+\fi
+\ifLuaTeX
+  \usepackage{fontspec}
+  \usepackage{luatexja}
+  \usepackage{luatexja-fontspec}
+\fi
+
+% ---------- Fonts ----------
+% Prefer Windows font locally; fall back to Noto on Overleaf.
+\ifXeTeX
+  \IfFontExistsTF{Microsoft YaHei}{
+    \setCJKmainfont{Microsoft YaHei}
+    \setCJKsansfont{Microsoft YaHei}
+  }{
+    \setCJKmainfont{Noto Sans CJK SC}
+    \setCJKsansfont{Noto Sans CJK SC}
+  }
+\fi
+\ifLuaTeX
+  \IfFontExistsTF{Microsoft YaHei}{
+    \setmainjfont{Microsoft YaHei}
+  }{
+    \setmainjfont{Noto Sans CJK SC}
+  }
+\fi
+\setmainfont{Arial}
+\linespread{1.03}\selectfont
+
+% ---------- Page Style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- Margins ----------
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-0.9in}
+\addtolength{\textheight}{1.15in}
+
+% ---------- Section Formatting ----------
+% Note: \scshape removed for CJK compatibility; bold underline retained
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{5pt plus 1pt minus 1pt}{3pt}
+
+% ---------- Custom Commands ----------
+\newcommand{\resumeItem}[1]{\item\small{#1}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & \small#2 \\
+    \textit{\small#3} & \textit{\small#4} \\
+  \end{tabular*}\vspace{-2pt}
+}
+
+\newcommand{\projheading}[2]{
+  \vspace{1pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & \textit{\small#2} \\
+  \end{tabular*}\vspace{2pt}
+}
+
+\newcommand{\resumeSubHeadingList}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+\newcommand{\projItemListStart}{\begin{itemize}[leftmargin=0.2in, topsep=3pt]}
+\newcommand{\projItemListEnd}{\end{itemize}\vspace{2pt}}
+
+% =================================================================
+\begin{document}
+% =================================================================
+
+
+% #################################################################
+% #################### 中文版 CHINESE VERSION #####################
+% #################################################################
+
+% ---------- 头部 Header ----------
+\begin{center}
+  {\huge \textbf{程彦达 \quad Yanda Cheng}} \\
+  \vspace{4pt}
+  \small
+  +1-859-338-3379 \quad$|$\quad
+  \href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \quad$|$\quad
+  \href{https://yanda-cheng.com}{yanda-cheng.com} \quad$|$\quad
+  \href{https://www.linkedin.com/in/yanda-cheng-4888a216b}{linkedin.com/in/yanda-cheng-4888a216b} \quad$|$\quad
+  \href{https://scholar.google.com/citations?view_op=search_authors&mauthors=Yanda+Cheng+University+at+Buffalo}{Google Scholar Profile}
+\end{center}
+
+\vspace{-2pt}
+
+% ---------- 个人简介 ----------
+\section{个人简介}
+
+生物医学工程博士候选人（布法罗大学，GPA\,4.0/4.0），研究方向为医学影像算法与临床转化（光声/超声、多模态成像、影像组学）。
+已发表第一/共同作者 SCI 论文 \textbf{11 篇}，代表期刊包括 \textit{npj Imaging}、\textit{IEEE TMI}、\textit{IEEE TUFFC}、\textit{Photoacoustics}、\textit{BOE}、\textit{Med-X}，Google Scholar 总引用约 \textbf{100}。
+长期主导 NIH 资助的多中心研究（最大队列 N\,>\,400），覆盖研究设计、IRB 伦理申报、临床数据管理、统计分析与论文发表全流程。
+具备与放射科/外科/肿瘤科/内分泌科医生协作经验，能够支持 CT 临床科研选题、数据分析与英文论文产出，推动学术合作和KOL关系建设。
+
+\vspace{-2pt}
+
+% ---------- 教育背景 ----------
+\section{教育背景}
+
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=3pt, topsep=2pt]
+  \item
+    \textbf{生物医学工程 博士（在读）}\hfill
+    \textit{布法罗大学（State University of New York at Buffalo）}\hfill
+    GPA: 4.0/4.0 \hfill 2021--2026（预计5月）
+  \item
+    \textbf{生物医学工程 硕士}\hfill
+    \textit{康奈尔大学（Cornell University，常春藤盟校）}\hfill
+    2020--2021
+  \item
+    \textbf{电子与计算机工程 学士}\hfill
+    \textit{肯塔基大学（University of Kentucky）}\hfill
+    2015--2020
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- 工作经历 ----------
+\section{工作经历}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  % --- Seno Medical ---
+  \item
+  \textbf{机器学习工程师实习 · Seno Medical（医疗成像设备公司）}\hfill 纽约 \\
+  \textit{临床数据集构建 · AI辅助医学影像评估 · 合规部署} \hfill \textit{2024年5月 -- 8月}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item 与临床团队协作，构建2000+条医学影像 QA 数据集并制定标注规范；完成 LLaMA（LoRA）微调与检索增强（RAG）系统开发
+    \item 设计符合 PHI 法规的本地化安全部署方案（FastAPI\,+\,Docker），供医院网络内部使用
+    \item 将技术成果整理为临床团队可读的评估报告，给出模型性能、局限与改进建议
+  \end{itemize}
+
+  \vspace{3pt}
+
+  % --- Roswell Park ---
+  \item
+  \textbf{研究科学家 · Roswell Park 综合癌症中心}\hfill 纽约州布法罗 \\
+  \textit{医学影像算法研发 · 临床数据分析} \hfill \textit{2023年5月 -- 8月}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item 参与肿瘤相关多模态医学影像研究，负责图像预处理、特征分析与算法评估
+    \item 与临床医生协作开展数据整理与结果验证，形成可用于论文发表的研究结论
+  \end{itemize}
+
+  \vspace{3pt}
+
+  % --- HydroSense ---
+  \item
+  \textbf{联合创始人 · HydroSense Tech LLC（高精度传感器公司）}\hfill 北京 / 新加坡 \\
+  \textit{传感器硬件研发 · 嵌入式ML · IoT数据平台} \hfill \textit{2015年 -- 至今（兼职）}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item 主导传感器硬件设计与机器学习算法开发，产品销售额突破百万美元，覆盖5+国家市政及工业客户
+    \item 持有多项传感器算法与硬件发明专利（信号处理、漂移补偿、EMI抑制等，2017--2023）
+  \end{itemize}
+
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- 代表性科研项目 ----------
+\section{代表性科研项目（与CT影像临床科研支持高度相关）}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  \projheading{慢性足部溃疡纵向光声影像与预后预测建模}{npj Imaging, 2026}
+  \projItemListStart
+    \item 设计纵向随访方案，纳入 N\,>\,400 例糖尿病足溃疡患者；协调内分泌科、血管外科、伤口护理科完成 IRB 申请与多中心数据采集
+    \item 融合影像组学特征与 LASSO / 随机森林预测模型，AUC\,>\,0.85，实现溃疡愈合概率定量预测，支撑临床决策
+    \item \textit{可迁移至：}CT灌注成像纵向随访研究、低剂量CT肺癌筛查队列预测建模
+  \projItemListEnd
+
+  \projheading{乳腺光声-超声多模态自动化成像系统（OneTouch）}{IEEE Transactions on Medical Imaging, 2025（被引8次）}
+  \projItemListStart
+    \item 参与多模态临床成像系统研发，结合 AI 辅助分析，面向乳腺癌早期筛查；与放射科及外科医生合作设计成像协议、完成临床验证
+    \item \textit{可迁移至：}西门子CT联合超声多模态乳腺筛查联合研究
+  \projItemListEnd
+
+  \projheading{光声图像无监督 AI 去噪（Noise2Noise Network）}{Biomedical Optics Express, 2024（被引14次）}
+  \projItemListStart
+    \item 提出无需配对干净图像的深度学习去噪框架，显著提升低信噪比医学图像质量
+    \item \textit{可迁移至：}\textbf{低剂量CT图像AI去噪}（SOMATOM低剂量肺癌筛查研究方向，图像质量提升是热门发表点）
+  \projItemListEnd
+
+  \projheading{足部血管双扫描光声断层成像（Dual-Scan PA Tomography）}{IEEE Transactions on UFFC, 2023（被引21次）}
+  \projItemListStart
+    \item 开发三维定量血管成像协议，用于外周动脉疾病（PAD）评估；与血管外科团队制定患者招募与成像标准
+    \item \textit{可迁移至：}西门子CT血管造影（CTA）研究、下肢PAD定量分析
+  \projItemListEnd
+
+  \projheading{吞咽困难光声影像评估（婴儿猪活体/离体模型）}{Med-X, 2025}
+  \projItemListStart
+    \item 首次将光声影像技术应用于吞咽功能评估；与言语治疗科合作，主导实验设计、影像处理与论文撰写全过程
+    \item \textit{展示：}开拓全新临床应用场景并推动发表的科研组织能力
+  \projItemListEnd
+
+  \projheading{乳腺癌早期检测转化研究与创业}{布法罗大学创业大赛获奖，2023--至今}
+  \projItemListStart
+    \item 主导乳腺癌光声早期检测的转化项目，与布法罗本地医院合作设计患者研究，完成创业路演并获批种子基金 \$3,000
+    \item \textit{展示：}科研成果转化与产业对接能力
+  \projItemListEnd
+
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- 代表性论文 ----------
+\section{代表性论文（第一 / 共同作者，同行评审，已发表）}
+
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Predictive modeling of chronic foot ulcer outcomes using longitudinal photoacoustic imaging. \textit{npj Imaging} 4(1), 12, \textbf{2026}.
+  \item \small \textbf{Cheng Y.}, Huang C., Bing R.W., et al. Dysphagia assessment based on photoacoustic imaging: a pilot ex vivo and in vivo study in infant swine. \textit{Med-X} 3(1), 1--9, \textbf{2025}.
+  \item \small \textbf{Cheng Y.}, Zheng W., Bing R.W., et al. Unsupervised denoising of photoacoustic images based on the Noise2Noise network. \textit{Biomedical Optics Express} 15(8), 4390--4405, \textbf{2024}.\quad\textbf{[被引 14 次]}
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Dual-scan photoacoustic tomography for the imaging of vascular structure on foot. \textit{IEEE Trans. Ultrason. Ferroelectr. Freq. Control} 70, \textbf{2023}.\quad\textbf{[被引 21 次]}
+  \item \small Huang C., \textbf{Cheng Y.}, et al. Enhanced clinical photoacoustic vascular imaging through a skin localization network and adaptive weighting. \textit{Photoacoustics} 42, 100690, \textbf{2025}. [被引 4 次]
+  \item \small Zhang H., Zheng E., ..., \textbf{Cheng Y.}, et al. OneTouch automated photoacoustic and ultrasound imaging of breast in standing pose. \textit{IEEE Trans. Medical Imaging}, \textbf{2025}. [被引 8 次]
+  \item \small Liu X., \textbf{Cheng Y.}, et al. Simultaneous measurements of tissue blood flow and oxygenation using a wearable fiber-free optical sensor. \textit{J. Biomed. Optics} 26(1), 012705, \textbf{2021}.\quad\textbf{[被引 38 次]}
+\end{itemize}
+\vspace{2pt}
+\noindent\small\textbf{总引用次数：约100次（Google Scholar）\quad 共11篇 SCI 论文\quad 期刊：npj Imaging, IEEE TMI, IEEE TUFFC, Photoacoustics, BOE, Med-X, JBO}
+
+\vspace{-2pt}
+
+% ---------- 专业技能 ----------
+\section{专业技能}
+\noindent
+\small
+\textbf{医学影像处理：} 图像重建、去噪（深度学习/传统）、配准、分割、3D可视化；CT、光声、超声、多光子显微成像 \\
+\textbf{AI / 机器学习：} CNN, UNet, Transformer, LSTM, 影像组学（Radiomics），LASSO, SVM, 随机森林，深度学习去噪 \\
+\textbf{临床数据分析：} 纵向分析、生存分析（Kaplan-Meier）、ROC/AUC, 线性/逻辑回归，统计检验（Python / R / SPSS）\\
+\textbf{科研协作流程：} IRB/伦理委员会申请、多中心患者招募、数据质量控制、SCI论文撰写与投稿、学术报告\\
+\textbf{编程工具：} Python, C/C++, MATLAB, R, SQL；PyTorch, scikit-learn, OpenCV, Pandas, Matplotlib, Docker \\
+\textbf{语言能力：} 普通话（母语），英语（流利——学术写作、科研汇报、跨国团队协作）
+
+\vspace{-2pt}
+
+% ---------- 荣誉获奖 ----------
+\section{荣誉与获奖}
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small 布法罗大学创业竞赛获奖，获批创业种子基金 \textbf{\$3,000}（乳腺癌光声早期检测创业项目，2023）
+  \item \small NIH 资助科研项目主要参与者（PI: Prof. Jun Xia，UB，持续资助中）
+  \item \small 布法罗大学优秀助教（BME 503 图像处理 / BME 302 医疗器械）
+\end{itemize}
+
+
+% #################################################################
+% ################### 英文版 ENGLISH VERSION ######################
+% #################################################################
+
+\clearpage
+
+% ---------- Header ----------
+\begin{center}
+  {\huge \textbf{Yanda Cheng}} \\
+  \vspace{4pt}
+  \small
+  +1-859-338-3379 \quad$|$\quad
+  \href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \quad$|$\quad
+  \href{https://yanda-cheng.com}{yanda-cheng.com} \quad$|$\quad
+  \href{https://www.linkedin.com/in/yanda-cheng-4888a216b}{linkedin.com/in/yanda-cheng-4888a216b} \quad$|$\quad
+  \href{https://scholar.google.com/citations?view_op=search_authors&mauthors=Yanda+Cheng+University+at+Buffalo}{Google Scholar Profile}
+\end{center}
+
+\begin{center}
+  \small
+  \textbf{Target Role:} CT Clinical Research Support Specialist $\cdot$ Siemens Healthineers $\cdot$ Shanghai $\cdot$
+  Available May 2026 (PhD graduation)
+\end{center}
+
+\vspace{-2pt}
+
+% ---------- Professional Summary ----------
+\section{Professional Summary}
+
+PhD candidate in Biomedical Engineering (University at Buffalo, GPA\,4.0/4.0), specializing in medical
+photoacoustic/ultrasound imaging and AI-assisted diagnostics. Published \textbf{11 first/co-author papers}
+in \textit{npj Imaging}, \textit{IEEE Transactions on Medical Imaging}, \textit{IEEE TUFFC},
+\textit{Photoacoustics}, \textit{Biomedical Optics Express}, and \textit{Med-X}, with $\sim$\textbf{100 total citations}.
+Led NIH-funded multi-center clinical studies (up to N\,$>$\,400) across the full research cycle:
+protocol design, IRB submission, multi-site data management, image processing, and SCI manuscript preparation.
+Extensive experience collaborating with radiologists, surgeons, oncologists, and endocrinologists to drive
+publishable clinical imaging research outcomes. Core expertise in medical image AI, radiomics, and
+longitudinal predictive modeling — directly transferable to CT perfusion analysis, low-dose CT denoising,
+and CT-based disease prediction research in support of Siemens Healthineers clinical programs.
+
+\vspace{-2pt}
+
+% ---------- Education ----------
+\section{Education}
+
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=2pt, topsep=2pt]
+  \item \textbf{PhD} in Biomedical Engineering \hfill \textit{University at Buffalo (SUNY), Buffalo, NY} \hfill GPA: 4.0/4.0 \hfill 2021--2026 (Expected)
+  \item \textbf{MEng} in Biomedical Engineering \hfill \textit{Cornell University (Ivy League), Ithaca, NY} \hfill 2020--2021
+  \item \textbf{BS} in Electrical \& Computer Engineering \hfill \textit{University of Kentucky, Lexington, KY} \hfill 2015--2020
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Work Experience ----------
+\section{Work Experience}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  % --- Seno Medical ---
+  \item
+  \textbf{Applied ML Engineer Intern -- Seno Medical (Medical Imaging Device Company)}\hfill New York \\
+  \textit{Clinical Dataset Development, AI-Assisted Medical Imaging, PHI-Compliant Deployment} \hfill \textit{May 2024 -- Aug 2024}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item Collaborated with clinicians to curate 2,000+ medical imaging QA datasets with annotation guidelines; fine-tuned LLaMA (LoRA) and built a RAG system, cutting hallucination by 50\% and raising Recall@5 to 90\%
+    \item Engineered PHI-compliant on-premises AI deployment (FastAPI\,+\,Docker) for hospital-network environments
+    \item Summarized technical findings into clinical-facing evaluation reports with model performance, limitations, and recommendations for downstream clinical workflow integration
+  \end{itemize}
+
+  \vspace{3pt}
+
+  % --- Roswell Park ---
+  \item
+  \textbf{Research Scientist -- Roswell Park Comprehensive Cancer Center}\hfill Buffalo, NY \\
+  \textit{Medical Imaging Algorithm Development, Clinical Data Analysis} \hfill \textit{May 2023 -- Aug 2023}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item Conducted oncology-focused multimodal medical imaging research, including image preprocessing, feature analysis, and model evaluation
+    \item Collaborated with clinicians on data curation and outcome validation, generating publication-ready research evidence
+  \end{itemize}
+
+  \vspace{3pt}
+
+  % --- HydroSense ---
+  \item
+  \textbf{Co-founder \& Core Engineer -- HydroSense Tech LLC}\hfill Beijing / Singapore \\
+  \textit{IoT Sensing, Embedded ML, Signal Processing} \hfill \textit{2015 -- Present (part-time)}
+  \begin{itemize}[leftmargin=0.2in, topsep=1pt]
+    \item Co-founded precision sensing startup; led hardware/software development driving multi-million dollar revenue across municipal and industrial customers in 5+ countries
+    \item Co-inventor on multiple patents covering sensor algorithms and hardware innovations (2017--2023)
+  \end{itemize}
+
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Research Projects ----------
+\section{Selected Research Projects (Directly Relevant to CT Imaging Research Support)}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  \projheading{Longitudinal PA Imaging \& Predictive Modeling of Chronic Foot Ulcers}{npj Imaging, 2026}
+  \projItemListStart
+    \item Designed full longitudinal follow-up protocol for N\,$>$\,400 diabetic foot ulcer patients; coordinated \textbf{IRB approval}, multi-center patient enrollment, and data collection with endocrinology, vascular surgery, and wound care teams
+    \item Combined radiomics features with LASSO/Random Forest models achieving AUC\,$>$\,0.85 for quantitative ulcer healing prediction, directly supporting clinical decision-making
+    \item \textit{Transferable to:} CT perfusion longitudinal studies, low-dose CT lung cancer screening cohort risk stratification
+  \projItemListEnd
+
+  \projheading{OneTouch Multi-modal Breast PA/US Automated Imaging System}{IEEE Trans. Medical Imaging, 2025 (cited 8$\times$)}
+  \projItemListStart
+    \item Co-developed a multi-modal clinical imaging platform integrating AI-assisted diagnosis for early breast cancer screening; coordinated with radiologists and surgeons on clinical protocol design and image interpretation validation
+    \item \textit{Transferable to:} Siemens CT + US multi-modal breast cancer screening collaborative research
+  \projItemListEnd
+
+  \projheading{Unsupervised AI Denoising for Medical Images (Noise2Noise Network)}{Biomedical Optics Express, 2024 (cited 14$\times$)}
+  \projItemListStart
+    \item Proposed deep learning denoising framework requiring no paired clean images; validated on photoacoustic imaging with significant SNR improvement
+    \item \textit{Directly transferable to:} \textbf{Low-dose CT image AI denoising} -- a key publication area for Siemens SOMATOM low-dose lung cancer screening programs
+  \projItemListEnd
+
+  \projheading{Dual-Scan Photoacoustic Tomography for Foot Vascular Imaging}{IEEE Trans. UFFC, 2023 (cited 21$\times$)}
+  \projItemListStart
+    \item Developed quantitative 3D vascular imaging protocol for peripheral arterial disease (PAD) assessment; established clinical imaging standards in collaboration with a vascular surgery team
+    \item \textit{Transferable to:} Siemens CT angiography (CTA) for lower extremity PAD quantitative analysis
+  \projItemListEnd
+
+  \projheading{Dysphagia Assessment via Photoacoustic Imaging (Infant Swine Model)}{Med-X, 2025}
+  \projItemListStart
+    \item First application of photoacoustic imaging for swallowing function evaluation; collaborated with speech-language pathology clinicians on experimental design, image processing, and full manuscript preparation
+    \item \textit{Demonstrates:} Ability to open new clinical application domains and deliver complete research output
+  \projItemListEnd
+
+  \projheading{Translational Research \& Startup for PA-Based Breast Cancer Detection}{UB Entrepreneurship Award, 2023--Present}
+  \projItemListStart
+    \item Led translational research project for early breast cancer detection; partnered with local hospitals to design patient studies and validate clinical feasibility; secured \textbf{\$3,000 startup grant} and entrepreneurship prizes
+    \item \textit{Demonstrates:} Clinical translation thinking and stakeholder relationship building (directly applicable to KOL management in a medical device company)
+  \projItemListEnd
+
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Publications ----------
+\section{Selected Publications (First / Co-Author, Peer-Reviewed)}
+
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Predictive modeling of chronic foot ulcer outcomes using longitudinal photoacoustic imaging. \textit{npj Imaging} 4(1), 12, \textbf{2026}.
+  \item \small \textbf{Cheng Y.}, Huang C., Bing R.W., et al. Dysphagia assessment based on photoacoustic imaging: a pilot ex vivo and in vivo study in infant swine. \textit{Med-X} 3(1), 1--9, \textbf{2025}.
+  \item \small \textbf{Cheng Y.}, Zheng W., et al. Unsupervised denoising of photoacoustic images based on the Noise2Noise network. \textit{Biomed.\ Optics Express} 15(8), 4390--4405, \textbf{2024}.\quad\textbf{[14 citations]}
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Dual-scan photoacoustic tomography for the imaging of vascular structure on foot. \textit{IEEE Trans.\ UFFC} 70, \textbf{2023}.\quad\textbf{[21 citations]}
+  \item \small Huang C., \textbf{Cheng Y.}, et al. Enhanced clinical photoacoustic vascular imaging through skin localization and adaptive weighting. \textit{Photoacoustics} 42, 100690, \textbf{2025}. [4 citations]
+  \item \small Zhang H., ..., \textbf{Cheng Y.}, et al. OneTouch automated PA/US breast imaging in standing pose. \textit{IEEE Trans.\ Medical Imaging}, \textbf{2025}. [8 citations]
+  \item \small Liu X., \textbf{Cheng Y.}, et al. Simultaneous tissue blood flow and oxygenation with a wearable fiber-free optical sensor. \textit{J.\ Biomed.\ Optics} 26(1), 012705, \textbf{2021}.\quad\textbf{[38 citations]}
+\end{itemize}
+\vspace{2pt}
+\noindent\small\textbf{Total: $\sim$100 citations (Google Scholar) $|$ 11 SCI papers $|$ Venues: npj Imaging, IEEE TMI, IEEE TUFFC, Photoacoustics, BOE, Med-X, JBO}
+
+\vspace{-2pt}
+
+% ---------- Technical Skills ----------
+\section{Technical Skills}
+\noindent
+\small
+\textbf{Medical Imaging:} Image reconstruction, denoising (DL/classical), registration, segmentation, 3D visualization; CT, PA, US, multiphoton microscopy \\
+\textbf{AI / Machine Learning:} CNN, UNet, Transformer, LSTM, Radiomics, LASSO, SVM, Random Forest, deep learning denoising \\
+\textbf{Clinical Data Analysis:} Longitudinal analysis, Kaplan-Meier survival analysis, ROC/AUC, regression, statistical testing (Python\,/\,R\,/\,SPSS) \\
+\textbf{Research Workflow:} IRB/ethics protocol submission, multi-site data management, SCI manuscript preparation \& submission, academic presentation \\
+\textbf{Programming:} Python, C/C++, MATLAB, R, SQL; PyTorch, scikit-learn, OpenCV, Pandas, Docker \\
+\textbf{Languages:} Mandarin Chinese (native), English (fluent -- academic writing, cross-national team collaboration)
+
+\vspace{-2pt}
+
+% ---------- Awards ----------
+\section{Awards \& Honors}
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small \textbf{\$3,000 Startup Seed Grant}, University at Buffalo Entrepreneurship Award -- PA-based Breast Cancer Detection (2023)
+  \item \small Key Contributor, NIH-Funded Research Project (PI: Prof.\ Jun Xia, University at Buffalo; ongoing)
+  \item \small Outstanding Teaching Assistant -- BME 503 Image Processing \& BME 302 Medical Devices, University at Buffalo
+\end{itemize}
+
+
+\end{document}
