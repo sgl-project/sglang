@@ -3633,13 +3633,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help=(
-                "The eviction policy of radix trees. "
-                "'lru' = Least Recently Used; "
-                "'lfu' = Least Frequently Used; "
-                "'clock' = Second-Chance (CLOCK) approximate-LRU with O(1) "
-                "amortized eviction cost."
-            ),
+            viction policy of r
         )
         parser.add_argument(
             "--enable-prefill-delayer",
