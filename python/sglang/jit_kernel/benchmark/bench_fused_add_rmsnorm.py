@@ -4,11 +4,18 @@ import torch
 import triton
 import triton.testing
 from flashinfer import fused_add_rmsnorm as fi_fused_add_rmsnorm
+from sgl_kernel import fused_add_rmsnorm as aot_fused_add_rmsnorm
 
 from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 
 IS_CI = is_in_ci()
+
+
+def sglang_aot_fused_add_rmsnorm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    aot_fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def sglang_jit_fused_add_rmsnorm(
@@ -33,9 +40,9 @@ else:
     BS_LIST = [2**n for n in range(0, 14)]
     HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
 
-LINE_VALS = ["jit", "fi"]
-LINE_NAMES = ["SGL JIT Kernel", "FlashInfer"]
-STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
+LINE_VALS = ["aot", "jit", "fi"]
+LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer"]
+STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
 
 configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
 
@@ -58,6 +65,7 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     residual = torch.randn((batch_size, hidden_size), dtype=DTYPE, device=DEVICE)
     weight = torch.randn(hidden_size, dtype=DTYPE, device=DEVICE)
     FN_MAP = {
+        "aot": sglang_aot_fused_add_rmsnorm,
         "jit": sglang_jit_fused_add_rmsnorm,
         "fi": flashinfer_fused_add_rmsnorm,
     }
