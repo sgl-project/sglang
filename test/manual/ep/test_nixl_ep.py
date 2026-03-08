@@ -20,12 +20,33 @@ os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
 ib_devices = get_rdma_devices_args()
 
 NIXL_COMMON = [
-    "--trust-remote-code", "--moe-a2a-backend", "nixl", "--deepep-mode", "low_latency",
-    "--tp", "8", "--mem-fraction-static", "0.78",
+    "--trust-remote-code",
+    "--moe-a2a-backend",
+    "nixl",
+    "--deepep-mode",
+    "low_latency",
+    "--tp",
+    "8",
+    "--mem-fraction-static",
+    "0.78",
 ]
 DP_ATTN = ["--dp", "8", "--enable-dp-attention"]
-ELASTIC_NIXL = ["--elastic-ep-backend", "nixl", "--enable-eplb", "--ep-num-redundant-experts", "24"]
-ELASTIC_MOONCAKE = ["--elastic-ep-backend", "mooncake", "--mooncake-ib-device", ib_devices, "--enable-eplb", "--ep-num-redundant-experts", "24"]
+ELASTIC_NIXL = [
+    "--elastic-ep-backend",
+    "nixl",
+    "--enable-eplb",
+    "--ep-num-redundant-experts",
+    "24",
+]
+ELASTIC_MOONCAKE = [
+    "--elastic-ep-backend",
+    "mooncake",
+    "--mooncake-ib-device",
+    ib_devices,
+    "--enable-eplb",
+    "--ep-num-redundant-experts",
+    "24",
+]
 
 
 class _EPTestBase(CustomTestCase):
@@ -88,6 +109,7 @@ class TestNixlMoeMooncakeElasticEP(_EPTestBase):
         os.system(f"pkill -f {self.pkill_process_1}")
         metrics = self._run_gsm8k()
         self.assertGreater(metrics["accuracy"], 0.60)
+
 
 if __name__ == "__main__":
     unittest.main()
