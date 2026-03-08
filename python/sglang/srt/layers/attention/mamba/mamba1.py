@@ -103,7 +103,6 @@ class MambaMixer1(nn.Module):
             prefix=f"{prefix}.in_proj",
         )
 
-        # Conv1d on intermediate dimension
         self.conv1d = ColumnParallelLinear(
             self.conv_kernel,
             self.intermediate_size,
@@ -113,11 +112,11 @@ class MambaMixer1(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # dt projection: dt_rank -> intermediate_size
         self.dt_proj = ColumnParallelLinear(
             dt_rank,
             self.intermediate_size,
             bias=True,
+            skip_bias_add=True,
             quant_config=quant_config,
             prefix=f"{prefix}.dt_proj",
         )
@@ -219,23 +218,19 @@ class MambaMixer1(nn.Module):
                 query_start_loc=query_start_loc,
             ).transpose(0, 1)[:num_prefill_tokens]
 
-            # x_proj: compute dt, B, C projections
             x_dbc, _ = self.x_proj(x_conv)
             dt, B, C = x_dbc.split(
                 [self.dt_rank, self.state_size, self.state_size], dim=-1
             )
 
-            # Apply optional layer norms
             if self.use_dt_bc_layernorm:
                 dt = self.dt_layernorm(dt)
                 B = self.b_layernorm(B)
                 C = self.c_layernorm(C)
 
-            # dt projection
-            dt, _ = self.dt_proj(dt)
-
-            # A = -exp(A_log)
+            dt, dt_proj_bias = self.dt_proj(dt)
             A = -torch.exp(self.A_log.float())
+            delta_bias = dt_proj_bias.float() if dt_proj_bias is not None else None
 
             # Process per-sequence for selective scan
             batch_sizes = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
@@ -270,6 +265,7 @@ class MambaMixer1(nn.Module):
                     C_i,
                     D=self.D.float(),
                     z=z_i,
+                    delta_bias=delta_bias,
                     delta_softplus=True,
                     return_last_state=True,
                     initial_state=initial_state,
@@ -305,8 +301,9 @@ class MambaMixer1(nn.Module):
                 B = self.b_layernorm(B)
                 C = self.c_layernorm(C)
 
-            dt, _ = self.dt_proj(dt)
+            dt, dt_proj_bias = self.dt_proj(dt)
             A = -torch.exp(self.A_log.float())
+            delta_bias = dt_proj_bias.float() if dt_proj_bias is not None else None
 
             selective_state_update(
                 ssm_state,
@@ -317,6 +314,7 @@ class MambaMixer1(nn.Module):
                 C,
                 D=self.D.float(),
                 z=z_d,
+                dt_bias=delta_bias,
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,
                 out=ssm_output[num_prefill_tokens:],
