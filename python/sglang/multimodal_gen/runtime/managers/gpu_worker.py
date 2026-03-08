@@ -43,7 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -474,6 +474,8 @@ def run_scheduler_process(
     globally_suppress_loggers()
     if current_platform.is_cuda():
         set_cuda_arch()
+    elif current_platform.is_musa():
+        set_musa_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 

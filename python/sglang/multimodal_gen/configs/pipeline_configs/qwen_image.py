@@ -500,7 +500,7 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
 
 @dataclass
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
-    resolution: int = 640  # TODO: allow user to set resolution
+    resolution: int = 640
     vae_precision: str = "bf16"
 
     def _prepare_edit_cond_kwargs(
