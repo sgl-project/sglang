@@ -54,6 +54,11 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
+    @property
+    def is_holding_kv(self) -> bool:
+        """Whether this slot currently holds KV pool resources."""
+        return self.req_pool_idx is not None
+
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         self.req_pool_idx = req.req_pool_idx
@@ -229,7 +234,7 @@ class SessionAwareCache(BasePrefixCache):
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
-        if slot.req_pool_idx is not None:
+        if slot.is_holding_kv:
             start = slot.cache_protected_len
             end = slot.kv_allocated_len
             if start < end:
@@ -243,7 +248,7 @@ class SessionAwareCache(BasePrefixCache):
         """Total KV tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.req_pool_idx is not None:
+            if slot.is_holding_kv:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
@@ -256,7 +261,7 @@ class SessionAwareCache(BasePrefixCache):
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.req_pool_idx is not None:
+            if slot.is_holding_kv:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
@@ -265,7 +270,7 @@ class SessionAwareCache(BasePrefixCache):
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(1 for s in self.slots.values() if s.req_pool_idx is not None)
+        return sum(s.is_holding_kv for s in self.slots.values())
 
     # -- Pass-through methods --
 
@@ -326,7 +331,7 @@ class SessionAwareCache(BasePrefixCache):
     def sanity_check(self):
         # Skip inner sanity check when sessions hold tree locks, because
         # the check asserts all nodes are unlocked during idle.
-        if any(s.req_pool_idx is not None for s in self.slots.values()):
+        if any(s.is_holding_kv for s in self.slots.values()):
             return
         self.inner.sanity_check()
 
