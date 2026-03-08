@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -316,7 +319,7 @@ class DiffusersExecutionStage(PipelineStage):
                     return next(component.parameters()).device
                 except StopIteration:
                     pass
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return current_platform.device_type
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
@@ -375,6 +378,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.memory_usages: dict[str, float] = {}
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
+        self._cache_dit_enabled = False
 
         logger.info("Loading diffusers pipeline from %s", model_path)
         self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
@@ -459,6 +463,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._apply_attention_backend(pipe, server_args)
         # Apply cache-dit acceleration if configured
         pipe = self._apply_cache_dit(pipe, server_args)
+        # Apply torch.compile if enabled and supported
+        pipe = self._apply_torch_compile(pipe, server_args)
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
@@ -559,13 +565,69 @@ class DiffusersPipeline(ComposedPipelineBase):
             raise
 
         logger.info("Enabled cache-dit for diffusers pipeline")
+        self._cache_dit_enabled = True
+        return pipe
+
+    def _apply_torch_compile(self, pipe: Any, server_args: ServerArgs) -> Any:
+        """Apply torch.compile to the pipeline if configured and supported."""
+        if not server_args.enable_torch_compile:
+            return pipe
+
+        # check if the pipeline has 'transformer' or 'unet' components which are
+        # typically the most expensive parts to compile. 'transformer_2' for some
+        # video pipelines, e.g, Wan 2.2 series, also check for that.
+        compilable_components = ["transformer", "transformer_2", "unet"]
+        if not any(hasattr(pipe, comp) for comp in compilable_components):
+            logger.warning(
+                "Pipeline does not have 'transformer' or 'unet' components. "
+                "torch.compile may not provide significant benefits and could increase latency."
+            )
+            return pipe
+
+        if self._cache_dit_enabled:
+            try:
+                import cache_dit
+
+                if hasattr(cache_dit, "set_compile_configs"):
+                    cache_dit.set_compile_configs()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to set torch_compile configs for cache-dit: {e}"
+                )
+
+        for comp in compilable_components:
+            if hasattr(pipe, comp):
+                try:
+                    component = getattr(pipe, comp)
+                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
+                    # modules which can significantly reduce compilation time for large models
+                    # with repeated blocks.
+                    if isinstance(component, torch.nn.Module) and hasattr(
+                        component, "compile"
+                    ):
+                        # Prefer in-place compilation if supported. According to PyTorch documentation:
+                        # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
+                        component.compile()
+                    else:
+                        compiled_component = torch.compile(component)
+                        setattr(pipe, comp, compiled_component)
+                    logger.info(
+                        f"Applied torch.compile to {comp} component of the pipeline"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply torch.compile to {comp}: {e}")
+
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
         """
         Determine the dtype to use for model loading.
         """
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        dtype = (
+            torch.bfloat16
+            if torch.get_device_module().is_bf16_supported()
+            else torch.float16
+        )
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
             dit_precision = server_args.pipeline_config.dit_precision

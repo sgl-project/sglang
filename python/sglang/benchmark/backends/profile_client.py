@@ -50,6 +50,17 @@ class ProfileBackendClient(BaseBackendClient):
                 else:
                     # stop_profile doesn't need any parameters
                     body = {}
+                # Add optional profiling parameters if provided.
+                if (
+                    hasattr(self.args, "profile_start_step")
+                    and self.args.profile_start_step is not None
+                ):
+                    body["start_step"] = str(self.args.profile_start_step)
+                if (
+                    hasattr(self.args, "profile_steps")
+                    and self.args.profile_steps is not None
+                ):
+                    body["num_steps"] = str(self.args.profile_steps)
                 async with session.post(url=api_url, json=body) as response:
                     if response.status == 200:
                         output.success = True
