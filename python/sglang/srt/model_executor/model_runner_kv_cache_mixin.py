@@ -714,15 +714,14 @@ class ModelRunnerKVCacheMixin:
         else:
             estimated = int(token_capacity / self.model_config.context_len * 512)
             max_num_reqs = max(min(estimated, 4096), 2048)
+            # When not explicitly set, cap at half the token capacity
+            max_num_reqs = min(max_num_reqs, token_capacity // 2)
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
-
-        # Never exceed half the token capacity
-        max_num_reqs = min(max_num_reqs, token_capacity // 2)
 
         return max_num_reqs
 
