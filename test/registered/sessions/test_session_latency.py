@@ -321,11 +321,15 @@ class TestSessionLatency(CustomTestCase):
     def setUpClass(cls):
         cls.model = "openai/gpt-oss-20b"
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # NOTE: Overlap scheduling commits KV cache one step ahead,
+        # so the last decode token is cached (unlike non-overlap).
+        # Disable overlap to keep session cache behavior consistent.
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--disable-overlap-schedule",
                 "--enable-streaming-session",
                 "--mem-fraction-static",
                 "0.70",
