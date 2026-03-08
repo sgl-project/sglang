@@ -68,7 +68,7 @@ def rpd_to_chrome_trace(
     rangeStringMonitor = ""
     min_time = connection.execute("select MIN(start) from rocpd_api;").fetchall()[0][0]
     max_time = connection.execute("select MAX(end) from rocpd_api;").fetchall()[0][0]
-    if min_time == None:
+    if min_time is None:
         raise Exception("Trace file is empty.")
 
     print("Timestamps:")

@@ -361,8 +361,6 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
         if self.guidance_scale is None:
             try:
@@ -626,8 +624,9 @@ class SamplingParams:
         parser.add_argument(
             "--prompt",
             type=str,
+            nargs="+",
             default=SamplingParams.prompt,
-            help="Text prompt for generation",
+            help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
         parser.add_argument(
             "--negative-prompt",

@@ -506,6 +506,23 @@ class ModelConfig:
                 scaling_factor = self.hf_config.rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
+        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+            self.head_dim = (
+                self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
+            )
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1343,6 +1360,7 @@ def is_audio_model(model_architectures: List[str]):
 def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "MllamaForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
