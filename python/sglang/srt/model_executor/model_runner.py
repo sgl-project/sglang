@@ -1655,7 +1655,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mamba1_config(self):
-        """Return config if this is a Mamba1-based model (e.g., Jamba)."""
         config = self.model_config.hf_config
         if isinstance(config, JambaConfig):
             return config

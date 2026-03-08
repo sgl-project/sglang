@@ -699,7 +699,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        layer_cache = self.req_to_token_pool.mamba_layer_cache(layer_id)
         return mixer.forward(
             hidden_states=hidden_states,
             output=output,
@@ -721,13 +721,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
 
 class Mamba1AttnBackend(MambaAttnBackendBase):
-    """Attention backend wrapper for Mamba1 mixer kernels (e.g., Jamba).
-
-    Mamba1 differs from Mamba2 in:
-    - 2D temporal state (intermediate_size/tp, state_size) vs 3D for Mamba2
-    - No chunk-based processing
-    - Uses selective_scan_fn for prefill, selective_state_update for decode
-    """
+    """Attention backend wrapper for Mamba1 mixer kernels."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -785,7 +779,7 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
             layer_id: Layer index
         """
         assert isinstance(self.forward_metadata, Mamba1Metadata)
-        layer_cache = self.req_to_token_pool.mamba1_layer_cache(layer_id)
+        layer_cache = self.req_to_token_pool.mamba_layer_cache(layer_id)
         return mixer.forward(
             hidden_states=hidden_states,
             output=output,

@@ -264,7 +264,7 @@ class JetBlock(nn.Module):
         )
         linear_attn_backend = forward_batch.attn_backend.linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
-        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
+        layer_cache = linear_attn_backend.req_to_token_pool.mamba_layer_cache(
             self.layer_id
         )
 

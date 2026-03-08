@@ -35,7 +35,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.attention.mamba.mamba1_metadata import Mamba1Metadata
 from sglang.srt.layers.attention.mamba.ops import (
-    mamba1_selective_scan,
+    selective_scan_fn,
     selective_state_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -262,7 +262,7 @@ class MambaMixer1(nn.Module):
                     if has_initial_states[i]:
                         initial_state = ssm_state[state_indices_p[i]].unsqueeze(0).float()
 
-                y_i, final_state = mamba1_selective_scan(
+                y_i, final_state = selective_scan_fn(
                     x_i,
                     dt_i,
                     A,

@@ -6,10 +6,14 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 from packaging import version
+
+from sgl_kernel import selective_scan_fwd
 
 PAD_SLOT_ID = -1
 
@@ -373,19 +377,13 @@ def selective_state_update(
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
 
-    # Get dimensions after normalization
     _, nheads, dim, dstate = state.shape
-    batch = x.shape[0]
-    T = x.shape[1]
+    batch, T, _, _ = x.shape
 
-    # Create output tensor if not provided
-    if out is None:
-        out = torch.empty((batch, T, nheads, dim), dtype=x.dtype, device=x.device)
-    else:
-        if out.dim() == 2:
-            out = out.unsqueeze(1)
-        if out.dim() == 3:
-            out = out.unsqueeze(1)
+    if out.dim() == 2:
+        out = out.unsqueeze(1)
+    if out.dim() == 3:
+        out = out.unsqueeze(1)
 
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
@@ -470,7 +468,7 @@ def selective_state_update(
             dt.stride(1),
             dt.stride(2),
             dt.stride(3),
-            *((dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else (0, 0)),
+            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
             A.stride(0),
             A.stride(1),
             A.stride(2),
@@ -482,7 +480,7 @@ def selective_state_update(
             C.stride(1),
             C.stride(2),
             C.stride(3),
-            *((D.stride(0), D.stride(1)) if D is not None else (0, 0)),
+            *(D.stride(0), D.stride(1)) if D is not None else 0,
             z_strides[0],
             z_strides[1],
             z_strides[2],
@@ -500,12 +498,51 @@ def selective_state_update(
             num_warps=num_warps,
         )
 
-    # Squeeze output back to original dimensions if needed
-    # For Mamba1 decode: (batch, 1, 1, dim) -> (batch, dim)
-    # For Mamba2 decode: (batch, 1, nheads, dim) -> (batch, nheads, dim)
-    if T == 1:
-        out = out.squeeze(1)  # Remove T dimension
-    if nheads == 1:
-        out = out.squeeze(1)  # Remove nheads dimension for Mamba1
 
+def selective_scan_fn(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    delta_bias: Optional[torch.Tensor] = None,
+    delta_softplus: bool = False,
+    return_last_state: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
+):
+    """
+    Args:
+        u: (batch, seqlen, dim) - input
+        delta: (batch, seqlen, dim) - time step
+        A: (dim, dstate) - A matrix
+        B: (batch, seqlen, dstate) - B projection
+        C: (batch, seqlen, dstate) - C projection
+        D: (dim,) - optional D parameter
+        z: (batch, seqlen, dim) - optional gate
+        delta_bias: (dim,) - optional delta bias
+        delta_softplus: whether to apply softplus to delta
+        return_last_state: whether to return the final state
+        initial_state: (batch, dim, dstate) - optional initial state for prefix caching
+
+    Returns:
+        out: (batch, seqlen, dim) - output
+        last_state: (batch, dim, dstate) - final state (if return_last_state)
+    """
+    u_t = u.transpose(1, 2).contiguous()
+    delta_t = delta.transpose(1, 2).contiguous()
+    B_t = B.transpose(1, 2).unsqueeze(1).contiguous()
+    C_t = C.transpose(1, 2).unsqueeze(1).contiguous()
+    z_t = z.transpose(1, 2).contiguous() if z is not None else None
+
+    results = selective_scan_fwd(
+        u_t, delta_t, A, B_t, C_t, D, z_t, delta_bias,
+        initial_state, delta_softplus, True,
+    )
+
+    out = results[0].transpose(1, 2)
+
+    if return_last_state:
+        return out, results[1]
     return out

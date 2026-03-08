@@ -290,7 +290,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.req_to_token_pool.mamba_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._prefill_and_mix_infer(
@@ -357,7 +357,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         # Do linear attention
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.req_to_token_pool.mamba_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._decode_infer(q, k, v, ssm_states, cache_indices, metadata, layer)

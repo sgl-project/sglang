@@ -115,9 +115,7 @@ _CONFIG_REGISTRY = {
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
-        # For configs that override built-in transformers configs (like JambaConfig),
-        # we need to force registration with exist_ok=True
-        AutoConfig.register(name, cls, exist_ok=True)
+        AutoConfig.register(name, cls)
 
 
 def download_from_hf(
