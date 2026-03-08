@@ -109,8 +109,11 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     if size:
         w, h = _parse_size(size)
         if w is not None:
-            kwargs.setdefault("width", w)
-            kwargs.setdefault("height", h)
+            # treat None dimensions as unset so parsed size can fill them
+            if kwargs.get("width") is None:
+                kwargs["width"] = w
+            if kwargs.get("height") is None:
+                kwargs["height"] = h
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
