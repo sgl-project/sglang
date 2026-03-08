@@ -317,7 +317,7 @@ def _print_summary(all_results: Dict[str, List[ModeResult]]):
 # ---------------------------------------------------------------------------
 
 
-class BenchSessionLatency(CustomTestCase):
+class TestSessionLatency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
