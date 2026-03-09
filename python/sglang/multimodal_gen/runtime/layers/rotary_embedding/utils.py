@@ -1,10 +1,29 @@
 """Primitive RoPE ops: rotate helpers and apply_rotary_emb utilities."""
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+logger = logging.getLogger(__name__)
+
+_is_hip = current_platform.is_hip()
+_use_aiter_rope = get_bool_env_var("SGLANG_USE_AITER_ROPE") and _is_hip
+
+_aiter_rope_cached_2c_fwd = None
+if _use_aiter_rope:
+    try:
+        from aiter.ops.rope import rope_cached_2c_fwd
+
+        _aiter_rope_cached_2c_fwd = rope_cached_2c_fwd
+        logger.info("AITer RoPE enabled (SGLANG_USE_AITER_ROPE=1)")
+    except ImportError:
+        _use_aiter_rope = False
+        logger.warning("SGLANG_USE_AITER_ROPE=1 but aiter.ops.rope not available")
 
 
 def _apply_rotary_emb(
@@ -119,3 +138,69 @@ def apply_flashinfer_rope_qk_inplace(
         is_neox=is_neox,
     )
     return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
+
+
+def apply_aiter_rope_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to Q and K simultaneously using AITer rope_cached_2c_fwd.
+
+    Processes both Q and K in a single kernel launch instead of two separate
+    Triton kernel calls. Requires SGLANG_USE_AITER_ROPE=1 on ROCm.
+
+    Args:
+        q: [batch, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        k: same shape as q
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: True for NEOX (split-half), False for GPT-J (interleaved).
+    """
+    assert (
+        _aiter_rope_cached_2c_fwd is not None
+    ), "AITer RoPE not available. Set SGLANG_USE_AITER_ROPE=1 on ROCm with aiter installed."
+
+    is_3d = q.dim() == 3
+    if is_3d:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+
+    bsz, seqlen, nheads_q, head_dim = q.shape
+    nheads_k = k.shape[2]
+
+    # AITer expects sbhd; transpose bshd → sbhd.
+    # For batch=1 (common in diffusion inference) this is a zero-cost view.
+    q_sbhd = q.transpose(0, 1).contiguous()
+    k_sbhd = k.transpose(0, 1).contiguous()
+
+    # AITer expects cos/sin in [s, 1, 1, d//2] with float32.
+    cos_4d = cos[:seqlen].to(torch.float32).view(seqlen, 1, 1, -1).contiguous()
+    sin_4d = sin[:seqlen].to(torch.float32).view(seqlen, 1, 1, -1).contiguous()
+
+    # rotate_style: 0 = NEOX (split-half), 1 = GPT-J (interleaved pairs)
+    rotate_style = 0 if is_neox_style else 1
+
+    q_out, k_out = _aiter_rope_cached_2c_fwd(
+        q_sbhd,
+        k_sbhd,
+        cos_4d,
+        sin_4d,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=True,
+        nope_first=False,
+        transpose_output=True,
+    )
+
+    # transpose_output=True → output memory is bshd, shape is sbhd.
+    # .transpose(0,1) restores bshd shape with contiguous memory.
+    q_out = q_out.transpose(0, 1)
+    k_out = k_out.transpose(0, 1)
+
+    if is_3d:
+        q_out = q_out.squeeze(0)
+        k_out = k_out.squeeze(0)
+
+    return q_out, k_out
