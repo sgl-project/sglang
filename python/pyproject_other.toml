@@ -24,7 +24,6 @@ runtime_common = [
   "av",
   "build",
   "compressed-tensors",
-  "decord2",
   "datasets",
   "einops",
   "fastapi",
