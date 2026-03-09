@@ -1542,9 +1542,8 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(
-                recv_req
-            ) and self.has_requests_being_processed(
+            is_health_check = is_health_check_generate_req(recv_req)
+            if is_health_check and self.has_requests_being_processed(
                 include_batch_state=False, include_compiling_grammars=True
             ):
                 self.return_health_check_ct += 1
