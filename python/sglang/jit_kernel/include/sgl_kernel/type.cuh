@@ -1,3 +1,18 @@
+/// \file type.cuh
+/// \brief Dtype trait system for CUDA scalar/packed types.
+///
+/// `dtype_trait<T>` provides per-type metadata: packed type alias,
+/// conversion functions (`from`), and unary/binary math operations.
+/// Use `device::cast<To>(from_value)` for type conversion on device.
+///
+/// Registered types:
+/// | Scalar    | Packed (x2)  | Notes                         |
+/// |-----------|-------------|-------------------------------|
+/// | `fp32_t`  | `fp32x2_t`  | Full math ops (abs,sqrt,...) |
+/// | `fp16_t`  | `fp16x2_t`  | Conversion only             |
+/// | `bf16_t`  | `bf16x2_t`  | Conversion only             |
+/// | `fp32x2_t`| `fp32x4_t`  | Packed float2 <-> half2/bf162 |
+
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
@@ -65,11 +80,18 @@ SGL_REGISTER_DTYPE_TRAIT(
 #undef SGL_REGISTER_DTYPE_TRAIT
 #undef SGL_REGISTER_FROM_FUNCTION
 
+/// \brief Alias: the packed (x2) type for `T`.
 template <typename T>
 using packed_t = typename dtype_trait<T>::packed_t;
 
 namespace device {
 
+/**
+ * \brief Cast a value from type `From` to type `To` on device.
+ *
+ * Dispatches through `dtype_trait<To>::from()`, which uses the appropriate
+ * CUDA intrinsic (e.g. `__half2float`, `__float22half2_rn`).
+ */
 template <typename To, typename From>
 SGL_DEVICE To cast(const From& value) {
   return dtype_trait<To>::from(value);
