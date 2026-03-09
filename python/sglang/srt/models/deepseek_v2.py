@@ -271,13 +271,18 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         if config.topk_method == "noaux_tc":
-            correction_bias_dtype = (
-                torch.bfloat16
-                if quant_config is not None
-                and quant_config.get_name() == "modelopt_fp4"
-                and get_moe_runner_backend().is_flashinfer_trtllm()
-                else torch.float32
-            )
+            correction_bias_dtype = torch.float32
+            if quant_config is not None:
+                if (
+                    quant_config.get_name() == "modelopt_fp4"
+                    and get_moe_runner_backend().is_flashinfer_trtllm()
+                ):
+                    correction_bias_dtype = torch.bfloat16
+                elif _use_aiter and quant_config.get_name() in (
+                    "fp8",
+                    "compressed_tensors",
+                ):
+                    correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
@@ -1195,8 +1200,6 @@ class DeepseekV2AttentionMLA(
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
-            else:
-                self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None

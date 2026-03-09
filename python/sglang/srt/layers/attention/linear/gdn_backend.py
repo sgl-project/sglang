@@ -68,6 +68,15 @@ class GDNKernelDispatcher:
             )
 
             self.decode_kernel = CuteDSLGDNKernel()
+        elif decode_backend.is_flashinfer():
+            if not is_cuda():
+                raise ValueError("FlashInfer backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                FlashInferGDNKernel,
+            )
+
+            flashinfer_kernel = FlashInferGDNKernel()
+            self.decode_kernel = flashinfer_kernel
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -78,10 +87,27 @@ class GDNKernelDispatcher:
                 "CuTe DSL backend only supports decode, not prefill. "
                 "Use --linear-attn-prefill-backend triton instead."
             )
+        elif prefill_backend.is_flashinfer():
+            if not is_cuda():
+                raise ValueError("FlashInfer backend requires CUDA")
+            # Reuse the FlashInfer kernel if already created for decode
+            if decode_backend.is_flashinfer():
+                self.extend_kernel = flashinfer_kernel
+            else:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    FlashInferGDNKernel,
+                )
+
+                flashinfer_kernel = FlashInferGDNKernel()
+                self.extend_kernel = flashinfer_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        self.verify_kernel = triton_kernel
+        # Verify kernel: use FlashInfer if either decode or prefill selected it
+        if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
+            self.verify_kernel = flashinfer_kernel
+        else:
+            self.verify_kernel = triton_kernel
 
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
@@ -145,11 +171,13 @@ class GDNKernelDispatcher:
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -157,11 +185,13 @@ class GDNKernelDispatcher:
         **kwargs,
     ) -> torch.Tensor:
         return self.verify_kernel.target_verify(
-            q,
-            k,
-            v,
-            g,
-            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -338,15 +368,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
                 q=query,
                 k=key,
                 v=value,
-                g=g,
-                beta=beta,
+                a=a,
+                b=b,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -356,6 +386,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -366,14 +397,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            if is_npu() or is_cpu():
+            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
+            if h is not None:
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
 
         return core_attn_out

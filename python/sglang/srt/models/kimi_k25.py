@@ -719,6 +719,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.language_model.end_layer
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -785,6 +793,35 @@ class KimiK25ForConditionalGeneration(nn.Module):
             num_logical_experts=text_config.n_routed_experts,
             num_groups=text_config.n_group,
         )
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """Set the layers to capture for EAGLE3 speculative decoding."""
+        if not hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            raise AttributeError(
+                "language_model does not support EAGLE3 speculative decoding."
+            )
+
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "get_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support get_embed_and_head()."
+            )
+
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+        """Set embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "set_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support set_embed_and_head()."
+            )
+
+        self.language_model.set_embed_and_head(embed, head)
 
 
 EntryClass = [KimiK25ForConditionalGeneration]
