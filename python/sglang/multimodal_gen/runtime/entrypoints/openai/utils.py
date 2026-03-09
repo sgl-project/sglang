@@ -286,6 +286,9 @@ async def process_generation_batch(
                 frame_interpolation_exp=batch.frame_interpolation_exp,
                 frame_interpolation_scale=batch.frame_interpolation_scale,
                 frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
             )
 
     total_time = time.perf_counter() - total_start_time
