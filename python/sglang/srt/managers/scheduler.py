@@ -2655,7 +2655,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.has_requests_being_processed():
+        if self.has_requests_being_processed():
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2708,7 +2708,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.has_requests_being_processed():
+        if self.has_requests_being_processed():
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
