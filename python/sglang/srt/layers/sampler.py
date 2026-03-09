@@ -375,7 +375,9 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
+        # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
+
         result = self.output_logprob_processor(
             logits, top_logprobs_nums, token_ids_logprobs
         )
