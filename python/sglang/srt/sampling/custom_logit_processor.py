@@ -64,6 +64,9 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
     THINKING_END_TOKEN_ID: int
     NEW_LINE_TOKEN_ID: int
 
+    _KEY_FORCING_NEWLINE = "__sglang_internal_forcing_newline"
+    _KEY_FORCING_END = "__sglang_internal_forcing_end"
+
     def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
         if custom_param_list is None or not custom_param_list:
             return logits
@@ -81,14 +84,14 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             ):
                 continue
 
-            if param_dict.pop("_forcing_end", False):
+            if param_dict.pop(self._KEY_FORCING_END, False):
                 logits[i, self.THINKING_END_TOKEN_ID] = -float("inf")
                 continue
 
-            if param_dict.pop("_forcing_newline", False):
+            if param_dict.pop(self._KEY_FORCING_NEWLINE, False):
                 logits[i, :] = -float("inf")
                 logits[i, self.THINKING_END_TOKEN_ID] = 0.0
-                param_dict["_forcing_end"] = True
+                param_dict[self._KEY_FORCING_END] = True
                 continue
 
             req: Req = param_dict.get("__req__")
@@ -114,13 +117,13 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             if not req.output_ids or req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
                 logits[i, :] = -float("inf")
                 logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
-                param_dict["_forcing_newline"] = True
+                param_dict[self._KEY_FORCING_NEWLINE] = True
                 continue
 
             # Assign highest probability to the thinking end token
             logits[i, :] = -float("inf")
             logits[i, self.THINKING_END_TOKEN_ID] = 0.0
-            param_dict["_forcing_end"] = True
+            param_dict[self._KEY_FORCING_END] = True
 
         return logits
 
