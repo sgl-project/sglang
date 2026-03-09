@@ -1498,7 +1498,7 @@ class Scheduler(
                     or not self.running_batch.is_empty()
                     or len(self.offload_tags) > 0
                 )
-                
+
                 # In PD disaggregation mode, also check if health check would be blocked
                 # in special queues (bootstrap/prealloc) due to external factors
                 will_block_in_pd_queue = False
@@ -1514,7 +1514,7 @@ class Scheduler(
                         len(self.disagg_decode_prealloc_queue.queue) > 0
                         or len(self.disagg_decode_transfer_queue.queue) > 0
                     )
-                
+
                 if has_running_requests or will_block_in_pd_queue:
                     self.return_health_check_ct += 1
                     continue
