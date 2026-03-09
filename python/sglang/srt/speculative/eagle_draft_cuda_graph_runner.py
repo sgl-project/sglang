@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -157,8 +156,7 @@ class EAGLEDraftCudaGraphRunner:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
-        if not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-            self.buffers.share_buffers()
+        self.buffers.share_buffers()
 
         # Capture
         try:
