@@ -195,6 +195,45 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
                     for tid in dec_tid:
                         self.assertAlmostEqual(dec_tid[tid], scr_tid[tid], delta=0.255)
 
+    def test_token_ids_logprob_ragged(self):
+        """Regression: get_token_ids_logprobs_raw crashes on ragged token_ids_logprob lists.
+
+        Sends concurrent requests with different-length token_ids_logprob lists
+        so they land in the same batch. torch.tensor() on ragged input will crash.
+        """
+        import concurrent.futures
+
+        def send(probe_ids):
+            return requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "Hello world",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                    },
+                    "return_logprob": True,
+                    "top_logprobs_num": 3,
+                    "token_ids_logprob": probe_ids,
+                },
+            ).json()
+
+        ragged_probes = [
+            [1, 2],
+            [3, 4, 5],
+            [6],
+            [10, 20, 30, 40],
+            [1, 2],
+            [3, 4, 5],
+            [6],
+            [10, 20, 30, 40],
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(send, ids) for ids in ragged_probes]
+            for f in concurrent.futures.as_completed(futs):
+                res = f.result()
+                self.assertIn("text", res, f"Server error: {res}")
+
 
 class TestEagleServerPage(TestEagleServerBase):
     other_launch_args = ["--page-size", "64"]
