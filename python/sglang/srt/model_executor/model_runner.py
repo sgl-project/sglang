@@ -13,6 +13,8 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+from __future__ import annotations
+
 import datetime
 import gc
 import inspect
@@ -132,6 +134,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -301,6 +304,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
     ):
         # Parse args
@@ -322,6 +326,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
