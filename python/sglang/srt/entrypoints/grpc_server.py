@@ -16,25 +16,41 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
+import msgspec
+import numpy as np
+import torch
+import zmq
+import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
 
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    KVEventsConfig,
+    ZmqEventPublisher,
+)
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
+from sglang.srt.grpc.utils import abort_code_from_output
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -159,6 +175,36 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.mm_receiver = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            from sglang.srt.disaggregation import encode_receiver as mm_receiver
+
+            self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
+
+        # Parse KV events config for SubscribeKvEvents support
+        self._kv_events_config: Optional[KVEventsConfig] = None
+        self._kv_event_id_counter = 0
+        if server_args.kv_events_config:
+            try:
+                self._kv_events_config = KVEventsConfig.from_cli(
+                    server_args.kv_events_config
+                )
+                if self._kv_events_config.publisher != "zmq":
+                    logger.info(
+                        "KV events publisher is '%s', SubscribeKvEvents disabled",
+                        self._kv_events_config.publisher,
+                    )
+                    self._kv_events_config = None
+                else:
+                    logger.info(
+                        "KV events enabled: endpoint=%s",
+                        self._kv_events_config.endpoint,
+                    )
+            except Exception as e:
+                logger.warning("Failed to parse kv_events_config: %s", e)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -176,6 +222,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
+            self._handle_epd_disaggregation_encode_request(request, tokenized_req)
 
             # Submit to request manager (automatically handles n>1)
             response_generator = self.request_manager.generate_request(
@@ -189,14 +236,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 if isinstance(output, list):
                     for batch_output in output:
                         if "error" in batch_output:
-                            yield sglang_scheduler_pb2.GenerateResponse(
-                                request_id=request.request_id,
-                                error=sglang_scheduler_pb2.GenerateError(
-                                    message=batch_output["error"],
-                                    http_status_code=(
-                                        "500" if "abort" not in batch_output else "499"
-                                    ),
-                                ),
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                batch_output["error"],
                             )
                         else:
                             # All non-error batch outputs are final responses
@@ -206,58 +248,52 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 else:
                     # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
-                        yield sglang_scheduler_pb2.GenerateResponse(
-                            request_id=request.request_id,
-                            error=sglang_scheduler_pb2.GenerateError(
-                                message=output["error"],
-                                http_status_code=(
-                                    "500" if "abort" not in output else "499"
-                                ),
-                            ),
+                        await context.abort(
+                            abort_code_from_output(output),
+                            output["error"],
                         )
-                    elif output.get("finished", False):
+                    elif request.stream:
+                        yield self._create_chunk_response(request.request_id, output)
+                        if output.get("finished", False):
+                            yield self._create_completion_response(
+                                request.request_id, output
+                            )
+                    else:
+                        # Non-streaming n=1: single completion response
                         yield self._create_completion_response(
                             request.request_id, output
                         )
-                    else:
-                        yield self._create_chunk_response(request.request_id, output)
 
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Generate invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(
                 f"Generate failed for request {request.request_id}: {e}\n"
                 f"{get_exception_traceback()}"
             )
-            yield sglang_scheduler_pb2.GenerateResponse(
-                request_id=request.request_id,
-                error=sglang_scheduler_pb2.GenerateError(
-                    message=str(e),
-                    http_status_code="500",
-                    details=get_exception_traceback(),
-                ),
-            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(
         self,
         request: sglang_scheduler_pb2.EmbedRequest,
-        _context: grpc.aio.ServicerContext,
+        context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
         logger.info(f"Receive embedding request: {request.request_id}")
 
         try:
-            # Convert request
             tokenized_req = self._convert_embed_request(request)
 
-            # Submit to request manager
             future = await self.request_manager.embedding_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
             )
 
-            # Wait for result
             result = await future
 
-            # Create response
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
                 complete=sglang_scheduler_pb2.EmbedComplete(
@@ -268,19 +304,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
             )
 
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Embed invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(
                 f"Embed failed for request {request.request_id}: {e}\n"
                 f"{get_exception_traceback()}"
             )
-            return sglang_scheduler_pb2.EmbedResponse(
-                request_id=request.request_id,
-                error=sglang_scheduler_pb2.EmbedError(
-                    message=str(e),
-                    code="INTERNAL_ERROR",
-                    details=get_exception_traceback(),
-                ),
-            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def HealthCheck(
         self,
@@ -533,6 +567,158 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             aggregate=_compute_aggregate_protobuf(loads),
         )
 
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.KvEventBatch]:
+        """Bridge internal ZMQ KV cache events to gRPC server-streaming.
+
+        Uses the ZMQ publisher's native sequence numbers as gRPC sequence
+        numbers directly.
+        """
+        if self._kv_events_config is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Start SGLang with "
+                '--kv-events-config \'{"publisher": "zmq"}\'',
+            )
+            return
+
+        config = self._kv_events_config
+
+        # Resolve the PUB endpoint to a connectable address.
+        # The publisher binds to e.g. "tcp://*:5557"; we connect to localhost.
+        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
+
+        # For DP attention, each rank publishes on port + rank with
+        # independent sequence counters. Subscribing to multiple ranks
+        # on one socket interleaves independent counters, breaking gap
+        # detection. For now, subscribe to rank 0 only.
+        # TODO(phase2): per-rank virtual workers or merged renumbering.
+        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, 0)
+
+        zmq_ctx = zmq.asyncio.Context.instance()
+        sub_socket = zmq_ctx.socket(zmq.SUB)
+        sub_socket.subscribe(config.topic.encode("utf-8"))
+        sub_socket.connect(pub_endpoint)
+
+        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
+
+        # Send response headers immediately so the tonic client's
+        # subscribe_kv_events().await resolves without waiting for the first
+        # yielded event (grpc.aio defers headers until first yield otherwise).
+        await context.send_initial_metadata(())
+
+        decoder = msgspec.msgpack.Decoder(KVEventBatch)
+
+        # Stream live events using the ZMQ publisher's native seq numbers.
+        try:
+            while not context.cancelled():
+                try:
+                    frames = await asyncio.wait_for(
+                        sub_socket.recv_multipart(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                # ZMQ multipart: [topic, seq_bytes, payload]
+                if len(frames) < 3:
+                    continue
+
+                zmq_seq = int.from_bytes(frames[1], "big")
+                payload = frames[2]
+
+                try:
+                    raw_batch = decoder.decode(payload)
+                except Exception as e:
+                    logger.warning("Failed to decode KV event batch: %s", e)
+                    continue
+
+                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sub_socket.close(linger=0)
+            logger.info("SubscribeKvEvents: stream closed")
+
+    def _convert_kv_event_batch(
+        self, raw_batch: KVEventBatch, seq_num: int
+    ) -> common_pb2.KvEventBatch:
+        """Convert a ZMQ KVEventBatch to proto KvEventBatch."""
+        proto_batch = common_pb2.KvEventBatch(
+            sequence_number=seq_num,
+            timestamp=raw_batch.ts,
+        )
+        if raw_batch.attn_dp_rank is not None:
+            proto_batch.dp_rank = raw_batch.attn_dp_rank
+
+        for event in raw_batch.events:
+            proto_event = self._convert_kv_event(event)
+            if proto_event is not None:
+                proto_batch.events.append(proto_event)
+
+        return proto_batch
+
+    def _convert_kv_event(self, event) -> Optional[common_pb2.KvCacheEvent]:
+        """Convert a single raw KV event to proto KvCacheEvent."""
+        self._kv_event_id_counter += 1
+        event_id = self._kv_event_id_counter
+
+        if isinstance(event, BlockStored):
+            # SGLang emits one BlockStored per page with block_hashes=[single_hash]
+            # and token_ids containing only that page's tokens.
+            blocks = []
+            for i, bh in enumerate(event.block_hashes):
+                start = i * event.block_size
+                end = start + event.block_size
+                block = common_pb2.KvBlock(
+                    block_hash=bh,
+                    token_ids=event.token_ids[start:end],
+                    block_size=event.block_size,
+                )
+                if event.lora_id is not None:
+                    block.lora_id = event.lora_id
+                blocks.append(block)
+
+            stored = common_pb2.KvBlocksStored(blocks=blocks)
+            if event.parent_block_hash is not None:
+                stored.parent_block_hash = event.parent_block_hash
+
+            return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
+
+        elif isinstance(event, BlockRemoved):
+            return common_pb2.KvCacheEvent(
+                event_id=event_id,
+                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
+            )
+
+        elif isinstance(event, AllBlocksCleared):
+            return common_pb2.KvCacheEvent(
+                event_id=event_id, cleared=common_pb2.KvCacheCleared()
+            )
+
+        return None
+
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if not self.mm_receiver:
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = self.mm_receiver.build_and_send_encode_request(
+            image_urls=image_urls,
+            rid=grpc_req.request_id,
+        )
+        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
     # Helper methods for request/response conversion
 
     def _convert_generate_request(
@@ -571,12 +757,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_req.disaggregated_params.bootstrap_room
             )  # Can be 0, don't use 'or None'
 
+        # Parse multimodal inputs if present
+        mm_inputs = None
+        if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField(
+            "pixel_values"
+        ):
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
-            mm_inputs=None,  # TODO: implement mm support
+            mm_inputs=mm_inputs,
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=(
@@ -594,6 +787,51 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
         )
+
+    @staticmethod
+    def _decode_tensor_data(tensor_data):
+        """Decode a proto TensorData message into a torch.Tensor."""
+        dtype_map = {"float32": np.float32, "int64": np.int64}
+        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
+        shape = list(tensor_data.shape)
+        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
+        return torch.from_numpy(arr)
+
+    def _parse_mm_inputs(self, mm_proto) -> dict:
+        """Parse proto MultimodalInputs into the mm_inputs dict expected by scheduler."""
+        # Decode pixel_values from typed TensorData field
+        pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
+
+        # Decode model-specific tensors
+        model_specific_data = {}
+        for key, tensor_data in mm_proto.model_specific_tensors.items():
+            model_specific_data[key] = self._decode_tensor_data(tensor_data)
+
+        # Convert placeholder ranges to offsets: list of (start, end_inclusive)
+        offsets = [
+            (p.offset, p.offset + p.length - 1) for p in mm_proto.mm_placeholders
+        ]
+        if not offsets:
+            logger.warning(
+                "No mm_placeholders from Rust gateway — token expansion may have "
+                "failed to find the placeholder token in input_ids. "
+                "Check that placeholder_token_id matches the tokenized image token."
+            )
+            offsets = None
+
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=pixel_values,
+            model_specific_data=model_specific_data,
+            offsets=offsets,
+        )
+
+        result = {"mm_items": [mm_item]}
+
+        if mm_proto.HasField("im_token_id"):
+            result["im_token_id"] = mm_proto.im_token_id
+
+        return result
 
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
@@ -936,6 +1174,12 @@ async def serve_grpc(
         options=[
             ("grpc.max_send_message_length", 1024 * 1024 * 256),
             ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+            # Allow client HTTP/2 keepalive pings every 10s+.
+            # Without this, the gRPC C-core default (300s minimum) causes
+            # GOAWAY when clients send pings more frequently during long
+            # requests (e.g. prefill) where no DATA frames flow.
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+            ("grpc.keepalive_permit_without_calls", True),
         ],
     )
 
@@ -966,10 +1210,132 @@ async def serve_grpc(
 
     # Start server
     listen_addr = f"{server_args.host}:{server_args.port}"
-    server.add_insecure_port(listen_addr)
+    if server_args.ssl_certfile and server_args.ssl_keyfile:
+        if server_args.ssl_keyfile_password:
+            raise ValueError(
+                "gRPC mode does not support encrypted SSL key files "
+                "(--ssl-keyfile-password). Please provide an unencrypted key "
+                "file when using --grpc-mode."
+            )
+
+        def _read_ssl_file(filepath: str, description: str) -> bytes:
+            try:
+                with open(filepath, "rb") as f:
+                    return f.read()
+            except OSError as e:
+                raise ValueError(
+                    f"Failed to read {description} '{filepath}': {e}"
+                ) from e
+
+        private_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+        certificate_chain = _read_ssl_file(
+            server_args.ssl_certfile, "SSL certificate file"
+        )
+        root_certificates = None
+        if server_args.ssl_ca_certs:
+            root_certificates = _read_ssl_file(
+                server_args.ssl_ca_certs, "SSL CA certificates file"
+            )
+
+        if server_args.enable_ssl_refresh:
+            # Use dynamic credentials so gRPC re-reads certs on each
+            # new connection via the fetcher callback.
+            _cert_mtime = os.path.getmtime(server_args.ssl_certfile)
+            _key_mtime = os.path.getmtime(server_args.ssl_keyfile)
+            _ca_mtime = (
+                os.path.getmtime(server_args.ssl_ca_certs)
+                if server_args.ssl_ca_certs
+                else None
+            )
+
+            def _cert_config_fetcher():
+                nonlocal _cert_mtime, _key_mtime, _ca_mtime
+                try:
+                    new_cert_mt = os.path.getmtime(server_args.ssl_certfile)
+                    new_key_mt = os.path.getmtime(server_args.ssl_keyfile)
+                    new_ca_mt = (
+                        os.path.getmtime(server_args.ssl_ca_certs)
+                        if server_args.ssl_ca_certs
+                        else None
+                    )
+
+                    if (
+                        new_cert_mt == _cert_mtime
+                        and new_key_mt == _key_mtime
+                        and new_ca_mt == _ca_mtime
+                    ):
+                        return None  # No change
+
+                    new_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+                    new_cert = _read_ssl_file(
+                        server_args.ssl_certfile, "SSL certificate file"
+                    )
+                    new_root = None
+                    if server_args.ssl_ca_certs:
+                        new_root = _read_ssl_file(
+                            server_args.ssl_ca_certs,
+                            "SSL CA certificates file",
+                        )
+
+                    logger.info("gRPC SSL certificate change detected, reloading.")
+                    config = grpc.ssl_server_certificate_configuration(
+                        [(new_key, new_cert)],
+                        root_certificates=new_root,
+                    )
+
+                    # Update mtimes only after successful reload
+                    _cert_mtime = new_cert_mt
+                    _key_mtime = new_key_mt
+                    _ca_mtime = new_ca_mt
+
+                    return config
+                except Exception:
+                    logger.exception(
+                        "Failed to reload gRPC SSL certificates — "
+                        "continuing with previous certificates."
+                    )
+                    return None
+
+            try:
+                initial_config = grpc.ssl_server_certificate_configuration(
+                    [(private_key, certificate_chain)],
+                    root_certificates=root_certificates,
+                )
+                credentials = grpc.dynamic_ssl_server_credentials(
+                    initial_config,
+                    _cert_config_fetcher,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to create gRPC dynamic SSL credentials. "
+                    f"Verify that --ssl-keyfile and --ssl-certfile contain "
+                    f"valid, matching PEM data. Underlying error: {e}"
+                ) from e
+            logger.info("gRPC SSL certificate auto-refresh enabled.")
+        else:
+            try:
+                credentials = grpc.ssl_server_credentials(
+                    [(private_key, certificate_chain)],  # pairs: (key, cert)
+                    root_certificates=root_certificates,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to create gRPC SSL credentials. Verify that "
+                    f"--ssl-keyfile and --ssl-certfile contain valid, matching "
+                    f"PEM data. Underlying error: {e}"
+                ) from e
+        bound_port = server.add_secure_port(listen_addr, credentials)
+        if bound_port == 0:
+            raise RuntimeError(
+                f"Failed to bind gRPC TLS server to {listen_addr}. "
+                f"Check that the port is available and SSL credentials are valid."
+            )
+        logger.info(f"gRPC server (TLS) listening on {listen_addr}")
+    else:
+        server.add_insecure_port(listen_addr)
+        logger.info(f"gRPC server listening on {listen_addr}")
 
     await server.start()
-    logger.info(f"gRPC server listening on {listen_addr}")
 
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(

@@ -189,6 +189,8 @@ def init_mori_op(
     world_size = get_moe_expert_parallel_world_size()
     rank = get_moe_expert_parallel_rank()
 
+    gpu_per_node = 8 if world_size >= 8 else world_size
+
     cpu_group = group.cpu_group
     torch._C._distributed_c10d._register_process_group("mori", cpu_group)
     mori.shmem.shmem_torch_process_group_init("mori")
@@ -227,6 +229,7 @@ def init_mori_op(
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
         kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
         num_qp_per_pe=2,
     )

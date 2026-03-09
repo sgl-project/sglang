@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
@@ -133,7 +134,9 @@ class WanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
+        prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        is_cross_attention: bool = False,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
@@ -149,16 +152,32 @@ class WanSelfAttention(nn.Module):
 
         # layers
         self.to_q = ColumnParallelLinear(
-            dim, dim, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
-            dim, dim, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
-            dim, dim, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
         )
         self.to_out = RowParallelLinear(
-            dim, dim, input_is_parallel=True, quant_config=quant_config
+            dim,
+            dim,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out.0", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
@@ -173,20 +192,21 @@ class WanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            skip_sequence_parallel=is_cross_attention,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, is_cross_attention=True)
 
     def forward(self, x, context, context_lens):
         r"""
@@ -230,6 +250,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         window_size=(-1, -1),
         qk_norm=True,
         eps=1e-6,
+        prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -240,14 +261,23 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            is_cross_attention=True,
             quant_config=quant_config,
         )
 
         self.add_k_proj = ColumnParallelLinear(
-            dim, dim, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("add_k_proj", prefix),
         )
         self.add_v_proj = ColumnParallelLinear(
-            dim, dim, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("add_v_proj", prefix),
         )
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -326,17 +356,37 @@ class WanTransformerBlock(nn.Module):
             dtype=torch.float32,
         )
         self.to_q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_v", prefix),
         )
 
         self.to_out = RowParallelLinear(
-            dim, dim, bias=True, reduce_results=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_out.0", prefix),
         )
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
@@ -352,6 +402,7 @@ class WanTransformerBlock(nn.Module):
                     AttentionBackendEnum.SLA_ATTN,
                     AttentionBackendEnum.SAGE_SLA_ATTN,
                 },
+                prefix=add_prefix("attn1", prefix),
             )
         else:
             self.attn1 = USPAttention(
@@ -359,7 +410,9 @@ class WanTransformerBlock(nn.Module):
                 head_size=dim // num_heads,
                 causal=False,
                 supported_attention_backends=self_attn_backends,
-                prefix=f"{prefix}.attn1",
+                prefix=add_prefix("attn1", prefix),
+                quant_config=quant_config,
+                is_cross_attention=False,
             )
 
         self.hidden_dim = dim
@@ -396,6 +449,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
+                prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -406,6 +460,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
+                prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -418,7 +473,11 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(
-            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=add_prefix("ffn.net", prefix),
+            quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
 
@@ -552,27 +611,53 @@ class WanTransformerBlock_VSA(nn.Module):
             dtype=torch.float32,
         )
         self.to_q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_v", prefix),
         )
         self.to_gate_compress = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_gate_compress", prefix),
         )
 
         self.to_out = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_out.0", prefix),
         )
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
+            prefix=add_prefix("attn1", prefix),
+            quant_config=quant_config,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -606,6 +691,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
+                prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -616,6 +702,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
+                prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -628,7 +715,11 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(
-            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=add_prefix("ffn.net", prefix),
+            quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
 
@@ -781,7 +872,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
-                    prefix=f"{config.prefix}.blocks.{i}",
+                    prefix=f"blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
                     quant_config=quant_config,
@@ -802,6 +893,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
+            prefix=f"proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(

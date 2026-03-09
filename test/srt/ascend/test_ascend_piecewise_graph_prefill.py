@@ -36,7 +36,7 @@ class TestPiecewiseGraphPrefillCorrectness(CustomTestCase):
                 "ascend",
                 "--cuda-graph-bs",
                 128,
-                "--enable-piecewise-cuda-graph",
+                "--enforce-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
                 *TOKENS_TO_CAPTURE,
             ],
@@ -77,7 +77,7 @@ class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
                 0.8,
                 "--attention-backend",
                 "ascend",
-                "--enable-piecewise-cuda-graph",
+                "--enforce-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
             ]
             + TOKENS_TO_CAPTURE,
