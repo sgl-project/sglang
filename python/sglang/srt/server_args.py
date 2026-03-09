@@ -169,7 +169,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -919,18 +919,7 @@ class ServerArgs:
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            if not os.path.exists(self.model_path):
-                from modelscope import snapshot_download
-
-                self.model_path = snapshot_download(
-                    self.model_path, cache_dir=self.download_dir, revision=self.revision
-                )
-                self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path,
-                    cache_dir=self.download_dir,
-                    revision=self.revision,
-                    ignore_patterns=["*.bin", "*.safetensors"],
-                )
+            self._handle_modelscope_paths()
 
         # Mamba scheduler strategy
         if self.mamba_scheduler_strategy == "auto":
@@ -945,6 +934,70 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _handle_modelscope_paths(self):
+        """Resolve model / tokenizer / speculative-draft paths from the local
+        ModelScope cache when possible, falling back to ``snapshot_download``
+        for any path that is not already present on disk.
+
+        Note: ``speculative_token_map`` is intentionally NOT handled here
+        because its value uses ``repo_id/filename`` semantics rather than a
+        plain repo ID.  That resolution lives in
+        :func:`sglang.srt.speculative.spec_utils.load_token_map`.
+        """
+
+        ms_root = None
+        ms_snapshot_download = None
+
+        def _resolve_or_download(
+            path: Optional[str],
+            ignore_patterns: Optional[list] = None,
+            revision: Optional[str] = None,
+        ) -> Optional[str]:
+            nonlocal ms_root, ms_snapshot_download
+            if path is None:
+                return None
+            if not path or os.path.exists(path):
+                return path
+
+            if ms_snapshot_download is None:
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as _ms_snapshot_download,
+                )
+                from modelscope.utils.file_utils import get_model_cache_root
+
+                ms_snapshot_download = _ms_snapshot_download
+                ms_root = get_model_cache_root()
+
+            # Check ModelScope default cache
+            cached = os.path.join(ms_root, path)
+            if os.path.exists(cached):
+                return cached
+            # Check user-specified download dir
+            if self.download_dir:
+                alt = os.path.join(self.download_dir, path)
+                if os.path.exists(alt):
+                    return alt
+
+            # Cache miss — download from ModelScope hub
+            return ms_snapshot_download(
+                path,
+                cache_dir=self.download_dir,
+                revision=revision,
+                **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
+            )
+
+        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
+        self.tokenizer_path = _resolve_or_download(
+            self.tokenizer_path,
+            ignore_patterns=["*.bin", "*.safetensors"],
+            revision=self.revision,
+        )
+        if self.speculative_draft_model_path:
+            self.speculative_draft_model_path = _resolve_or_download(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision or "main",
+            )
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -1279,7 +1332,9 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+            self.kv_cache_dtype = (
+                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
+            )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1298,11 +1353,18 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if self.dp_size == 1 and major >= 10:
+                self.nsa_prefill_backend = "trtllm"
+                self.nsa_decode_backend = "trtllm"
+                logger.warning(
+                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
+                )
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -3062,6 +3124,12 @@ class ServerArgs:
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
                 self.attention_backend = "triton"
+        elif is_npu():
+            if self.attention_backend != "ascend":
+                logger.warning(
+                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
+                )
+                self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
             if self.attention_backend != "flashinfer":
                 logger.warning(
@@ -3571,7 +3639,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -3896,7 +3964,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch.",
+            help="The log and metrics reporting interval (in decode iterations) for decode batches.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",

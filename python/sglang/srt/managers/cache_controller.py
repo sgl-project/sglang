@@ -264,7 +264,12 @@ class HiCacheController:
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
-        self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -571,6 +576,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
