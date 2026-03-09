@@ -87,10 +87,7 @@ serve:
 		--watch $(SOURCEDIR) \
 		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"
 
-# Alias: "build" is not a Sphinx builder; use html
-build: html
-
-.PHONY: help Makefile compile clean serve build
+.PHONY: help Makefile compile clean serve
 
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
