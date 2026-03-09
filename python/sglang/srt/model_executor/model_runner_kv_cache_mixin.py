@@ -735,24 +735,29 @@ class ModelRunnerKVCacheMixin:
         # Resolve the token capacity
         token_capacity = self._resolve_token_capacity(profiled_tokens)
 
+        # HACK: spec decode uses server_args as a mutable channel to pass
+        # resolved values between target and draft workers. Target writes first,
+        # draft reads later. Should be replaced with an explicit handoff.
+        # NOTE: draft worker override must happen BEFORE SWA splitting so that
+        # swa_max_total_num_tokens is computed from the correct base value.
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            token_capacity = self.server_args.draft_runner_cache_size
+
         # Hybrid SWA: split capacity into full/swa pools, adjust effective capacity
         if self.is_hybrid_swa:
             token_capacity = self.set_num_tokens_hybrid_swa(token_capacity)
 
         # Commit the resolved token capacity & max number of requests
         self.max_total_num_tokens = token_capacity
-        self.max_running_requests = self._resolve_max_num_reqs(token_capacity)
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            self.max_running_requests = self.server_args.max_num_reqs
+        else:
+            self.max_running_requests = self._resolve_max_num_reqs(token_capacity)
 
-        # HACK: spec decode uses server_args as a mutable channel to pass
-        # resolved values between target and draft workers. Target writes first,
-        # draft reads later. Should be replaced with an explicit handoff.
-        if not self.spec_algorithm.is_none():
-            if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.max_running_requests = self.server_args.max_num_reqs
-            else:
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
-                self.server_args.max_num_reqs = self.max_running_requests
+        # Target worker stores resolved values for draft worker to read later
+        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+            self.server_args.max_num_reqs = self.max_running_requests
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
