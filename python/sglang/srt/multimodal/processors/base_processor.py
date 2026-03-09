@@ -385,8 +385,7 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
-        # Lazy import because decord is not available on some arm platforms.
-        from decord import VideoReader, cpu
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
         # Before processing inputs
         if not image_data or len(image_data) == 0:
@@ -395,9 +394,8 @@ class BaseMultimodalProcessor(ABC):
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
-                # Estimate frames for the video
-                vr = VideoReader(path, ctx=cpu(0))
-                num_frames = len(vr)
+                decoder = VideoDecoderWrapper(path)
+                num_frames = len(decoder)
             else:
                 # For images, each contributes one frame
                 num_frames = 1
