@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_xpu,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
@@ -1046,7 +1047,7 @@ class ServerArgs:
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
         # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        if is_hip() or is_npu() or is_cpu() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
