@@ -156,7 +156,6 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
         get_dsv3_gemm_output_zero_allocator_size,
-        rope_plus_attn_mqa,
     )
 
 if _is_cuda:

@@ -366,7 +366,7 @@ class DeepseekMLAForwardMixin:
                     k,
                     k_nope,
                     forward_batch,
-                    save_kv_cache=save_kv_cache,
+                    save_kv_cache=True,
                     **(
                         dict(topk_indices=topk_indices)
                         if topk_indices is not None
