@@ -474,19 +474,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
-            elif hasattr(final_res, "prompt_token_ids") and hasattr(
-                final_res, "outputs"
-            ):
+            elif "prompt_token_ids" in final_res and "outputs" in final_res:
                 # Fallback calculation if meta_info not available
                 num_prompt_tokens = (
-                    len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
-                )
-                num_generated_tokens = (
-                    len(final_res.outputs[0].token_ids)
-                    if final_res.outputs and final_res.outputs[0].token_ids
+                    len(final_res["prompt_token_ids"])
+                    if final_res["prompt_token_ids"]
                     else 0
                 )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
+                num_generated_tokens = (
+                    len(final_res["outputs"][0]["token_ids"])
+                    if final_res["outputs"] and final_res["outputs"][0]["token_ids"]
+                    else 0
+                )
+                num_cached_tokens = final_res.get("num_cached_tokens", 0)
                 num_reasoning_tokens = 0
             else:
                 # Final fallback
