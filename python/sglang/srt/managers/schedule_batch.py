@@ -727,7 +727,9 @@ class Req(ReqDllmMixin):
 
         # Constrained decoding
         self.grammar_key: Optional[Tuple[str, str]] = None
-        self.grammar: Optional[BaseGrammarObject | Future[BaseGrammarObject]] = None
+        self.grammar: Optional[Union[BaseGrammarObject, Future[BaseGrammarObject]]] = (
+            None
+        )
         self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
