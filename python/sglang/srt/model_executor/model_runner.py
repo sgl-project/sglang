@@ -602,16 +602,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
-        # Init max running requests
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests // self.dp_size
-            ),
-            self.req_to_token_pool.size,
-        )
-
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
