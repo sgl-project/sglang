@@ -1544,7 +1544,7 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             is_health_check = is_health_check_generate_req(recv_req)
             if is_health_check and self.has_requests_being_processed(
-                include_batch_state=False, include_compiling_grammars=True
+                include_batch_state=False, include_compiling_grammars=False
             ):
                 self.return_health_check_ct += 1
                 continue
