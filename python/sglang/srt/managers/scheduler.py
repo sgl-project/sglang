@@ -2019,6 +2019,9 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        # Skip cache_unfinished_req for needs_full_prefill dLLM (recomputes full sequence each round)
+        if req.is_dllm() and req.dllm_config.needs_full_prefill:
+            return
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:

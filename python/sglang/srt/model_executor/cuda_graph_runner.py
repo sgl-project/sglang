@@ -468,6 +468,23 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+
+    # Workaround for Blackwell (SM >= 10.0): capturing multiple CUDA graphs
+    # with different batch sizes causes earlier-captured graphs to become invalid
+    # on replay (cudaErrorIllegalAddress / cudaErrorIllegalInstruction).
+    # Only capture the maximum BS and pad smaller batches to it.
+    if (
+        len(capture_bs) > 1
+        and num_tokens_per_bs > 1  # dLLM / speculative mode (more tokens per BS)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 10
+    ):
+        logger.warning(
+            f"Blackwell GPU detected: only capturing max BS={capture_bs[-1]} "
+            f"(requested {capture_bs}). Smaller batches will be padded."
+        )
+        capture_bs = [capture_bs[-1]]
+
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -572,11 +589,16 @@ class CudaGraphRunner:
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
+        # For non-full-prefill dLLM, seq_len_fill_value stays at block_size.
+        # The real fix for Blackwell is in flashinfer_backend: passing
+        # max_sequence_kv=max_context_len to stabilise _max_kv_len across
+        # capture and replay (see call_begin_forward in FlashInferIndicesUpdaterPrefill).
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             if self.dllm_config is None
             else self.dllm_config.block_size
         )
+        self._disable_dllm_cuda_graph = False
 
         self.encoder_len_fill_value = 0
 
@@ -704,12 +726,23 @@ class CudaGraphRunner:
             else True
         )
 
+        # dLLM with needs_full_prefill may have variable-length inputs
+        is_dllm_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.is_dllm and self.dllm_config.needs_full_prefill
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dllm_supported
         )
 
     def _init_profile_context_and_memory_record(self):

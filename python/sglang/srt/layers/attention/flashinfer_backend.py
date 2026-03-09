@@ -667,12 +667,18 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
+            # Bidirectional models (ENCODER_ONLY) don't save KV cache,
+            # so prefix_lens must be 0 to recompute all tokens each pass.
+            if self.dllm_config.needs_full_prefill:
+                dllm_prefix_lens = torch.zeros_like(seq_lens)
+            else:
+                dllm_prefix_lens = seq_lens - self.dllm_config.block_size
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=dllm_prefix_lens,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=True,
                 encoder_lens=encoder_lens,
@@ -731,12 +737,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            if self.dllm_config.needs_full_prefill:
+                dllm_prefix_lens = torch.zeros_like(seq_lens[:bs])
+            else:
+                dllm_prefix_lens = seq_lens - self.dllm_config.block_size
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=dllm_prefix_lens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,

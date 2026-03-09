@@ -422,6 +422,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For diffusion LLM: original input lengths (before adding mask tokens)
+    dllm_origin_input_lens: Optional[List[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -468,6 +471,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            dllm_origin_input_lens=batch.dllm_origin_input_lens,
         )
         device = model_runner.device
 
@@ -516,14 +520,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in batch.dllm_block_offsets
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            if batch.dllm_config.needs_full_prefill:
+                # Bidirectional models: positions cover the full sequence per request
+                if batch.seq_lens_cpu is not None:
+                    seq_lens_list = batch.seq_lens_cpu.tolist()
+                else:
+                    seq_lens_list = batch.seq_lens.cpu().tolist()
+                ret.positions = torch.tensor(
+                    [i for seq_len in seq_lens_list for i in range(seq_len)],
+                    dtype=positions_dtype,
+                ).to(device, non_blocking=True)
+            else:
+                ret.positions = torch.tensor(
+                    [
+                        i
+                        for block_offset in batch.dllm_block_offsets
+                        for i in range(block_offset, block_offset + block_size)
+                    ],
+                    dtype=positions_dtype,
+                ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

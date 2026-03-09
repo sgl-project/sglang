@@ -504,7 +504,11 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    # For dLLM models, use larger max_new_tokens to ensure proper decoding
+    max_new_tokens = 1
+    if _global_state.tokenizer_manager.server_args.dllm_algorithm is not None:
+        max_new_tokens = 64  # Must be >= block_size (typically 32)
+    sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
     if _global_state.tokenizer_manager.is_image_gen:
@@ -1800,6 +1804,9 @@ def _execute_server_warmup(server_args: ServerArgs):
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
+    # For dLLM models, use larger max_new_tokens to ensure proper decoding
+    if server_args.dllm_algorithm is not None:
+        max_new_tokens = 64  # Must be >= block_size (typically 32)
     json_data = {
         "sampling_params": {
             "temperature": 0,
