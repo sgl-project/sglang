@@ -109,6 +109,7 @@ def rmsnorm(
         input.device.type == "musa"
         or not _has_flashinfer
         or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        or torch.compiler.is_dynamo_compiling()
     ):
         return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
     else:
@@ -149,6 +150,7 @@ def fused_add_rmsnorm(
         input.device.type == "musa"
         or not _has_flashinfer
         or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        or torch.compiler.is_dynamo_compiling()
     ):
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
     else:
@@ -190,6 +192,7 @@ def gemma_rmsnorm(
         input.device.type == "musa"
         or not _has_flashinfer
         or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        or torch.compiler.is_dynamo_compiling()
     ):
         return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
     else:
@@ -230,6 +233,7 @@ def gemma_fused_add_rmsnorm(
         input.device.type == "musa"
         or not _has_flashinfer
         or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        or torch.compiler.is_dynamo_compiling()
     ):
         _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
     else:
