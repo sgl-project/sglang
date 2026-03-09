@@ -70,7 +70,7 @@ class GDNKernelDispatcher:
             self.decode_kernel = CuteDSLGDNKernel()
         elif decode_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                 FlashInferGDNKernel,
             )
@@ -89,7 +89,7 @@ class GDNKernelDispatcher:
             )
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
             if decode_backend.is_flashinfer():
                 self.extend_kernel = flashinfer_kernel
@@ -215,6 +215,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Pool layout is [pool, HV, V, K] (K-last) for all FlashInfer paths.
+        # SM100+ uses the pool API (initial_state_indices) to avoid gather/scatter;
+        # SM90 still gathers/scatters explicitly in decode.
+        self._use_flashinfer_pool = (
+            decode_backend.is_flashinfer()
+            and self.kernel_dispatcher.decode_kernel.use_state_pool
+        )
 
     def forward_decode(
         self,
@@ -387,17 +394,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if self._use_flashinfer_pool:
+                extend_states = ssm_states[cache_indices].transpose(-1, -2).contiguous()
+                extend_indices = torch.arange(
+                    cache_indices.shape[0],
+                    dtype=torch.int32,
+                    device=cache_indices.device,
+                )
+            else:
+                extend_states = ssm_states
+                extend_indices = cache_indices
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=extend_states,
+                cache_indices=extend_indices,
                 query_start_loc=query_start_loc,
             )
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+
+            if self._use_flashinfer_pool:
+                ssm_states[cache_indices] = extend_states.transpose(-1, -2)
+            elif (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

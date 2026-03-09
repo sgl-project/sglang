@@ -764,6 +764,7 @@ class ServerArgs:
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -2384,6 +2385,23 @@ class ServerArgs:
                 raise ValueError(
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
+
+    def _handle_linear_attn_backend(self):
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        import torch
+
+        decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        if (
+            decode == "flashinfer"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
