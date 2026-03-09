@@ -29,7 +29,7 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         self.is_dynamic = (
             self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
         )
-        self.force_dynamic_quant = get_bool_env_var("FORCE_DYNAMIC_QUANT", "false")
+        self.force_dynamic_quant = get_bool_env_var("SGLANG_ASCEND_W8A8_LINEAR_FORCE_DYNAMIC_QUANT", "false")
         if self.is_dynamic or self.force_dynamic_quant:
             self.kernel = NPUW8A8Int8DynamicLinearMethod()
         else:
