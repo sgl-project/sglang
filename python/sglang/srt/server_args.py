@@ -169,7 +169,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -309,6 +309,13 @@ class ServerArgs:
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
+    # SSL/TLS
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+    enable_ssl_refresh: bool = False
+
     # Quantization and data type
     dtype: str = "auto"
     quantization: Optional[str] = None
@@ -333,6 +340,8 @@ class ServerArgs:
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
+    disable_priority_preemption: bool = False
+    default_priority_value: Optional[int] = None
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
@@ -367,6 +376,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
@@ -676,6 +686,7 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -715,6 +726,9 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
+
+        # Validate SSL arguments early (before dummy-model short-circuit).
+        self._handle_ssl_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -825,6 +839,47 @@ class ServerArgs:
             )
             return
 
+    def _handle_ssl_validation(self):
+        """Ensure SSL arguments are consistent and referenced files exist."""
+        if self.ssl_keyfile and not self.ssl_certfile:
+            raise ValueError(
+                "--ssl-keyfile requires --ssl-certfile to be specified as well."
+            )
+        if self.ssl_certfile and not self.ssl_keyfile:
+            raise ValueError(
+                "--ssl-certfile requires --ssl-keyfile to be specified as well."
+            )
+        if not self.ssl_certfile and not self.ssl_keyfile:
+            if self.ssl_ca_certs:
+                raise ValueError(
+                    "--ssl-ca-certs has no effect without --ssl-certfile and --ssl-keyfile."
+                )
+            if self.ssl_keyfile_password:
+                raise ValueError(
+                    "--ssl-keyfile-password has no effect without --ssl-certfile and --ssl-keyfile."
+                )
+        # Validate files exist early to avoid late failures after model loading.
+        if self.ssl_keyfile and not os.path.isfile(self.ssl_keyfile):
+            raise ValueError(
+                f"SSL key file not found: '{self.ssl_keyfile}'. "
+                f"Please check the --ssl-keyfile path."
+            )
+        if self.ssl_certfile and not os.path.isfile(self.ssl_certfile):
+            raise ValueError(
+                f"SSL certificate file not found: '{self.ssl_certfile}'. "
+                f"Please check the --ssl-certfile path."
+            )
+        if self.ssl_ca_certs and not os.path.isfile(self.ssl_ca_certs):
+            raise ValueError(
+                f"SSL CA certificates file not found: '{self.ssl_ca_certs}'. "
+                f"Please check the --ssl-ca-certs path."
+            )
+        if self.enable_ssl_refresh and not (self.ssl_certfile and self.ssl_keyfile):
+            raise ValueError(
+                "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
+                "to be specified."
+            )
+
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -833,6 +888,14 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        if self.enable_nan_detection:
+            logger.warning(
+                "--enable-nan-detection is deprecated. "
+                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
+            )
+            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
+            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -856,18 +919,7 @@ class ServerArgs:
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            if not os.path.exists(self.model_path):
-                from modelscope import snapshot_download
-
-                self.model_path = snapshot_download(
-                    self.model_path, cache_dir=self.download_dir, revision=self.revision
-                )
-                self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path,
-                    cache_dir=self.download_dir,
-                    revision=self.revision,
-                    ignore_patterns=["*.bin", "*.safetensors"],
-                )
+            self._handle_modelscope_paths()
 
         # Mamba scheduler strategy
         if self.mamba_scheduler_strategy == "auto":
@@ -882,6 +934,70 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _handle_modelscope_paths(self):
+        """Resolve model / tokenizer / speculative-draft paths from the local
+        ModelScope cache when possible, falling back to ``snapshot_download``
+        for any path that is not already present on disk.
+
+        Note: ``speculative_token_map`` is intentionally NOT handled here
+        because its value uses ``repo_id/filename`` semantics rather than a
+        plain repo ID.  That resolution lives in
+        :func:`sglang.srt.speculative.spec_utils.load_token_map`.
+        """
+
+        ms_root = None
+        ms_snapshot_download = None
+
+        def _resolve_or_download(
+            path: Optional[str],
+            ignore_patterns: Optional[list] = None,
+            revision: Optional[str] = None,
+        ) -> Optional[str]:
+            nonlocal ms_root, ms_snapshot_download
+            if path is None:
+                return None
+            if not path or os.path.exists(path):
+                return path
+
+            if ms_snapshot_download is None:
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as _ms_snapshot_download,
+                )
+                from modelscope.utils.file_utils import get_model_cache_root
+
+                ms_snapshot_download = _ms_snapshot_download
+                ms_root = get_model_cache_root()
+
+            # Check ModelScope default cache
+            cached = os.path.join(ms_root, path)
+            if os.path.exists(cached):
+                return cached
+            # Check user-specified download dir
+            if self.download_dir:
+                alt = os.path.join(self.download_dir, path)
+                if os.path.exists(alt):
+                    return alt
+
+            # Cache miss — download from ModelScope hub
+            return ms_snapshot_download(
+                path,
+                cache_dir=self.download_dir,
+                revision=revision,
+                **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
+            )
+
+        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
+        self.tokenizer_path = _resolve_or_download(
+            self.tokenizer_path,
+            ignore_patterns=["*.bin", "*.safetensors"],
+            revision=self.revision,
+        )
+        if self.speculative_draft_model_path:
+            self.speculative_draft_model_path = _resolve_or_download(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision or "main",
+            )
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -1216,7 +1332,9 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+            self.kv_cache_dtype = (
+                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
+            )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1235,11 +1353,18 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if self.dp_size == 1 and major >= 10:
+                self.nsa_prefill_backend = "trtllm"
+                self.nsa_decode_backend = "trtllm"
+                logger.warning(
+                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
+                )
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -1430,6 +1555,15 @@ class ServerArgs:
                         logger.info(
                             "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+                        # Validate usage of ep
+                        if self.ep_size == 1:
+                            raise ValueError(
+                                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
+                                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
+                                f"Current ep_size is {self.ep_size}. "
+                                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
+                                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
+                            )
                     else:
                         self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
@@ -1896,10 +2030,11 @@ class ServerArgs:
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
             else:
-                logger.warning(
-                    f"Disabling radix cache since speculative decoding for {model_arch} is not supported with radix cache yet."
-                )
-                self.disable_radix_cache = True
+                if not self.disable_radix_cache:
+                    raise ValueError(
+                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
+                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                    )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -3000,11 +3135,27 @@ class ServerArgs:
                 "Overlap schedule is disabled because of using diffusion LLM inference"
             )
             self.disable_overlap_schedule = True
+
         if not self.disable_radix_cache:
-            logger.warning(
-                "Radix cache is disabled because of using diffusion LLM inference"
-            )
-            self.disable_radix_cache = True
+            from sglang.srt.dllm.config import DllmConfig
+
+            config = DllmConfig.from_server_args(self)
+            if self.page_size % config.block_size != 0:
+                logger.warning(
+                    f"Setting page size to {config.block_size} for diffusion LLM inference"
+                )
+                self.page_size = config.block_size
+            if self.enable_hierarchical_cache:
+                logger.warning(
+                    "Hierarchical cache is disabled because of using diffusion LLM inference"
+                )
+                self.enable_hierarchical_cache = False
+            if self.enable_lmcache:
+                logger.warning(
+                    "LMCache is disabled because of using diffusion LLM inference"
+                )
+                self.enable_lmcache = False
+
         if not self.pp_size > 1:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
@@ -3225,6 +3376,39 @@ class ServerArgs:
             "before serving inference requests.",
         )
 
+        # SSL/TLS
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="The file path to the SSL key file.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="The file path to the SSL certificate file.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="The CA certificates file.",
+        )
+        parser.add_argument(
+            "--ssl-keyfile-password",
+            type=str,
+            default=ServerArgs.ssl_keyfile_password,
+            help="The password to decrypt the SSL keyfile.",
+        )
+        parser.add_argument(
+            "--enable-ssl-refresh",
+            action="store_true",
+            default=ServerArgs.enable_ssl_refresh,
+            help="Enable automatic SSL certificate hot-reloading when cert/key "
+            "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+        )
+
         # Quantization and data type
         parser.add_argument(
             "--dtype",
@@ -3386,6 +3570,18 @@ class ServerArgs:
             help="Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
         )
         parser.add_argument(
+            "--disable-priority-preemption",
+            action="store_true",
+            default=ServerArgs.disable_priority_preemption,
+            help="Disable priority scheduling preemption.",
+        )
+        parser.add_argument(
+            "--default-priority-value",
+            type=int,
+            default=ServerArgs.default_priority_value,
+            help="Default priority for requests without explicit priority.",
+        )
+        parser.add_argument(
             "--abort-on-priority-when-disabled",
             action="store_true",
             default=ServerArgs.abort_on_priority_when_disabled,
@@ -3437,7 +3633,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -3602,6 +3798,11 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
+            "--use-ray",
+            action="store_true",
+            help="Use Ray actors for scheduler process management.",
+        )
+        parser.add_argument(
             "--custom-sigquit-handler",
             help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
@@ -3757,7 +3958,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch.",
+            help="The log and metrics reporting interval (in decode iterations) for decode batches.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",
@@ -4882,7 +5083,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -5155,6 +5356,12 @@ class ServerArgs:
             default=[],
             help="List of encoder server urls.",
         )
+        parser.add_argument(
+            "--enable-adaptive-dispatch-to-encoder",
+            default=ServerArgs.enable_adaptive_dispatch_to_encoder,
+            action="store_true",
+            help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        )
 
         # Custom weight loader
         parser.add_argument(
@@ -5313,10 +5520,43 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        scheme = "https" if self.ssl_certfile else "http"
+        # When binding to all interfaces, use loopback for internal requests.
+        host = self.host
+        if not host or host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"{scheme}://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"{scheme}://{host}:{self.port}"
+
+    def ssl_verify(self):
+        """Return the value for the requests library's ``verify=`` parameter.
+
+        When SSL is configured:
+          - If a CA certificate file is provided, return its path so requests
+            validates the server certificate against that CA.
+          - Otherwise, return False to disable certificate verification
+            (suitable for self-signed certificates in development/testing).
+            A warning is logged once when this happens.
+        When SSL is not configured, return True to use the system's default
+        CA bundle.
+        """
+        if self.ssl_ca_certs:
+            return self.ssl_ca_certs
+        if self.ssl_certfile:
+            if not getattr(self, "_ssl_verify_warned", False):
+                logger.warning(
+                    "SSL is enabled but --ssl-ca-certs was not provided. "
+                    "Certificate verification is DISABLED for internal "
+                    "health checks. For production deployments, provide "
+                    "--ssl-ca-certs or use CA-signed certificates."
+                )
+                self._ssl_verify_warned = True
+            return False
+        return True
 
     def get_model_config(self):
         # Lazy init to avoid circular import
@@ -5455,6 +5695,21 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            if self.default_priority_value is None:
+                logger.warning(
+                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
+                    "Requests without explicit priority will have priority=None, "
+                    "resulting in priority='None' string labels in Prometheus metrics."
+                )
+        else:
+            if self.disable_priority_preemption:
+                logger.warning(
+                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
+                )
+            if self.default_priority_value is not None:
+                logger.warning(
+                    "--default-priority-value has no effect without --enable-priority-scheduling"
+                )
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:

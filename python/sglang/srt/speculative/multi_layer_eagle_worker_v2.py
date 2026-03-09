@@ -38,8 +38,9 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
+    maybe_detect_nan,
+    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
@@ -286,6 +287,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states,
         )
 
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -329,6 +332,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -386,6 +395,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         for step in range(self.speculative_num_steps):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
+            )
+            maybe_detect_nan(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
             )
             probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -560,7 +573,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -702,8 +714,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         logits_output = forward_batch_output.logits_output
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,
