@@ -1,6 +1,7 @@
 import math
-import torch
+
 import pytest
+import torch
 
 from sglang.srt.constrained import xgrammar_backend as xb
 
@@ -10,7 +11,7 @@ def _pack_mask(allowed_ids, vocab_size, batch_size=1):
     m = torch.zeros((batch_size, nwords), dtype=torch.int32)
     for b in range(batch_size):
         for tid in allowed_ids[b]:
-            m[b, tid // 32] |= (1 << (tid % 32))
+            m[b, tid // 32] |= 1 << (tid % 32)
     return m
 
 
@@ -25,7 +26,10 @@ def _apply_ref_cpu(logits, vocab_mask):
     out.masked_fill_(~allowed, float("-inf"))
     return out
 
-@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="NPU required")
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(), reason="NPU required"
+)
 def test_mask_blocks_disallowed_token_on_npu():
     device = "npu:0"
     vocab_size = 64
@@ -45,7 +49,9 @@ def test_mask_blocks_disallowed_token_on_npu():
     assert int(torch.argmax(out[0]).item()) != 16
 
 
-@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="NPU required")
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(), reason="NPU required"
+)
 def test_npu_path_matches_reference_random():
     device = "npu:0"
     B, V = 4, 257
@@ -66,5 +72,10 @@ def test_npu_path_matches_reference_random():
     out_ref = _apply_ref_cpu(logits, vocab_mask)
 
     assert torch.equal(torch.isfinite(out_npu), torch.isfinite(out_ref))
-    diff = torch.nan_to_num(out_npu - out_ref, nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
+    diff = (
+        torch.nan_to_num(out_npu - out_ref, nan=0.0, posinf=0.0, neginf=0.0)
+        .abs()
+        .max()
+        .item()
+    )
     assert diff < 1e-5

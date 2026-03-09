@@ -140,6 +140,7 @@ def apply_token_bitmask_inplace_triton(
         num_stages=3,
     )
 
+
 def apply_token_bitmask_inplace_torch_npu(
     logits: torch.Tensor,
     bitmask: torch.Tensor,

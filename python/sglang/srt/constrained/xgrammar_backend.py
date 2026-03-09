@@ -43,8 +43,8 @@ if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
     from sglang.srt.constrained.triton_ops.bitmask_ops import (
-        apply_token_bitmask_inplace_triton,
         apply_token_bitmask_inplace_torch_npu,
+        apply_token_bitmask_inplace_triton,
     )
 
 
