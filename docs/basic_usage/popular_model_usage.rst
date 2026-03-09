@@ -7,10 +7,11 @@ Popular Model Usage
    Please visit the cookbook for detailed guides on:
 
    - `DeepSeek models <https://cookbook.sglang.io/docs/category/deepseek>`_
-   - `Qwen models <https://cookbook.sglang.io/docs/category/qwen>`_
    - `GLM models <https://cookbook.sglang.io/docs/category/zhipuai>`_
+   - `GPT-OSS models <https://cookbook.sglang.io/docs/category/openai>`_
    - `Llama models <https://cookbook.sglang.io/docs/category/meta>`_
    - `MiniMax models <https://cookbook.sglang.io/docs/category/minimax>`_
+   - `Qwen models <https://cookbook.sglang.io/docs/category/qwen>`_
    - And many more...
 
    The cookbook provides:
