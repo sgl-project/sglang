@@ -160,9 +160,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # At TP=1, fuse all 6 DeltaNet projections into one matmul (~9%
-        # decode latency improvement from 66 fewer kernel launches).
-        # At TP>1, keep separate layers for correct per-head sharding.
+        # Split projection layers for TP>1 (following vLLM's implementation)
+        # so that Q/K/V heads can be sharded independently across ranks.
+        # At TP=1 we fuse all 6 projections into a single matmul instead,
+        # which gives ~9% decode latency improvement on the 0.8B model
+        # (66 fewer kernel launches per forward pass).
         self._fuse_all = self.attn_tp_size == 1
         if self._fuse_all:
             self._fused_qkv_dim = self.key_dim + self.key_dim + self.value_dim
