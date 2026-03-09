@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -15,8 +15,13 @@ class Mamba1Metadata(ForwardMetadata):
     num_prefill_tokens: int
     num_decodes: int
 
-    # For chunked prefill: which prefill requests have initial states to load
-    has_initial_states: Optional[torch.Tensor] = field(default=None)
+    @dataclass(kw_only=True, frozen=True)
+    class MixedMetadata:
+        has_initial_states: Optional[torch.Tensor]
+        extend_seq_lens_cpu: list[int]
+
+    mixed_metadata: MixedMetadata | None = None
+    """`mixed_metadata` is used for extend/mixed requests"""
 
     @staticmethod
     def prepare_decode(
@@ -57,5 +62,8 @@ class Mamba1Metadata(ForwardMetadata):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
-            has_initial_states=has_initial_states,
+            mixed_metadata=cls.MixedMetadata(
+                has_initial_states=has_initial_states,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ),
         )

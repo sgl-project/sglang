@@ -29,6 +29,12 @@ if is_cuda():
         causal_conv1d_fn,
         causal_conv1d_update,
     )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
 
 
 class MambaMixer1(nn.Module):
@@ -156,6 +162,7 @@ class MambaMixer1(nn.Module):
         output: torch.Tensor,
         layer_cache: MambaPool.State,
         metadata: Mamba1Metadata,
+        use_triton_causal_conv: bool = False,
     ):
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
@@ -186,17 +193,28 @@ class MambaMixer1(nn.Module):
 
         # 2. Process prefill requests
         if has_prefill:
-            has_initial_states = metadata.has_initial_states
+            mixed_metadata = metadata.mixed_metadata
+            has_initial_states = mixed_metadata.has_initial_states
 
-            x_conv = causal_conv1d_fn(
-                x_p.transpose(0, 1),
-                conv_weight,
-                self.conv1d.bias,
-                activation=self.activation,
+            ccfn = (
+                causal_conv1d_fn
+                if not use_triton_causal_conv
+                else causal_conv1d_fn_triton
+            )
+            ccfn_kwargs = dict(
                 conv_states=conv_state,
                 has_initial_state=has_initial_states,
                 cache_indices=state_indices_p,
                 query_start_loc=query_start_loc_p,
+                seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
+            )
+
+            x_conv = ccfn(
+                x_p.transpose(0, 1),
+                conv_weight,
+                self.conv1d.bias,
+                activation=self.activation,
+                **ccfn_kwargs,
             ).transpose(0, 1)[:num_prefill_tokens]
 
             dt, B, C, A = self._ssm_transform(x_conv)
@@ -246,7 +264,12 @@ class MambaMixer1(nn.Module):
 
         # 3. Process decode requests
         if has_decode:
-            x_conv = causal_conv1d_update(
+            ccu = (
+                causal_conv1d_update
+                if not use_triton_causal_conv
+                else causal_conv1d_update_triton
+            )
+            x_conv = ccu(
                 x_d,
                 conv_state,
                 conv_weight,

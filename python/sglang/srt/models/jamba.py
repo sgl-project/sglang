@@ -216,6 +216,7 @@ class JambaMambaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             output=output,
             layer_id=self.layer_idx,
+            use_triton_causal_conv=True,
         )
         hidden_states, residual = self.pre_ff_layernorm(output, residual)
         hidden_states = self.feed_forward(hidden_states)
