@@ -12,6 +12,13 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+try:
+    from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+    _swiglu_quant_available = True
+except ImportError:
+    _swiglu_quant_available = False
+    swiglu_quant = None
 
 
 def npu_fused_experts(
@@ -125,7 +132,12 @@ def npu_fused_moe_without_routing_weights_bf16(
         group_list=group_list,
         output_dtype=output_dtype,
     )[0]
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    if _swiglu_quant_available:
+        hidden_states, _ = swiglu_quant(
+            hidden_states, group_list, group_list_type, need_quant=False
+        )
+    else:
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
