@@ -1493,6 +1493,10 @@ class Scheduler(
             or self.dllm_manager.any_staging_reqs()
             or not self.running_batch.is_empty()
             or len(self.offload_tags) > 0
+            or (self.last_batch is not None and not self.last_batch.is_empty())
+            or (self.cur_batch is not None and not self.cur_batch.is_empty())
+            or (self.enable_overlap and len(self.result_queue) > 0)
+            or (self.pp_size > 1 and any(not x.is_empty() for x in self.running_mbs))
         )
 
         has_waiting_reqs = len(self.waiting_queue) > 0
