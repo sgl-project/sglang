@@ -26,6 +26,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import Base64Bytes
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -127,6 +128,13 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Alternative to input_embeds: base64-encoded raw float32 bytes of shape
+    # (seq_len, d_model), row-major. Requires input_embeds_shape. Faster and
+    # smaller on the wire than the JSON float list. WARNING: input_embeds (in
+    # either encoding) bypasses the tokenizer; enable only for trusted clients.
+    input_embeds_bytes: Optional[Union[List[Base64Bytes], Base64Bytes]] = None
+    # Shape for input_embeds_bytes: [seq_len, d_model] (or list thereof for batch).
+    input_embeds_shape: Optional[Union[List[List[int]], List[int]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -278,15 +286,23 @@ class GenerateReqInput(BaseReq):
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
+        provided = sum(
+            x is not None
+            for x in (
+                self.text,
+                self.input_ids,
+                self.input_embeds,
+                self.input_embeds_bytes,
+            )
+        )
+        if provided != 1:
             raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of text, input_ids, input_embeds or "
+                "input_embeds_bytes should be provided."
+            )
+        if (self.input_embeds_bytes is None) != (self.input_embeds_shape is None):
+            raise ValueError(
+                "input_embeds_bytes and input_embeds_shape must be provided together."
             )
 
     def _determine_batch_size(self):
@@ -309,6 +325,15 @@ class GenerateReqInput(BaseReq):
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
             self.input_embeds = None
+        elif self.input_embeds_bytes is not None:
+            if isinstance(self.input_embeds_bytes, list):
+                if len(self.input_embeds_bytes) == 0:
+                    raise ValueError("input_embeds_bytes cannot be empty.")
+                self.is_single = False
+                self.batch_size = len(self.input_embeds_bytes)
+            else:
+                self.is_single = True
+                self.batch_size = 1
         else:
             if isinstance(self.input_embeds[0][0], float):
                 self.is_single = True
@@ -342,6 +367,9 @@ class GenerateReqInput(BaseReq):
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.input_embeds_bytes is not None:
+                self.input_embeds_bytes = [self.input_embeds_bytes]
+                self.input_embeds_shape = [self.input_embeds_shape]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -397,6 +425,9 @@ class GenerateReqInput(BaseReq):
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
+        elif self.input_embeds_bytes is not None:
+            self.input_embeds_bytes = self.input_embeds_bytes * self.parallel_sample_num
+            self.input_embeds_shape = self.input_embeds_shape * self.parallel_sample_num
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -594,6 +625,16 @@ class GenerateReqInput(BaseReq):
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
+            ),
+            input_embeds_bytes=(
+                self.input_embeds_bytes[i]
+                if self.input_embeds_bytes is not None
+                else None
+            ),
+            input_embeds_shape=(
+                self.input_embeds_shape[i]
+                if self.input_embeds_shape is not None
+                else None
             ),
             image_data=self.image_data[i],
             video_data=self.video_data[i],

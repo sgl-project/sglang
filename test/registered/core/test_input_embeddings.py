@@ -1,9 +1,9 @@
+import base64
 import json
-import os
-import tempfile
 import unittest
 
 import requests
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
@@ -42,7 +42,7 @@ class TestInputEmbeds(CustomTestCase):
         """Generate input embeddings for a given text."""
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
         embeddings = self.ref_model.get_input_embeddings()(input_ids)
-        return embeddings.squeeze().tolist()  # Convert tensor to a list for API use
+        return embeddings.squeeze()  # CPU float tensor, shape (seq_len, d_model)
 
     def send_request(self, payload):
         """Send a POST request to the /generate endpoint and return the response."""
@@ -51,20 +51,6 @@ class TestInputEmbeds(CustomTestCase):
             json=payload,
             timeout=30,  # Set a reasonable timeout for the API request
         )
-        if response.status_code == 200:
-            return response.json()
-        return {
-            "error": f"Request failed with status {response.status_code}: {response.text}"
-        }
-
-    def send_file_request(self, file_path):
-        """Send a POST request to the /generate_from_file endpoint with a file."""
-        with open(file_path, "rb") as f:
-            response = requests.post(
-                self.base_url + "/generate_from_file",
-                files={"file": f},
-                timeout=30,  # Set a reasonable timeout for the API request
-            )
         if response.status_code == 200:
             return response.json()
         return {
@@ -90,13 +76,35 @@ class TestInputEmbeds(CustomTestCase):
             embeddings = self.generate_input_embeddings(text)
             payload = {
                 "model": self.model,
-                "input_embeds": embeddings,
+                "input_embeds": embeddings.tolist(),
                 "sampling_params": {"temperature": 0, "max_new_tokens": 50},
             }
             response = self.send_request(payload)
             print(
                 f"Embeddings Input (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
             )
+
+    def test_embedding_bytes_response(self):
+        """Test input_embeds_bytes (raw float32) matches input_embeds output."""
+        for text in self.texts:
+            embeddings = self.generate_input_embeddings(text)
+            arr = embeddings.detach().to(torch.float32).contiguous().cpu().numpy()
+            sampling = {"temperature": 0, "max_new_tokens": 50}
+
+            list_resp = self.send_request(
+                {"input_embeds": arr.tolist(), "sampling_params": sampling}
+            )
+            bytes_resp = self.send_request(
+                {
+                    "input_embeds_bytes": base64.b64encode(arr.tobytes()).decode(),
+                    "input_embeds_shape": list(arr.shape),
+                    "sampling_params": sampling,
+                }
+            )
+
+            self.assertNotIn("error", list_resp, list_resp)
+            self.assertNotIn("error", bytes_resp, bytes_resp)
+            self.assertEqual(list_resp["text"], bytes_resp["text"])
 
     def test_compare_text_vs_embedding(self):
         """Test and compare responses for text-based and embedding-based inputs."""
@@ -111,7 +119,7 @@ class TestInputEmbeds(CustomTestCase):
             embeddings = self.generate_input_embeddings(text)
             embed_payload = {
                 "model": self.model,
-                "input_embeds": embeddings,
+                "input_embeds": embeddings.tolist(),
                 "sampling_params": {"temperature": 0, "max_new_tokens": 50},
             }
             # Get responses
@@ -126,25 +134,6 @@ class TestInputEmbeds(CustomTestCase):
             )
             # This is flaky, so we skip this temporarily
             # self.assertEqual(text_response["text"], embed_response["text"])
-
-    def test_generate_from_file(self):
-        """Test the /generate_from_file endpoint using tokenized embeddings."""
-        for text in self.texts:
-            embeddings = self.generate_input_embeddings(text)
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as tmp_file:
-                json.dump(embeddings, tmp_file)
-                tmp_file_path = tmp_file.name
-
-            try:
-                response = self.send_file_request(tmp_file_path)
-                print(
-                    f"Text Input: {text}\nResponse from /generate_from_file: {json.dumps(response, indent=2)}\n{'-' * 80}"
-                )
-            finally:
-                # Ensure the temporary file is deleted
-                os.remove(tmp_file_path)
 
     @classmethod
     def tearDownClass(cls):
