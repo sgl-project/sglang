@@ -35,7 +35,22 @@ _is_hip = is_hip()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        from sglang.jit_kernel.flash_attention_v4 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+        )
+
+        def flash_attn_func(*args, ver: int = 3, **kwargs):
+            if ver == 4:
+                return flash_attn_varlen_func_fa4(*args, **kwargs)
+            return flash_attn_varlen_func(*args, **kwargs)
+
+    except ImportError as e:
+        raise e
+
 
 if _is_npu:
     import torch_npu
@@ -391,7 +406,7 @@ class VisionFlash3Attention(nn.Module):
         """
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             max_seqlen = cu_seqlens[1]
-            output = flash_attn_varlen_func(
+            output = flash_attn_func(
                 q,
                 k,
                 v,
@@ -406,7 +421,7 @@ class VisionFlash3Attention(nn.Module):
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
 
-            output = flash_attn_varlen_func(
+            output = flash_attn_func(
                 q,
                 k,
                 v,
@@ -457,7 +472,7 @@ class VisionFlash4Attention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        output = flash_attn_varlen_func(
+        output = flash_attn_func(
             q,
             k,
             v,
@@ -663,28 +678,33 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if "output_ws" not in kwargs:
+                raise RuntimeError("output_ws should be prepared for npu-graph mode")
+            output = kwargs["output_ws"]
+            # graph mode: runner already passes seq_lens (int32 on CPU)
+            seq_len_arg = cu_seqlens
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            if seq_lens.is_npu:
+                seq_lens = seq_lens.to("cpu")
+            output = torch.empty_like(q)
+            seq_len_arg = seq_lens.to(torch.int32)
 
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if seq_lens.is_npu:
-            # cu_seqlens must be on cpu because of operator restriction
-            seq_lens = seq_lens.to("cpu")
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
-        output = torch.empty_like(q)
 
-        # operator requires pta version >= 2.5.1
         torch_npu._npu_flash_attention_unpad(
             query=q,
             key=k,
             value=v,
-            seq_len=seq_lens.to(torch.int32),
+            seq_len=seq_len_arg,
             scale_value=head_size**-0.5,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             out=output,
         )
-
         return output
 
 
