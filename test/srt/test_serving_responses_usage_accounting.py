@@ -16,18 +16,12 @@ class TestUsageAccountingFromDict(unittest.TestCase):
         """Mimics the fixed code path in
         OpenAIServingResponses.create_responses (non-streaming).
         """
-        if "meta_info" in final_res:
-            return {
-                "prompt_tokens": final_res["meta_info"].get("prompt_tokens", 0),
-                "completion_tokens": final_res["meta_info"].get("completion_tokens", 0),
-                "cached_tokens": final_res["meta_info"].get("cached_tokens", 0),
-                "reasoning_tokens": final_res["meta_info"].get("reasoning_tokens", 0),
-            }
+        meta_info = final_res.get("meta_info", {})
         return {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "cached_tokens": 0,
-            "reasoning_tokens": 0,
+            "prompt_tokens": meta_info.get("prompt_tokens", 0),
+            "completion_tokens": meta_info.get("completion_tokens", 0),
+            "cached_tokens": meta_info.get("cached_tokens", 0),
+            "reasoning_tokens": meta_info.get("reasoning_tokens", 0),
         }
 
     def test_dict_with_meta_info(self):
@@ -53,6 +47,8 @@ class TestUsageAccountingFromDict(unittest.TestCase):
         usage = self._extract_usage(final_res)
         self.assertEqual(usage["prompt_tokens"], 0)
         self.assertEqual(usage["completion_tokens"], 0)
+        self.assertEqual(usage["cached_tokens"], 0)
+        self.assertEqual(usage["reasoning_tokens"], 0)
 
     def test_dict_with_partial_meta_info(self):
         """meta_info present but missing some keys should default to 0."""
@@ -64,6 +60,7 @@ class TestUsageAccountingFromDict(unittest.TestCase):
         self.assertEqual(usage["prompt_tokens"], 7)
         self.assertEqual(usage["completion_tokens"], 0)
         self.assertEqual(usage["cached_tokens"], 0)
+        self.assertEqual(usage["reasoning_tokens"], 0)
 
     def test_hasattr_wrong_on_dict(self):
         """Demonstrate why the old hasattr check was wrong.
