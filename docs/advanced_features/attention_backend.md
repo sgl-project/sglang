@@ -66,7 +66,21 @@ Speculative decoding topk: `topk` is the number of draft tokens sampled per step
 ```
 
 ```{note}
-**Speculative Decoding V2 (Spec V2):** When using Spec V2 (overlap scheduler with `SGLANG_ENABLE_SPEC_V2=True`), attention backends behave differently. FlashInfer will run but still incurs a synchronization from its plan stream (used for split-KV optimization), which can limit overlap benefits. Backends such as Triton do not use a separate plan stream and can achieve better overlap. For optimal Spec V2 performance, consider backends that avoid plan-stream synchronization.
+**Speculative Decoding V2 (Spec V2):** Spec V2 uses an overlap scheduler (`SGLANG_ENABLE_SPEC_V2=True`) that benefits from backends without plan-stream synchronization. Requires `--speculative-eagle-topk 1`; applies to EAGLE, EAGLE3, and STANDALONE algorithms.
+
+**Verified backends:**
+
+- **TRTLLM MLA** — no plan stream; achieves full overlap.
+- **TRTLLM MHA** — no plan stream; achieves full overlap.
+- **FA3 (FlashAttention 3)** — no plan-stream synchronization.
+- **Ascend (NPU)** — no plan stream; used in production Spec V2 deployments (see [Ascend NPU examples](../platforms/ascend_npu_deepseek_example.md)).
+- **Triton** — no plan stream; compatible with Spec V2 overlap.
+
+**Limited support:**
+
+- **FlashInfer** — *can* run under Spec V2, but its plan stream (used for split-KV optimization) introduces a synchronization point that limits overlap benefits.
+
+Other backends that do not use a plan stream (e.g., Cutlass MLA, FlashMLA) may also be compatible, but have not been explicitly verified with Spec V2.
 ```
 
 ```{tip}
@@ -328,23 +342,23 @@ Linear attention kernel backends (GDN, KDA) follow a different pattern. They imp
 ```
 
 1. Run without cuda graph. Support the two forward functions
-  - forward_extend
-    - Will be used for prefill, prefill with KV cache, and target verification
-    - It will be called once per layer
-  - forward_decode
-    - Will be used for normal decode, and draft decode
-    - It will be called once per layer
-  - init_forward_metadata
-    - Initialize the class and common metadata shared by all layers
-    - Call the plan function for optimizations like split_kv
-    - It will be called once per forward
+- forward_extend
+  - Will be used for prefill, prefill with KV cache, and target verification
+  - It will be called once per layer
+- forward_decode
+  - Will be used for normal decode, and draft decode
+  - It will be called once per layer
+- init_forward_metadata
+  - Initialize the class and common metadata shared by all layers
+  - Call the plan function for optimizations like split_kv
+  - It will be called once per forward
 2. Run with cuda graph. It has two phases (capture and replay) and you need to implement three functions
-  - init_cuda_graph_state
-    - It will be called once during life time
-    - Create all common shared buffers
-  - init_forward_metadata_capture_cuda_graph
-    - It will be called before capturing a cuda graph
-    - It is similar to init_forward_metadata but write the medatada to some pre-defined buffers
-  - init_forward_metadata_replay_cuda_graph
-    - It will be called before replaying a cuda graph
-    - This function is in the critical path and needs to be fast
+- init_cuda_graph_state
+  - It will be called once during life time
+  - Create all common shared buffers
+- init_forward_metadata_capture_cuda_graph
+  - It will be called before capturing a cuda graph
+  - It is similar to init_forward_metadata but write the medatada to some pre-defined buffers
+- init_forward_metadata_replay_cuda_graph
+  - It will be called before replaying a cuda graph
+  - This function is in the critical path and needs to be fast
