@@ -1,5 +1,5 @@
 from collections.abc import Iterable
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import nn
