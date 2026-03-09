@@ -11,7 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob import OutputLogprobProcessor
+from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL

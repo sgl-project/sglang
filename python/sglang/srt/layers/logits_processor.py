@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.logprob import (
+from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     get_token_ids_logprobs_prefill,
     get_top_logprobs_prefill,
