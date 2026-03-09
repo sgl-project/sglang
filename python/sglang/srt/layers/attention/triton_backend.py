@@ -954,7 +954,9 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos = None
 
         # Build unified kv_indices using fused Triton kernel
-        extend_kv_indices = forward_batch.out_cache_loc
+        extend_kv_indices = set_extend_kv_indices(
+            forward_batch.out_cache_loc, self.token_to_kv_pool_allocator
+        )
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
@@ -1393,3 +1395,21 @@ def update_sliding_window_buffer_cuda_graph(
             )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
+
+
+def set_extend_kv_indices(
+    out_cache_loc,
+    sliding_window_size,
+    token_to_kv_pool_allocator=None,
+):
+    """
+    Under deterministic mode, when using SWA pool, the extend_kv_indices should be
+    transformed into the ones of SWA pool.
+    """
+    out_cache_loc_new = out_cache_loc
+    if sliding_window_size is not None and sliding_window_size > 0:
+        if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+            out_cache_loc_new = (
+                token_to_kv_pool_allocator.translate_loc_from_full_to_swa(out_cache_loc)
+            )
+    return out_cache_loc_new
