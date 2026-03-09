@@ -366,29 +366,16 @@ class LogitsProcessor(nn.Module):
             or self.do_tensor_parallel_all_gather_dp_attn
         )
 
-        if should_skip_chunking:
-            # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-            sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
-            )
-            input_logits = logits[input_logprob_indices]
-            del logits
-
-            logprobs_result = self.input_logprob_processor(
-                input_logits, logits_metadata
-            )
-        else:
-            logprobs_result, sampled_logits = (
-                self.input_logprob_processor.forward_by_chunk(
-                    pruned_states,
-                    sample_indices,
-                    input_logprob_indices,
-                    token_to_seq_idx,
-                    lambda states: self._get_logits(states, lm_head, logits_metadata),
-                    logits_metadata,
-                )
-            )
+        logprobs_result, sampled_logits = self.input_logprob_processor(
+            pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+            lm_head,
+            self._get_logits,
+            logits_metadata,
+            enable_chunk=not should_skip_chunking,
+        )
 
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,

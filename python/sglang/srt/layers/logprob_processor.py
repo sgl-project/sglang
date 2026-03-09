@@ -512,10 +512,8 @@ class InputLogprobProcessor(nn.Module):
     """Processes input (prefill) logprobs:
     (hidden_states, lm_head, get_logits_fn) -> chunk -> log_softmax -> utilities.
 
-    Delegated to logits_processor for input logprob computation.
-    Two entry points:
-      - forward:          non-chunked, operates on pre-computed input logits
-      - forward_by_chunk: chunked, computes logits from hidden states via get_logits_fn
+    Single entry point: forward() handles both chunked and non-chunked paths.
+    Logits are computed internally via get_logits_fn(hidden_states, lm_head, logits_metadata).
     """
 
     def __init__(self, chunk_size: int = 4096):
@@ -524,10 +522,33 @@ class InputLogprobProcessor(nn.Module):
 
     def forward(
         self,
-        input_logits: torch.Tensor,
+        pruned_states: torch.Tensor,
+        sample_indices: Optional[torch.Tensor],
+        input_logprob_indices: torch.Tensor,
+        token_to_seq_idx: list[int],
+        lm_head,
+        get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
-    ) -> LogprobResult:
-        """Compute input logprobs from pre-computed logits (non-chunked path)."""
+        enable_chunk: bool = False,
+    ) -> Tuple[LogprobResult, torch.Tensor]:
+        if enable_chunk:
+            return self._forward_by_chunk(
+                pruned_states,
+                sample_indices,
+                input_logprob_indices,
+                token_to_seq_idx,
+                lm_head,
+                get_logits_fn,
+                logits_metadata,
+            )
+
+        logits = get_logits_fn(pruned_states, lm_head, logits_metadata)
+        sampled_logits = (
+            logits[sample_indices] if sample_indices is not None else logits
+        )
+        input_logits = logits[input_logprob_indices]
+        del logits
+
         input_logprobs = compute_temp_top_p_normalized_logprobs(
             input_logits, logits_metadata
         )
@@ -555,31 +576,30 @@ class InputLogprobProcessor(nn.Module):
             logits_metadata.extend_input_logprob_token_ids_gpu,
         ]
 
-        return LogprobResult(
-            token_logprobs=input_token_logprobs,
-            top_logprobs_val=input_top_logprobs_val,
-            top_logprobs_idx=input_top_logprobs_idx,
-            token_ids_logprobs_val=input_token_ids_logprobs_val,
-            token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+        return (
+            LogprobResult(
+                token_logprobs=input_token_logprobs,
+                top_logprobs_val=input_top_logprobs_val,
+                top_logprobs_idx=input_top_logprobs_idx,
+                token_ids_logprobs_val=input_token_ids_logprobs_val,
+                token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            ),
+            sampled_logits,
         )
 
-    def forward_by_chunk(
+    def _forward_by_chunk(
         self,
         pruned_states: torch.Tensor,
         sample_indices: torch.Tensor,
         input_logprob_indices: torch.Tensor,
         token_to_seq_idx: list[int],
-        get_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        lm_head,
+        get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogprobResult, torch.Tensor]:
-        """Compute input logprobs by chunking hidden states to limit peak memory.
-
-        Returns:
-            Tuple of (LogprobResult, sampled_logits tensor)
-        """
-
+        """Compute input logprobs by chunking hidden states to limit peak memory."""
         # The peak memory usage is proportional to the chunk size.
-        chunk_size = self.logprobs_chunk_size
+        chunk_size = self.chunk_size
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
@@ -618,7 +638,7 @@ class InputLogprobProcessor(nn.Module):
 
             # Get the logits for this chunk
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = get_logits_fn(chunk_states)
+            chunk_logits = get_logits_fn(chunk_states, lm_head, logits_metadata)
             # Initialize sampled_logits on first chunk
             if i == 0:
                 sampled_logits = torch.empty(
