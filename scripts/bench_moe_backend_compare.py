@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """
-Compare FlashInfer MoE backends on small quality + throughput checks.
+MoE backend concurrency sweep benchmark.
 
-Example:
-python3 scripts/bench_moe_backend_compare.py \
-  --model nvidia/DeepSeek-R1-0528-FP4-V2 \
-  --backends flashinfer_cutlass flashinfer_trtllm flashinfer_cutedsl
+Compares flashinfer_trtllm, flashinfer_cutlass, and flashinfer_cutedsl across
+a range of concurrency levels and EP configurations.  For each (backend, ep)
+pair the script launches a server, runs a quick MMLU sanity check, then sweeps
+concurrency values with bench_serving and records throughput / latency metrics.
+
+Example (8xGPU, DeepSeek-R1 NVFP4):
+
+    python3 scripts/bench_moe_backend_compare.py \\
+        --model nvidia/DeepSeek-R1-0528-NVFP4-v2 \\
+        --backends flashinfer_trtllm flashinfer_cutlass flashinfer_cutedsl \\
+        --ep-sizes 1 8 \\
+        --tp-size 8 \\
+        --concurrency 1 2 4 8 16 32 64 128 512 1024 2048 \\
+        --output-dir bench_moe_sweep_results
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -24,136 +38,85 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
 
-def _safe_tensor_head(x, n: int):
-    """Return first n flattened values for a tensor-like object."""
-    if x is None:
-        return None
-    try:
-        import torch
+DEFAULT_MODEL = "nvidia/DeepSeek-R1-0528-NVFP4-v2"
+DEFAULT_BACKENDS = ["flashinfer_trtllm", "flashinfer_cutlass", "flashinfer_cutedsl"]
+DEFAULT_EP_SIZES = [1, 8]
+DEFAULT_TP_SIZE = 8
+DEFAULT_CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 512, 1024, 2048]
 
-        if not isinstance(x, torch.Tensor):
-            return None
-        return x.detach().to(torch.float32).reshape(-1)[:n].cpu().tolist()
-    except Exception:
-        return None
+BENCH_METRIC_KEYS = [
+    "output_throughput",
+    "request_throughput",
+    "mean_ttft_ms",
+    "mean_tpot_ms",
+    "median_tpot_ms",
+    "p99_tpot_ms",
+    "mean_itl_ms",
+    "mean_e2e_latency_ms",
+    "completed",
+    "total_output_tokens",
+]
 
-
-def _safe_list_head(x, n: int):
-    """Return first n values for list-like/tensor-like data."""
-    if x is None:
-        return None
-    try:
-        import torch
-
-        if isinstance(x, torch.Tensor):
-            return x.detach().to(torch.float32).reshape(-1)[:n].cpu().tolist()
-    except Exception:
-        pass
-    if isinstance(x, list):
-        if len(x) > 0 and isinstance(x[0], list):
-            return x[0][:n]
-        return x[:n]
-    return None
-
-
-def _fmt_head_line(label: str, values):
-    if values is None:
-        return None
-    return f"  {label}={values}"
+CSV_FIELDS = [
+    "backend",
+    "ep_size",
+    "tp_size",
+    "concurrency",
+    "num_prompts",
+    *BENCH_METRIC_KEYS,
+]
 
 
-def _load_cutedsl_diag_snapshot(diag_path: str, head_k: int):
-    """Load compact debug snapshot from CUTEDSL_DIAG dump."""
-    import torch
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    if not os.path.exists(diag_path):
-        return None, f"diag file not found: {diag_path}"
 
-    try:
-        d = torch.load(diag_path, map_location="cpu")
-    except Exception as e:
-        return None, f"failed to load diag file {diag_path}: {e}"
+def _num_prompts_for_concurrency(concurrency: int) -> int:
+    """Scale down num-prompts for low concurrency to keep wall-clock reasonable."""
+    if concurrency <= 4:
+        return 128
+    if concurrency <= 32:
+        return 512
+    return 2048
 
-    scales = d.get("scales", {}) or {}
-    isolate_meta = d.get("isolate_meta", {}) or {}
-    map_swap = isolate_meta.get("manual_finalize_map_swap_baseline")
-    map_swap_line = None
-    if isinstance(map_swap, dict):
-        raw = map_swap.get("raw_inverse_consistency", {}) or {}
-        rebuilt = map_swap.get("rebuilt_inverse_consistency", {}) or {}
-        raw_diff = map_swap.get("raw_vs_rebuilt_output_diff", {}) or {}
-        map_swap_line = (
-            "  manual_finalize_map_swap_baseline: "
-            f"raw_inverse_mismatch={raw.get('inverse_mismatch_count')}/{raw.get('valid_pairs')}, "
-            f"rebuilt_inverse_mismatch={rebuilt.get('inverse_mismatch_count')}/{rebuilt.get('valid_pairs')}, "
-            f"raw_vs_rebuilt_mean_abs={raw_diff.get('mean_abs_diff')}, "
-            f"raw_vs_rebuilt_max_abs={raw_diff.get('max_abs_diff')}"
-        )
 
-    snapshot = {
-        "cutedsl_vs_cutlass": d.get("cutedsl_vs_cutlass"),
-        "cutedsl_vs_trtllm": d.get("cutedsl_vs_trtllm"),
-        "cutedsl_output_head": _safe_tensor_head(d.get("cutedsl_output"), head_k),
-        "cutlass_output_head": _safe_tensor_head(d.get("cutlass_output"), head_k),
-        "trtllm_output_head": _safe_tensor_head(d.get("trtllm_output"), head_k),
-        "topk_ids_head": _safe_list_head(d.get("topk_ids"), head_k),
-        "topk_weights_head": _safe_list_head(d.get("topk_weights"), head_k),
-        "w1_alpha_cutedsl_head": _safe_tensor_head(
-            scales.get("w1_alpha_cutedsl"), head_k
-        ),
-        "g1_alphas_head": _safe_tensor_head(scales.get("g1_alphas"), head_k),
-        "w2_alpha_cutedsl_head": _safe_tensor_head(
-            scales.get("w2_alpha_cutedsl"), head_k
-        ),
-        "g2_alphas_head": _safe_tensor_head(scales.get("g2_alphas"), head_k),
-        "fc2_input_scale_head": _safe_tensor_head(
-            scales.get("fc2_input_scale"), head_k
-        ),
-        "w2_input_scale_quant_head": _safe_tensor_head(
-            scales.get("w2_input_scale_quant"), head_k
-        ),
-        "w13_input_scale_quant_head": _safe_tensor_head(
-            scales.get("w13_input_scale_quant"), head_k
-        ),
-        "used_input_scale_head": _safe_tensor_head(
-            scales.get("used_input_scale"), head_k
-        ),
-        "manual_finalize_map_swap_baseline": map_swap,
-    }
-
-    lines = [
-        f"[CUTEDSL_DIAG_BRIEF] from {diag_path}",
-        _fmt_head_line("topk_ids[0][:k]", snapshot["topk_ids_head"]),
-        _fmt_head_line("topk_weights[0][:k]", snapshot["topk_weights_head"]),
-        _fmt_head_line("CuteDSL output[:k]", snapshot["cutedsl_output_head"]),
-        _fmt_head_line("CUTLASS output[:k]", snapshot["cutlass_output_head"]),
-        _fmt_head_line("TRTLLM output[:k]", snapshot["trtllm_output_head"]),
-        _fmt_head_line("CuteDSL w1_alpha[:k]", snapshot["w1_alpha_cutedsl_head"]),
-        _fmt_head_line("CUTLASS g1_alphas[:k]", snapshot["g1_alphas_head"]),
-        _fmt_head_line("CuteDSL w2_alpha[:k]", snapshot["w2_alpha_cutedsl_head"]),
-        _fmt_head_line("CUTLASS g2_alphas[:k]", snapshot["g2_alphas_head"]),
-        _fmt_head_line("fc2_input_scale[:k]", snapshot["fc2_input_scale_head"]),
-        _fmt_head_line(
-            "w2_input_scale_quant[:k]", snapshot["w2_input_scale_quant_head"]
-        ),
-        _fmt_head_line(
-            "w13_input_scale_quant[:k]", snapshot["w13_input_scale_quant_head"]
-        ),
-        _fmt_head_line("used_input_scale[:k]", snapshot["used_input_scale_head"]),
+def _build_server_args(
+    backend: str,
+    tp_size: int,
+    ep_size: int,
+    extra_server_args: list[str],
+) -> list[str]:
+    args = [
+        "--trust-remote-code",
+        "--tp-size",
+        str(tp_size),
+        "--ep-size",
+        str(ep_size),
+        "--attention-backend",
+        "trtllm_mla",
+        "--quantization",
+        "modelopt_fp4",
+        "--moe-runner-backend",
+        backend,
+        "--model-loader-extra-config",
+        '{"enable_multithread_load": true}',
     ]
-    if map_swap_line is not None:
-        lines.append(map_swap_line)
-    if snapshot["cutedsl_vs_cutlass"] is not None:
-        lines.append(f"  cutedsl_vs_cutlass={snapshot['cutedsl_vs_cutlass']}")
-    if snapshot["cutedsl_vs_trtllm"] is not None:
-        lines.append(f"  cutedsl_vs_trtllm={snapshot['cutedsl_vs_trtllm']}")
-    lines = [x for x in lines if x is not None]
-
-    return (snapshot, lines), None
+    args.extend(extra_server_args)
+    return args
 
 
-def run_small_mmlu(base_url: str, model: str, num_examples: int, num_threads: int):
+def run_mmlu_sanity(
+    base_url: str,
+    model: str,
+    num_examples: int = 32,
+    num_threads: int = 4,
+) -> float:
+    """Run a small MMLU eval and return the score."""
     from sglang.test.run_eval import run_eval_once
     from sglang.test.simple_eval_mmlu import MMLUEval
 
@@ -162,20 +125,26 @@ def run_small_mmlu(base_url: str, model: str, num_examples: int, num_threads: in
 
     filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
     eval_obj = MMLUEval(filename, num_examples, num_threads)
-    args = SimpleNamespace(
-        base_url=base_url,
-        model=model,
-    )
+    args = SimpleNamespace(base_url=base_url, model=model)
     base_url_v1 = f"{base_url}/v1"
-    result, latency, sampler = run_eval_once(args, base_url_v1, eval_obj)
-    return {"score": result.score, "latency": latency, **result.metrics}
+    result, _latency, _sampler = run_eval_once(args, base_url_v1, eval_obj)
+    return float(result.score)
 
 
-def run_small_bench_serving(base_url: str, num_prompts: int, max_concurrency: int):
+def run_bench_serving(
+    base_url: str,
+    num_prompts: int,
+    max_concurrency: int,
+    random_input_len: int = 1024,
+    random_output_len: int = 1024,
+    random_range_ratio: float = 1.0,
+) -> dict[str, Any]:
+    """Run bench_serving and return the parsed JSON result."""
     with tempfile.NamedTemporaryFile(
-        prefix="moe_backend_bench_", suffix=".jsonl", delete=False
+        prefix="moe_sweep_", suffix=".jsonl", delete=False
     ) as tf:
         output_file = tf.name
+
     cmd = [
         sys.executable,
         "-m",
@@ -189,11 +158,11 @@ def run_small_bench_serving(base_url: str, num_prompts: int, max_concurrency: in
         "--num-prompts",
         str(num_prompts),
         "--random-input-len",
-        "128",
+        str(random_input_len),
         "--random-output-len",
-        "64",
+        str(random_output_len),
         "--random-range-ratio",
-        "0.0",
+        str(random_range_ratio),
         "--max-concurrency",
         str(max_concurrency),
         "--disable-tqdm",
@@ -202,7 +171,7 @@ def run_small_bench_serving(base_url: str, num_prompts: int, max_concurrency: in
     ]
     try:
         subprocess.run(cmd, check=True)
-        with open(output_file, "r") as f:
+        with open(output_file) as f:
             lines = [line.strip() for line in f if line.strip()]
         if not lines:
             raise RuntimeError("bench_serving produced no JSON output")
@@ -214,272 +183,299 @@ def run_small_bench_serving(base_url: str, num_prompts: int, max_concurrency: in
             pass
 
 
-def get_backend_args(
-    backend: str,
-    tp_size: int,
-    ep_size: int,
-    mem_fraction_static: float,
-    attention_backend: str,
-    sampling_backend: str,
-    fp4_gemm_backend: str,
-    watchdog_timeout: int | None,
-    soft_watchdog_timeout: int | None,
-    cutedsl_safe_launch: bool,
-    cutedsl_enable_server_warmup: bool,
-    cutedsl_enable_overlap_schedule: bool,
-    cutedsl_enable_custom_all_reduce: bool,
-    cutedsl_enable_radix_cache: bool,
-):
-    args = [
-        "--trust-remote-code",
-        "--tp-size",
-        str(tp_size),
-        "--ep-size",
-        str(ep_size),
-        "--mem-fraction-static",
-        str(mem_fraction_static),
-        "--moe-runner-backend",
-        backend,
-        "--quantization",
-        "modelopt_fp4",
-        "--attention-backend",
-        attention_backend,
-        "--sampling-backend",
-        sampling_backend,
-        "--fp4-gemm-backend",
-        fp4_gemm_backend,
-        "--disable-cuda-graph",
-    ]
-    if backend == "flashinfer_cutedsl":
-        args += ["--moe-a2a-backend", "none"]
-        if cutedsl_safe_launch:
-            if not cutedsl_enable_server_warmup:
-                args += ["--skip-server-warmup"]
-            if not cutedsl_enable_overlap_schedule:
-                args += ["--disable-overlap-schedule"]
-            if not cutedsl_enable_custom_all_reduce:
-                args += ["--disable-custom-all-reduce"]
-            if not cutedsl_enable_radix_cache:
-                args += ["--disable-radix-cache"]
-    if watchdog_timeout is not None:
-        args += ["--watchdog-timeout", str(watchdog_timeout)]
-    if soft_watchdog_timeout is not None:
-        args += ["--soft-watchdog-timeout", str(soft_watchdog_timeout)]
-    return args
+def _print_header(title: str) -> None:
+    print(f"\n{'=' * 90}")
+    print(title)
+    print("=" * 90)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark small MoE quality + throughput across backends."
+        description="MoE backend concurrency sweep benchmark.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--model", required=True, help="Model path/name.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model path/name.")
     parser.add_argument(
         "--base-url",
         default="http://127.0.0.1:30000",
-        help="Server URL for eval/bench.",
+        help="Server URL.",
     )
     parser.add_argument(
         "--backends",
         nargs="+",
-        default=[
-            "flashinfer_cutlass",
-            "flashinfer_trtllm",
-            "flashinfer_cutedsl",
-        ],
+        default=DEFAULT_BACKENDS,
         help="MoE runner backends to compare.",
     )
     parser.add_argument(
-        "--tp-size", type=int, default=1, help="Tensor-parallel size for server launch."
+        "--ep-sizes",
+        nargs="+",
+        type=int,
+        default=DEFAULT_EP_SIZES,
+        help="Expert-parallel sizes to sweep.",
     )
     parser.add_argument(
-        "--ep-size", type=int, default=1, help="Expert-parallel size for server launch."
+        "--tp-size",
+        type=int,
+        default=DEFAULT_TP_SIZE,
+        help="Tensor-parallel size (constant across all runs).",
     )
     parser.add_argument(
-        "--mem-fraction-static",
+        "--concurrency",
+        nargs="+",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help="Max-concurrency values to sweep.",
+    )
+    parser.add_argument(
+        "--random-input-len",
+        type=int,
+        default=1024,
+        help="Input token length for bench_serving.",
+    )
+    parser.add_argument(
+        "--random-output-len",
+        type=int,
+        default=1024,
+        help="Output token length for bench_serving.",
+    )
+    parser.add_argument(
+        "--random-range-ratio",
         type=float,
-        default=0.7,
-        help="Static memory fraction for server launch.",
+        default=1.0,
+        help="Random range ratio for bench_serving.",
     )
     parser.add_argument(
-        "--attention-backend",
-        type=str,
-        default="triton",
-        help="Attention backend for server launch.",
+        "--mmlu-examples",
+        type=int,
+        default=32,
+        help="Number of MMLU examples for sanity check per server launch.",
     )
     parser.add_argument(
-        "--sampling-backend",
-        type=str,
-        default="pytorch",
-        help="Sampling backend for server launch.",
-    )
-    parser.add_argument(
-        "--fp4-gemm-backend",
-        type=str,
-        default="auto",
-        help="FP4 GEMM backend for server launch.",
+        "--mmlu-threads",
+        type=int,
+        default=4,
+        help="Threads for MMLU eval.",
     )
     parser.add_argument(
         "--launch-timeout",
         type=int,
-        default=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        default=max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1200),
         help="Server launch timeout (seconds).",
     )
     parser.add_argument(
-        "--watchdog-timeout",
-        type=int,
-        default=1800,
-        help="Scheduler hard watchdog timeout (seconds) for launched servers.",
+        "--output-dir",
+        default="bench_moe_sweep_results",
+        help="Directory for output CSV / JSONL.",
     )
     parser.add_argument(
-        "--soft-watchdog-timeout",
-        type=int,
-        default=1800,
-        help="Scheduler soft watchdog timeout (seconds) for launched servers.",
-    )
-    parser.add_argument(
-        "--cutedsl-safe-launch",
-        action="store_true",
-        help=(
-            "Use conservative stability flags for flashinfer_cutedsl "
-            "(skip warmup, disable overlap/custom-all-reduce/radix cache)."
-        ),
-    )
-    parser.add_argument(
-        "--cutedsl-enable-server-warmup",
-        action="store_true",
-        help="With --cutedsl-safe-launch, re-enable server warmup.",
-    )
-    parser.add_argument(
-        "--cutedsl-enable-overlap-schedule",
-        action="store_true",
-        help="With --cutedsl-safe-launch, re-enable overlap schedule.",
-    )
-    parser.add_argument(
-        "--cutedsl-enable-custom-all-reduce",
-        action="store_true",
-        help="With --cutedsl-safe-launch, re-enable custom all-reduce.",
-    )
-    parser.add_argument(
-        "--cutedsl-enable-radix-cache",
-        action="store_true",
-        help="With --cutedsl-safe-launch, re-enable radix cache.",
-    )
-    parser.add_argument(
-        "--num-examples", type=int, default=32, help="MMLU examples per backend."
-    )
-    parser.add_argument(
-        "--num-threads", type=int, default=4, help="MMLU eval worker count."
-    )
-    parser.add_argument(
-        "--num-prompts", type=int, default=48, help="bench_serving prompt count."
-    )
-    parser.add_argument(
-        "--max-concurrency", type=int, default=8, help="bench_serving max concurrency."
-    )
-    parser.add_argument(
-        "--print-cutedsl-diag-brief",
-        action="store_true",
-        help=(
-            "If enabled, load CUTEDSL_DIAG dump and print compact tensor/value heads "
-            "for quick backend-contract debugging."
-        ),
-    )
-    parser.add_argument(
-        "--cutedsl-diag-path",
-        type=str,
-        default="/tmp/cutedsl_diag_rank0.pt",
-        help="Path to CUTEDSL_DIAG dump file.",
-    )
-    parser.add_argument(
-        "--cutedsl-diag-head-k",
-        type=int,
-        default=4,
-        help="Number of values to print for each tensor head in diag brief.",
+        "--extra-server-args",
+        nargs="*",
+        default=[],
+        help="Additional server args passed to every launch (e.g. --disable-cuda-graph).",
     )
     args = parser.parse_args()
 
-    results = {}
-    for backend in args.backends:
-        print(f"\n=== Running backend: {backend} ===")
-        if backend == "flashinfer_cutedsl" and args.print_cutedsl_diag_brief:
-            # Avoid stale prints when backend run fails before producing a new dump.
-            try:
-                os.remove(args.cutedsl_diag_path)
-            except OSError:
-                pass
-        process = popen_launch_server(
-            model=args.model,
-            base_url=args.base_url,
-            timeout=args.launch_timeout,
-            other_args=get_backend_args(
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = output_dir / f"sweep_{timestamp}.csv"
+    jsonl_path = output_dir / f"sweep_{timestamp}.jsonl"
+
+    concurrency_values = sorted(args.concurrency)
+
+    total_servers = len(args.backends) * len(args.ep_sizes)
+    total_bench_runs = total_servers * len(concurrency_values)
+    _print_header("MoE Backend Concurrency Sweep")
+    print(f"Model            : {args.model}")
+    print(f"Backends         : {args.backends}")
+    print(f"EP sizes         : {args.ep_sizes}")
+    print(f"TP size          : {args.tp_size}")
+    print(f"Concurrency      : {concurrency_values}")
+    print(f"Input/Output len : {args.random_input_len} / {args.random_output_len}")
+    print(f"MMLU examples    : {args.mmlu_examples}")
+    print(f"Server launches  : {total_servers}")
+    print(f"Bench runs       : {total_bench_runs}")
+    print(f"Output           : {csv_path}")
+
+    all_rows: list[dict[str, Any]] = []
+    mmlu_results: dict[tuple[str, int], float] = {}
+    done = 0
+
+    for ep_size in args.ep_sizes:
+        for backend in args.backends:
+            label = f"{backend} (EP={ep_size}, TP={args.tp_size})"
+            _print_header(f"Launching {label}")
+
+            server_args = _build_server_args(
                 backend=backend,
                 tp_size=args.tp_size,
-                ep_size=args.ep_size,
-                mem_fraction_static=args.mem_fraction_static,
-                attention_backend=args.attention_backend,
-                sampling_backend=args.sampling_backend,
-                fp4_gemm_backend=args.fp4_gemm_backend,
-                watchdog_timeout=args.watchdog_timeout,
-                soft_watchdog_timeout=args.soft_watchdog_timeout,
-                cutedsl_safe_launch=args.cutedsl_safe_launch,
-                cutedsl_enable_server_warmup=args.cutedsl_enable_server_warmup,
-                cutedsl_enable_overlap_schedule=args.cutedsl_enable_overlap_schedule,
-                cutedsl_enable_custom_all_reduce=args.cutedsl_enable_custom_all_reduce,
-                cutedsl_enable_radix_cache=args.cutedsl_enable_radix_cache,
-            ),
-            env=dict(os.environ),
-        )
-        try:
-            eval_metrics = run_small_mmlu(
-                args.base_url, args.model, args.num_examples, args.num_threads
+                ep_size=ep_size,
+                extra_server_args=args.extra_server_args,
             )
-            bench_metrics = run_small_bench_serving(
-                args.base_url, args.num_prompts, args.max_concurrency
+            process = popen_launch_server(
+                model=args.model,
+                base_url=args.base_url,
+                timeout=args.launch_timeout,
+                other_args=server_args,
+                env=dict(os.environ),
             )
-            results[backend] = {
-                "mmlu_score": float(eval_metrics["score"]),
-                "output_throughput": float(bench_metrics["output_throughput"]),
-                "mean_tpot_ms": float(bench_metrics["mean_tpot_ms"]),
-                "mean_ttft_ms": float(bench_metrics["mean_ttft_ms"]),
-            }
-            if backend == "flashinfer_cutedsl" and args.print_cutedsl_diag_brief:
-                diag_payload, diag_err = _load_cutedsl_diag_snapshot(
-                    args.cutedsl_diag_path, args.cutedsl_diag_head_k
-                )
-                if diag_err is not None:
-                    print(f"[CUTEDSL_DIAG_BRIEF] {diag_err}")
+
+            try:
+                # -- MMLU sanity check --
+                print(f"\n[MMLU] Running {args.mmlu_examples}-example sanity check ...")
+                try:
+                    score = run_mmlu_sanity(
+                        args.base_url,
+                        args.model,
+                        num_examples=args.mmlu_examples,
+                        num_threads=args.mmlu_threads,
+                    )
+                    mmlu_results[(backend, ep_size)] = score
+                    status = "OK" if score >= 0.5 else "WARNING: low accuracy"
+                    print(f"[MMLU] {label}: score={score:.4f} [{status}]")
+                except Exception as e:
+                    print(f"[MMLU] {label}: FAILED ({e})")
+                    mmlu_results[(backend, ep_size)] = float("nan")
+
+                # -- Warmup --
+                print(f"\n[WARMUP] concurrency=32, 64 prompts (discarded) ...")
+                try:
+                    run_bench_serving(
+                        base_url=args.base_url,
+                        num_prompts=64,
+                        max_concurrency=32,
+                        random_input_len=args.random_input_len,
+                        random_output_len=args.random_output_len,
+                        random_range_ratio=args.random_range_ratio,
+                    )
+                    print("[WARMUP] done")
+                except Exception as e:
+                    print(f"[WARMUP] failed ({e}), continuing anyway")
+
+                # -- Concurrency sweep --
+                for conc in concurrency_values:
+                    num_prompts = _num_prompts_for_concurrency(conc)
+                    done += 1
+                    print(
+                        f"\n[BENCH {done}/{total_bench_runs}] "
+                        f"{label} | concurrency={conc} | num_prompts={num_prompts}"
+                    )
+
+                    try:
+                        result = run_bench_serving(
+                            base_url=args.base_url,
+                            num_prompts=num_prompts,
+                            max_concurrency=conc,
+                            random_input_len=args.random_input_len,
+                            random_output_len=args.random_output_len,
+                            random_range_ratio=args.random_range_ratio,
+                        )
+                        row: dict[str, Any] = {
+                            "backend": backend,
+                            "ep_size": ep_size,
+                            "tp_size": args.tp_size,
+                            "concurrency": conc,
+                            "num_prompts": num_prompts,
+                        }
+                        for key in BENCH_METRIC_KEYS:
+                            row[key] = result.get(key, "")
+                        all_rows.append(row)
+
+                        print(
+                            f"       out_thr={row['output_throughput']:.2f} tok/s, "
+                            f"mean_tpot={row['mean_tpot_ms']:.3f} ms, "
+                            f"mean_ttft={row['mean_ttft_ms']:.2f} ms"
+                        )
+                    except Exception as e:
+                        print(f"       FAILED: {e}")
+                        all_rows.append(
+                            {
+                                "backend": backend,
+                                "ep_size": ep_size,
+                                "tp_size": args.tp_size,
+                                "concurrency": conc,
+                                "num_prompts": num_prompts,
+                                **{k: "" for k in BENCH_METRIC_KEYS},
+                            }
+                        )
+
+            finally:
+                print(f"\n[TEARDOWN] Stopping {label}")
+                kill_process_tree(process.pid)
+
+    # -------------------------------------------------------------------
+    # Write outputs
+    # -------------------------------------------------------------------
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    with jsonl_path.open("w") as f:
+        for row in all_rows:
+            f.write(json.dumps(row) + "\n")
+
+    # -------------------------------------------------------------------
+    # Console summary
+    # -------------------------------------------------------------------
+
+    _print_header("MMLU Sanity Check")
+    print(f"{'backend':28s} {'ep':>4s} {'mmlu_score':>12s}")
+    print("-" * 48)
+    for (backend, ep_size), score in sorted(mmlu_results.items()):
+        print(f"{backend:28s} {ep_size:4d} {score:12.4f}")
+
+    for ep_size in args.ep_sizes:
+        _print_header(f"Throughput Sweep: EP={ep_size}, TP={args.tp_size}")
+
+        # Build pivot: concurrency -> backend -> metrics
+        pivot: dict[int, dict[str, dict[str, Any]]] = {}
+        for row in all_rows:
+            if row["ep_size"] != ep_size:
+                continue
+            conc = row["concurrency"]
+            bk = row["backend"]
+            pivot.setdefault(conc, {})[bk] = row
+
+        backends_present = [
+            b for b in args.backends if any(b in v for v in pivot.values())
+        ]
+        if not backends_present:
+            print("(no data)")
+            continue
+
+        # Header
+        hdr_parts = [f"{'conc':>6s}", f"{'n_prompts':>10s}"]
+        for bk in backends_present:
+            short = bk.replace("flashinfer_", "")
+            hdr_parts.append(f"{short + '_thr':>14s}")
+            hdr_parts.append(f"{short + '_tpot':>12s}")
+        header = " | ".join(hdr_parts)
+        print(header)
+        print("-" * len(header))
+
+        for conc in concurrency_values:
+            if conc not in pivot:
+                continue
+            parts = [f"{conc:6d}", f"{_num_prompts_for_concurrency(conc):10d}"]
+            for bk in backends_present:
+                data = pivot[conc].get(bk)
+                if data and data.get("output_throughput") != "":
+                    parts.append(f"{float(data['output_throughput']):14.2f}")
+                    parts.append(f"{float(data['mean_tpot_ms']):12.3f}")
                 else:
-                    diag_snapshot, diag_lines = diag_payload
-                    results[backend]["cutedsl_diag_brief"] = diag_snapshot
-                    print("\n".join(diag_lines))
-        finally:
-            kill_process_tree(process.pid)
+                    parts.append(f"{'FAIL':>14s}")
+                    parts.append(f"{'FAIL':>12s}")
+            print(" | ".join(parts))
 
-    print("\n=== Summary ===")
-    print(
-        f"{'backend':24s} {'mmlu':>8s} {'out_thr(tok/s)':>16s} {'mean_tpot(ms)':>14s} {'mean_ttft(ms)':>14s}"
-    )
-    for backend, metric in results.items():
-        print(
-            f"{backend:24s} {metric['mmlu_score']:8.4f} {metric['output_throughput']:16.2f} "
-            f"{metric['mean_tpot_ms']:14.3f} {metric['mean_ttft_ms']:14.3f}"
-        )
-
-    if "flashinfer_cutedsl" in results and "flashinfer_cutlass" in results:
-        delta = abs(
-            results["flashinfer_cutedsl"]["mmlu_score"]
-            - results["flashinfer_cutlass"]["mmlu_score"]
-        )
-        print(f"\ncutedsl vs cutlass MMLU delta: {delta:.4f}")
-    if "flashinfer_cutedsl" in results and "flashinfer_trtllm" in results:
-        delta = abs(
-            results["flashinfer_cutedsl"]["mmlu_score"]
-            - results["flashinfer_trtllm"]["mmlu_score"]
-        )
-        print(f"cutedsl vs trtllm MMLU delta: {delta:.4f}")
-
-    print("\nJSON results:")
-    print(json.dumps(results, indent=2))
+    print(f"\nResults written to: {csv_path}")
+    print(f"Raw JSONL:          {jsonl_path}")
 
 
 if __name__ == "__main__":
