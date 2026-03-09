@@ -347,6 +347,60 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         self.assertEqual(found_name, "get_weather")
 
+    def test_specific_function_multi_call_no_stall(self):
+        """Regression test for https://github.com/sgl-project/sglang/issues/17998
+
+        When tool_choice specifies a function and the prompt implies multiple
+        calls, the model must produce at least one tool call instead of
+        stalling on whitespace (which happened when maxItems: 1 was set).
+        """
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+        messages = [
+            {
+                "role": "user",
+                "content": "What is the weather in NYC, LA, and Chicago?",
+            }
+        ]
+        tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=300,
+            temperature=0.1,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=False,
+        )
+
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsNotNone(
+            tool_calls, "Expected tool calls but got None (model may have stalled)"
+        )
+        self.assertGreaterEqual(len(tool_calls), 1)
+        for tc in tool_calls:
+            self.assertEqual(tc.function.name, "get_weather")
+            args = json.loads(tc.function.arguments)
+            self.assertIn("city", args)
+
     def test_required_streaming_arguments_chunks_json(self):
         """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
         tools = self.get_test_tools()
@@ -914,15 +968,6 @@ class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
-
-    @unittest.skip("maxItems:1 bug causes whitespace stall")
-    def test_tool_choice_required_non_streaming(self):
-        pass
-
-    @unittest.skip("maxItems:1 bug causes whitespace stall")
-    def test_tool_choice_specific_function_non_streaming(self):
-        pass
-
 
 if __name__ == "__main__":
     unittest.main()
