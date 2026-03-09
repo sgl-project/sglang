@@ -143,7 +143,7 @@ class SWAKVPool(KVCache):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def set_kv_buffer(
         self,
@@ -279,10 +279,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             [
                 torch.zeros(
                     size + self.page_size,
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                     device=device,
                 ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int32, device=device),
             ]
         )
 

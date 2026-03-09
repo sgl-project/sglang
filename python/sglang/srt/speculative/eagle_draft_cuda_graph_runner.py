@@ -168,7 +168,7 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:

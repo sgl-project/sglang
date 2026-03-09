@@ -131,11 +131,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, self.size + 1, dtype=torch.int32, device=self.device
         )
         self.is_not_in_free_group = True
         self.free_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self.release_pages = torch.empty((0,), dtype=torch.int32, device=self.device)
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -421,7 +421,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int64, device=self.device
+            (extend_num_tokens,), dtype=torch.int32, device=self.device
         )
 
         alloc_extend_kernel[(bs,)](
@@ -463,7 +463,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        out_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
@@ -506,11 +506,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
-            1, self.num_pages + 1, dtype=torch.int64, device=self.device
+            1, self.num_pages + 1, dtype=torch.int32, device=self.device
         )
         self.is_not_in_free_group = True
         self.free_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self.release_pages = torch.empty((0,), dtype=torch.int32, device=self.device)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

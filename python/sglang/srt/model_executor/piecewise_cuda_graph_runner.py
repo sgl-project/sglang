@@ -57,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +211,7 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -407,7 +407,7 @@ class PiecewiseCudaGraphRunner:
             )
 
     def _cache_loc_dtype(self):
-        return torch.int64 if not is_npu() else torch.int32
+        return torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings

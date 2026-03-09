@@ -247,7 +247,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return torch.int32
 
     def _capture_init(self, run_once_fn):
         for _ in range(2):

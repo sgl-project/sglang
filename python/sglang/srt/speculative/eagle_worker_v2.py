@@ -931,11 +931,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         tgt_cache_loc = torch.zeros(
             size,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=self.device,
         )
         accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
+            size, dtype=torch.int32, device=self.device
         )
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,

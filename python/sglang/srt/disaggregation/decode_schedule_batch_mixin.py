@@ -35,7 +35,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Pre-calculate total size
         total_size = sum(req.extend_input_len for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
+        out_cache_loc = torch.empty(total_size, dtype=torch.int32, device=self.device)
 
         # Fill the tensor in one pass
         offset = 0

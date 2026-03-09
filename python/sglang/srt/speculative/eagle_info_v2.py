@@ -154,7 +154,7 @@ class EagleDraftInputV2Mixin:
             # Assign cache locations
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=batch.input_ids.device,
             )
             # FIXME(lsyin): align with the default code path
@@ -470,7 +470,7 @@ def assign_extend_cache_locs_func(
     if _is_cuda or _is_hip:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         assign_extend_cache_locs[(batch_size,)](

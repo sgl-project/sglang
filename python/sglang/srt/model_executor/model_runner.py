@@ -1915,7 +1915,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             seq_len_fill_value=seq_len_fill_value,
             encoder_len_fill_value=0,
             num_tokens_per_bs=num_tokens_per_bs,
-            cache_loc_dtype=torch.int64,
+            cache_loc_dtype=torch.int32,
             enable_mamba_track=False,
         )
         buffers.num_token_non_padded[...] = num_tokens

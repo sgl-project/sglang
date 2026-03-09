@@ -653,10 +653,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 (self.offsets[-1],), dtype=torch.int64
             )
             self.cuda_graph_buffers["out_cache_loc"] = torch.ones(
-                (self.offsets[-1],), dtype=torch.int64
+                (self.offsets[-1],), dtype=torch.int32
             )
             self.cuda_graph_buffers["swa_out_cache_loc"] = torch.ones(
-                (self.offsets[-1],), dtype=torch.int64
+                (self.offsets[-1],), dtype=torch.int32
             )
             self.cuda_graph_buffers["positions"] = torch.zeros(
                 (self.offsets[-1],), dtype=torch.int64

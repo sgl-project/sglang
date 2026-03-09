@@ -1221,7 +1221,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens: torch.Tensor = None  # shape: [b], int64
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
-    out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    out_cache_loc: torch.Tensor = None  # shape: [b], int32
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -1420,14 +1420,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         if not decoder_out_cache_loc:
-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+            self.out_cache_loc = torch.zeros(0, dtype=torch.int32).to(
                 self.device, non_blocking=True
             )
         else:
             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
 
         if not encoder_out_cache_loc:
-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int32).to(
                 self.device, non_blocking=True
             )
         else:
@@ -1931,7 +1931,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0

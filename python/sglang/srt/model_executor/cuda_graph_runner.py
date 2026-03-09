@@ -610,7 +610,7 @@ class CudaGraphRunner:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
