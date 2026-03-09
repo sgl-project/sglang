@@ -444,7 +444,7 @@ class Envs:
     SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Mamba
-    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr(None)
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
 
     # Release & Resume Memory

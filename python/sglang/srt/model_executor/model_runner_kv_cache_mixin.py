@@ -64,6 +64,28 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+
+def _override_cache_dtype_if_needed(cache_params, model_dtype):
+    """Override mamba cache conv dtype to match model serving dtype.
+
+    This fixes the dtype mismatch when --dtype float16 but the model config
+    says bfloat16. The conv_states must match the serving dtype because
+    causal_conv1d_update requires matching scalar types.
+    """
+    if cache_params.dtype.conv != model_dtype:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"Overriding mamba conv cache dtype from {cache_params.dtype.conv} "
+            f"to {model_dtype} to match serving dtype"
+        )
+        # Create new cache params with overridden dtype
+        from dataclasses import replace
+        from sglang.srt.configs.mamba_utils import Mamba2StateDType
+        new_dtype = Mamba2StateDType(conv=model_dtype, temporal=cache_params.dtype.temporal)
+        cache_params = replace(cache_params, dtype=new_dtype)
+    return cache_params
+
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
@@ -396,7 +418,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
+                        cache_params=_override_cache_dtype_if_needed(config.mamba2_cache_params, self.model_config.dtype),
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -421,7 +443,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
+                    cache_params=_override_cache_dtype_if_needed(config.mamba2_cache_params, self.model_config.dtype),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
