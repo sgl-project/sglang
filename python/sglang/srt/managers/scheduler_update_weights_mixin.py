@@ -125,7 +125,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self._is_no_request()
+            not self.has_requests_being_processed()
         ), "release_memory_occupation should be called only when no ongoing request."
 
         tags = recv_req.tags

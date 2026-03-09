@@ -1486,37 +1486,53 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def has_requests_being_processed(
-        self, exclude_compiling_grammars: bool = False
+        self,
+        include_batch_state: bool = True,
+        exclude_compiling_grammars: bool = False,
     ) -> bool:
-        has_running_reqs = (
+        """Check if any requests are active in the scheduler.
+
+        Args:
+            include_batch_state: When True, also check batch execution state
+                (last_batch, cur_batch, overlap result_queue, pp running_mbs).
+                Use True for strict idle checks (hicache ops, flush).
+                Use False for health check skip (only pre-queue blockers).
+            exclude_compiling_grammars: When True, skip grammar queue check.
+        """
+        being_processed = (
             self.chunked_req is not None
             or self.dllm_manager.any_staging_reqs()
             or not self.running_batch.is_empty()
             or len(self.offload_tags) > 0
-            or (self.last_batch is not None and not self.last_batch.is_empty())
-            or (self.cur_batch is not None and not self.cur_batch.is_empty())
-            or (self.enable_overlap and len(self.result_queue) > 0)
-            or (self.pp_size > 1 and any(not x.is_empty() for x in self.running_mbs))
         )
 
-        has_waiting_reqs = len(self.waiting_queue) > 0
+        being_processed |= len(self.waiting_queue) > 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            has_waiting_reqs |= (
+            being_processed |= (
                 len(self.disagg_prefill_bootstrap_queue.queue) > 0
-                or len(self.disagg_prefill_inflight_queue)
-                > 0  # NOTE: actually, this is not a waiting queue, but a post-processing queue
+                or len(self.disagg_prefill_inflight_queue) > 0
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            has_waiting_reqs |= (
+            being_processed |= (
                 len(self.disagg_decode_prealloc_queue.queue) > 0
                 or len(self.disagg_decode_transfer_queue.queue) > 0
             )
 
-        if not exclude_compiling_grammars:
-            has_waiting_reqs |= len(self.grammar_manager.grammar_queue) > 0
+        if include_batch_state:
+            being_processed |= (
+                (self.last_batch is not None and not self.last_batch.is_empty())
+                or (self.cur_batch is not None and not self.cur_batch.is_empty())
+                or (self.enable_overlap and len(self.result_queue) > 0)
+                or (
+                    self.pp_size > 1 and any(not x.is_empty() for x in self.running_mbs)
+                )
+            )
 
-        return has_running_reqs or has_waiting_reqs
+        if not exclude_compiling_grammars:
+            being_processed |= len(self.grammar_manager.grammar_queue) > 0
+
+        return being_processed
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
@@ -1525,7 +1541,9 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(
                 recv_req
-            ) and self.has_requests_being_processed(exclude_compiling_grammars=True):
+            ) and self.has_requests_being_processed(
+                include_batch_state=False, exclude_compiling_grammars=True
+            ):
                 self.return_health_check_ct += 1
                 continue
 
@@ -2778,26 +2796,6 @@ class Scheduler(
             nodes_pinned=nodes_pinned,
             message=msg,
         )
-
-    def _is_no_request(self):
-        no_request = (
-            self.running_batch.is_empty()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (self.cur_batch is None or self.cur_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-        )
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            no_request &= (
-                len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                and len(self.disagg_prefill_inflight_queue) == 0
-            )
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            no_request &= (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
-                and len(self.disagg_decode_transfer_queue.queue) == 0
-            )
-        return no_request
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
