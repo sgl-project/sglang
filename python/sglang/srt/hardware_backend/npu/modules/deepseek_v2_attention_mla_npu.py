@@ -4,21 +4,24 @@ from typing import TYPE_CHECKING
 import torch
 import torch_npu
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
 # region MHA
@@ -28,6 +31,7 @@ def forward_mha_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     if m.q_lora_rank is not None:
         q, latent_cache = (
@@ -55,6 +59,13 @@ def forward_mha_prepare_npu(
 
         else:
             q = m.q_a_layernorm(q)
+            if (
+                _use_ag_after_qlora
+                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            ):
+                q = scattered_to_tp_attn_full(q, forward_batch)
+                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
     else:
@@ -142,6 +153,7 @@ def forward_mla_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
@@ -184,6 +196,13 @@ def forward_mla_prepare_npu(
             k_nope = latent_cache[..., : m.kv_lora_rank]
 
             q = m.q_a_layernorm(q)
+            if (
+                _use_ag_after_qlora
+                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            ):
+                q = scattered_to_tp_attn_full(q, forward_batch)
+                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             k_nope = m.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
@@ -285,6 +304,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
@@ -313,7 +333,13 @@ def forward_dsa_prepare_npu(
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
-
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            q = scattered_to_tp_attn_full(q, forward_batch)
+            latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
         q_lora = q.clone()  # required for topk_indices
 
         q_event = None
@@ -353,7 +379,13 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id, dynamic_scale
+        hidden_states,
+        q_lora,
+        positions,
+        forward_batch,
+        m.layer_id,
+        layer_scatter_modes,
+        dynamic_scale,
     )
 
     return (

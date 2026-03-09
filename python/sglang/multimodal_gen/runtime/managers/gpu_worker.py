@@ -43,7 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -255,18 +255,23 @@ class GPUWorker:
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only and self.rank == 0:
-                output_paths = save_outputs(
-                    output_batch.output,
-                    req.data_type,
-                    req.fps,
-                    True,
-                    lambda idx: req.output_file_path(len(output_batch.output), idx),
-                    audio=output_batch.audio,
-                    audio_sample_rate=output_batch.audio_sample_rate,
-                    output_compression=req.output_compression,
-                )
-                output_batch.output_file_paths = output_paths
-                output_batch.output = None
+                if output_batch.output is not None:
+                    output_paths = save_outputs(
+                        output_batch.output,
+                        req.data_type,
+                        req.fps,
+                        True,
+                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        audio=output_batch.audio,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        output_compression=req.output_compression,
+                        enable_frame_interpolation=req.enable_frame_interpolation,
+                        frame_interpolation_exp=req.frame_interpolation_exp,
+                        frame_interpolation_scale=req.frame_interpolation_scale,
+                        frame_interpolation_model_path=req.frame_interpolation_model_path,
+                    )
+                    output_batch.output_file_paths = output_paths
+                    output_batch.output = None
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -469,6 +474,8 @@ def run_scheduler_process(
     globally_suppress_loggers()
     if current_platform.is_cuda():
         set_cuda_arch()
+    elif current_platform.is_musa():
+        set_musa_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 

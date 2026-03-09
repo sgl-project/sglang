@@ -9,6 +9,7 @@ or
 import json
 import unittest
 import uuid
+from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -704,6 +705,83 @@ class ServingChatTestCase(unittest.TestCase):
             mock_hf_config.architectures = ["LlamaForCausalLM"]
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
             self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+
+    def test_streaming_abort_yields_error(self):
+        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+            max_tokens=100,
+            stream=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            # Create a mock conversation object
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                try:
+                    async for chunk in self.chat._generate_chat_stream(
+                        adapted_request, req, self.fastapi_request
+                    ):
+                        chunks.append(chunk)
+                except Exception as e:
+                    print(f"Error during stream iteration: {e}")
+                return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        error_chunk_data = None
+        for c in chunks:
+            if "error" in c:
+                error_chunk_data = json.loads(c[len("data: ") :])
+                break
+        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+
+        # Ensure the stream stops after the abort error
+        # The last chunk should be "data: [DONE]\n\n"
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+        # Check that there is an error chunk and a DONE chunk
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("error", chunks[0])
 
 
 if __name__ == "__main__":

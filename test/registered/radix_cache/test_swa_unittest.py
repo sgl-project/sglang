@@ -22,6 +22,74 @@ register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestSWA(unittest.TestCase):
+    class _DummyReq:
+        def __init__(self):
+            self._kv_committed_len = 0
+
+        def pop_committed_kv_cache(self):
+            return self._kv_committed_len
+
+    def _build_swa_tree(
+        self,
+        is_eagle: bool,
+        page_size: int = 1,
+        req_size: int = 8,
+        max_context_len: int = 64,
+        kv_size: int = 64,
+        kv_size_swa: int = 32,
+        sliding_window_size: int = 4,
+    ):
+        head_num = 8
+        head_dim = 128
+        num_layers = 24
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = get_device()
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+
+        req_to_token_pool = ReqToTokenPool(
+            size=req_size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+        )
+        kv_pool = SWAKVPool(
+            size=kv_size,
+            size_swa=kv_size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=kv_size,
+            size_swa=kv_size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        tree = SWARadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                disable=False,
+                is_eagle=is_eagle,
+                sliding_window_size=sliding_window_size,
+            ),
+        )
+        return tree, allocator, req_to_token_pool
+
     @classmethod
     def setUpClass(cls):
         pass
@@ -412,6 +480,77 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(last_node.key), 2)
         self.assertEqual(last_node.key.token_ids[0], (5, 60))
         self.assertEqual(last_node.key.token_ids[1], (60, 70))
+
+    def test_swa_cache_finished_req_eagle_uses_cache_protected_len_and_bigram_key(self):
+        tree, allocator, req_to_token_pool = self._build_swa_tree(is_eagle=True)
+
+        # Case 1: is_insert=True should pass bigram key and use cache_protected_len.
+        req = self._DummyReq()
+        req.req_pool_idx = 0
+        req.origin_input_ids = [1, 2, 3, 4, 5, 6]
+        req.output_ids = []
+        req._kv_committed_len = len(req.origin_input_ids)
+        kv_indices = allocator.alloc(req._kv_committed_len)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
+        )
+        req.extra_key = None
+        req.last_node = tree.root_node
+        req.swa_uuid_for_lock = None
+        req.swa_evicted_seqlen = 0
+        req.cache_protected_len = 1
+        # Intentionally mismatch to ensure code does not use len(prefix_indices).
+        req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
+
+        captured = {}
+        original_insert = tree.insert
+
+        def wrapped_insert(params):
+            captured["prev_prefix_len"] = params.prev_prefix_len
+            captured["is_bigram"] = params.key.is_bigram
+            captured["key_len"] = len(params.key)
+            return original_insert(params)
+
+        tree.insert = wrapped_insert
+        tree.cache_finished_req(req, is_insert=True)
+
+        self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
+        self.assertTrue(captured["is_bigram"])
+        self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
+
+        # Case 2: is_insert=False should free [cache_protected_len:page_aligned_len]
+        # even when len(prefix_indices) is intentionally larger.
+        req2 = self._DummyReq()
+        req2.req_pool_idx = 1
+        req2.origin_input_ids = [11, 12, 13, 14, 15, 16]
+        req2.output_ids = []
+        req2._kv_committed_len = len(req2.origin_input_ids)
+        kv_indices2 = allocator.alloc(req2._kv_committed_len)
+        req_to_token_pool.write(
+            (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
+        )
+        req2.extra_key = None
+        req2.last_node = tree.root_node
+        req2.swa_uuid_for_lock = None
+        req2.swa_evicted_seqlen = 0
+        req2.cache_protected_len = 1
+        req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
+
+        freed_lens = []
+        original_free = allocator.free
+
+        def wrapped_free(indices):
+            freed_lens.append(int(indices.numel()))
+            return original_free(indices)
+
+        allocator.free = wrapped_free
+        tree.cache_finished_req(req2, is_insert=False)
+
+        # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
+        # Expected frees:
+        #   overlap range [1:5] -> 4
+        #   tail range [5:]     -> 1
+        self.assertEqual(freed_lens, [4, 1])
 
 
 if __name__ == "__main__":
