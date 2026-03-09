@@ -1500,7 +1500,7 @@ class Scheduler(
                 need to know if active processing or queued requests guarantee
                 a future process_batch_result() call that will drain the
                 pending health check signal.
-            exclude_compiling_grammars: When True, skip grammar queue check.
+            include_compiling_grammars: When True, also check grammar queue.
         """
         being_processed = (
             self.chunked_req is not None
