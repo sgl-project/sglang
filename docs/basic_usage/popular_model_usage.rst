@@ -1,19 +1,28 @@
-Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, MiniMax, Qwen, and more)
-===============================================================
+Popular Model Usage
+===================
 
-For more usage examples and recipes, visit the `SGLang Cookbook <https://cookbook.sglang.io/>`_.
+.. note::
+   The model-specific documentation has been moved to the `SGLang Cookbook <https://cookbook.sglang.io/>`_ for better organization and more comprehensive examples.
 
-.. toctree::
-   :maxdepth: 1
+   Please visit the cookbook for detailed guides on:
 
-   deepseek_v3.md
-   deepseek_v32.md
-   glm45.md
-   glmv.md
-   gpt_oss.md
-   minimax_m2.md
-   qwen3.md
-   qwen3_5.md
-   qwen3_vl.md
-   deepseek_ocr.md
-   llama4.md
+   - `DeepSeek models <https://cookbook.sglang.io/docs/category/deepseek>`_
+   - `Qwen models <https://cookbook.sglang.io/docs/category/qwen>`_
+   - `GLM models <https://cookbook.sglang.io/docs/category/zhipuai>`_
+   - `Llama models <https://cookbook.sglang.io/docs/category/meta>`_
+   - `MiniMax models <https://cookbook.sglang.io/docs/category/minimax>`_
+   - And many more...
+
+   The cookbook provides:
+
+   - Step-by-step deployment instructions
+   - Hardware-specific configurations
+   - Benchmark results
+   - Advanced usage examples (reasoning, tool calling, etc.)
+
+Quick Links
+-----------
+
+- `SGLang Cookbook Homepage <https://cookbook.sglang.io/>`_
+- `Autoregressive Models <https://cookbook.sglang.io/docs/category/autoregressive>`_
+- `Diffusion Models <https://cookbook.sglang.io/docs/category/diffusion>`_
