@@ -35,11 +35,12 @@ The control path is:
 
 ## 2. Idle-state requirement (strict)
 
-The Scheduler uses a stricter `_is_idle_for_hicache_storage_op()`:
+The Scheduler uses `has_requests_being_processed()` (with default `include_batch_state=True`) to enforce a strict idle check before attach/detach. This single method covers all active states:
 
-- `_is_no_request()` is true (covers running/overlap/pp/disagg and other active states)
-- `waiting_queue` is empty
-- `grammar_queue` is empty (if the grammar backend is enabled)
+- Running requests: `chunked_req`, `dllm_manager`, `running_batch`, `offload_tags`
+- Batch execution state: `last_batch`, `cur_batch`, overlap `result_queue`, pp `running_mbs`
+- Waiting queues: `waiting_queue`, disagg bootstrap/prealloc/transfer/inflight queues
+- `grammar_queue` (if the grammar backend is enabled)
 
 If the condition is not met, attach/detach returns an error like:
 
