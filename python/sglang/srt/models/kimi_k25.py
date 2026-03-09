@@ -26,6 +26,7 @@ except ImportError:
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -39,7 +40,6 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
@@ -122,16 +122,11 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
 
-        if isinstance(quant_config, ModelSlimConfig):
-            self.quant_config = quant_config
-        else:
-            self.quant_config = None
-
         self.mlp = MLP2(
             [hidden_dim, mlp_dim, hidden_dim],
             activation,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
         self.attn = VisionAttention(
@@ -443,6 +438,7 @@ class MoonViT3dEncoder(nn.Module):
         block_cfg: dict,
         video_attn_type: str = "spatial_temporal",
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -458,7 +454,7 @@ class MoonViT3dEncoder(nn.Module):
                 MoonViTEncoderLayer(
                     **block_cfg,
                     quant_config=quant_config,
-                    prefix=f"vision_tower.encoder.blocks.{layer_idx}",
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -501,11 +497,12 @@ class MoonViT3dPretrainedModel(nn.Module):
     _supports_sdpa = True
 
     def __init__(
-        self, 
-        config, 
-        *inputs, 
-        use_data_parallel: bool = False, 
-        quant_config: Optional[QuantizationConfig] = None, 
+        self,
+        config,
+        *inputs,
+        use_data_parallel: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
         **kwargs,
     ):
         super().__init__()
@@ -537,6 +534,7 @@ class MoonViT3dPretrainedModel(nn.Module):
             },
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
         )
 
     @property
@@ -699,12 +697,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config, use_data_parallel=self.use_data_parallel, quant_config=quant_config
+            config.vision_config,
+            use_data_parallel=self.use_data_parallel,
+            quant_config=quant_config if isinstance(quant_config, ModelSlimConfig) else None,
+            prefix="vision_tower",
         )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
-        self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config, prefix="language_model")
+        self.language_model = DeepseekV3ForCausalLM(
+            config.text_config,
+            quant_config,
+            prefix="language_model" if isinstance(quant_config, ModelSlimConfig) else "",
+        )
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
