@@ -969,5 +969,6 @@ class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
+
 if __name__ == "__main__":
     unittest.main()
