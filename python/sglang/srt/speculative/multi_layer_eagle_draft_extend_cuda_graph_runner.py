@@ -669,7 +669,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 dtype=torch.int32,
             )
             self.cuda_graph_buffers["req_pool_indices"] = torch.zeros(
-                (self.max_bs,), dtype=torch.int32
+                (self.max_bs,), dtype=torch.int64
             )
             self.cuda_graph_buffers["accept_length"] = torch.full(
                 (self.max_bs,), 1, dtype=torch.int32

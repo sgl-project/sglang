@@ -276,6 +276,7 @@ class Envs:
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
@@ -422,6 +423,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
+    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -482,6 +485,7 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)

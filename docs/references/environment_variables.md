@@ -75,6 +75,8 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
+| `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
+| `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
@@ -164,6 +166,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
 | `SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE` | Use SGLang's custom Triton kernel cache implementation for lower overheads (automatically enabled on CUDA) | `false` |
+| `SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE` | Decode-side incremental KV cache offload stride. Rounded down to a multiple of `--page-size` (min is `--page-size`). If unset/invalid/<=0, it falls back to `--page-size`. | Not set (uses `--page-size`) |
+
 
 ## Function Calling / Tool Use
 

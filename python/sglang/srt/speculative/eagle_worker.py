@@ -49,12 +49,13 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
-    detect_nan,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
     load_token_map,
+    maybe_detect_nan,
+    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
@@ -94,7 +95,6 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -152,6 +152,7 @@ class EAGLEWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -622,6 +623,9 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
@@ -670,10 +674,15 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -741,8 +750,7 @@ class EAGLEWorker(TpModelWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -893,8 +901,7 @@ class EAGLEWorker(TpModelWorker):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
@@ -975,8 +982,10 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(
+            logits_output.next_token_logits,
+            f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",
+        )
 
         # Restore backup.
         # This is because `seq_lens` can be modified in `prepare_extend_after_decode`

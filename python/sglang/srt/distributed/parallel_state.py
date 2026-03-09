@@ -2182,6 +2182,11 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
+    global _ATTN_TP
+    if _ATTN_TP:
+        _ATTN_TP.destroy()
+    _ATTN_TP = None
+
     global _MOE_DP
     if _MOE_DP:
         _MOE_DP.destroy()

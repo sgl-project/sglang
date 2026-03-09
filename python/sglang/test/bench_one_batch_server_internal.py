@@ -541,7 +541,7 @@ def run_one_case(
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
-            profile_activities=profile_activities,
+            activities=profile_activities,
             output_dir=profile_output_dir,
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
@@ -600,8 +600,8 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
+    input_throughput = batch_size * input_len / latency
+    output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":

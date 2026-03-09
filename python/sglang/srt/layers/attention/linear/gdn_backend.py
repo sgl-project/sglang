@@ -171,11 +171,13 @@ class GDNKernelDispatcher:
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -183,11 +185,13 @@ class GDNKernelDispatcher:
         **kwargs,
     ) -> torch.Tensor:
         return self.verify_kernel.target_verify(
-            q,
-            k,
-            v,
-            g,
-            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -364,15 +368,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
                 q=query,
                 k=key,
                 v=value,
-                g=g,
-                beta=beta,
+                a=a,
+                b=b,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -380,13 +384,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
-                # Pass raw pre-gating values for FlashInfer MTP kernel
-                a_raw=a,
-                b_raw=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
             )
         else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
