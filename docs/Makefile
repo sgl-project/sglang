@@ -45,7 +45,7 @@ markdown:
 	mkdir -p "$(BUILDDIR)/html/markdown"; \
 	\
 	# 1) Copy .md and .rst files as-is; additionally convert .rst -> .md \
-	find $(SOURCEDIR) -path "*/_build/*" -prune -o \( -name "*.md" -o -name "*.rst" \) -print0 | \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -path "*/_ext" -prune -o \( -name "*.md" -o -name "*.rst" \) -print0 | \
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		SRC="{}"; \
 		REL_DIR=$$(dirname "$$SRC"); \
@@ -60,7 +60,7 @@ markdown:
 		' || exit 1; \
 	\
 	# 2) Convert .ipynb -> .md \
-	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -path "*/_ext" -prune -o -name "*.ipynb" -print0 | \
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		NB_SRC="{}"; \
 		REL_DIR=$$(dirname "$$NB_SRC"); \

@@ -3,6 +3,7 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.abspath("../.."))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "_ext")))
 
 version_file = "../python/sglang/version.py"
 with open(version_file, "r") as f:
@@ -26,6 +27,7 @@ extensions = [
     "sphinx_tabs.tabs",
     "myst_parser",
     "sphinx_copybutton",
+    "sphinx_copy_page_source",
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
@@ -95,7 +97,7 @@ master_doc = "index"
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "_ext", "Thumbs.db", ".DS_Store"]
 
 pygments_style = "sphinx"
 

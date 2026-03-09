@@ -122,3 +122,9 @@ make markdown   # export markdown artifacts into _build/html/markdown
 ```
 
 Then, the compiled results are forced pushed to [sgl-project.io](https://github.com/sgl-project/sgl-project.github.io) for rendering. In other words, sgl-project.io is push-only. All the changes of SGLang docs should be made directly in SGLang main repo, then push to the sgl-project.io.
+
+### Custom Extensions (`_ext/`)
+
+The `docs/_ext/` directory contains Sphinx extensions used only for documentation:
+
+* **sphinx_copy_page_source**: Adds a "Copy" option in the download dropdown (next to .md and .pdf). Clicking it copies the current page's Markdown source to the clipboard. Requires `make markdown` for the fallback URL to work.
