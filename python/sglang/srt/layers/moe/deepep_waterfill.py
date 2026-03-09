@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -13,7 +13,6 @@
 # ==============================================================================
 """DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -21,6 +20,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
@@ -310,6 +310,7 @@ def waterfill_prepare_dispatch_fused(
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
+@torch.compile(dynamic=True)
 def expand_topk_with_shared_expert(
     topk_ids: Tensor,
     topk_weights: Tensor,
@@ -376,7 +377,7 @@ class DeepEPWaterfillBalancer:
 
     def update_static_weights(self):
         """Update static weights from EPLB metadata if layout changes."""
-        if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
+        if envs.SGLANG_DISABLE_STATIC_WATERFILL.get():
             return
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 
@@ -439,11 +440,10 @@ class DeepEPWaterfillBalancer:
                 self.shared_weight,
             )
 
-        routed_counts_i64 = routed_counts.to(torch.int64)
         effective_load = (
-            routed_counts_i64 + local_tokens_per_rank.to(torch.int64)
+            routed_counts + local_tokens_per_rank
             if local_tokens_per_rank is not None
-            else routed_counts_i64
+            else routed_counts
         )
         topk = topk_ids.shape[1]
 
@@ -451,17 +451,15 @@ class DeepEPWaterfillBalancer:
             allow_all_ranks = True
             target_total = 0
         else:
-            total_routed_t = routed_counts_i64.sum()
+            total_routed_t = routed_counts.sum()
             total_tokens_global_t = total_routed_t // topk
             total_effective_t = effective_load.sum()
             max_effective_t = effective_load.max()
             target_total = int(
-                (
-                    (total_effective_t + total_tokens_global_t + self.world_size - 1)
-                    // self.world_size
-                ).item()
+                (total_effective_t + total_tokens_global_t + self.world_size - 1)
+                // self.world_size
             )
-            allow_all_ranks = bool((max_effective_t <= target_total).item())
+            allow_all_ranks = bool(max_effective_t <= target_total)
 
         return waterfill_prepare_dispatch_fused(
             topk_ids,

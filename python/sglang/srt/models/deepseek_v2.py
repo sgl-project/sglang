@@ -2945,9 +2945,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        # Waterfill handles shared expert fusion via dispatch; skip disable checks.
         disable_reason = None
-        if (
+        if get_global_server_args().enable_deepep_waterfill:
+            disable_reason = None
+        elif (
             self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
@@ -2960,17 +2962,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif (
-            get_moe_expert_parallel_world_size() > 1
-            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
-            and not get_global_server_args().enable_deepep_waterfill
+        elif get_moe_expert_parallel_world_size() > 1 and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif (
-            disable_reason is None
-            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori())
-            and not get_global_server_args().enable_deepep_waterfill
-        ):
+        elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."

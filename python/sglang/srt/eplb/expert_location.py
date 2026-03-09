@@ -537,6 +537,8 @@ def _compute_rank_load(logical_count_raw, physical_to_logical_map, ep_size):
     """Compute per-rank load (num_layers, ep_size) from logical counts and EPLB mapping."""
     from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
 
+    # logical_count_raw comes from data_dict["logical_count"] loaded from .pt/.json:
+    # it may be Tensor/list, and shape may be [layers, experts] or [samples, layers, experts].
     if not isinstance(logical_count_raw, torch.Tensor):
         logical_count_raw = torch.tensor(logical_count_raw)
     if logical_count_raw.dim() == 3:
@@ -591,7 +593,7 @@ def compute_initial_expert_location_metadata(
         metadata = ExpertLocationMetadata.init_by_eplb(
             server_args, model_config, logical_count=data_dict["logical_count"]
         )
-        if metadata is not None:
+        if metadata is not None and server_args.enable_deepep_waterfill:
             metadata.rank_load = _compute_rank_load(
                 data_dict["logical_count"],
                 metadata.physical_to_logical_map,

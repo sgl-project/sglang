@@ -557,37 +557,19 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Waterfill expands num_experts by ep_size (one shared slot per rank).
-        # Checkpoint IDs use the ORIGINAL layout, so we must map using
-        # old_experts_per_rank to avoid loading experts onto wrong EP ranks.
-        if (
-            get_global_server_args().enable_deepep_waterfill
-            and get_moe_a2a_backend().is_deepep()
-        ):
-            old_num_global_routed_experts = num_global_routed_experts - self.moe_ep_size
-            if (
-                old_num_global_routed_experts > 0
-                and old_num_global_routed_experts % self.moe_ep_size == 0
-            ):
-                old_num_local_routed_experts = (
-                    old_num_global_routed_experts // self.moe_ep_size
-                )
-                # Routed experts: map using original experts_per_rank
-                start_idx = self.moe_ep_rank * old_num_local_routed_experts
-                end_idx = (self.moe_ep_rank + 1) * old_num_local_routed_experts
-                if start_idx <= expert_id < end_idx:
-                    return expert_id - start_idx
-                # Shared expert: maps to old_num_local_routed_experts on ALL ranks
-                if expert_id >= old_num_global_routed_experts:
-                    return old_num_local_routed_experts
-                return -1
+        # Use pre-expansion counts so checkpoint IDs map correctly.
+        is_waterfill = get_global_server_args().enable_deepep_waterfill
+        if is_waterfill:
+            num_global_routed_experts -= self.moe_ep_size
+            num_local_routed_experts = num_global_routed_experts // self.moe_ep_size
 
         start_idx = self.moe_ep_rank * num_local_routed_experts
         end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
         elif (
-            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
-        ):
+            self.num_fused_shared_experts > 0 or is_waterfill
+        ) and expert_id >= num_global_routed_experts:
             return expert_id - num_global_routed_experts + num_local_routed_experts
         else:
             return -1
@@ -634,10 +616,7 @@ class FusedMoE(torch.nn.Module):
             return
 
         # Waterfill: detect shared expert via original expert count, not expanded.
-        _is_waterfill = (
-            get_global_server_args().enable_deepep_waterfill
-            and get_moe_a2a_backend().is_deepep()
-        )
+        _is_waterfill = get_global_server_args().enable_deepep_waterfill
         num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
         if _is_waterfill:
             shared_expert_threshold = num_global_routed_experts - self.moe_ep_size
