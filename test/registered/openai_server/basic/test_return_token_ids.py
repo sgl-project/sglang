@@ -1,17 +1,17 @@
 """
-Unit tests for the return_prompt_token_ids feature in ChatCompletion endpoint.
+Unit tests for token ID return features in ChatCompletion endpoint.
 
 Tests that:
 1. Protocol models correctly handle return_prompt_token_ids / prompt_token_ids fields
-2. ChatCompletionTokenLogprob includes token_id field
+2. response_token_ids is populated when logprobs=True (non-streaming)
 3. Request conversion passes return_prompt_token_ids flag through
-4. Non-streaming response includes prompt_token_ids
-5. Fields are omitted from JSON when return_prompt_token_ids is False (default)
+4. Non-streaming response includes prompt_token_ids and response_token_ids
+5. Fields are omitted from JSON when not applicable
 
 Run with:
-    python -m pytest test/registered/openai_server/basic/test_return_prompt_token_ids.py -v
+    python -m pytest test/registered/openai_server/basic/test_return_token_ids.py -v
 or:
-    python test/registered/openai_server/basic/test_return_prompt_token_ids.py -v
+    python test/registered/openai_server/basic/test_return_token_ids.py -v
 """
 
 import json
@@ -60,10 +60,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
-    ChatCompletionTokenLogprob,
     ChatMessage,
-    ChoiceLogprobs,
-    TopLogprob,
     UsageInfo,
 )
 
@@ -147,36 +144,27 @@ class TestReturnTokenIdsProtocol(unittest.TestCase):
         self.assertIn("prompt_token_ids", data)
         self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
 
-    # --- ChatCompletionTokenLogprob ---
+    # --- response_token_ids ---
 
-    def test_token_logprob_includes_token_id(self):
-        logprob = ChatCompletionTokenLogprob(
-            token="hello",
-            token_id=12345,
-            bytes=list(b"hello"),
-            logprob=-0.5,
-            top_logprobs=[],
-        )
-        data = logprob.model_dump()
-        self.assertEqual(data["token_id"], 12345)
-
-    def test_token_logprob_in_choice_logprobs(self):
-        """token_id should appear in serialized logprobs.content entries."""
-        logprob_entry = ChatCompletionTokenLogprob(
-            token="hi",
-            token_id=100,
-            bytes=list(b"hi"),
-            logprob=-1.0,
-            top_logprobs=[],
-        )
+    def test_choice_omits_response_token_ids_when_none(self):
         choice = ChatCompletionResponseChoice(
             index=0,
             message=ChatMessage(role="assistant", content="hi"),
-            logprobs=ChoiceLogprobs(content=[logprob_entry]),
             finish_reason="stop",
         )
         data = choice.model_dump()
-        self.assertEqual(data["logprobs"]["content"][0]["token_id"], 100)
+        self.assertNotIn("response_token_ids", data)
+
+    def test_choice_includes_response_token_ids_when_set(self):
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="hi"),
+            finish_reason="stop",
+            response_token_ids=MOCK_OUTPUT_TOKEN_IDS,
+        )
+        data = choice.model_dump()
+        self.assertIn("response_token_ids", data)
+        self.assertEqual(data["response_token_ids"], MOCK_OUTPUT_TOKEN_IDS)
 
     # --- Full JSON round-trip ---
 
@@ -364,7 +352,18 @@ class TestReturnTokenIdsResponseBuilding(unittest.TestCase):
 
         self.chat = OpenAIServingChat(tm, template_mgr)
 
-    def _make_ret(self, include_prompt_token_ids: bool = False):
+    def _make_ret(
+        self,
+        include_prompt_token_ids: bool = False,
+        include_logprobs: bool = False,
+    ):
+        output_token_logprobs = []
+        if include_logprobs:
+            output_token_logprobs = [
+                (-0.5, 100, "Test"),
+                (-0.3, 200, " response"),
+                (-0.1, 300, "<eos>"),
+            ]
         ret = {
             "text": "Test response",
             "output_ids": MOCK_OUTPUT_TOKEN_IDS,
@@ -374,7 +373,7 @@ class TestReturnTokenIdsResponseBuilding(unittest.TestCase):
                 "completion_tokens": 3,
                 "cached_tokens": 0,
                 "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
+                "output_token_logprobs": output_token_logprobs,
                 "output_top_logprobs": None,
                 "weight_version": "default",
             },
@@ -419,6 +418,46 @@ class TestReturnTokenIdsResponseBuilding(unittest.TestCase):
 
         data = json.loads(response.model_dump_json())
         self.assertEqual(data["choices"][0]["prompt_token_ids"], MOCK_PROMPT_TOKEN_IDS)
+
+    def test_response_token_ids_with_logprobs(self):
+        """response_token_ids should be populated when logprobs=True."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            logprobs=True,
+        )
+        ret = [self._make_ret(include_logprobs=True)]
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        self.assertEqual(response.choices[0].response_token_ids, [100, 200, 300])
+
+    def test_response_token_ids_without_logprobs(self):
+        """response_token_ids should be None when logprobs is not enabled."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        ret = [self._make_ret(include_logprobs=False)]
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        self.assertIsNone(response.choices[0].response_token_ids)
+
+        data = json.loads(response.model_dump_json())
+        self.assertNotIn("response_token_ids", data["choices"][0])
+
+    def test_response_token_ids_json_round_trip(self):
+        """response_token_ids should survive JSON round-trip."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            logprobs=True,
+        )
+        ret = [self._make_ret(include_logprobs=True)]
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        data = json.loads(response.model_dump_json())
+        self.assertEqual(data["choices"][0]["response_token_ids"], [100, 200, 300])
 
 
 # ===========================================================================

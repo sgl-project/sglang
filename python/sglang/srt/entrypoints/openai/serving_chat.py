@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageParam
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -372,6 +373,14 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
+        # Short-circuit: use pretokenized path if provided
+        if (
+            request.pretokenized_token_ids is not None
+            and request.pretokenized_num_message is not None
+            and request.pretokenized_num_message > 0
+        ):
+            return self._apply_pretokenized_template(request, tools)
+
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
@@ -591,6 +600,137 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=video_data,
             audio_data=audio_data,
             modalities=modalities,
+            stop=stop,
+        )
+
+    def _apply_pretokenized_template(
+        self,
+        request: ChatCompletionRequest,
+        tools: Optional[List[Dict]],
+    ) -> MessageProcessingResult:
+        """Apply pretokenized template with incremental tokenization for tool messages.
+
+        Supported input pattern (non-streaming, non-multimodal only):
+            messages[0..N-1] are pretokenized (token IDs provided via pretokenized_token_ids)
+            messages[N..end] are new tool responses to be incrementally tokenized
+
+        Constraints:
+            - messages[N-1] must be role="assistant" (the last pretokenized turn)
+            - messages[N..end] must all be role="tool" or "system"
+            - No multimodal content allowed in any message
+
+        Example valid pattern:
+            messages = [system, user, assistant(tool_calls), tool, tool, system, ...]
+            pretokenized_num_message = 3  (system + user + assistant are pretokenized)
+            pretokenized_token_ids = [...]  (token IDs for the first 3 messages)
+
+        How it works:
+            1. Tokenize first N messages with apply_chat_template(add_generation_prompt=False)
+               to get prefix_ids
+            2. Tokenize ALL messages with apply_chat_template(add_generation_prompt=True)
+               to get full_ids
+            3. Verify prefix_ids matches full_ids[:len(prefix_ids)]
+            4. incremental_ids = full_ids[len(prefix_ids):]
+            5. Final prompt_ids = pretokenized_token_ids + incremental_ids
+        """
+        N = request.pretokenized_num_message
+        messages = request.messages
+
+        # FIXME
+        if self.tokenizer_manager.model_config.is_multimodal:
+            raise ValueError(
+                "Pretokenized token IDs input is not supported for multimodal models"
+            )
+
+        if N > len(messages):
+            raise ValueError(
+                f"pretokenized_num_message ({N}) > total messages ({len(messages)})"
+            )
+
+        if messages[N - 1].role != "assistant":
+            raise ValueError(
+                f"Message at index {N - 1} must be assistant, got {messages[N - 1].role}"
+            )
+
+        ALLOWED_APPEND_ROLES = {"tool", "system"}
+        for i in range(N, len(messages)):
+            if messages[i].role not in ALLOWED_APPEND_ROLES:
+                raise ValueError(
+                    f"Message at index {i} must be one of {ALLOWED_APPEND_ROLES}, got {messages[i].role}"
+                )
+
+        all_msg_dicts = [msg.model_dump() for msg in messages]
+        prefix_msgs = all_msg_dicts[:N]
+
+        # Process tool_calls arguments: str -> dict (consistent with standard path)
+        for msg in all_msg_dicts:
+            if (
+                msg["role"] == "assistant"
+                and "tool_calls" in msg
+                and isinstance(msg["tool_calls"], list)
+            ):
+                for item in msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = orjson.loads(
+                            item["function"]["arguments"]
+                        )
+
+        chat_template_kwargs = request.chat_template_kwargs or {}
+
+        # Tokenize first N messages (no generation prompt)
+        prefix_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            prefix_msgs,
+            tokenize=True,
+            add_generation_prompt=False,
+            tools=tools,
+            reasoning_effort=request.reasoning_effort,
+            return_dict=False,
+            **chat_template_kwargs,
+        )
+
+        # Tokenize all messages (with generation prompt)
+        full_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            all_msg_dicts,
+            tokenize=True,
+            add_generation_prompt=True,
+            tools=tools,
+            reasoning_effort=request.reasoning_effort,
+            return_dict=False,
+            **chat_template_kwargs,
+        )
+
+        # Validate prefix match
+        if full_ids[: len(prefix_ids)] != prefix_ids:
+            raise ValueError(
+                "Prefix mismatch: tokenizing first N messages does not match "
+                "the prefix of tokenizing all messages. "
+                f"prefix_ids length={len(prefix_ids)}, full_ids length={len(full_ids)}"
+            )
+
+        incremental_ids = full_ids[len(prefix_ids) :]
+        # Fault tolerance: templates like qwen3 insert a trailing `\n` after
+        # the last assistant message.  Its loss-mask is 0, so we only prepend
+        # it for alignment when it really is a whitespace-only token.
+        if (
+            prefix_ids[-1] != request.pretokenized_token_ids[-1]
+            and self.tokenizer_manager.tokenizer.decode([prefix_ids[-1]]).strip() == ""
+        ):
+            incremental_ids = [prefix_ids[-1]] + incremental_ids
+        prompt_ids = list(request.pretokenized_token_ids) + incremental_ids
+
+        # Decode prompt_ids to text for the prompt field
+        prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+
+        stop = request.stop
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
             stop=stop,
         )
 
@@ -975,6 +1115,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 else None
             )
 
+            choice_meta_info = (
+                ret_item["meta_info"] if request.return_meta_info else None
+            )
+
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
@@ -992,6 +1136,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                meta_info=choice_meta_info,
             )
             choices.append(choice_data)
 
@@ -1023,8 +1168,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         token_logprobs = []
 
-        for token_idx, (token, token_id, logprob) in enumerate(
-            zip(logprobs.tokens, logprobs.token_ids, logprobs.token_logprobs)
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
         ):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
@@ -1046,7 +1191,6 @@ class OpenAIServingChat(OpenAIServingBase):
             token_logprobs.append(
                 ChatCompletionTokenLogprob(
                     token=token,
-                    token_id=token_id,
                     bytes=token_bytes,
                     logprob=logprob,
                     top_logprobs=top_logprobs,
