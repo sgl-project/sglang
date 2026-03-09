@@ -148,12 +148,11 @@ def apply_token_bitmask_inplace_torch_npu(
     assert logits.device.type == "npu", "NPU-only helper called on non-NPU device"
 
     vocab_size = logits.shape[-1]
-    mask_dev = logits.device
     bitmask_cpu = bitmask.detach().cpu()
     token_ids = torch.arange(vocab_size, device="cpu", dtype=torch.int32)
     word_idx = token_ids // 32
-    bit_idx = (token_ids % 32).to(torch.int32)
+    bit_idx = token_ids % 32
     words = bitmask_cpu[:, word_idx].to(torch.int32)
     allowed = ((words >> bit_idx) & 1).to(torch.bool)
-    allowed = allowed.to(mask_dev, non_blocking=True)
+    allowed = allowed.to(logits.device, non_blocking=True)
     logits.masked_fill_(~allowed, float("-inf"))
