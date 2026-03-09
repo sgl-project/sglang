@@ -3,8 +3,15 @@
  * Copies the current page's Markdown source to clipboard.
  */
 (function () {
+  var DROPDOWN_SELECTOR = ".dropdown-download-buttons";
+  var DROPDOWN_MENU_SELECTOR = DROPDOWN_SELECTOR + " .dropdown-menu";
+  var COPY_ITEM_ID = "copy-page-source-dropdown-item";
+  var COPY_BTN_CLASS = "copy-page-source-btn";
+  var COPY_DONE_CLASS = "copy-page-source-done";
+  var FEEDBACK_DURATION_MS = 2000;
+
   function getMarkdownUrl() {
-    var dropdown = document.querySelector(".dropdown-download-buttons");
+    var dropdown = document.querySelector(DROPDOWN_SELECTOR);
     if (dropdown) {
       var mdLink = dropdown.querySelector('a[href*=".md"]');
       if (mdLink) {
@@ -13,7 +20,9 @@
           try {
             var full = new URL(href, window.location.origin).href;
             if (new URL(full).origin === window.location.origin) return full;
-          } catch (e) {}
+          } catch (e) {
+            console.warn("Failed to parse URL:", href, e);
+          }
         }
       }
     }
@@ -39,12 +48,12 @@
         if (btn) {
           var textSpan = btn.querySelector(".btn__text-container");
           if (textSpan) textSpan.textContent = "Copied";
-          btn.classList.add("copy-page-source-done");
+          btn.classList.add(COPY_DONE_CLASS);
           setTimeout(function () {
             if (textSpan) textSpan.textContent = "Copy";
             btn.disabled = false;
-            btn.classList.remove("copy-page-source-done");
-          }, 2000);
+            btn.classList.remove(COPY_DONE_CLASS);
+          }, FEEDBACK_DURATION_MS);
         }
       })
       .catch(function (err) {
@@ -54,15 +63,14 @@
       });
   }
 
-  function injectCopyOption() {
-    var menu = document.querySelector(".dropdown-download-buttons .dropdown-menu");
-    if (!menu || document.getElementById("copy-page-source-dropdown-item")) return;
+  function injectCopyOption(menu) {
+    if (!menu || document.getElementById(COPY_ITEM_ID)) return;
 
     var li = document.createElement("li");
-    li.id = "copy-page-source-dropdown-item";
+    li.id = COPY_ITEM_ID;
     var btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "btn btn-sm btn-download-source-button dropdown-item copy-page-source-btn";
+    btn.className = "btn btn-sm btn-download-source-button dropdown-item " + COPY_BTN_CLASS;
     btn.title = "Copy this page's Markdown source to clipboard";
     btn.setAttribute("aria-label", "Copy Markdown to clipboard");
     btn.innerHTML =
@@ -77,11 +85,32 @@
     menu.appendChild(li);
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", injectCopyOption);
-  } else {
-    injectCopyOption();
+  function tryInject() {
+    var menu = document.querySelector(DROPDOWN_MENU_SELECTOR);
+    if (menu) {
+      injectCopyOption(menu);
+      return true;
+    }
+    return false;
   }
-  setTimeout(injectCopyOption, 500);
-  setTimeout(injectCopyOption, 1500);
+
+  function observeAndInject() {
+    if (tryInject()) return;
+    var body = document.body;
+    if (!body) return;
+    var observer = new MutationObserver(function (mutations, obs) {
+      if (tryInject()) obs.disconnect();
+    });
+    observer.observe(body, { childList: true, subtree: true });
+  }
+
+  function init() {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", observeAndInject);
+    } else {
+      observeAndInject();
+    }
+  }
+
+  init();
 })();
