@@ -38,4 +38,4 @@ def test_rmsnorm(batch_size: int, hidden_size: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])
