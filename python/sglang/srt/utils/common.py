@@ -609,8 +609,12 @@ def get_available_gpu_memory(
     return free_gpu_memory / (1 << 30)
 
 
-def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+def is_pin_memory_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if device is not None and str(device) == "cpu":
+        return False
+    return True
 
 
 class LayerFn(Protocol):
@@ -1721,6 +1725,39 @@ def get_device_sm():
     return 0
 
 
+def _cuda_mem_fallback(reason: str) -> int:
+    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
+
+    Queries all visible CUDA devices and returns the minimum total memory,
+    consistent with the nvidia-smi path that takes min(memory_values).
+
+    Returns the total memory in MiB, or raises RuntimeError if CUDA is
+    unavailable or mem_get_info() fails.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(reason)
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            # Include the original failure reason for diagnostics
+            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
+        memory_values = []
+        for i in range(device_count):
+            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
+            memory_values.append(total)
+        result = min(memory_values)
+        logger.warning(
+            f"{reason} Falling back to torch.cuda.mem_get_info(). "
+            f"Reported total GPU memory per device (MiB): {memory_values}, "
+            f"using min: {result} MiB."
+        )
+        return result
+    except (RuntimeError, ValueError, OSError) as e:
+        raise RuntimeError(
+            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
+        ) from e
+
+
 def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
@@ -1732,7 +1769,9 @@ def get_nvgpu_memory_capacity():
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+            return _cuda_mem_fallback(
+                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
+            )
 
         # Parse the output to extract memory values
         memory_values = [
@@ -1742,20 +1781,17 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # Fallback when nvidia-smi returns no parseable values,
             # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
-                )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
-            raise ValueError("No GPU memory values found.")
+            return _cuda_mem_fallback(
+                "Failed to get GPU memory capacity from nvidia-smi."
+            )
 
         # Return the minimum memory value
         return min(memory_values)
 
     except FileNotFoundError:
-        raise RuntimeError(
+        return _cuda_mem_fallback(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
 
@@ -2029,12 +2065,12 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "cuda:{}".format(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "xpu"
         return "xpu:{}".format(device_id)
 
     if is_npu():
-        if device_id == None:
+        if device_id is None:
             return "npu"
         return "npu:{}".format(device_id)
 
@@ -2043,16 +2079,16 @@ def get_device(device_id: Optional[int] = None) -> str:
             import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
-                if device_id == None:
+                if device_id is None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
     if is_musa():
-        if device_id == None:
+        if device_id is None:
             return "musa"
         return "musa:{}".format(device_id)
 
@@ -3378,7 +3414,12 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+            parts = line.strip().split(",")
+            if len(parts) != 4:
+                logger.warning("Skipping malformed lscpu line: %s", line.strip())
+                continue
+            cpu = int(parts[0])  # CPU id must always be present
+            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
             cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]

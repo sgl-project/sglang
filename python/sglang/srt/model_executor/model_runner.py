@@ -97,6 +97,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
+    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -390,8 +391,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
-        # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
+        # Get available memory before model loading
+        pre_model_load_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -412,7 +413,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # Initialize the model runner
-        self.initialize(min_per_gpu_memory)
+        self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
 
         if self.is_multimodal:
@@ -446,7 +447,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def initialize(self, min_per_gpu_memory: float):
+    def initialize(self, pre_model_load_memory: float):
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -599,14 +600,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        self.init_memory_pool(pre_model_load_memory)
 
         # Init max running requests
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests // (self.dp_size)
+                else server_args.max_running_requests // self.dp_size
             ),
             self.req_to_token_pool.size,
         )
@@ -825,7 +826,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-        min_per_gpu_memory = get_available_gpu_memory(
+        pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -838,9 +839,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
-            if min_per_gpu_memory < local_gpu_memory * 0.9:
+            if pre_model_load_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                 if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
                     raise RuntimeError(msg)
                 else:
@@ -850,7 +851,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
-        return min_per_gpu_memory
+        return pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         """
@@ -867,6 +868,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or (
                 self.server_args.enable_hierarchical_cache
                 and self.server_args.hicache_storage_backend == "mooncake"
+                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
             )
             or (
                 self.server_args.encoder_only
@@ -1041,11 +1043,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        # Get quantization config from ModelConfig
+        # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
+        quant_str = self.model_config.get_quantization_config_log_str()
+
         logger.info(
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
+            f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
@@ -1886,6 +1892,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_bs
+
+        if require_gathered_buffer(self.server_args):
+            attn_tp_size = get_attention_tp_size()
+            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
+                num_tokens = num_tokens // attn_tp_size * attn_tp_size
+                batch_size = num_tokens // num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
 
