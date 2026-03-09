@@ -11,6 +11,8 @@ try:
 except ImportError:
     _has_flashinfer = False
 
+_FLASHINFER_NORM_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+
 
 def _rmsnorm_internal(
     input: torch.Tensor,
@@ -103,7 +105,11 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    if input.device.type == "musa" or not _has_flashinfer:
+    if (
+        input.device.type == "musa"
+        or not _has_flashinfer
+        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    ):
         return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
     else:
         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
@@ -139,7 +145,11 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if input.device.type == "musa" or not _has_flashinfer:
+    if (
+        input.device.type == "musa"
+        or not _has_flashinfer
+        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    ):
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
     else:
         _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
@@ -176,7 +186,11 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if input.device.type == "musa" or not _has_flashinfer:
+    if (
+        input.device.type == "musa"
+        or not _has_flashinfer
+        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    ):
         return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
     else:
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
@@ -212,7 +226,11 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if input.device.type == "musa" or not _has_flashinfer:
+    if (
+        input.device.type == "musa"
+        or not _has_flashinfer
+        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    ):
         _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
     else:
         _flashinfer_norm.gemma_fused_add_rmsnorm(
