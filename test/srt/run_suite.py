@@ -83,6 +83,8 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_autoround_dense.py", 400),
+        TestFile("ascend/test_ascend_autoround_moe.py", 400),
         TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_gptq_moe.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),

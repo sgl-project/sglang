@@ -436,6 +436,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}resolution",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}resolution",
+            default=None,
+            help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
 
         # DiT configuration
         parser.add_argument(
