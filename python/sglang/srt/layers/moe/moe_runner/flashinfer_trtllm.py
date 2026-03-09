@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
@@ -151,25 +152,22 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     )
 
     # Set flashinfer parameters
-    layer.gemm1_weights_fp4_shuffled = Parameter(
-        gemm1_weights_fp4_shuffled, requires_grad=False
+    copy_or_rebind_param(
+        layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
     )
-    layer.gemm2_weights_fp4_shuffled = Parameter(
-        gemm2_weights_fp4_shuffled, requires_grad=False
+    copy_or_rebind_param(
+        layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
     )
-    layer.gemm1_scales_fp4_shuffled = Parameter(
-        gemm1_scales_fp4_shuffled, requires_grad=False
-    )
-    layer.gemm2_scales_fp4_shuffled = Parameter(
-        gemm2_scales_fp4_shuffled, requires_grad=False
-    )
+    copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
+    copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
 
     # Compute additional scaling factor needed for TRT-LLM
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
-    layer.g1_scale_c = Parameter(
+    copy_or_rebind_param(
+        layer,
+        "g1_scale_c",
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
-        requires_grad=False,
     )
 
     # Clean up weights that won't be used by TRT-LLM
@@ -444,7 +442,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         routing_logits=router_logits,
         routing_bias=correction_bias,
         hidden_states=hs_fp4,
-        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+            *hs_scale_linear.shape[:-1], -1
+        ),
         gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
         gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
             torch.float8_e4m3fn
