@@ -688,11 +688,30 @@ def generate_token_bitmask(
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+        repo_id = os.path.dirname(token_map_path)
+        file_name = os.path.basename(token_map_path)
+
+        cache_dir = None
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.utils.file_utils import get_model_cache_root
+
+            cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
+            if os.path.exists(cached_repo_path):
+                cache_dir = cached_repo_path
+
+        if cache_dir is None:
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as download_func,
+                )
+            else:
+                download_func = snapshot_download
+            cache_dir = download_func(
+                repo_id,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+
+        token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
