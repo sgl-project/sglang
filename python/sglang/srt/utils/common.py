@@ -94,11 +94,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
-    from decord import VideoReader
-
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -850,7 +848,8 @@ def load_audio(
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
-    from scipy.signal import resample
+    import torch
+    import torchaudio
 
     if sr is None:
         sr = 16000
@@ -877,14 +876,26 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    # Resample audio if the original sample rate is different from the desired sample rate
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
-
-    # Convert to mono if requested and audio is stereo
+    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        audio_tensor = torch.from_numpy(audio).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        else:
+            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
+
+        audio_tensor = torchaudio.functional.resample(
+            audio_tensor, orig_freq=original_sr, new_freq=sr
+        )
+
+        if audio_tensor.shape[0] == 1:
+            audio = audio_tensor.squeeze(0).numpy()
+        else:
+            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
 
     return audio
 
@@ -956,75 +967,55 @@ def get_image_bytes(image_file: Union[str, bytes]):
         raise NotImplementedError(f"Invalid image: {image_file}")
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
-    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from decord import VideoReader, cpu, gpu
+def _normalize_video_input(
+    video_file: Union[str, bytes],
+) -> Union[str, bytes, None]:
+    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
 
-    try:
-        from decord.bridge import decord_bridge
-
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
-    except Exception:
-        ctx = cpu(0)
-
-    tmp_file = None
-    vr = None
-    try:
-        if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, str):
-            if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("file://"):
-                video_file = unquote(urlparse(video_file).path)
-                vr = VideoReader(video_file, ctx=ctx)
-            # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(unquote(urlparse(video_file).path)):
-                vr = VideoReader(video_file, ctx=ctx)
-            else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
-            vr = video_file
+    Returns a file path or bytes suitable for a decoder, or None on failure.
+    URLs and base64 are returned as bytes (no temp files needed since both
+    torchcodec and VideoDecoderWrapper accept bytes natively).
+    """
+    if isinstance(video_file, bytes):
+        return video_file
+    elif isinstance(video_file, str):
+        if video_file.startswith(("http://", "https://")):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            response = requests.get(video_file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            return response.content
+        elif video_file.startswith("data:"):
+            _, encoded = video_file.split(",", 1)
+            return pybase64.b64decode(encoded, validate=True)
+        elif video_file.startswith("file://"):
+            return unquote(urlparse(video_file).path)
+        elif os.path.isfile(unquote(urlparse(video_file).path)):
+            return video_file
         else:
-            raise ValueError(f"Unsupported video input type: {type(video_file)}")
-
-        return vr
-
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+            return pybase64.b64decode(video_file, validate=True)
+    else:
+        return None
 
 
-def sample_video_frames(
-    video: "VideoReader", *, desired_fps: int, max_frames: int
-) -> list[int]:
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+        return video_file
+
+    source = _normalize_video_input(video_file)
+    if source is None:
+        raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+    device = "cuda" if use_gpu else "cpu"
+    return VideoDecoderWrapper(source, device=device)
+
+
+def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
     total_frames = len(video)
     assert total_frames > 0, "Video must have at least one frame"
 
-    duration = total_frames / video.get_avg_fps()
-    fps = min(desired_fps, video.get_avg_fps())
+    avg_fps = video.avg_fps
+    duration = total_frames / avg_fps if avg_fps > 0 else 0
+    fps = min(desired_fps, avg_fps)
 
     num_frames = math.floor(duration * fps)
     num_frames = min(max_frames, num_frames, total_frames)
@@ -1036,9 +1027,6 @@ def sample_video_frames(
 
 
 def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
         return []
@@ -1051,14 +1039,23 @@ def encode_video(video_path, frame_count_limit=None):
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    decoder = VideoDecoderWrapper(video_path)
+    avg_fps = decoder.avg_fps
+    total_frames = len(decoder)
+
+    sample_fps = round(avg_fps / 1)
+    if sample_fps == 0:
+        sample_fps = 1
+    frame_indices = [i for i in range(0, total_frames, sample_fps)]
     if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
         frame_indices = uniform_sample(frame_indices, frame_count_limit)
 
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    if not frame_indices:
+        return []
+
+    frames_data = decoder.get_frames_at(frame_indices)
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames_data]
+
     return frames
 
 
@@ -4180,9 +4177,9 @@ def get_system_nvgpu_count() -> int:
 
 
 @lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
+def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
     """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
 
     First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
     If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
@@ -4196,10 +4193,8 @@ def get_current_device_numa_node_cuda() -> int:
     Raises:
         RuntimeError: If device information cannot be retrieved.
     """
-    import torch
 
-    logical_device_id = torch.cuda.current_device()
-    physical_device_id = get_physical_device_id(logical_device_id)
+    physical_device_id = get_physical_device_id(gpu_id)
 
     # Query NUMA topology from nvidia-smi
     result = subprocess.run(
@@ -4229,6 +4224,32 @@ def get_current_device_numa_node_cuda() -> int:
             f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
         )
         numa_node = 0
+
+    return numa_node
+
+
+def get_numa_node(gpu_id):
+    numa_node = None
+    try:
+        device = get_device()
+        if device == "cuda":
+            numa_node = get_device_numa_node_cuda(gpu_id)
+        else:
+            logger.info(f"Now only supports NVIDIA devices")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+
+    return numa_node
+
+
+@lru_cache(maxsize=1)
+def get_current_device_numa_node_cuda() -> int:
+    """
+    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    """
+
+    logical_device_id = torch.cuda.current_device()
+    numa_node = get_device_numa_node_cuda(logical_device_id)
 
     return numa_node
 
