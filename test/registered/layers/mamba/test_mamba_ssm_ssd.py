@@ -14,6 +14,7 @@ from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
+from sglang.srt.utils import get_device
 from sglang.srt.utils.common import is_hip
 from sglang.utils import is_in_ci
 
@@ -99,10 +100,12 @@ def ssd_minimal_discrete(
     return Y, final_state
 
 
-def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device="cuda"):
+def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=None):
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    if device is None:
+        device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     torch.manual_seed(0)
     A = -torch.exp(torch.rand(n_heads, dtype=itype, device=device))
@@ -125,7 +128,7 @@ def generate_continuous_batched_examples(
     n_heads,
     d_head,
     itype,
-    device="cuda",
+    device=None,
     return_naive_ref=True,
 ):
 
@@ -138,8 +141,10 @@ def generate_continuous_batched_examples(
 
     # generate the full-length example
     A, dt, X, B, C = generate_random_inputs(
-        num_examples, full_length, n_heads, d_head, itype
+        num_examples, full_length, n_heads, d_head, itype, device
     )
+    # Capture the resolved device from the tensors
+    device = X.device
 
     if return_naive_ref:
         Y_min, final_state_min = ssd_minimal_discrete(
@@ -227,8 +232,9 @@ if is_in_ci():
 @pytest.mark.parametrize("d_head", SINGLE_DHEAD)
 @pytest.mark.parametrize("seq_len_chunk_size", SINGLE_SEQ_LEN_CHUNK_SIZE)
 def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this tests the kernels on a single example (no batching)
 
@@ -319,8 +325,9 @@ if is_in_ci():
     ],
 )
 def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this test with multiple examples in a continuous batch
     # (i.e. chunked prefill)
@@ -398,8 +405,9 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ],
 )
 def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # This test verifies the correctness of the chunked prefill implementation
     # in the mamba2 ssd kernels, by comparing concatenation (in the sequence
@@ -632,8 +640,9 @@ def test_mamba_chunk_scan_intermediate_states(
     seq_len_chunk_size,
     itype,
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     if itype == torch.bfloat16:
         atol, rtol = 5e-2, 5e-2
