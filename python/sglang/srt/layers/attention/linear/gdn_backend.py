@@ -41,6 +41,14 @@ elif is_npu():
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
     fused_gdn_gating = fused_gdn_gating_npu
+
+    try: # todo: move to sgl_kernel_npu
+        import vllm_ascend
+        from vllm_ascend.utils import enable_custom_op
+    except ModuleNotFoundError as e:
+        raise ValueError(
+            "Npu ascend conv1d ops not found, Please intall package. "
+        ) from e
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
@@ -233,14 +241,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        if is_npu() and enable_custom_op():
+            conv_weights = layer.conv_weights.transpose(-1, -2).contiguous()
+            mixed_qkv = torch.ops._C_ascend.npu_causal_conv1d_update(
+                    mixed_qkv,
+                    conv_weights,
+                    conv_states,
+                    cache_indices,
+                    layer.bias,
+                    None,
+                    None,
+                    layer.activation,
+                    self.pad_slot_id,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -346,17 +368,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if is_npu() and enable_custom_op():
+                x_origin=mixed_qkv.transpose(-1, -2).contiguous()
+                weight_origin=layer.conv_weights.transpose(-1, -2).contiguous()
+                kernel_size = layer.conv_weights.shape[-1]
+                conv_states = conv_states[:, -(kernel_size - 1):, :]  # fix mtp prefill, kernel_size = 4
+                mixed_qkv = torch.ops._C_ascend.causal_conv1d_fn(
+                    x_origin,
+                    weight_origin,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_state=conv_states,
+                    has_initial_state=has_initial_states,
+                    non_spec_state_indices_tensor=cache_indices,
+                    non_spec_query_start_loc=query_start_loc,
+                    pad_slot_id=self.pad_slot_id,
+                )
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         query, key, value = torch.split(
             mixed_qkv,
