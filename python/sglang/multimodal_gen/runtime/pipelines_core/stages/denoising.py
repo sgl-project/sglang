@@ -343,9 +343,9 @@ class DenoisingStage(PipelineStage):
             torch.full(
                 (batch_size,),
                 guidance_val,
-                dtype=torch.float32,
+                dtype=target_dtype,
                 device=device,
-            ).to(target_dtype)
+            )
             * 1000.0
         )
 

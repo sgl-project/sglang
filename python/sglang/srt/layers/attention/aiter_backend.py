@@ -1704,7 +1704,8 @@ class AiterAttnBackend(AttentionBackend):
                         num_kv_splits=num_kv_splits,
                     )
 
-                    return o[q_mask]
+                    total_valid_q = int(qo_indptr[-1].item())
+                    return o[:total_valid_q]
                 else:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),

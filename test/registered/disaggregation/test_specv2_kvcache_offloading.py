@@ -25,9 +25,11 @@ def _make_mock_req(
     kv_committed_len: int,
     kv_allocated_len: int,
     prefix_indices_len: int = 0,
+    rid: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
+    req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
     req.kv_allocated_len = kv_allocated_len
@@ -74,6 +76,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.token_to_kv_pool_allocator = allocator
     manager.page_size = page_size
     manager.tree_cache = tree_cache
+    manager.offloaded_state = {}
 
     return manager, freed_indices
 
@@ -169,7 +172,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefix_indices_len=5,
         )
 
-        manager._release_finished_req(req, prefill_offloaded_len=0)
+        manager._release_finished_req(req, start_offset=0)
 
         self.assertEqual(manager.tree_cache.protected_size_, 5)
 
