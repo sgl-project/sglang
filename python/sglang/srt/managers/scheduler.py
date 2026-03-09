@@ -33,6 +33,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
+from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -199,6 +200,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    get_numa_node,
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -208,6 +210,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -222,6 +225,8 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -390,6 +395,9 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
 
+        # Init Ngram Embedding
+        self.maybe_init_ngram_embedding()
+
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
@@ -409,6 +417,24 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        if _is_npu:
+            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
+            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
+            from sglang.srt.dllm.config import DllmConfig
+
+            self.dllm_config = (  # For diffusion LLM
+                DllmConfig.from_server_args(self.server_args)
+                if self.server_args.dllm_algorithm is not None
+                else None
+            )
+            if self.dllm_config:
+                if self.dllm_config.block_size < self.page_size:
+                    logger.warning(
+                        "WARNING: "
+                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
+                        f"Page size now falls back to {self.dllm_config.block_size}"
+                    )
+                    self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -1028,6 +1054,57 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+    def maybe_init_ngram_embedding(self):
+        self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
+        if self.use_ngram_embedding:
+            self.token_table = self.tp_worker.model_runner.token_table
+            hf_config = self.tp_worker.model_config.hf_config
+            self.ngram_embedding_n = hf_config.ngram_embedding_n
+            self.ngram_embedding_k = hf_config.ngram_embedding_k
+
+    def _maybe_prepare_ngram_embedding(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        """Fill the token table for ngram embedding before a forward pass."""
+        if batch is None or not self.use_ngram_embedding:
+            return batch
+        batch.ne_token_table = self.token_table
+        if batch.forward_mode == ForwardMode.EXTEND:
+            all_tokens = []
+            column_starts = []
+            request_lengths = []
+            for req in batch.reqs:
+                start = len(req.prefix_indices)
+                end = start + req.extend_input_len
+                fill_ids = req.origin_input_ids + req.output_ids
+                if start == 0:
+                    tokens = fill_ids[start:end]
+                    column_starts.append(0)
+                elif start < self.ngram_embedding_n:
+                    tokens = fill_ids[0:end]
+                    column_starts.append(0)
+                else:
+                    # Prepend n-1 tokens before prefix_len for n-gram context
+                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
+                    column_starts.append(start - self.ngram_embedding_n + 1)
+                all_tokens.extend(tokens)
+                request_lengths.append(len(tokens))
+            dtype = self.token_table.dtype
+            device = self.token_table.device
+            update_token_table(
+                ne_token_table=self.token_table,
+                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                row_indices=batch.req_pool_indices,
+                column_starts=torch.tensor(
+                    column_starts, dtype=torch.int32, device=device
+                ),
+                req_lens=torch.tensor(
+                    request_lengths, dtype=torch.int32, device=device
+                ),
+                ignore_tokens=None,
+            )
+        return batch
+
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
@@ -1413,14 +1490,34 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None
-                or self.dllm_manager.any_staging_reqs()
-                or not self.running_batch.is_empty()
-                or len(self.offload_tags) > 0
-            ):
-                self.return_health_check_ct += 1
-                continue
+            if is_health_check_generate_req(recv_req):
+                # Check if there are requests being processed
+                has_running_requests = (
+                    self.chunked_req is not None
+                    or self.dllm_manager.any_staging_reqs()
+                    or not self.running_batch.is_empty()
+                    or len(self.offload_tags) > 0
+                )
+
+                # In PD disaggregation mode, also check if health check would be blocked
+                # in special queues (bootstrap/prealloc) due to external factors
+                will_block_in_pd_queue = False
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # If bootstrap queue has backlog, health check will also be blocked there
+                    will_block_in_pd_queue = (
+                        len(self.disagg_prefill_bootstrap_queue.queue) > 0
+                        or len(self.disagg_prefill_inflight_queue) > 0
+                    )
+                elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                    # If prealloc/transfer queue has backlog, health check will also be blocked there
+                    will_block_in_pd_queue = (
+                        len(self.disagg_decode_prealloc_queue.queue) > 0
+                        or len(self.disagg_decode_transfer_queue.queue) > 0
+                    )
+
+                if has_running_requests or will_block_in_pd_queue:
+                    self.return_health_check_ct += 1
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -2012,6 +2109,9 @@ class Scheduler(
 
         # Handle DP attention and log stats
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+
+        # Handle ngram embedding
+        ret = self._maybe_prepare_ngram_embedding(ret)
 
         if ret:
             set_schedule_time_batch(ret)
@@ -3229,10 +3329,14 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if (
-        numa_node := server_args.numa_node
-    ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node[gpu_id])
+    numa_node = None
+    if (numa_nodes := server_args.numa_node) is not None:
+        numa_node = numa_nodes[gpu_id]
+    elif envs.SGLANG_AUTO_NUMA_BIND.get():
+        numa_node = get_numa_node(gpu_id)
+        logger.info(f"auto get NUMA node {numa_node} for GPU {gpu_id}")
+    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:
