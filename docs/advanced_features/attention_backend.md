@@ -66,21 +66,11 @@ Speculative decoding topk: `topk` is the number of draft tokens sampled per step
 ```
 
 ```{note}
-**Speculative Decoding V2 (Spec V2):** Spec V2 uses an overlap scheduler (`SGLANG_ENABLE_SPEC_V2=True`) that benefits from backends without plan-stream synchronization. Requires `--speculative-eagle-topk 1`; applies to EAGLE, EAGLE3, and STANDALONE algorithms.
+**Speculative Decoding V2 (Spec V2):** Spec V2 uses overlap scheduling (`SGLANG_ENABLE_SPEC_V2=True`) that benefits various attention backends. Requires `--speculative-eagle-topk 1` and currently applies to EAGLE and EAGLE3.
 
-**Verified backends:**
+**Verified backends:** TRTLLM MLA, TRTLLM MHA, FA3, Ascend (NPU), Triton.
 
-- **TRTLLM MLA** — no plan stream; achieves full overlap.
-- **TRTLLM MHA** — no plan stream; achieves full overlap.
-- **FA3 (FlashAttention 3)** — no plan-stream synchronization.
-- **Ascend (NPU)** — no plan stream; used in production Spec V2 deployments (see [Ascend NPU examples](../platforms/ascend_npu_deepseek_example.md)).
-- **Triton** — no plan stream; compatible with Spec V2 overlap.
-
-**Limited support:**
-
-- **FlashInfer** — *can* run under Spec V2, but its plan stream (used for split-KV optimization) introduces a synchronization point that limits overlap benefits.
-
-Other backends that do not use a plan stream (e.g., Cutlass MLA, FlashMLA) may also be compatible, but have not been explicitly verified with Spec V2.
+**Limited support:** FlashInfer can run under Spec V2, but its plan stream (used for split-KV optimization) introduces a synchronization point that limits overlap benefits.
 ```
 
 ```{tip}
