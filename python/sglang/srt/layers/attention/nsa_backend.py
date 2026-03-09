@@ -2048,10 +2048,6 @@ class NativeSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
             )
-
-            # TRTLLM sparse MLA kernel requires MHA as prefill impl
-            if self.nsa_prefill_impl == "trtllm":
-                self.use_mha = True
         else:
             self.use_mha = False  # Decode/verify always use MLA
 

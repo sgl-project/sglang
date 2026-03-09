@@ -1375,6 +1375,10 @@ class ServerArgs:
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                         )
                     if self.nsa_prefill_backend == "trtllm":
+                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
+                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            128 * 1024
+                        )
                         logger.warning(
                             "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
                         )
