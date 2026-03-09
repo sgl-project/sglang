@@ -1488,7 +1488,7 @@ class Scheduler(
     def has_requests_being_processed(
         self,
         include_batch_state: bool = True,
-        exclude_compiling_grammars: bool = False,
+        include_compiling_grammars: bool = True,
     ) -> bool:
         """Check if the scheduler has active processing or queued requests.
 
@@ -1532,7 +1532,7 @@ class Scheduler(
                 )
             )
 
-        if not exclude_compiling_grammars:
+        if include_compiling_grammars:
             being_processed |= len(self.grammar_manager.grammar_queue) > 0
 
         return being_processed
@@ -1545,7 +1545,7 @@ class Scheduler(
             if is_health_check_generate_req(
                 recv_req
             ) and self.has_requests_being_processed(
-                include_batch_state=False, exclude_compiling_grammars=True
+                include_batch_state=False, include_compiling_grammars=True
             ):
                 self.return_health_check_ct += 1
                 continue
