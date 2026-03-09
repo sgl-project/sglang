@@ -848,7 +848,8 @@ def load_audio(
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
-    from scipy.signal import resample
+    import torch
+    import torchaudio
 
     if sr is None:
         sr = 16000
@@ -875,14 +876,26 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    # Resample audio if the original sample rate is different from the desired sample rate
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
-
-    # Convert to mono if requested and audio is stereo
+    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        audio_tensor = torch.from_numpy(audio).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        else:
+            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
+
+        audio_tensor = torchaudio.functional.resample(
+            audio_tensor, orig_freq=original_sr, new_freq=sr
+        )
+
+        if audio_tensor.shape[0] == 1:
+            audio = audio_tensor.squeeze(0).numpy()
+        else:
+            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
 
     return audio
 
