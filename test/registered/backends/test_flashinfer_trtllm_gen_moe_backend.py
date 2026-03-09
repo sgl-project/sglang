@@ -187,5 +187,11 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     backend = "flashinfer_trtllm_routed"
 
 
+class TestFlashinferTrtllmGenMoeBackendBF16Routed(
+    TestFlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
+
+
 if __name__ == "__main__":
     unittest.main()
