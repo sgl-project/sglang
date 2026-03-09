@@ -134,6 +134,7 @@ def _init_allocator():
         ).allocator()
         _cur_device = torch.cuda.current_device()
 
+
 def get_nccl_mem_pool(group_name: str) -> torch.cuda.MemPool:
     """
     Get or create a MemPool for the specified group.
