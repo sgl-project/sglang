@@ -870,6 +870,61 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
+    def extend_layers(self, extra_layers: int):
+        """Add extra KV cache layers (for multi-expert draft models).
+
+        Each additional layer gets its own k_buffer and v_buffer with
+        the same shape as the existing ones. This allows different experts
+        to use different layer_ids for independent KV caches without
+        inflating the overall KV pool size estimate.
+        """
+        if extra_layers <= 0:
+            return
+
+        for _ in range(extra_layers):
+            self.k_buffer.append(
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+            )
+            self.v_buffer.append(
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+            )
+
+        self.layer_num += extra_layers
+        self.end_layer = self.layer_num - 1
+
+        # Rebuild data_ptrs and data_strides
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+        logger.info(
+            f"Extended KV cache pool by {extra_layers} layers, "
+            f"now {self.layer_num} total layers"
+        )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer

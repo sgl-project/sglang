@@ -491,6 +491,7 @@ class ServerArgs:
     speculative_draft_attention_backend: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    speculative_draft_model_config: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
@@ -2769,6 +2770,46 @@ class ServerArgs:
                             "DeepSeek MTP does not require setting speculative_draft_model_path."
                         )
 
+            # Load speculative params from draft model config JSON if provided
+            if self.speculative_draft_model_config is not None:
+                try:
+                    import json as _json
+
+                    with open(self.speculative_draft_model_config, "r") as _f:
+                        _draft_cfg = _json.load(_f)
+                    if (
+                        "speculative_num_steps" in _draft_cfg
+                        and self.speculative_num_steps is None
+                    ):
+                        self.speculative_num_steps = _draft_cfg["speculative_num_steps"]
+                    if (
+                        "speculative_eagle_topk" in _draft_cfg
+                        and self.speculative_eagle_topk is None
+                    ):
+                        self.speculative_eagle_topk = _draft_cfg[
+                            "speculative_eagle_topk"
+                        ]
+                    if (
+                        "speculative_num_draft_tokens" in _draft_cfg
+                        and self.speculative_num_draft_tokens is None
+                    ):
+                        self.speculative_num_draft_tokens = _draft_cfg[
+                            "speculative_num_draft_tokens"
+                        ]
+                    # Use the first profile's draft_model_path as the default if not set
+                    if self.speculative_draft_model_path is None:
+                        _default_name = _draft_cfg.get("default_profile", "default")
+                        _profiles = _draft_cfg.get("profiles", {})
+                        if _default_name in _profiles:
+                            _path = _profiles[_default_name].get("draft_model_path")
+                            if _path:
+                                self.speculative_draft_model_path = _path
+                                logger.info(
+                                    f"Using draft model path from config: {_path}"
+                                )
+                except Exception as e:
+                    logger.error(f"Failed to load draft model config: {e}")
+
             if self.speculative_num_steps is None:
                 assert (
                     self.speculative_eagle_topk is None
@@ -4439,12 +4480,23 @@ class ServerArgs:
             help="Choose the backend for MoE A2A in speculative decoding",
         )
         parser.add_argument(
+            "--speculative-draft-model-config",
+            type=str,
+            default=ServerArgs.speculative_draft_model_config,
+            help="Path to a JSON config file for multi-profile speculative decoding. "
+            "The file can contain speculative_num_steps, speculative_eagle_topk, "
+            "speculative_num_draft_tokens, default_profile, and a profiles dict "
+            "mapping profile names to draft_model_path. Requests can select a profile "
+            "via extra_body={'eagle_draft_profile': 'profile_name'}.",
+        )
+        parser.add_argument(
             "--speculative-draft-model-quantization",
             type=str,
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
+        
 
         # Speculative decoding (ngram)
         parser.add_argument(

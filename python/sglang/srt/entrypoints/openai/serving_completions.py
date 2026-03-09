@@ -154,6 +154,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "sampling_seed": request.seed,
         }
 
+        # Inject eagle_draft_profile into custom_params for speculative decoding routing
+        if request.eagle_draft_profile is not None:
+            if sampling_params["custom_params"] is None:
+                sampling_params["custom_params"] = {}
+            sampling_params["custom_params"][
+                "eagle_draft_profile"
+            ] = request.eagle_draft_profile
+
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(

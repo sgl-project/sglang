@@ -294,6 +294,9 @@ class CompletionRequest(BaseModel):
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
 
+    # For speculative decoding draft profile selection
+    eagle_draft_profile: Optional[str] = None
+
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -623,6 +626,9 @@ class ChatCompletionRequest(BaseModel):
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
 
+    # For speculative decoding draft profile selection
+    eagle_draft_profile: Optional[str] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -778,6 +784,14 @@ class ChatCompletionRequest(BaseModel):
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
+
+        # Inject eagle_draft_profile into custom_params for speculative decoding routing
+        if self.eagle_draft_profile is not None:
+            if sampling_params["custom_params"] is None:
+                sampling_params["custom_params"] = {}
+            sampling_params["custom_params"][
+                "eagle_draft_profile"
+            ] = self.eagle_draft_profile
 
         if self.response_format and self.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(

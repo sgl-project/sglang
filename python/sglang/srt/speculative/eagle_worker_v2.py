@@ -1,7 +1,8 @@
 import contextlib
+import json
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -12,11 +13,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLAMultiStepDraftBackend,
-)
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -40,30 +36,27 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
+    select_top_k_tokens_tmp,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    detect_nan,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
-    maybe_detect_oob,
-    select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
-    is_cuda,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +80,6 @@ class EagleDraftWorker(BaseDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -100,8 +91,6 @@ class EagleDraftWorker(BaseDraftWorker):
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -110,6 +99,35 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+
+        # Pre-parse multi-profile config to determine profile count.
+        # KV cache layers will be extended AFTER pool creation in _init_draft_profiles.
+        self._num_draft_profiles = 1
+        self._draft_profiles_config = None
+        if (
+            self.speculative_algorithm.is_eagle3()
+            and server_args.speculative_draft_model_config is not None
+        ):
+            try:
+                with open(server_args.speculative_draft_model_config, "r") as f:
+                    self._draft_profiles_config = json.load(f)
+                n_profiles = len(self._draft_profiles_config.get("profiles", {}))
+                if n_profiles > 1:
+                    self._num_draft_profiles = n_profiles
+                    logger.info(
+                        f"Multi-profile EAGLE3 (V2): detected {n_profiles} profiles, "
+                        f"KV cache layers will be extended after pool creation"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to pre-parse multi-profile config: {e}. "
+                    "Falling back to single-profile."
+                )
+
+        # Set constant
+        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
+            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -122,15 +140,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-
-        # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
-        else:
-            ctx = empty_context()
-        with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -139,8 +149,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -150,16 +158,12 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        self.eagle_use_aux_hidden_state = False
-        if self.speculative_algorithm.is_eagle3():
-            eagle_config = getattr(
-                self.draft_runner.model_config.hf_config, "eagle_config", {}
-            )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
-            )
+
         self.init_token_map()
         self.init_lm_head()
+
+        # Multi-profile draft model support
+        self._init_draft_profiles(server_args)
 
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
@@ -276,18 +280,8 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
-            )
-        ):
+        # FIXME cuda not support draft_extend capture
+        if self.draft_extend_attn_backend and _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -313,6 +307,11 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Run draft
+        # CUDA graph captures a fixed computation path (default expert only).
+        # When the batch has mixed profiles, fall back to eager mode
+        # so that _forward_moe() can route tokens to different experts.
+        if can_cuda_graph and self._has_mixed_profiles(model_worker_batch):
+            can_cuda_graph = False
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch,
@@ -389,9 +388,6 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-
-        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
-
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
@@ -410,7 +406,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
@@ -429,18 +425,13 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_runner.forward(
+            logits_output, _ = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+            )
+            if self.server_args.enable_nan_detection:
+                detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -457,12 +448,6 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -473,6 +458,196 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return parent_list, top_scores_index, draft_tokens
 
+    def _init_draft_profiles(self, server_args: ServerArgs):
+        """Initialize MoE-style multi-expert draft model for per-request routing.
+
+        Creates N expert sub-modules (fc, midlayer, norm, lm_head) inside the model.
+        Each expert's midlayer uses a unique layer_id for independent KV cache.
+        The default expert shares weights with the base model.
+        Additional experts' weights are loaded from separate checkpoints.
+
+        This implements a true MoE-style parallel architecture where all experts
+        can process tokens simultaneously, and a router selects per-token outputs.
+        """
+        if self._draft_profiles_config is None or self._num_draft_profiles <= 1:
+            return
+
+        profiles_config = self._draft_profiles_config
+        default_profile_name = profiles_config.get("default_profile", "default")
+        profiles = profiles_config.get("profiles", {})
+
+        if not profiles:
+            logger.warning(
+                "No profiles found in config file. Skipping multi-expert init."
+            )
+            return
+
+        model = self.draft_runner.model
+
+        # Build ordered profile list with default at a known index
+        profile_names = []
+        default_idx = -1
+        for name in profiles.keys():
+            if name == default_profile_name:
+                default_idx = len(profile_names)
+            profile_names.append(name)
+
+        if default_idx < 0:
+            # Default profile not in the profiles dict, prepend it
+            profile_names.insert(0, default_profile_name)
+            default_idx = 0
+
+        n = len(profile_names)
+        logger.info(
+            f"Initializing MoE-style multi-expert EAGLE3 (V2) with {n} experts: "
+            f"{profile_names}, default='{default_profile_name}' (idx={default_idx})"
+        )
+
+        # Step 1: Register expert sub-modules in the model
+        model.register_experts(
+            profile_names=profile_names,
+            default_profile_idx=default_idx,
+        )
+
+        # Step 2: Load weights for non-default experts
+        for i, profile_name in enumerate(profile_names):
+            if i == default_idx:
+                logger.info(
+                    f"Expert {i} ('{profile_name}'): uses already-loaded default weights"
+                )
+                continue
+
+            profile_cfg = profiles.get(profile_name, {})
+            draft_model_path = profile_cfg.get("draft_model_path")
+            if draft_model_path is None:
+                logger.warning(
+                    f"Expert {i} ('{profile_name}'): no draft_model_path, using default weights"
+                )
+                default_weights = model._extract_own_profile_weights()
+                model.load_expert_weights(i, default_weights)
+                continue
+
+            logger.info(
+                f"Loading expert {i} ('{profile_name}') from {draft_model_path}"
+            )
+            weights = self._load_profile_weights(draft_model_path, server_args)
+            if weights is not None:
+                model.load_expert_weights(i, weights)
+                logger.info(
+                    f"Expert {i} ('{profile_name}'): weights loaded successfully"
+                )
+            else:
+                logger.error(
+                    f"Expert {i} ('{profile_name}'): failed to load weights, using default"
+                )
+                default_weights = model._extract_own_profile_weights()
+                model.load_expert_weights(i, default_weights)
+
+        # Step 3: Extend KV cache pool with additional layers for extra experts.
+        extra_layers = n - 1  # default expert reuses layer_id=0
+        if extra_layers > 0:
+            kv_pool = self.draft_runner.token_to_kv_pool
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+            if isinstance(kv_pool, MHATokenToKVPool):
+                kv_pool.extend_layers(extra_layers)
+                logger.info(
+                    f"Extended draft KV cache pool by {extra_layers} layers "
+                    f"for {n} expert midlayers (total layers: {kv_pool.layer_num})"
+                )
+            else:
+                logger.warning(
+                    f"Cannot extend KV cache pool of type {type(kv_pool).__name__}. "
+                    f"Multi-expert may not work correctly."
+                )
+
+    def _load_profile_weights(
+        self, draft_model_path: str, server_args: ServerArgs
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Load a new set of draft model weights from a given path.
+
+        Creates a temporary model instance, loads weights, extracts profile-specific
+        parameter tensors (cloned), then deletes the temporary model entirely.
+        """
+        from sglang.srt.configs.device_config import DeviceConfig
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_loader import get_model
+
+        try:
+            # Create model config for the new profile
+            temp_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+
+            load_config = LoadConfig(
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
+            )
+
+            # Load the model
+            temp_model = get_model(
+                model_config=temp_model_config,
+                load_config=load_config,
+                device_config=DeviceConfig(self.device, self.gpu_id),
+            )
+
+            # Extract profile-specific weights (cloned tensors)
+            weights = temp_model._extract_own_profile_weights()
+
+            # Delete the entire temporary model to free GPU memory
+            del temp_model
+            torch.cuda.empty_cache()
+
+            return weights
+
+        except Exception as e:
+            logger.error(f"Failed to load draft profile from {draft_model_path}: {e}")
+            return None
+
+    def _has_mixed_profiles(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        """Check if the current batch contains requests routed to different draft experts.
+
+        CUDA graphs are captured with the default expert only and cannot handle
+        dynamic MoE routing. When multiple profiles are present in the same batch,
+        we must fall back to eager mode so that _forward_moe() can route each
+        token to its correct expert.
+
+        Returns True if the batch has tokens targeting more than one expert.
+        """
+        if self._num_draft_profiles <= 1:
+            return False
+
+        model = self.draft_runner.model
+        if not getattr(model, "_has_experts", False):
+            return False
+
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        if sampling_info is None:
+            return False
+
+        custom_params_list = getattr(sampling_info, "custom_params", None)
+        if custom_params_list is None:
+            return False
+
+        profile_names = model._profile_names
+        default_profile_name = profile_names[model._default_profile_idx]
+        profile_name_set = set()
+
+        for cp in custom_params_list:
+            if isinstance(cp, dict):
+                p = cp.get("eagle_draft_profile", default_profile_name)
+            else:
+                p = default_profile_name
+            profile_name_set.add(p)
+            if len(profile_name_set) > 1:
+                return True
+
+        return False
+
     def draft_extend(self):
         pass
 
@@ -481,7 +656,6 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -506,19 +680,16 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 token per req
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
+            # draft mode is same with decode mode, only 1 num token per batch
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
 
         batch.spec_info = next_draft_input
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
+        logits_output, _ = self.draft_runner.forward(forward_batch)
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -534,8 +705,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            num_tokens_per_batch=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_batch=1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -559,27 +730,23 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        if forward_batch.spec_info.accept_length is None:
-            forward_batch.spec_info.accept_length = batch_result.accept_lens
-
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+        # CUDA graph for draft extend also captures default expert only.
+        # Fall back to eager mode when batch has mixed draft profiles.
+        if can_cuda_graph and self._has_mixed_profiles(batch):
+            can_cuda_graph = False
         if can_cuda_graph:
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
         else:
-            draft_logits_output = self.draft_runner.forward(
+            draft_logits_output, _ = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            ).logits_output
-
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
-        )
+            )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -613,8 +780,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -623,6 +788,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.enable_nan_detection = server_args.enable_nan_detection
         self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -640,15 +806,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            nccl_port,
-            target_worker,
+            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
 
         # Some dummy tensors
@@ -684,15 +842,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
                     )
                 )
                 return batch_output
@@ -705,18 +860,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
@@ -732,7 +883,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -802,23 +953,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        if self.enable_nan_detection:
+            detect_nan(logits_output)
         (
             predict,
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
-
-        # Update mamba state for hybrid GDN models after verification
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-        ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_length, accept_index, bs
-            )
-
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
@@ -848,70 +990,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
-
-    def _mamba_verify_update(
-        self,
-        batch: ModelWorkerBatch,
-        verify_input: EagleVerifyInput,
-        accept_length: torch.Tensor,
-        accept_index: torch.Tensor,
-        bs: int,
-    ):
-        """Update mamba state for hybrid GDN models after verification."""
-        # Calculate accepted_steps for mamba state update
-        # Include the bonus token (+1)
-        accepted_length_with_bonus = accept_length
-        if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
-            accepted_indices_offset = torch.arange(
-                0,
-                bs * self.speculative_num_draft_tokens,
-                step=self.speculative_num_draft_tokens,
-                dtype=accepted_length_with_bonus.dtype,
-                device=accepted_length_with_bonus.device,
-            )
-            accepted_steps = accepted_length_with_bonus - 1
-
-            if batch.mamba_track_indices is not None:
-                # If after verify, the request's seq_lens has crossed a mamba track interval,
-                # we need to update the mamba state for the request at the crossing point.
-                seq_lens_pre_verify = batch.seq_lens
-                seq_lens_post_verify = batch.seq_lens + accepted_length_with_bonus
-                mamba_track_interval = self.server_args.mamba_track_interval
-                to_track_mask = (
-                    seq_lens_pre_verify // mamba_track_interval
-                    != seq_lens_post_verify // mamba_track_interval
-                )
-                tracking_point = (
-                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-                )
-                to_track_ith = torch.clamp(
-                    tracking_point - seq_lens_pre_verify - 1, min=0
-                ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accepted_length_with_bonus.device,
-                )
-                candidate_track_steps = (
-                    accept_index[req_idx, to_track_ith] - accepted_indices_offset
-                )
-                mamba_steps_to_track = torch.where(
-                    to_track_mask,
-                    candidate_track_steps,
-                    torch.full_like(candidate_track_steps, -1),
-                )
-            else:
-                mamba_steps_to_track = None
-
-            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                accepted_steps=accepted_steps,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=self.target_worker.model_runner.model,
-            )
 
     def move_accepted_tokens_to_target_kvcache(
         self,
