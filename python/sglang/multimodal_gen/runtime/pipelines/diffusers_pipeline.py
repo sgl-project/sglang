@@ -456,7 +456,22 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        pipe = pipe.to(get_local_torch_device())
+        # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        any_offload = (
+            server_args.dit_cpu_offload
+            or server_args.text_encoder_cpu_offload
+            or server_args.image_encoder_cpu_offload
+            or server_args.vae_cpu_offload
+        )
+        if any_offload:
+            device = get_local_torch_device()
+            gpu_id = device.index if device.index is not None else 0
+            pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+            logger.info(
+                "Enabled model CPU offload for diffusers pipeline (gpu_id=%d)", gpu_id
+            )
+        else:
+            pipe = pipe.to(get_local_torch_device())
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
         # Apply attention backend if specified

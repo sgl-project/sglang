@@ -16,7 +16,7 @@ classifiers = [
 
 dependencies = [
   "torch==2.9.0",
-  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
+  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. torch==2.9.0 on XPU uses 0.9.1
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchaudio==2.9.0",
   "torchvision",
@@ -28,7 +28,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "decord",
   "einops",
   "fastapi",
   "gguf",
