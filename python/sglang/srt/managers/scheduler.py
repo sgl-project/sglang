@@ -1502,40 +1502,46 @@ class Scheduler(
                 pending health check signal.
             include_compiling_grammars: When True, also check grammar queue.
         """
-        being_processed = (
+        if (
             self.chunked_req is not None
             or self.dllm_manager.any_staging_reqs()
             or not self.running_batch.is_empty()
             or len(self.offload_tags) > 0
-        )
+        ):
+            return True
 
-        being_processed |= len(self.waiting_queue) > 0
+        if len(self.waiting_queue) > 0:
+            return True
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            being_processed |= (
+            if (
                 len(self.disagg_prefill_bootstrap_queue.queue) > 0
                 or len(self.disagg_prefill_inflight_queue) > 0
-            )
+            ):
+                return True
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            being_processed |= (
+            if (
                 len(self.disagg_decode_prealloc_queue.queue) > 0
                 or len(self.disagg_decode_transfer_queue.queue) > 0
-            )
+            ):
+                return True
 
         if include_batch_state:
-            being_processed |= (
+            if (
                 (self.last_batch is not None and not self.last_batch.is_empty())
                 or (self.cur_batch is not None and not self.cur_batch.is_empty())
                 or (self.enable_overlap and len(self.result_queue) > 0)
                 or (
                     self.pp_size > 1 and any(not x.is_empty() for x in self.running_mbs)
                 )
-            )
+            ):
+                return True
 
         if include_compiling_grammars:
-            being_processed |= len(self.grammar_manager.grammar_queue) > 0
+            if len(self.grammar_manager.grammar_queue) > 0:
+                return True
 
-        return being_processed
+        return False
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
