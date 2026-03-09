@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
@@ -8,12 +9,16 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import crash_on_warnings
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyOutput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -422,12 +427,66 @@ def get_token_ids_logprobs_chunk(
 class OutputLogprobProcessor(nn.Module):
     """Processes output (decode) logprobs: logits -> log_softmax -> utilities.
 
-    Delegated to sampler for output logprob computation.
-    Two entry points:
-      - forward:       logits -> log_softmax -> extract (standard pipeline)
-      - from_logprobs: pre-computed logprobs -> extract (when logprobs are
-                       already available, e.g. as a side-effect of sampling)
+    Handles the full output logprob pipeline including preprocessing,
+    log_softmax computation, and extraction of top-k / token-id logprobs.
+
+    Entry points:
+      - forward:                  logits -> preprocess -> log_softmax -> extract
+      - from_logprobs:            pre-computed logprobs -> extract (when logprobs are
+                                  already available, e.g. as a side-effect of sampling)
+      - process_output_logprobs:  compute and attach logprob results to LogitsProcessorOutput
     """
+
+    def __init__(self, use_nan_detection: bool = False):
+        super().__init__()
+        self.use_nan_detection = use_nan_detection
+
+    def preprocess_logits(
+        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    ) -> torch.Tensor:
+        """Apply custom logit processors and handle NaN detection."""
+        # Apply the custom logit processors if registered in the sampling info
+        if sampling_info.has_custom_logit_processor:
+            from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+            apply_custom_logit_processor(logits, sampling_info)
+
+        # Detect and handle NaN values in logits
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
+            logger.warning("Detected errors during sampling! NaN in the logits.")
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+            )
+            if crash_on_warnings():
+                raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+        return logits
+
+    def compute_logprobs_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute log-probabilities from raw logits via log_softmax."""
+        return torch.nn.functional.log_softmax(logits, dim=-1)
+
+    def compute_logprobs_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Compute log-probabilities from a probability distribution."""
+        return torch.log(probs)
+
+    def process_output_logprobs(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logprobs: torch.Tensor,
+        batch_next_token_ids: torch.Tensor,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[Optional[List[int]]],
+    ):
+        """Compute and attach logprob results to logits_output."""
+        result = self.from_logprobs(
+            logprobs, batch_next_token_ids, top_logprobs_nums, token_ids_logprobs
+        )
+        logits_output.next_token_logprobs = result.token_logprobs
+        logits_output.next_token_top_logprobs_val = result.top_logprobs_val
+        logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
+        logits_output.next_token_token_ids_logprobs_val = result.token_ids_logprobs_val
+        logits_output.next_token_token_ids_logprobs_idx = result.token_ids_logprobs_idx
 
     def from_logprobs(
         self,
@@ -469,14 +528,15 @@ class OutputLogprobProcessor(nn.Module):
     def forward(
         self,
         logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[Optional[List[int]]],
         needs_token_ids_logprobs: bool,
         needs_top_logprobs: bool,
     ) -> LogprobResult:
-        """Compute logprobs from logits and extract results."""
-        # Compute logprobs
-        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        """Preprocess logits, compute log_softmax, and extract results."""
+        logits = self.preprocess_logits(logits, sampling_info)
+        logprobs = self.compute_logprobs_from_logits(logits)
 
         next_token_top_logprobs_val = next_token_top_logprobs_idx = None
         next_token_token_ids_logprobs_val = next_token_token_ids_logprobs_idx = None

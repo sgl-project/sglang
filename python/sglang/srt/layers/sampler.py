@@ -16,7 +16,7 @@ from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils.common import get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -54,26 +54,9 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
-        self.output_logprob_processor = OutputLogprobProcessor()
-
-    def _preprocess_logits(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ) -> torch.Tensor:
-        """Apply custom logit processors and handle NaN detection."""
-        # Apply the custom logit processors if registered in the sampling info
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
-
-        return logits
+        self.output_logprob_processor = OutputLogprobProcessor(
+            use_nan_detection=self.use_nan_detection,
+        )
 
     def forward(
         self,
@@ -101,14 +84,14 @@ class Sampler(nn.Module):
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits, sampling_info)
+        logits = self.output_logprob_processor.preprocess_logits(logits, sampling_info)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
-                original_logprobs = logprobs = torch.nn.functional.log_softmax(
-                    logits, dim=-1
+                logprobs = self.output_logprob_processor.compute_logprobs_from_logits(
+                    logits
                 )
         else:
             simple_sampling_case = (
@@ -119,7 +102,9 @@ class Sampler(nn.Module):
 
             # If requested, cache original logprobs before temperature scaling.
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
-                original_logprobs = torch.log_softmax(logits, dim=-1)
+                original_logprobs = (
+                    self.output_logprob_processor.compute_logprobs_from_logits(logits)
+                )
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
@@ -128,8 +113,10 @@ class Sampler(nn.Module):
                 logits_div_temperature = (
                     logits.bfloat16().div(sampling_info.temperatures).bfloat16()
                 )
-                logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
+                logprobs_via_logsoftmax_kernel = (
+                    self.output_logprob_processor.compute_logprobs_from_logits(
+                        logits_div_temperature
+                    )
                 )
                 del logits_div_temperature
 
@@ -166,7 +153,9 @@ class Sampler(nn.Module):
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
+                        else self.output_logprob_processor.compute_logprobs_from_probs(
+                            probs
+                        )
                     )
                 del probs
 
@@ -174,13 +163,12 @@ class Sampler(nn.Module):
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
-            self._attach_logprobs_to_output(
+            self.output_logprob_processor.process_output_logprobs(
                 logits_output,
                 logprobs,
+                batch_next_token_ids,
                 top_logprobs_nums,
                 token_ids_logprobs,
-                sampling_info,
-                batch_next_token_ids,
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -308,26 +296,10 @@ class Sampler(nn.Module):
         )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.log_softmax(logits, dim=-1)
+            logprobs = self.output_logprob_processor.compute_logprobs_from_logits(
+                logits
+            )
         return batch_next_token_ids, logprobs
-
-    def _attach_logprobs_to_output(
-        self,
-        logits_output: LogitsProcessorOutput,
-        logprobs: torch.Tensor,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
-        sampling_info: SamplingBatchInfo,
-        batch_next_token_ids: torch.Tensor,
-    ):
-        result = self.output_logprob_processor.from_logprobs(
-            logprobs, batch_next_token_ids, top_logprobs_nums, token_ids_logprobs
-        )
-        logits_output.next_token_logprobs = result.token_logprobs
-        logits_output.next_token_top_logprobs_val = result.top_logprobs_val
-        logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
-        logits_output.next_token_token_ids_logprobs_val = result.token_ids_logprobs_val
-        logits_output.next_token_token_ids_logprobs_idx = result.token_ids_logprobs_idx
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -375,11 +347,13 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
-        # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
-
         result = self.output_logprob_processor(
-            logits, top_logprobs_nums, token_ids_logprobs
+            logits_output.next_token_logits,
+            sampling_info,
+            top_logprobs_nums,
+            token_ids_logprobs,
+            needs_token_ids_logprobs,
+            needs_top_logprobs,
         )
         logits_output.next_token_top_logprobs_val = result.top_logprobs_val
         logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
