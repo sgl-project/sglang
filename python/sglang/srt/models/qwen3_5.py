@@ -84,37 +84,64 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
-    # Stacked param mappings for the fused DeltaNet projections (z, b, a).
-    # Q/K/V (shards 0-2) are handled by load_fused_qkv below.
-    STACKED_PARAMS = [
-        ("in_proj_all", "in_proj_z", 3),
-        ("in_proj_all", "in_proj_b", 4),
-        ("in_proj_all", "in_proj_a", 5),
-    ]
+    # Weight name → (fused_name, shard_id) for each fused target.
+    # At TP=1: all 6 projections fuse into in_proj_all (shards 0-5).
+    # At TP>1: only Z/B/A fuse into in_proj_zba (shards 0-2);
+    #          QKV stays as in_proj_qkv (loaded via stacked_params_mapping).
+    # We use exact suffix matching (not substring) to avoid collisions
+    # between names like in_proj_a / in_proj_all / in_proj_zba.
+    _DELTANET_WEIGHT_MAP = {
+        # checkpoint name suffix → list of (fused_param_suffix, shard_id)
+        # First match in params_dict wins.
+        "in_proj_z": [("in_proj_all", 3), ("in_proj_zba", 0)],
+        "in_proj_b": [("in_proj_all", 4), ("in_proj_zba", 1)],
+        "in_proj_a": [("in_proj_all", 5), ("in_proj_zba", 2)],
+    }
 
     @staticmethod
-    def load_fused_qkv(name, loaded_weight, params_dict, loaded_params):
-        """Load in_proj_qkv checkpoint weight into fused in_proj_all.
+    def load_fused_deltanet(name, loaded_weight, params_dict, loaded_params):
+        """Load DeltaNet checkpoint weights into fused parameters.
 
-        The checkpoint stores in_proj_qkv as a single [Q+K+V, H] tensor.
-        We split it into Q, K, V and load each as a separate shard (0, 1, 2)
-        of the fused in_proj_all parameter.
+        Handles two cases:
+        1. in_proj_qkv → split into Q/K/V shards of in_proj_all (TP=1 only)
+        2. in_proj_z/b/a → load as shards of in_proj_all (TP=1) or in_proj_zba (TP>1)
 
+        Uses exact suffix matching to avoid substring collisions.
         Returns True if the weight was handled, False otherwise.
         """
-        if "in_proj_qkv" not in name or not name.endswith(".weight"):
+        if not name.endswith(".weight"):
             return False
-        param_name = name.replace("in_proj_qkv", "in_proj_all")
-        if param_name not in params_dict:
-            return False
-        param = params_dict[param_name]
-        weight_loader = getattr(param, "weight_loader")
-        chunk = loaded_weight.shape[0] // 3
-        weight_loader(param, loaded_weight[:chunk], 0)  # Q
-        weight_loader(param, loaded_weight[chunk : 2 * chunk], 1)  # K
-        weight_loader(param, loaded_weight[2 * chunk :], 2)  # V
-        loaded_params.add(param_name)
-        return True
+
+        # Handle in_proj_qkv → in_proj_all (TP=1 only)
+        if ".in_proj_qkv." in name:
+            param_name = name.replace("in_proj_qkv", "in_proj_all")
+            if param_name not in params_dict:
+                return False
+            param = params_dict[param_name]
+            weight_loader = getattr(param, "weight_loader")
+            chunk = loaded_weight.shape[0] // 3
+            weight_loader(param, loaded_weight[:chunk], 0)  # Q
+            weight_loader(param, loaded_weight[chunk : 2 * chunk], 1)  # K
+            weight_loader(param, loaded_weight[2 * chunk :], 2)  # V
+            loaded_params.add(param_name)
+            return True
+
+        # Handle in_proj_z/b/a → in_proj_all or in_proj_zba
+        for ckpt_suffix, targets in Qwen3_5GatedDeltaNet._DELTANET_WEIGHT_MAP.items():
+            # Exact match: check for ".{suffix}." in the name
+            if f".{ckpt_suffix}." not in name:
+                continue
+            for fused_suffix, shard_id in targets:
+                param_name = name.replace(ckpt_suffix, fused_suffix)
+                if param_name not in params_dict:
+                    continue
+                param = params_dict[param_name]
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(param_name)
+                return True
+
+        return False
 
     def __init__(
         self,
@@ -155,30 +182,55 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # Fused input projections: single matmul for all DeltaNet inputs
-        # Merges qkv + z + b + a into one kernel launch, reducing decode
-        # latency by ~9% (66 fewer kernel launches across 22 DeltaNet layers)
+        # Input projections: fuse all 6 into one matmul at TP=1 (saves ~9%
+        # decode latency from 66 fewer kernel launches). At TP>1, QKV needs
+        # per-head sharding so we keep it separate and only fuse Z/B/A.
         tp = self.attn_tp_size
-        self._fused_qkv_dim = (self.key_dim + self.key_dim + self.value_dim) // tp
-        self._fused_z_dim = self.value_dim // tp
-        self._fused_b_dim = self.num_v_heads // tp
-        self._fused_a_dim = self.num_v_heads // tp
-        self.in_proj_all = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[
-                self.key_dim,  # Q
-                self.key_dim,  # K
-                self.value_dim,  # V
-                self.value_dim,  # Z
-                self.num_v_heads,  # B
-                self.num_v_heads,  # A
-            ],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_all", prefix),
-        )
+        self._fuse_all = tp == 1
+        if self._fuse_all:
+            self._fused_qkv_dim = self.key_dim + self.key_dim + self.value_dim
+            self._fused_z_dim = self.value_dim
+            self._fused_b_dim = self.num_v_heads
+            self._fused_a_dim = self.num_v_heads
+            self.in_proj_all = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,  # Q
+                    self.key_dim,  # K
+                    self.value_dim,  # V
+                    self.value_dim,  # Z
+                    self.num_v_heads,  # B
+                    self.num_v_heads,  # A
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_all", prefix),
+            )
+        else:
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_qkv", prefix),
+            )
+            self.in_proj_zba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.value_dim,  # Z
+                    self.num_v_heads,  # B
+                    self.num_v_heads,  # A
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_zba", prefix),
+            )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -277,15 +329,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         seq_len, _ = hidden_states.shape
 
-        proj_out, _ = self.in_proj_all(hidden_states)
-
-        qkv_end = self._fused_qkv_dim
-        z_end = qkv_end + self._fused_z_dim
-        b_end = z_end + self._fused_b_dim
-        mixed_qkv = proj_out[:, :qkv_end]
-        z = proj_out[:, qkv_end:z_end].reshape(proj_out.size(0), -1, self.head_v_dim)
-        b = proj_out[:, z_end:b_end].contiguous()
-        a = proj_out[:, b_end:].contiguous()
+        if self._fuse_all:
+            proj_out, _ = self.in_proj_all(hidden_states)
+            qkv_end = self._fused_qkv_dim
+            z_end = qkv_end + self._fused_z_dim
+            b_end = z_end + self._fused_b_dim
+            mixed_qkv = proj_out[:, :qkv_end]
+            z = proj_out[:, qkv_end:z_end].reshape(
+                proj_out.size(0), -1, self.head_v_dim
+            )
+            b = proj_out[:, z_end:b_end].contiguous()
+            a = proj_out[:, b_end:].contiguous()
+        else:
+            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            zba, _ = self.in_proj_zba(hidden_states)
+            z_dim = self.value_dim // self.attn_tp_size
+            b_dim = self.num_v_heads // self.attn_tp_size
+            z = zba[:, :z_dim].reshape(zba.size(0), -1, self.head_v_dim)
+            b = zba[:, z_dim : z_dim + b_dim].contiguous()
+            a = zba[:, z_dim + b_dim :].contiguous()
 
         core_attn_out = self.attn(
             forward_batch=forward_batch,
@@ -314,6 +376,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -337,6 +400,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                is_nextn=is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -433,6 +497,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -535,6 +600,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                is_nextn=is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -684,6 +750,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -717,6 +784,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
 
         self.layers = make_layers(
@@ -827,16 +895,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            *Qwen3_5GatedDeltaNet.STACKED_PARAMS,
+
         ]
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(
-                name, loaded_weight, params_dict, loaded_params
-            ):
-                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -847,6 +911,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if Qwen3_5GatedDeltaNet.load_fused_deltanet(
+                name, loaded_weight, params_dict, loaded_params
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -882,6 +950,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
+
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
@@ -900,7 +976,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            *Qwen3_5GatedDeltaNet.STACKED_PARAMS,
+
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -959,10 +1035,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(
-                name, loaded_weight, params_dict, loaded_params
-            ):
-                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -973,6 +1045,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if Qwen3_5GatedDeltaNet.load_fused_deltanet(
+                name, loaded_weight, params_dict, loaded_params
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -1136,13 +1212,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            *Qwen3_5GatedDeltaNet.STACKED_PARAMS,
+
         ]
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+            if Qwen3_5GatedDeltaNet.load_fused_deltanet(
                 name, loaded_weight, params_dict, loaded_params
             ):
                 continue
@@ -1237,7 +1313,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            *Qwen3_5GatedDeltaNet.STACKED_PARAMS,
+
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1294,7 +1370,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if Qwen3_5GatedDeltaNet.load_fused_qkv(
+            if Qwen3_5GatedDeltaNet.load_fused_deltanet(
                 name, loaded_weight, params_dict, loaded_params
             ):
                 continue
@@ -1424,7 +1500,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+
         return loaded_params
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
