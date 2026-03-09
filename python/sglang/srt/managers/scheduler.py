@@ -1490,13 +1490,16 @@ class Scheduler(
         include_batch_state: bool = True,
         exclude_compiling_grammars: bool = False,
     ) -> bool:
-        """Check if any requests are active in the scheduler.
+        """Check if the scheduler has active processing or queued requests.
 
         Args:
-            include_batch_state: When True, also check batch execution state
-                (last_batch, cur_batch, overlap result_queue, pp running_mbs).
-                Use True for strict idle checks (hicache ops, flush).
-                Use False for health check skip (only pre-queue blockers).
+            include_batch_state: When True, also check residual batch pipeline
+                state (last_batch, cur_batch, overlap result_queue, pp
+                running_mbs). Use True for strict idle checks (hicache ops,
+                flush). Use False for health check skip — in that case we only
+                need to know if active processing or queued requests guarantee
+                a future process_batch_result() call that will drain the
+                pending health check signal.
             exclude_compiling_grammars: When True, skip grammar queue check.
         """
         being_processed = (
