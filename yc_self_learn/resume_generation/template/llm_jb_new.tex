@@ -1,0 +1,141 @@
+\documentclass[letterpaper,10pt]{article}
+
+% ---------- Packages ----------
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=4pt, left=1.5em}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage[sfdefault]{roboto}
+
+% ---------- Page Style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- Margins ----------
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-0.9in}
+\addtolength{\textheight}{1.15in}
+
+% ---------- Section Formatting ----------
+\titleformat{\section}{\large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{5pt plus 1pt minus 1pt}{3pt}
+
+% ---------- Commands ----------
+\newcommand{\resumeItem}[1]{\item\small{#1}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1 pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & #2 \\
+    \textit{#3} & \textit{#4} \\
+  \end{tabular*}\vspace{0.5pt}
+}
+
+\newcommand{\resumeSubHeadingList}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+
+% ---------- Document ----------
+\begin{document}
+
+% ---------- Header ----------
+\begin{center}
+  {\Large \textbf{Yanda Cheng}} \\
+  \vspace{2pt}
+  \small +1(859)3383379 \textbar\ \href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \textbar\
+\href{https://linkedin.com/in/yanda-cheng-4888a216b}{linkedin.com/in/yanda-cheng-4888a216b} \textbar\
+\href{https://github.com/YandaCheng}{github.com/YandaCheng}
+
+\end{center}
+\vspace*{-10pt}
+\vspace*{-5pt}
+
+% ---------- Summary ----------
+\section{Summary}
+\small
+PhD candidate (ECE) with \textbf{10+ years} building \textbf{production ML and data systems}: large-scale sensor data pipelines, \textbf{ML deployment} on edge devices, and cloud-based analytics platforms. Built ML and systems at HydroSense (tens of millions RMB revenue, 20k+ deployed sensors); contributed to \textbf{SGLang} (LLM serving); shipped RAG and evaluation systems at Seno Medical. Strong in \textbf{data ingestion}, \textbf{reliability}, and \textbf{ML deployment}—positioned for \textbf{ML Systems / Applied ML Engineer} roles.
+
+\vspace*{-10pt}
+% ---------- Education ----------
+\section{Education}
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=2pt, topsep=2pt]
+  \item \textbf{PhD}   in Electrical and Computer Engineering \hfill\textit{| University at Buffalo, Buffalo, NY}\hfill GPA: 4.0/4.0 \hfill 2021--2026 (Expected)
+  \vspace*{-3pt}
+  \item \textbf{Master}  in Electrical and Computer Engineering \hfill\textit{| Cornell University, Ithaca, NY} \hfill 2020--2021
+  \vspace*{-3pt}
+  \item \textbf{Bachelor}  in Electrical and Computer Engineering\hfill  \textit{| University of Kentucky, Lexington, KY} \hfill 2015--2020
+\end{itemize}
+
+\vspace*{-10pt}
+% ---------- Experience ----------
+\section{Work Experience}
+\fontsize{10.5pt}{12.6pt}\selectfont
+\begin{itemize}[leftmargin=0in, label={}]
+
+% ---------- HydroSense: one role, evolution narrative (4-5 bullets) ----------
+\vspace{-3pt}\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{HydroSense Tech} & Remote / Singapore \\
+  \textit{ML Systems Engineer} & \textit{2017 -- Present (Part Time); May 2025 -- Sep 2025 (Full Time)} \\
+\end{tabular*}\vspace{1pt}
+\begin{itemize}[leftmargin=0.2in, topsep=1pt]
+  \item Built a production \textbf{ML-driven sensing platform} that continuously analyzes environmental data from thousands of deployed sensors across municipal and industrial customers, enabling automated monitoring and analytics and scaling to \textbf{tens of millions RMB} annual revenue.
+  \item Developed \textbf{ML-based sensor drift-correction models} (on-device 1D-CNN, INT8) and automated retraining pipelines; owned the workflow from \textbf{cloud training} to \textbf{model/software upgrade} and remote deployment across field devices.
+  \item Designed \textbf{cloud data pipelines} on Alibaba Cloud for high-frequency sensor ingestion, validation, anomaly detection, alert generation, and geo-redundant storage; integrated with \textbf{customer-designated cloud and database} environments where required.
+  \item Implemented \textbf{edge software stack} (C++ firmware on STM32 and Python gateways) supporting \textbf{RS-485}, \textbf{Bluetooth}, and \textbf{Wi-Fi} with \textbf{remote OTA} for large-scale sensor fleets; participated in circuit and board selection/design.
+  \item Led \textbf{system architecture and reliability engineering} across \textbf{20--50} hardware engineers; established monitoring, on-call, and incident response. Co-inventor on \textbf{3 patents} (hardware \& ML drift compensation).
+\end{itemize}
+
+\vspace*{6pt}
+\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{SGLang (LLM/VLM Serving Framework)} & Mountain View, CA \\
+  \textit{Open-Source Contributor} & \textit{Aug 2025 -- Feb 2026} \\
+\end{tabular*}\vspace{1pt}
+
+\begin{itemize}[leftmargin=0.2in]
+  \item Added \textbf{Sequence Parallelism (SP)} for GLM-Image in SGLang-D (\textbf{\#18077}): multi-GPU sharded execution, latency/VRAM baselines, validation across SP/TP—unblocking high-resolution diffusion generation.
+  \item Fixed high-concurrency file-descriptor leaks in HTTP utils (\textbf{\#12047}) by ensuring urllib responses closed on all paths; stress-tested \textbf{5,000} requests (\textbf{100 threads}) to \textbf{0\% failures}, \textbf{p99 $<$ 30 ms}, stable FD count.
+  \item Unblocked out-of-the-box diffusion launches by fixing missing dependencies in \texttt{sglang[diffusion]} (\textbf{\#17900}/\textbf{\#17671}): added \textbf{accelerate} and \textbf{ftfy}, enabling \texttt{device\_map="cuda/auto"} for Wan2.1/FLUX in clean installs.
+  \item Built and shared \textbf{Qwen} \textbf{p99 latency} benchmarks across \textbf{SP/TP} configs for parallelism trade-offs and regression detection.
+\end{itemize}
+
+\vspace*{-1pt}
+\item \textbf{Seno Medical} \hfill New York City, NY  \\
+\textit{Applied Machine Learning Engineer} \hfill \textit{May 2024 -- Aug 2024}
+\vspace*{1pt}
+\begin{itemize}[leftmargin=0.2in, topsep=1pt]
+  \item Built \textbf{2k+ QA} dataset with domain experts, fine-tuned \textbf{LLaMA (LoRA)}, and benchmarked \textbf{BM25} and \textbf{MiniLM} for retrieval-augmented QA over technical documents.
+  \item Designed \textbf{evaluation harness} with label schema (factuality, coverage, style), automatic metrics, and Python error-analysis; reduced hallucination from \textbf{30\% to 15\%} and increased \textbf{Recall@5 to 90\%}.
+  \item Implemented \textbf{RAG backend} (chunking, ingestion, \textbf{FAISS} vector store, retriever/re-ranker, LLM orchestration), served via \textbf{FastAPI} and containerized with \textbf{Docker} for on-prem deployment.
+  \item Set up Git workflows, \textbf{observability} (structured logs, latency/error dashboards), Docker images, and runbooks so downstream teams could deploy and operate independently.
+\end{itemize}
+
+\end{itemize}
+\vspace*{-10pt}
+\vspace*{-2pt}
+\fontsize{10pt}{12pt}\selectfont
+
+% ---------- Publications ----------
+\section{Selected Publication and Skills}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small \textbf{Cheng, Y.}, et al., ``Unsupervised Denoising of Medical Images Based on the Noise2Noise Network,'' \textit{Biomedical Optics Express} 15 (8), 4390-4405 2024.
+\end{itemize}
+\vspace*{-5pt}
+\noindent \small
+\textbf{Languages:} Python, C/C++, SQL, Bash, MATLAB, JavaScript \\
+\textbf{ML \& Frameworks:} PyTorch, TensorFlow, CUDA, FastAPI, Docker, Kubernetes; RAG, LoRA, Quantization, CNN, Transformer \\
+\textbf{Data \& Systems:} PostgreSQL, BigQuery, AWS, GCP, CI/CD, REST, Observability, MLflow
+
+\end{document}

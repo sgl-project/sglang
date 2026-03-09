@@ -1,0 +1,181 @@
+\documentclass[letterpaper,10pt]{article}
+
+% ---------- Packages ----------
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=4pt, left=1.5em}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage[sfdefault]{roboto}
+
+% ---------- Page Style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- Margins ----------
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-0.9in}
+\addtolength{\textheight}{1.15in}
+
+% ---------- Section Formatting ----------
+\titleformat{\section}{\large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{5pt plus 1pt minus 1pt}{3pt}
+
+% ---------- Commands ----------
+\newcommand{\resumeItem}[1]{\item\small{#1}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1 pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & #2 \\
+    \textit{#3} & \textit{#4} \\
+  \end{tabular*}\vspace{0.5pt}
+}
+
+\newcommand{\resumeSubHeadingList}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+
+% ---------- Document ----------
+\begin{document}
+
+% ---------- Header ----------
+\begin{center}
+  {\Large \textbf{Yanda Cheng}} \\
+  \vspace{2pt}
+  \small +1(859)3383379 \textbar\ \href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \textbar\
+\href{https://linkedin.com/in/yanda-cheng-4888a216b}{linkedin.com/in/yanda-cheng-4888a216b} \textbar\
+\href{https://github.com/YandaCheng}{github.com/YandaCheng}
+
+\end{center}
+\vspace*{-10pt}
+\vspace*{-5pt}
+% ---------- Summary (merged with Skills/Keywords) ----------
+% ---------- Summary ----------
+
+
+
+
+
+% ---------- Education ----------
+\section{Education}
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=2pt, topsep=2pt]
+  \item \textbf{PhD}   in Electrical and Computer Engineering \hfill\textit{| University at Buffalo, Buffalo, NY}\hfill GPA: 4.0/4.0 \hfill 2021--2026 (Expected)
+  \vspace*{-3pt}
+  \item \textbf{Master}  in Electrical and Computer Engineering \hfill\textit{| Cornell University, Ithaca, NY} \hfill 2020--2021
+  \vspace*{-3pt}
+  \item \textbf{Bachelor}  in Electrical and Computer Engineering\hfill  \textit{| University of Kentucky, Lexington, KY} \hfill 2015--2020
+\end{itemize}
+
+\vspace*{-10pt}
+% ---------- Experience ----------
+\section{Work Experience}
+\begin{itemize}[leftmargin=0in, label={}]
+
+\vspace{-3pt}\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{SGLang (LLM/VLM Serving Framework)} & Mountain View, CA \\
+  \textit{Open-Source Contributor} & \textit{Aug 2025 -- Feb 2026} \\
+\end{tabular*}\vspace{-2mm}
+
+\begin{itemize}[leftmargin=0.2in]
+  \item \small Added \textbf{Sequence Parallelism (SP)} support for \textbf{GLM-Image} in SGLang-D diffusion pipeline (\textbf{\#18077}): enabled multi-GPU sharded execution for DiT-style diffusion, established reproducible latency/VRAM baselines, and validated behavior across SP/TP settings to unblock high-resolution generation.
+  \item \small Fixed high-concurrency file-descriptor leaks in HTTP utils (\textbf{\#12047}) by ensuring urllib responses are always closed (success/error paths), preventing \textbf{OSError: Too many open files}; stress-tested with \textbf{5,000} requests (\textbf{100 threads}) achieving \textbf{0\% failures} and \textbf{p99 $<$ 30 ms} with stable FD count.
+  \item \small Unblocked out-of-the-box diffusion launches by fixing missing dependencies in \texttt{sglang[diffusion]} (\textbf{\#17900}; related \textbf{\#17671}): added \textbf{accelerate} and \textbf{ftfy} to extras, enabling \texttt{device\_map="cuda/auto"} model loading for Wan2.1 / FLUX-class models in clean-room installs.
+  \item \small Built and shared \textbf{Qwen} performance benchmarks focusing on \textbf{p99 latency} across multiple \textbf{SP/TP} configurations, providing actionable baselines for parallelism trade-offs and regression detection.
+\end{itemize}
+
+\vspace*{-3pt}
+
+\vspace*{-3pt}
+
+
+\item 
+\textbf{HydroSense Tech }    \hfill     
+\hfill  \textit{Sep 2017 -- Present (Part Time, remote); 
+\item  Co-founder / Machine Learning Engineer\hfill May 2025 -- Sep 2025 (Full Time, Singapore)}
+\vspace*{-3pt}
+\begin{itemize}[leftmargin=0.2in, topsep=1pt]
+  \item Co-founded an IoT rainfall sensing startup and led ML for field-deployed devices, helping scale the product line from pilot deployments to \textbf{multi-million-dollar annual revenue} across municipal and industrial customers.
+  \item Built an end-to-end deployment stack: C++ firmware on STM32-based controllers plus Python services on an edge gateway, with secure OTA updates over RS-485 (local bus) and Bluetooth/Wi-Fi (field apps), enabling \textbf{fleet-wide remote monitoring and configuration} for 1000+ devices.
+  \item Designed and shipped an \textbf{on-device 1D-CNN} for temperature-drift compensation using PyTorch training + INT8 quantization, reducing weight-estimation MAE by \textbf{15\% in production} (20k+ installed sensors)
+  \item \textbf{Patents:} Co-inventor on 3 patents, covering rainfall sensing hardware and ML-based drift compensation algorithms.
+\end{itemize}
+
+
+\vspace*{-1pt}
+\item \textbf{Seno Medical} \hfill New York City, NY  \\
+\textit{Machine Learning Engineer} \hfill \quad \textit{May 2024 -- Aug 2024}
+\vspace*{-3pt}
+\begin{itemize}[leftmargin=0.2in, topsep=1pt]
+  \item Collaborated with domain experts to build a \textbf{2k+ QA} dataset from  technical documents; fine-tuned a \textbf{LLaMA-based model (LoRA)} and benchmarked retrieval baselines (\textbf{BM25, MiniLM}) as part of a retrieval-augmented QA system.
+  \item Designed an end-to-end \textbf{evaluation harness} with a label schema (factuality, coverage, style), automatic metrics, and Python error-analysis scripts; reduced hallucination rate from \textbf{30\% to 15\%} and increased \textbf{Recall@5 to 90\%}.
+  \item Implemented a modular \textbf{RAG backend}: chunking and ingestion jobs, \textbf{FAISS}-based vector store, retriever / re-ranker layer, and LLM orchestration, served via \textbf{FastAPI} and containerized with \textbf{Docker} for on-prem deployment.
+\item Set up Git-based workflows and basic \textbf{observability} (structured logs, latency / error-rate dashboards) and shipped reproducible Docker images plus deployment runbooks for downstream teams.
+
+
+\end{itemize}
+
+
+
+
+\vspace*{-1pt}
+\item \textbf{Roswell Park Comprehensive Cancer Center}\\
+\textit{Research Scientist} \hfill Buffalo, NY \quad \textit{May 2023 -- Aug 2023}
+\vspace*{-3pt}
+\begin{itemize}[leftmargin=0.2in, topsep=1pt]
+   \item Designed a \textbf{multi-modal data pipeline} that aligns imaging with structured text reports, including de-identification, schema normalization, and automated QC, to produce clean image–text pairs for generative modeling.
+  \item Built \textbf{dataset generation jobs} (filtering, sampling, augmentation, metadata tagging) to create balanced image–report datasets for conditional generation and downstream training.
+  \item Implemented a \textbf{domain-specific latent diffusion model} (Stable Diffusion–style, DDIM/DPMS sampling), trained on \textbf{AWS}, for conditional image–to–text report generation and synthetic data augmentation.
+  \item Automated \textbf{GPU training and experiment tracking} with standardized configs, logging, and comparison scripts, enabling fast iteration over model variants and dataset settings on the AWS stack. 
+\end{itemize}
+
+
+
+
+
+\end{itemize}
+\vspace*{-10pt}
+\vspace*{-2pt}
+% ---------- Projects ----------
+\section{Projects}
+
+\begin{itemize}[leftmargin=0.0in, label={}]
+
+
+% ---------- Project 2: Edge AI ----------
+\vspace{-3pt}\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{Baby Monitoring System (AWS)}\quad\textit{| Individual Contributor} & New York City, NY \quad\quad\textit{May 2022 -- Aug 2022}
+\end{tabular*}\vspace{-1mm}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small Developed a \textbf{production-ready edge AI system} for continuous infant vital monitoring, integrating embedded sensors, on-device PyTorch inference, and AWS IoT Greengrass for local anomaly detection.
+  \item \small Enabled \textbf{offline operation and data caching} with AWS Greengrass v2, ensuring uninterrupted monitoring and automatic synchronization to \textbf{AWS S3} once connectivity resumed. \small Containerized the entire pipeline with \textbf{Docker}, automated model updates via \textbf{AWS Lambda triggers}, and configured \textbf{CloudWatch metrics} for system health tracking and anomaly alerts.
+\end{itemize}
+
+\end{itemize}
+
+
+\vspace*{-10pt}
+\vspace*{-3pt}
+% ---------- Publications ----------
+\section{Selected Publications and skills}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small \textbf{Cheng, Y.}, et al., ``Unsupervised Denoising of Medical Images Based on the Noise2Noise Network,'' \textit{Biomedical Optics Express} 15 (8), 4390-4405 2024.
+\end{itemize}
+\vspace*{-5pt}
+\noindent \small
+\textbf {Languages:} Python, C/C++, SQL, Bash, MATLAB, JavaScript  \textbf{Libraries:} NumPy, Pandas, Scikit-learn, OpenCV, Matplotlib, Seaborn \textbf{Frameworks:} PyTorch, TensorFlow, Keras, CUDA, FastAPI, Flask, gRPC, Docker, Kubernetes, Git, Linux \textbf{Machine Learning:} Retrieval, Reranking, RAG, LoRA, QLoRA, Quantization, CNN, UNet, LSTM, Transformer, SVM, LASSO \textbf{Data/Cloud:} PostgreSQL, BigQuery, AWS, GCP, CI/CD, REST API, Container Orchestration, Monitoring, MLflow
+
+
+\end{document}
