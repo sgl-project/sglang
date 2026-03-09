@@ -292,6 +292,7 @@ class FusedMoE(torch.nn.Module):
                 else self.weight_loader_fused
             ),
             with_bias=with_bias,
+            moe_intermediate_size=intermediate_size,
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
@@ -417,7 +418,9 @@ class FusedMoE(torch.nn.Module):
         # w3, up_proj: Load into second logical weight of w13.
         # trtllm cutlass kernel assumes differently
         switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
-        if (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3"):
+        if (
+            (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3")
+        ) and self.moe_runner_config.is_gated:
             start = shard_size
         else:
             start = 0
@@ -1223,12 +1226,13 @@ class FlashInferFP4MoE(FusedMoE):
             symm_output = torch.empty(
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
             )
-
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=correction_bias,
             hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn),
+            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+                *hs_scale_linear.shape[:-1], -1
+            ),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn

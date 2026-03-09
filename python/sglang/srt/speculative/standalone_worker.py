@@ -40,7 +40,6 @@ class StandaloneWorker(EAGLEWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
