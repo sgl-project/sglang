@@ -7,7 +7,10 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     get_threshold,
     should_skip_component,
 )
-from sglang.multimodal_gen.test.server.accuracy_utils import extract_output_tensor
+from sglang.multimodal_gen.test.server.accuracy_utils import (
+    build_deterministic_text_encoder_inputs,
+    extract_output_tensor,
+)
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
 from sglang.multimodal_gen.test.server.testcase_configs import ONE_GPU_CASES_A
 
@@ -73,21 +76,21 @@ class TestAccuracy1GPU_A:
         sgl, ref, device = AccuracyEngine.load_component_pair(
             case, ComponentType.TEXT_ENCODER, "transformers", 1
         )
-
-        # Vocab size resolution
-        vocab_size = getattr(ref.config, "vocab_size", 32000)
-        if hasattr(ref.config, "text_config"):
-            vocab_size = getattr(ref.config.text_config, "vocab_size", vocab_size)
-
-        # Use safe clamped range to avoid out-of-bounds or special tokens that trigger assertions
-        torch.manual_seed(42)
-        input_ids = torch.randint(
-            100, min(vocab_size, 30000), (1, 32), device="cpu", dtype=torch.long
-        ).to(device)
+        input_ids, attention_mask = build_deterministic_text_encoder_inputs(
+            ref.config, device
+        )
 
         with torch.no_grad():
-            sgl_out = sgl(input_ids, output_hidden_states=True)
-            ref_out = ref(input_ids, output_hidden_states=True)
+            sgl_out = sgl(
+                input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            ref_out = ref(
+                input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
 
             AccuracyEngine.check_accuracy(
                 extract_output_tensor(sgl_out),

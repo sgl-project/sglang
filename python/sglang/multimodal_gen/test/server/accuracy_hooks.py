@@ -7,6 +7,11 @@ from typing import Any, Callable, Dict, Optional
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.test.server.accuracy_config import (
+    DEFAULT_TIMESTEP,
+    I2V_IMAGE_DIM,
+    TIMESTEP_NORMALIZATION_FACTOR,
+)
 from sglang.multimodal_gen.test.server.accuracy_utils import (
     extract_output_tensor,
     seed_and_broadcast,
@@ -17,8 +22,36 @@ BuildInputsFn = Callable[[Any, nn.Module, str, Optional[nn.Module]], Inputs]
 PrepareCallFn = Callable[[nn.Module, Inputs], "HookCall"]
 NormalizeFn = Callable[[Any], torch.Tensor]
 
-DEFAULT_TIMESTEP = 500.0
 DEFAULT_TEXT_SEQ_LEN = 64
+DEFAULT_TOKEN_LAYOUT_SIZE = 32
+REDUCED_TOKEN_LAYOUT_SIZE = 16
+DEFAULT_VIDEO_FRAME_COUNT = 4
+DEFAULT_IMAGE_TOKEN_COUNT = 257
+ALIAS_ROTARY_TEXT_PAD_MULTIPLE = 32
+DEFAULT_TRANSFORMER_IN_CHANNELS = 16
+DEFAULT_TRANSFORMER_TEXT_CHANNELS = 4096
+DEFAULT_TRANSFORMER_POOLED_CHANNELS = 768
+DEFAULT_VAE_LATENT_CHANNELS = 16
+DEFAULT_VAE_LATENT_SPATIAL_SIZE = 32
+LARGE_CHANNEL_LAYOUT_THRESHOLD = 128
+
+
+@dataclass(frozen=True)
+class TransformerHookCompat:
+    normalize_reference_timestep: bool = False
+    negate_reference_output: bool = False
+
+
+def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
+    model_path = case.server_args.model_path.lower()
+    if "z-image" in model_path:
+        return TransformerHookCompat(
+            normalize_reference_timestep=True,
+            negate_reference_output=True,
+        )
+    if "flux" in model_path or "qwen" in model_path:
+        return TransformerHookCompat(normalize_reference_timestep=True)
+    return TransformerHookCompat()
 
 
 @dataclass
@@ -125,7 +158,7 @@ def _build_alias_rotary_freqs(
     model: nn.Module, device: str, height: int, width: int
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     cap_len = DEFAULT_TEXT_SEQ_LEN
-    cap_pad_len = (-cap_len) % 32
+    cap_pad_len = (-cap_len) % ALIAS_ROTARY_TEXT_PAD_MULTIPLE
     cap_ids = (
         torch.stack(
             torch.meshgrid(
@@ -170,7 +203,7 @@ def _supports_image_conditioning(module: nn.Module) -> bool:
 def _build_generic_transformer_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
-    del case
+    compat = _resolve_transformer_hook_compat(case)
     param_names = _forward_parameter_names(model)
     if ref_model is not None:
         param_names |= _forward_parameter_names(ref_model)
@@ -184,12 +217,15 @@ def _build_generic_transformer_inputs(
             "in_channels",
             "transformer_config.in_channels",
         ],
-        default=16,
+        default=DEFAULT_TRANSFORMER_IN_CHANNELS,
     )
     text_channels = _read_config_value(
         model,
         [
             "text_states_dim",
+            "arch_config.cap_feat_dim",
+            "cap_feat_dim",
+            "caption_channels",
             "arch_config.text_dim",
             "text_dim",
             "arch_config.text_embed_dim",
@@ -200,7 +236,7 @@ def _build_generic_transformer_inputs(
             "hidden_size",
             "dim",
         ],
-        default=4096,
+        default=DEFAULT_TRANSFORMER_TEXT_CHANNELS,
     )
     pooled_channels = _read_config_value(
         model,
@@ -212,32 +248,38 @@ def _build_generic_transformer_inputs(
             "text_embed_dim",
             "projection_dim",
         ],
-        default=768,
+        default=DEFAULT_TRANSFORMER_POOLED_CHANNELS,
     )
     image_channels = _read_config_value(
         model,
         ["arch_config.image_dim", "image_dim", "cross_attention_dim"],
-        default=1280,
+        default=I2V_IMAGE_DIM,
     )
 
     if layout == "token_shapes":
-        height, width = 32, 32
+        height, width = DEFAULT_TOKEN_LAYOUT_SIZE, DEFAULT_TOKEN_LAYOUT_SIZE
         seq_len = (height // 2) * (width // 2)
         hidden_states = rng.randn((1, seq_len, in_channels), device, torch.bfloat16)
     elif layout == "token_ids":
-        height, width = 16, 16
+        height, width = REDUCED_TOKEN_LAYOUT_SIZE, REDUCED_TOKEN_LAYOUT_SIZE
         seq_len = height * width
         hidden_states = rng.randn((1, seq_len, in_channels), device, torch.bfloat16)
     elif layout == "alias":
-        height, width = 32, 32
+        height, width = DEFAULT_TOKEN_LAYOUT_SIZE, DEFAULT_TOKEN_LAYOUT_SIZE
         hidden_states = rng.randn(
             (1, in_channels, 1, height, width), device, torch.bfloat16
         )
     else:
-        spatial_size = 16 if "encoder_attention_mask" in param_names else 32
+        spatial_size = (
+            REDUCED_TOKEN_LAYOUT_SIZE
+            if "encoder_attention_mask" in param_names
+            else DEFAULT_TOKEN_LAYOUT_SIZE
+        )
         height, width = spatial_size, spatial_size
         hidden_states = rng.randn(
-            (1, in_channels, 4, height, width), device, torch.bfloat16
+            (1, in_channels, DEFAULT_VIDEO_FRAME_COUNT, height, width),
+            device,
+            torch.bfloat16,
         )
 
     inputs: Inputs = {
@@ -263,7 +305,7 @@ def _build_generic_transformer_inputs(
         model
     ):
         inputs["encoder_hidden_states_image"] = rng.randn(
-            (1, 257, image_channels), device, torch.bfloat16
+            (1, DEFAULT_IMAGE_TOKEN_COUNT, image_channels), device, torch.bfloat16
         )
     if "additional_t_cond" in param_names:
         inputs["additional_t_cond"] = torch.zeros((1,), device=device, dtype=torch.long)
@@ -272,7 +314,7 @@ def _build_generic_transformer_inputs(
     if "txt_seq_lens" in param_names:
         inputs["txt_seq_lens"] = [DEFAULT_TEXT_SEQ_LEN]
     if "img_ids" in param_names or "txt_ids" in param_names:
-        id_dims = 4 if in_channels >= 128 else 3
+        id_dims = 4 if in_channels >= LARGE_CHANNEL_LAYOUT_THRESHOLD else 3
         img_ids, txt_ids = _build_position_ids(height, width, id_dims, device)
         inputs["img_ids"] = img_ids
         inputs["txt_ids"] = txt_ids
@@ -299,16 +341,15 @@ def _build_generic_transformer_inputs(
                 model, device, height, width
             )
 
+    inputs["hook_compat"] = compat
     return inputs
 
 
-def _needs_reference_timestep_normalization(param_names: set[str]) -> bool:
-    return (
-        "t" in param_names
-        or "img_shapes" in param_names
-        or "img_ids" in param_names
-        or "txt_ids" in param_names
-    )
+def _get_transformer_hook_compat(inputs: Inputs) -> TransformerHookCompat:
+    compat = inputs.get("hook_compat")
+    if isinstance(compat, TransformerHookCompat):
+        return compat
+    return TransformerHookCompat()
 
 
 def _supports_guidance_embedding(module: nn.Module) -> bool:
@@ -340,8 +381,9 @@ def _prepare_generic_transformer_call(
 ) -> HookCall:
     param_names = _forward_parameter_names(module)
     signature = inspect.signature(module.forward)
+    compat = _get_transformer_hook_compat(inputs)
     kwargs: Dict[str, Any] = {}
-    negate_output = False
+    negate_output = side == "reference" and compat.negate_reference_output
 
     if "hidden_states" in param_names:
         kwargs["hidden_states"] = inputs["hidden_states"]
@@ -362,16 +404,17 @@ def _prepare_generic_transformer_call(
         kwargs["encoder_hidden_states"] = encoder_value
     if "cap_feats" in param_names:
         kwargs["cap_feats"] = [inputs["encoder_hidden_states"].squeeze(0)]
-        negate_output = side == "reference"
 
     if "timestep" in param_names:
         timestep = inputs["timestep"]
-        if side == "reference" and _needs_reference_timestep_normalization(param_names):
-            timestep = timestep / 1000.0
+        if side == "reference" and compat.normalize_reference_timestep:
+            timestep = timestep / TIMESTEP_NORMALIZATION_FACTOR
         kwargs["timestep"] = timestep
     if "t" in param_names:
-        kwargs["t"] = inputs["timestep"] / 1000.0
-        negate_output = side == "reference"
+        timestep = inputs["timestep"]
+        if side == "reference" and compat.normalize_reference_timestep:
+            timestep = timestep / TIMESTEP_NORMALIZATION_FACTOR
+        kwargs["t"] = timestep
 
     if "guidance" in param_names and "guidance" in inputs:
         skip_guidance_for_image_context = (
@@ -389,7 +432,7 @@ def _prepare_generic_transformer_call(
         if should_include_guidance or requires_guidance_arg:
             guidance_value = inputs["guidance"]
             if side == "sglang":
-                guidance_value = guidance_value * 1000.0
+                guidance_value = guidance_value * TIMESTEP_NORMALIZATION_FACTOR
             kwargs["guidance"] = guidance_value
 
     if (
@@ -469,7 +512,7 @@ def _infer_vae_latent_channels(model: nn.Module) -> int:
             "z_channels",
             "arch_config.z_channels",
         ],
-        default=16,
+        default=DEFAULT_VAE_LATENT_CHANNELS,
     )
 
 
@@ -479,7 +522,18 @@ def _build_generic_vae_inputs(
     del case, ref_model
     latent_channels = _infer_vae_latent_channels(model)
     rng = _DeterministicRNG()
-    return {"z": rng.randn((1, latent_channels, 32, 32), device, torch.bfloat16)}
+    return {
+        "z": rng.randn(
+            (
+                1,
+                latent_channels,
+                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+            ),
+            device,
+            torch.bfloat16,
+        )
+    }
 
 
 def _prepare_vae_call(module: nn.Module, inputs: Inputs) -> HookCall:

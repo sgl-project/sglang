@@ -43,7 +43,12 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.accuracy_config import ComponentType
+from sglang.multimodal_gen.test.server.accuracy_config import (
+    DEFAULT_TIMESTEP,
+    I2V_IMAGE_DIM,
+    I2V_TEXT_ENCODER_DIM,
+    ComponentType,
+)
 from sglang.multimodal_gen.test.server.accuracy_hooks import (
     HookCall,
     resolve_native_profile,
@@ -52,8 +57,29 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
-DEFAULT_TIMESTEP = 500.0
 MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98"))
+
+SOURCE_PREFIXES = (
+    "module.",
+    "model.",
+    "transformer.",
+    "text_encoder.",
+    "image_encoder.",
+    "encoder.",
+    "decoder.",
+    "model.language_model.",
+    "model.visual.",
+)
+
+TARGET_PREFIXES = (
+    "module.",
+    "model.",
+    "transformer.",
+    "text_encoder.",
+    "image_encoder.",
+    "encoder.",
+    "decoder.",
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +120,7 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
 }
 
 
+# Component path and config resolution helpers
 def _read_json(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
@@ -117,8 +144,7 @@ def _is_text_encoder_config(path: str) -> bool:
     if not os.path.exists(cfg_path):
         return False
     cfg = _read_json(cfg_path)
-    # 5120 is the known i2v text-encoder hidden size used by WAN video models.
-    if cfg.get("model_type") == "i2v" or cfg.get("dim") == 5120:
+    if cfg.get("model_type") == "i2v" or cfg.get("dim") == I2V_TEXT_ENCODER_DIM:
         return False
     return True
 
@@ -179,13 +205,24 @@ def _build_pipeline_config(case: DiffusionTestCase, hub_id: str):
         if info
         else _CONFIG_REGISTRY["0"].pipeline_config_cls()
     )
-    if hasattr(pipeline_config, "dit_config") and (
-        "i2v" in case.id.lower() or "i2v" in hub_id.lower() or "ti2v" in case.id.lower()
-    ):
-        pipeline_config.dit_config.image_dim = 1280
+    dit_config = getattr(pipeline_config, "dit_config", None)
+    if dit_config is None:
+        return pipeline_config
+
+    case_id = case.id.lower()
+    hub_id_lower = hub_id.lower()
+    if "i2v" in case_id or "i2v" in hub_id_lower or "ti2v" in case_id:
+        dit_config.image_dim = I2V_IMAGE_DIM
     return pipeline_config
 
 
+# Transformer models that require single-rank execution in component accuracy.
+def _requires_single_rank_transformer(model_path: str) -> bool:
+    model_path = model_path.lower()
+    return any(token in model_path for token in ("z-image", "wan", "qwen"))
+
+
+# Distributed/runtime setup helpers
 def _ensure_distributed_env_defaults() -> None:
     if "WORLD_SIZE" in os.environ:
         return
@@ -207,16 +244,13 @@ def _init_parallel(
     cfg_parallel = bool(case.server_args.cfg_parallel)
     is_transformer = component == ComponentType.TRANSFORMER
     is_text_encoder = component == ComponentType.TEXT_ENCODER
-    is_zimage_transformer = is_transformer and (
-        "zimage" in model_path or "z-image" in model_path
+    requires_single_rank_transformer = (
+        is_transformer and _requires_single_rank_transformer(model_path)
     )
-    is_wan_transformer = is_transformer and "wan" in model_path
 
     if is_text_encoder:
         tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), False
-    elif is_zimage_transformer:
-        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), False
-    elif is_wan_transformer:
+    elif requires_single_rank_transformer:
         # Force SP=1 for accuracy comparisons against Diffusers to avoid SP-aware rotary mismatch.
         tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), cfg_parallel
     else:
@@ -291,6 +325,7 @@ def _build_server_args(
     return sgl_args
 
 
+# Component loading helpers
 def _load_sglang_component(
     comp_path: str,
     sgl_args: ServerArgs,
@@ -349,7 +384,7 @@ def _load_reference_component(
             or "ti2v" in hub_id.lower()
             or "i2v" in comp_path.lower()
         ):
-            load_kwargs["image_dim"] = 1280
+            load_kwargs["image_dim"] = I2V_IMAGE_DIM
         candidates = [diffusers.AutoModel]
         if class_name:
             maybe_cls = getattr(diffusers, str(class_name), None)
@@ -368,7 +403,6 @@ def _load_reference_component(
         kwargs = {
             "torch_dtype": torch.bfloat16,
             "trust_remote_code": True,
-            "ignore_mismatched_sizes": True,
             "config": config,
         }
         class_order = [
@@ -391,6 +425,7 @@ def _load_reference_component(
     raise RuntimeError(f"Unsupported component {component.value}")
 
 
+# Module materialization and state mapping helpers
 def _set_module_attr(module: nn.Module, name: str, value: Any) -> None:
     attrs = name.split(".")
     parent = module
@@ -434,29 +469,15 @@ def _materialize_module(
             buf.data = buf.data.to(device=device, dtype=dtype)
 
 
-SOURCE_PREFIXES = (
-    "module.",
-    "model.",
-    "transformer.",
-    "text_encoder.",
-    "image_encoder.",
-    "encoder.",
-    "decoder.",
-    "model.language_model.",
-    "model.visual.",
-)
+def _resolve_reference_transfer_module(ref_component: nn.Module) -> nn.Module:
+    if getattr(ref_component, "shared", None) is not None:
+        return ref_component
 
-TARGET_PREFIXES = (
-    "module.",
-    "model.",
-    "transformer.",
-    "text_encoder.",
-    "image_encoder.",
-    "encoder.",
-    "decoder.",
-)
+    get_encoder = getattr(ref_component, "get_encoder", None)
+    return get_encoder() if callable(get_encoder) else ref_component
 
 
+# Weight-name normalization and tensor copy helpers.
 def _build_state_lookup(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     lookup: Dict[str, torch.Tensor] = {}
     for key, val in state.items():
@@ -569,6 +590,7 @@ def _copy_tensor(
     return False
 
 
+# Forward hook capture helper.
 class _ForwardCapture:
     def __init__(self, module: nn.Module):
         self._module = module
@@ -588,6 +610,7 @@ class _ForwardCapture:
         self._handle = None
 
 
+# Public accuracy engine
 class AccuracyEngine:
     @staticmethod
     def clear_memory() -> None:
@@ -601,8 +624,9 @@ class AccuracyEngine:
     def check_accuracy(
         target: torch.Tensor, reference: torch.Tensor, name: str, threshold: float
     ) -> None:
-        if hasattr(target, "full_tensor"):
-            target = target.full_tensor()
+        full_tensor = getattr(target, "full_tensor", None)
+        if callable(full_tensor):
+            target = full_tensor()
         t, r = target.detach().cpu().float(), reference.detach().cpu().float()
 
         logger.info(
@@ -774,11 +798,7 @@ class AccuracyEngine:
         override_ring = None
         if component == ComponentType.TEXT_ENCODER or (
             component == ComponentType.TRANSFORMER
-            and (
-                "zimage" in hub_id.lower()
-                or "z-image" in hub_id.lower()
-                or "wan" in hub_id.lower()
-            )
+            and _requires_single_rank_transformer(hub_id)
         ):
             override_sp = 1
             override_tp = 1
@@ -810,24 +830,17 @@ class AccuracyEngine:
                 current_timestep=0, attn_metadata=None
             )
 
-        if component == ComponentType.TEXT_ENCODER:
-            # T5/UMT5 expose the token embedding as `shared`, which lives on the full model.
-            # Using get_encoder() drops it and leads to a large accuracy drop.
-            if hasattr(ref_component, "shared"):
-                ref_for_transfer = ref_component
-            elif hasattr(ref_component, "get_encoder"):
-                ref_for_transfer = ref_component.get_encoder()
-            else:
-                ref_for_transfer = ref_component
-        else:
-            ref_for_transfer = ref_component
+        ref_for_transfer = (
+            _resolve_reference_transfer_module(ref_component)
+            if component == ComponentType.TEXT_ENCODER
+            else ref_component
+        )
         AccuracyEngine.transfer_weights(ref_for_transfer, sgl_component)
 
-        if component != ComponentType.VAE and not hasattr(
-            fc_mod._forward_context, "attn_metadata"
-        ):
-            fc_mod._forward_context = ForwardContext(
-                current_timestep=int(DEFAULT_TIMESTEP), attn_metadata=None
-            )
+        if component != ComponentType.VAE:
+            if not hasattr(fc_mod._forward_context, "attn_metadata"):
+                fc_mod._forward_context = ForwardContext(
+                    current_timestep=int(DEFAULT_TIMESTEP), attn_metadata=None
+                )
 
         return sgl_component.eval(), ref_component.eval(), str(device)

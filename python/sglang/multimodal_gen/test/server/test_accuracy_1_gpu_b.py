@@ -7,7 +7,11 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     get_threshold,
     should_skip_component,
 )
-from sglang.multimodal_gen.test.server.accuracy_utils import extract_output_tensor
+from sglang.multimodal_gen.test.server.accuracy_utils import (
+    build_deterministic_text_encoder_inputs,
+    extract_output_tensor,
+    resolve_text_encoder_forward_module,
+)
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
 from sglang.multimodal_gen.test.server.testcase_configs import ONE_GPU_CASES_B
 
@@ -77,26 +81,13 @@ class TestAccuracy1GPU_B:
         sgl, ref, device = AccuracyEngine.load_component_pair(
             case, ComponentType.TEXT_ENCODER, "transformers", 1
         )
-
-        vocab_size = 32000
-        if hasattr(ref.config, "vocab_size"):
-            vocab_size = ref.config.vocab_size
-        elif hasattr(ref.config, "text_config") and hasattr(
-            ref.config.text_config, "vocab_size"
-        ):
-            vocab_size = ref.config.text_config.vocab_size
-
-        torch.manual_seed(42)
-        # Generate on CPU to keep deterministic input IDs across runs.
-        input_ids = torch.randint(
-            100, min(vocab_size, 30000), (1, 32), device="cpu", dtype=torch.long
-        ).to(device)
-        attention_mask = torch.ones_like(input_ids)
+        input_ids, attention_mask = build_deterministic_text_encoder_inputs(
+            ref.config, device
+        )
 
         with torch.no_grad():
-            # Handle UMT5 and other Encoder-Decoder models that might be loaded as full models
-            ref_model = ref.get_encoder() if hasattr(ref, "get_encoder") else ref
-            sgl_model = sgl.get_encoder() if hasattr(sgl, "get_encoder") else sgl
+            ref_model = resolve_text_encoder_forward_module(ref)
+            sgl_model = resolve_text_encoder_forward_module(sgl)
 
             sgl_out = sgl_model(
                 input_ids, attention_mask=attention_mask, output_hidden_states=True

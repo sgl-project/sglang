@@ -18,6 +18,17 @@ class ComponentSkip:
     reason: str
 
 
+DEFAULT_TIMESTEP = 500.0
+TIMESTEP_NORMALIZATION_FACTOR = 1000.0
+I2V_IMAGE_DIM = 1280
+I2V_TEXT_ENCODER_DIM = 5120
+
+DEFAULT_TEXT_ENCODER_VOCAB_SIZE = 32000
+TEXT_ENCODER_INPUT_SEED = 42
+TEXT_ENCODER_TOKEN_MIN = 100
+TEXT_ENCODER_TOKEN_MAX = 30000
+TEXT_ENCODER_TOKEN_LENGTH = 32
+
 # Default thresholds by component. Override per component/case if needed.
 DEFAULT_THRESHOLDS = {
     ComponentType.VAE: 0.999,
@@ -32,6 +43,7 @@ CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     "flux_2_image_t2i_layerwise_offload": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_ti2i": {ComponentType.TRANSFORMER: 0.99},
+    "flux_2_t2i_customized_vae_path": {ComponentType.TRANSFORMER: 0.99},
     "fast_hunyuan_video": {ComponentType.TRANSFORMER: 0.99},
 }
 
