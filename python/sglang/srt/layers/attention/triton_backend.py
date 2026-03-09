@@ -955,7 +955,9 @@ class TritonAttnBackend(AttentionBackend):
 
         # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = set_extend_kv_indices(
-            forward_batch.out_cache_loc, self.token_to_kv_pool_allocator
+            forward_batch.out_cache_loc, 
+            self.sliding_window_size,
+            self.token_to_kv_pool_allocator
         )
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
