@@ -1,8 +1,10 @@
+import asyncio
 import json
 import os
 import unittest
 from types import SimpleNamespace
 
+import aiohttp
 import openai
 import requests
 from transformers import AutoTokenizer
@@ -435,6 +437,185 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["accuracy"], 0.62)
+
+
+class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
+    """Regression test: pause_generation must not leak prefill requests into
+    running_batch.  With a small --max-running-requests the leak fills the
+    scheduling budget and blocks all subsequent prefills."""
+
+    MAX_RUNNING = 4
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "1",
+            "--max-running-requests",
+            str(cls.MAX_RUNNING),
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_prefill_not_blocked_after_pause_resume(self):
+        """Keep the prefill engine busy with async workers, repeatedly
+        pause/resume to trigger the leak, abort everything, then verify new
+        requests still work.
+
+        Without the fix, each in_place pause leaks one last_batch into
+        running_batch.  After enough cycles the max-running-requests budget
+        is exhausted and all new prefills hang."""
+        asyncio.run(self._run_pause_resume_leak_test())
+
+    async def _run_pause_resume_leak_test(self):
+        NUM_WORKERS = 64
+        # Try several times to trigger leak condition
+        NUM_PAUSE_RESUME_CYCLES = self.MAX_RUNNING * 4
+        NUM_FINAL_REQUESTS = 4
+        MAX_NEW_TOKENS = 1
+        FINAL_TIMEOUT = 5
+        LONG_PROMPT = "Tell me a story. " * 200
+
+        async def _background_worker(session, worker_id, cancel_event):
+            """Send requests sequentially until cancelled."""
+            seq = 0
+            while not cancel_event.is_set():
+                try:
+                    async with session.post(
+                        self.lb_url + "/generate",
+                        json={
+                            "text": f"[w{worker_id}-{seq}] {LONG_PROMPT}",
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": MAX_NEW_TOKENS,
+                            },
+                        },
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        await resp.read()
+                except Exception:
+                    pass
+                seq += 1
+
+        async def _post(session, url, json_data):
+            async with session.post(
+                url,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+
+        cancel_event = asyncio.Event()
+
+        async with aiohttp.ClientSession() as session:
+            # Phase 1: start background workers to keep the engine saturated
+            workers = [
+                asyncio.create_task(_background_worker(session, i, cancel_event))
+                for i in range(NUM_WORKERS)
+            ]
+
+            # Repeatedly pause/resume to accumulate leaked requests
+            for _ in range(NUM_PAUSE_RESUME_CYCLES):
+                await _post(
+                    session,
+                    self.prefill_url + "/pause_generation",
+                    {"mode": "in_place"},
+                )
+                await _post(
+                    session,
+                    self.prefill_url + "/continue_generation",
+                    {},
+                )
+                await asyncio.sleep(0.1)
+
+            # Stop workers and abort all in-flight requests
+            cancel_event.set()
+            await _post(
+                session, self.prefill_url + "/abort_request", {"abort_all": True}
+            )
+            await _post(
+                session, self.decode_url + "/abort_request", {"abort_all": True}
+            )
+
+            await asyncio.gather(*workers, return_exceptions=True)
+
+            # Phase 2: send fresh requests — these must not hang.
+            # With the bug, running_batch is full of phantom requests and
+            # get_num_allocatable_reqs returns <= 0, blocking all new prefills.
+            async def _final_request(i):
+                async with session.post(
+                    self.lb_url + "/generate",
+                    json={
+                        "text": f"[final-{i}] What is 1+1?",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": MAX_NEW_TOKENS,
+                        },
+                    },
+                    timeout=aiohttp.ClientTimeout(total=FINAL_TIMEOUT),
+                ) as resp:
+                    resp.raise_for_status()
+                    body = await resp.json()
+                    assert "text" in body and len(body["text"]) > 0
+                    return body
+
+            results = await asyncio.gather(
+                *[_final_request(i) for i in range(NUM_FINAL_REQUESTS)],
+                return_exceptions=True,
+            )
+
+        errors = [
+            f"Request {i}: {r}"
+            for i, r in enumerate(results)
+            if isinstance(r, Exception)
+        ]
+        completed = sum(1 for r in results if not isinstance(r, Exception))
+        self.assertEqual(
+            completed,
+            NUM_FINAL_REQUESTS,
+            f"Phase 2 requests blocked after pause/resume "
+            f"({completed}/{NUM_FINAL_REQUESTS} succeeded). Errors: {errors}",
+        )
 
 
 if __name__ == "__main__":
