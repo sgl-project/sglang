@@ -16,17 +16,29 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
+import msgspec
 import numpy as np
 import torch
+import zmq
+import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
 
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    KVEventsConfig,
+    ZmqEventPublisher,
+)
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
@@ -171,6 +183,28 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             from sglang.srt.disaggregation import encode_receiver as mm_receiver
 
             self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
+
+        # Parse KV events config for SubscribeKvEvents support
+        self._kv_events_config: Optional[KVEventsConfig] = None
+        self._kv_event_id_counter = 0
+        if server_args.kv_events_config:
+            try:
+                self._kv_events_config = KVEventsConfig.from_cli(
+                    server_args.kv_events_config
+                )
+                if self._kv_events_config.publisher != "zmq":
+                    logger.info(
+                        "KV events publisher is '%s', SubscribeKvEvents disabled",
+                        self._kv_events_config.publisher,
+                    )
+                    self._kv_events_config = None
+                else:
+                    logger.info(
+                        "KV events enabled: endpoint=%s",
+                        self._kv_events_config.endpoint,
+                    )
+            except Exception as e:
+                logger.warning("Failed to parse kv_events_config: %s", e)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -532,6 +566,139 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             loads=loads,
             aggregate=_compute_aggregate_protobuf(loads),
         )
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.KvEventBatch]:
+        """Bridge internal ZMQ KV cache events to gRPC server-streaming.
+
+        Uses the ZMQ publisher's native sequence numbers as gRPC sequence
+        numbers directly.
+        """
+        if self._kv_events_config is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Start SGLang with "
+                '--kv-events-config \'{"publisher": "zmq"}\'',
+            )
+            return
+
+        config = self._kv_events_config
+
+        # Resolve the PUB endpoint to a connectable address.
+        # The publisher binds to e.g. "tcp://*:5557"; we connect to localhost.
+        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
+
+        # For DP attention, each rank publishes on port + rank with
+        # independent sequence counters. Subscribing to multiple ranks
+        # on one socket interleaves independent counters, breaking gap
+        # detection. For now, subscribe to rank 0 only.
+        # TODO(phase2): per-rank virtual workers or merged renumbering.
+        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, 0)
+
+        zmq_ctx = zmq.asyncio.Context.instance()
+        sub_socket = zmq_ctx.socket(zmq.SUB)
+        sub_socket.subscribe(config.topic.encode("utf-8"))
+        sub_socket.connect(pub_endpoint)
+
+        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
+
+        # Send response headers immediately so the tonic client's
+        # subscribe_kv_events().await resolves without waiting for the first
+        # yielded event (grpc.aio defers headers until first yield otherwise).
+        await context.send_initial_metadata(())
+
+        decoder = msgspec.msgpack.Decoder(KVEventBatch)
+
+        # Stream live events using the ZMQ publisher's native seq numbers.
+        try:
+            while not context.cancelled():
+                try:
+                    frames = await asyncio.wait_for(
+                        sub_socket.recv_multipart(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                # ZMQ multipart: [topic, seq_bytes, payload]
+                if len(frames) < 3:
+                    continue
+
+                zmq_seq = int.from_bytes(frames[1], "big")
+                payload = frames[2]
+
+                try:
+                    raw_batch = decoder.decode(payload)
+                except Exception as e:
+                    logger.warning("Failed to decode KV event batch: %s", e)
+                    continue
+
+                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sub_socket.close(linger=0)
+            logger.info("SubscribeKvEvents: stream closed")
+
+    def _convert_kv_event_batch(
+        self, raw_batch: KVEventBatch, seq_num: int
+    ) -> common_pb2.KvEventBatch:
+        """Convert a ZMQ KVEventBatch to proto KvEventBatch."""
+        proto_batch = common_pb2.KvEventBatch(
+            sequence_number=seq_num,
+            timestamp=raw_batch.ts,
+        )
+        if raw_batch.attn_dp_rank is not None:
+            proto_batch.dp_rank = raw_batch.attn_dp_rank
+
+        for event in raw_batch.events:
+            proto_event = self._convert_kv_event(event)
+            if proto_event is not None:
+                proto_batch.events.append(proto_event)
+
+        return proto_batch
+
+    def _convert_kv_event(self, event) -> Optional[common_pb2.KvCacheEvent]:
+        """Convert a single raw KV event to proto KvCacheEvent."""
+        self._kv_event_id_counter += 1
+        event_id = self._kv_event_id_counter
+
+        if isinstance(event, BlockStored):
+            # SGLang emits one BlockStored per page with block_hashes=[single_hash]
+            # and token_ids containing only that page's tokens.
+            blocks = []
+            for i, bh in enumerate(event.block_hashes):
+                start = i * event.block_size
+                end = start + event.block_size
+                block = common_pb2.KvBlock(
+                    block_hash=bh,
+                    token_ids=event.token_ids[start:end],
+                    block_size=event.block_size,
+                )
+                if event.lora_id is not None:
+                    block.lora_id = event.lora_id
+                blocks.append(block)
+
+            stored = common_pb2.KvBlocksStored(blocks=blocks)
+            if event.parent_block_hash is not None:
+                stored.parent_block_hash = event.parent_block_hash
+
+            return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
+
+        elif isinstance(event, BlockRemoved):
+            return common_pb2.KvCacheEvent(
+                event_id=event_id,
+                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
+            )
+
+        elif isinstance(event, AllBlocksCleared):
+            return common_pb2.KvCacheEvent(
+                event_id=event_id, cleared=common_pb2.KvCacheCleared()
+            )
+
+        return None
 
     def _handle_epd_disaggregation_encode_request(
         self,
