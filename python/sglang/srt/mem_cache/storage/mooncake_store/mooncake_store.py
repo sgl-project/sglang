@@ -16,9 +16,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_nsa_storage import (
-    NsaStagingBufferManager,
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    HostTensorAllocator,
+    NSATokenToKVPoolHost,
 )
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
@@ -278,8 +279,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-    _NSA_STAGING_DEFAULT_PAGES = 128
-
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
@@ -287,9 +286,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         MooncakeDistributedStore = self._import_mooncake_store()
         try:
             self.store = MooncakeDistributedStore()
-            self._nsa_staging = NsaStagingBufferManager(
-                self.store, self._NSA_STAGING_DEFAULT_PAGES
-            )
 
             self.config = self._load_config(storage_config)
             extra_config = (
@@ -498,10 +494,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
+        if isinstance(self.mem_pool_host, NSATokenToKVPoolHost):
+            try:
+                super().register_buffer(self.mem_pool_host.index_k_with_scale_buffer)
+            except TypeError as err:
+                logger.error(
+                    "Failed to register NSA indexer buffer to Mooncake Store: %s", err
+                )
+                raise TypeError(
+                    "Mooncake Store Register NSA Indexer Buffer Error."
+                ) from err
+
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
-
-        self._nsa_staging.initialize(self.mem_pool_host)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -553,32 +558,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if suffix:
             return [f"{key}_{suffix}{self._NSA_INDEXER_SUFFIX}" for key in keys]
         return [f"{key}{self._NSA_INDEXER_SUFFIX}" for key in keys]
-
-    def _register_staging_buffers(self, buffers: List[torch.Tensor]):
-        if not buffers:
-            return None
-        base_ptr = buffers[0].data_ptr()
-        last_buf = buffers[-1]
-        total_size = (
-            last_buf.data_ptr() - base_ptr
-        ) + last_buf.numel() * last_buf.element_size()
-        ret_code = self.store.register_buffer(base_ptr, total_size)
-        if ret_code:
-            logger.warning(
-                "Failed to register staging buffer for NSA indexer RDMA, "
-                "error code: %s",
-                ret_code,
-            )
-            return None
-        return base_ptr
-
-    def _unregister_staging_buffers(self, base_ptr):
-        """Unregister a previously registered staging buffer."""
-        if base_ptr is not None:
-            try:
-                self.store.unregister_buffer(base_ptr)
-            except Exception as e:
-                logger.warning("Failed to unregister staging buffer: %s", e)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
@@ -654,42 +633,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prefix = self.extra_backend_tag
             keys = [f"{prefix}_{key}" for key in keys]
         key_strs = self._get_extra_keys_for_nsa(keys)
-        if self._nsa_staging.enabled:
-            try:
-                with self._nsa_staging.borrow(
-                    slot_name="get",
-                    min_pages=len(keys),
-                    mem_pool_host=self.mem_pool_host,
-                ) as staging:
-                    staging_buffers = [staging[i] for i in range(len(keys))]
-                    buffer_ptrs = [buf.data_ptr() for buf in staging_buffers]
-                    buffer_sizes = [
-                        buf.numel() * buf.element_size() for buf in staging_buffers
-                    ]
-                    get_results = self._get_batch_zero_copy_impl(
-                        key_strs, buffer_ptrs, buffer_sizes
-                    )
-                    results = [res > 0 for res in get_results]
-                    for i, ok in enumerate(results):
-                        if ok:
-                            buffers[i].copy_(staging_buffers[i])
-                    return results
-            except Exception as e:
-                self._nsa_staging.disable_with_warning(
-                    "Reusable NSA get staging failed, falling back to "
-                    "per-operation registration",
-                    e,
-                )
-
         buffer_ptrs = [buf.data_ptr() for buf in buffers]
         buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
-        base_ptr = self._register_staging_buffers(buffers)
-        try:
-            get_results = self._get_batch_zero_copy_impl(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
-        finally:
-            self._unregister_staging_buffers(base_ptr)
+        get_results = self._get_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
         return [res > 0 for res in get_results]
 
     def batch_set_v1(
@@ -764,53 +712,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_results[i] = 0
 
         if len(set_keys) > 0:
-            if self._nsa_staging.enabled:
-                try:
-                    with self._nsa_staging.borrow(
-                        slot_name="set",
-                        min_pages=len(set_keys),
-                        mem_pool_host=self.mem_pool_host,
-                    ) as staging:
-                        for staged_i, src_i in enumerate(set_indices):
-                            staging[staged_i].copy_(buffers[src_i])
-                        staged_buffers = [staging[i] for i in range(len(set_keys))]
-                        staged_ptrs = [buf.data_ptr() for buf in staged_buffers]
-                        staged_sizes = [
-                            buf.numel() * buf.element_size() for buf in staged_buffers
-                        ]
-                        put_results = self._put_batch_zero_copy_impl(
-                            set_keys, staged_ptrs, staged_sizes
-                        )
-                except Exception as e:
-                    self._nsa_staging.disable_with_warning(
-                        "Reusable NSA set staging failed, falling back to "
-                        "per-operation registration",
-                        e,
-                    )
-                    set_buffer_ptrs = [buffers[i].data_ptr() for i in set_indices]
-                    set_buffer_sizes = [
-                        buffers[i].numel() * buffers[i].element_size()
-                        for i in set_indices
-                    ]
-                    base_ptr = self._register_staging_buffers(buffers)
-                    try:
-                        put_results = self._put_batch_zero_copy_impl(
-                            set_keys, set_buffer_ptrs, set_buffer_sizes
-                        )
-                    finally:
-                        self._unregister_staging_buffers(base_ptr)
-            else:
-                set_buffer_ptrs = [buffers[i].data_ptr() for i in set_indices]
-                set_buffer_sizes = [
-                    buffers[i].numel() * buffers[i].element_size() for i in set_indices
-                ]
-                base_ptr = self._register_staging_buffers(buffers)
-                try:
-                    put_results = self._put_batch_zero_copy_impl(
-                        set_keys, set_buffer_ptrs, set_buffer_sizes
-                    )
-                finally:
-                    self._unregister_staging_buffers(base_ptr)
+            set_buffer_ptrs = [buffers[i].data_ptr() for i in set_indices]
+            set_buffer_sizes = [
+                buffers[i].numel() * buffers[i].element_size() for i in set_indices
+            ]
+            put_results = self._put_batch_zero_copy_impl(
+                set_keys, set_buffer_ptrs, set_buffer_sizes
+            )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
 
@@ -984,10 +892,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys)
 
     def close(self):
-        # MooncakeDistributedStore will automatically call the destructor, so
-        # it is unnecessary to close it manually. But we still need to
-        # unregister reusable staging buffers we registered explicitly.
-        self._nsa_staging.shutdown()
+        return
 
     def clear(self) -> None:
         self.store.remove_all()

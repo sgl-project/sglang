@@ -3,7 +3,7 @@ import logging
 import threading
 from collections import defaultdict
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import psutil
 import torch
@@ -1303,54 +1303,25 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device_pool, host_indices, device_indices, io_backend
         )
 
-    def pack_indexer_pages(self, host_indices: torch.Tensor) -> torch.Tensor:
+    def get_indexer_page_views(self, host_indices: torch.Tensor) -> List[torch.Tensor]:
         if host_indices.numel() == 0:
-            return torch.empty(
-                (0, self.layer_num, self.indexer_page_stride_size),
-                dtype=self.indexer_dtype,
-                device=self.device,
-            )
+            return []
         if host_indices.numel() % self.page_size != 0:
             raise ValueError(
                 "Index buffer transfer expects page-aligned indices for NSA."
             )
-        host_page_indices = (
-            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
-        if host_page_indices.device.type != "cpu":
-            host_page_indices = host_page_indices.cpu()
-        staging = torch.empty(
-            (host_page_indices.numel(), self.layer_num, self.indexer_page_stride_size),
-            dtype=self.indexer_dtype,
-            device=self.device,
-        )
-        for layer_id in range(self.layer_num):
-            staging[:, layer_id, :] = self.index_k_with_scale_buffer[layer_id][
-                host_page_indices
-            ]
-        return staging
+        if self.layout not in ["page_first", "page_first_direct"]:
+            raise ValueError(
+                "Direct NSA indexer storage requires page_first/page_first_direct "
+                f"layout, got {self.layout}."
+            )
 
-    def unpack_indexer_pages(
-        self,
-        host_indices: torch.Tensor,
-        staging: torch.Tensor,
-    ) -> None:
-        if host_indices.numel() == 0:
-            return
-        if host_indices.numel() % self.page_size != 0:
-            raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
-            )
         host_page_indices = (
             host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
         if host_page_indices.device.type != "cpu":
             host_page_indices = host_page_indices.cpu()
-        if host_page_indices.numel() == 0:
-            return
-        if staging.device.type != "cpu":
-            staging = staging.cpu()
-        for layer_id in range(self.layer_num):
-            self.index_k_with_scale_buffer[layer_id][host_page_indices] = staging[
-                :, layer_id, :
-            ]
+        return [
+            self.index_k_with_scale_buffer[page_idx]
+            for page_idx in host_page_indices.tolist()
+        ]

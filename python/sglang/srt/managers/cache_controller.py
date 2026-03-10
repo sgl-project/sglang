@@ -487,14 +487,20 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
-            self.nsa_extra_supported = isinstance(
-                self.mem_pool_host, NSATokenToKVPoolHost
-            ) and all(
-                hasattr(self.storage_backend, fn)
-                for fn in (
-                    "batch_get_extra",
-                    "batch_set_extra",
-                    "batch_exists_extra",
+            self.nsa_extra_supported = (
+                isinstance(self.mem_pool_host, NSATokenToKVPoolHost)
+                and self.mem_pool_host.layout
+                in (
+                    "page_first",
+                    "page_first_direct",
+                )
+                and all(
+                    hasattr(self.storage_backend, fn)
+                    for fn in (
+                        "batch_get_extra",
+                        "batch_set_extra",
+                        "batch_exists_extra",
+                    )
                 )
             )
             if self.nsa_extra_supported:
@@ -892,33 +898,20 @@ class HiCacheController:
         if kv_pages == 0:
             return
         num_pages = kv_pages
-        staging = torch.empty(
-            (
-                num_pages,
-                self.mem_pool_host.layer_num,
-                self.mem_pool_host.indexer_page_stride_size,
-            ),
-            dtype=self.mem_pool_host.indexer_dtype,
-            device=self.mem_pool_host.device,
+        buffers = self.mem_pool_host.get_indexer_page_views(
+            host_indices[: num_pages * self.page_size]
         )
-        buffers = [staging[i] for i in range(num_pages)]
         results = self.storage_backend.batch_get_extra(
             hash_values[:num_pages], buffers, extra_info
         )
         idx_pages = self._count_consecutive_true(results)
         completed_pages = min(kv_pages, idx_pages)
-        if completed_pages > 0:
-            self.mem_pool_host.unpack_indexer_pages(
-                host_indices[: completed_pages * self.page_size],
-                staging[:completed_pages],
-            )
         operation.increment(completed_pages * self.page_size)
 
     def _page_set_nsa_extra(self, hash_values, host_indices, extra_info=None) -> bool:
         if not self._kv_set_pages(hash_values, host_indices, extra_info):
             return False
-        staging = self.mem_pool_host.pack_indexer_pages(host_indices)
-        buffers = [staging[i] for i in range(len(hash_values))]
+        buffers = self.mem_pool_host.get_indexer_page_views(host_indices)
         results = self.storage_backend.batch_set_extra(hash_values, buffers, extra_info)
         return all(results)
 
