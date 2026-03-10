@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, fields
 from typing import Dict
 
@@ -38,7 +39,11 @@ class ForwardInputBuffers:
 
             if buffer is None:
                 continue
-            elif isinstance(buffer, dict):
+
+            if dataclasses.is_dataclass(buffer):
+                buffer = vars(buffer)
+
+            if isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
                     assert isinstance(
                         sub_buffer, torch.Tensor
@@ -50,6 +55,6 @@ class ForwardInputBuffers:
             else:
                 assert isinstance(
                     buffer, torch.Tensor
-                ), f"Field {name} is expected to be a torch.Tensor or a dict of torch.Tensor, but got {type(buffer)}."
+                ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 new_buffer = self._share_one_buffer(name, buffer)
                 setattr(self, name, new_buffer)
