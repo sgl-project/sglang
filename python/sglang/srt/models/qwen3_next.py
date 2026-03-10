@@ -303,7 +303,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )
-            if get_global_server_args().enable_piecewise_cuda_graph
+            if not get_global_server_args().disable_piecewise_cuda_graph
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -387,7 +387,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if (
+            _is_cpu
+            or _is_npu
+            or not get_global_server_args().disable_piecewise_cuda_graph
+        ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -481,6 +485,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -509,6 +514,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                is_nextn=is_nextn,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -578,6 +584,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -625,13 +632,19 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),  # see impl of get_rope
         )
 
+        # qkv_proj is not quantized for fp4
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() != "modelopt_fp4"
+                else None
+            ),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -678,6 +691,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                is_nextn=is_nextn,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -812,6 +826,7 @@ class Qwen3NextModel(nn.Module):
         config: Qwen3NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -837,6 +852,7 @@ class Qwen3NextModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
 
         self.layers = make_layers(
@@ -1123,6 +1139,11 @@ class Qwen3NextForCausalLM(nn.Module):
                     # if is_pp_missing_parameter(name, self):
                     #     continue
 
+                    if name.endswith("_scale") and name not in params_dict:
+                        assert (
+                            abs(loaded_weight.item() - 1.0) < 1e-6
+                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

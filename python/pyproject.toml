@@ -23,12 +23,12 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python==12.9",
-  "decord2",
+  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.3",
+  "flashinfer_python==0.6.4", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.4",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -59,6 +59,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
+  "sgl-fa4==4.0.3",
   "sgl-kernel==0.3.21",
   "soundfile==0.13.1",
   "tiktoken",
@@ -67,15 +68,17 @@ dependencies = [
   "torch==2.9.1",
   "torchao==0.9.0",
   "torchaudio==2.9.1",
-  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
+  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.9.1 for torch 2.9.x. Not available on Linux ARM.
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xgrammar==0.1.27",
 
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto>=0.4.1",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
   "grpcio-health-checking>=1.78.0",
@@ -114,6 +117,13 @@ diffusion = [
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
+]
+
+ray = [
+  "ray[default]>=2.54.0",
 ]
 
 tracing = [
