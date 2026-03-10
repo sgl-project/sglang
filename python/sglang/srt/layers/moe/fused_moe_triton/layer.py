@@ -207,7 +207,11 @@ class FusedMoE(torch.nn.Module):
 
         # Dev hack: load weights as EP instead of TP so each rank reads
         # disjoint full experts rather than sharded slices of all experts.
-        self._ep_load_for_tp = os.environ.get("SGLANG_EP_LOAD_FOR_TP", "0") == "1"
+        # Only applies to pure TP (ep_size==1); with real EP this is a no-op.
+        self._ep_load_for_tp = (
+            os.environ.get("SGLANG_EP_LOAD_FOR_TP", "0") == "1"
+            and self.moe_ep_size == 1
+        )
         if self._ep_load_for_tp:
             self._orig_moe_tp_size = self.moe_tp_size
             self._orig_moe_tp_rank = self.moe_tp_rank
