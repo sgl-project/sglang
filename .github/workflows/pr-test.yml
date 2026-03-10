@@ -831,6 +831,79 @@ jobs:
           cd python/sglang/jit_kernel
           pytest tests/
 
+  jit-kernel-unit-test-nightly:
+    needs: [check-changes]
+    if: |
+      github.event_name == 'schedule' &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run full nightly test
+        timeout-minutes: 60
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
+
+  jit-kernel-benchmark-test:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs and when target_stage is set
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      CI: true
+      RUNNER_LABELS: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run benchmark smoke tests
+        timeout-minutes: 45
+        run: |
+          cd python/sglang/jit_kernel/benchmark
+          echo "Running jit-kernel benchmark smoke tests in CI mode..."
+
+          failures=()
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            if ! timeout 120 python3 "$bench_file"; then
+              failures+=("$bench_file")
+            fi
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          if [ ${#failures[@]} -ne 0 ]; then
+            echo "The following benchmark smoke tests failed: ${failures[*]}"
+            exit 1
+          fi
+
+          echo "All jit-kernel benchmark smoke tests completed successfully!"
+
   # =============================================== primary ====================================================
 
   stage-a-test-1:
@@ -1695,6 +1768,8 @@ jobs:
         wait-for-stage-b,
 
         jit-kernel-unit-test,
+        jit-kernel-unit-test-nightly,
+        jit-kernel-benchmark-test,
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
