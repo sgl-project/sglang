@@ -2286,8 +2286,7 @@ def set_gpu_proc_affinity(
             bind_cpu_ids = allowed_cpu_ids[start_idx:end_idx]
         else:
             bind_cpu_ids = (
-                allowed_cpu_ids[start_idx:]
-                + allowed_cpu_ids[: end_idx - total_allowed]
+                allowed_cpu_ids[start_idx:] + allowed_cpu_ids[: end_idx - total_allowed]
             )
         p.cpu_affinity(bind_cpu_ids)
         logger.info(

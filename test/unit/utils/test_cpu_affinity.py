@@ -20,7 +20,9 @@ def test_set_gpu_proc_affinity_respects_allowed_cpus(monkeypatch) -> None:
 
     monkeypatch.setattr(common.os, "getpid", lambda: 123)
     monkeypatch.setattr(common.psutil, "Process", lambda _pid: dummy)
-    monkeypatch.setattr(common.psutil, "cpu_count", lambda logical=True: 64 if logical else 32)
+    monkeypatch.setattr(
+        common.psutil, "cpu_count", lambda logical=True: 64 if logical else 32
+    )
 
     common.set_gpu_proc_affinity(pp_size=1, tp_size=4, nnodes=1, gpu_id=1)
 
