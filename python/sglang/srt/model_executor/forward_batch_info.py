@@ -228,6 +228,48 @@ def compute_local_num_token_non_padded(
 
 
 @dataclass
+class NgramEmbeddingInfo:
+    """Ngram embedding state for LongCat models."""
+
+    token_table: torch.Tensor
+    column_starts: torch.Tensor
+    req_lens: torch.Tensor
+    out_column_starts: torch.Tensor
+    out_req_lens: torch.Tensor
+
+    @classmethod
+    def create(
+        cls,
+        token_table: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        column_starts=None,
+        req_lens=None,
+    ) -> NgramEmbeddingInfo:
+        info = cls(
+            token_table=token_table,
+            column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+        )
+        if column_starts is not None:
+            info.column_starts[:] = column_starts
+        if req_lens is not None:
+            info.req_lens[:] = req_lens
+        return info
+
+    def slice(self, bs: int) -> NgramEmbeddingInfo:
+        return NgramEmbeddingInfo(
+            token_table=self.token_table,
+            column_starts=self.column_starts[:bs],
+            req_lens=self.req_lens[:bs],
+            out_column_starts=self.out_column_starts[:bs],
+            out_req_lens=self.out_req_lens[:bs],
+        )
+
+
+@dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
 
@@ -374,6 +416,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For ngram embedding
+    ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
@@ -470,7 +515,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
-            positions_dtype = torch.int64 if is_hip() else torch.int32
+            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(
                 [
                     i
@@ -510,6 +555,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+        if model_runner.use_ngram_embedding:
+            ret._init_ngram_embedding_info(batch, model_runner, device)
 
         if model_runner.model_is_mrope:
             if (
@@ -600,6 +648,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.contains_audio_inputs()
             or self.contains_video_inputs()
             or self.contains_image_inputs()
+        )
+
+    def _init_ngram_embedding_info(
+        self, batch: ModelWorkerBatch, model_runner: ModelRunner, device: torch.device
+    ):
+        if self.forward_mode.is_decode():
+            column_starts, req_lens = self.seq_lens - 1, 1
+        else:
+            column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
+        self.ngram_embedding_info = NgramEmbeddingInfo.create(
+            batch.ne_token_table,
+            self.batch_size,
+            device,
+            column_starts=column_starts,
+            req_lens=req_lens,
         )
 
     def _compute_spec_mrope_positions(
