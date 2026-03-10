@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -41,6 +42,8 @@ class MoeRunner:
             self.runner_core = None  # Marlin only supports fused path
         elif runner_backend.is_flashinfer_trtllm():
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_hpc_ops():
+            self.runner_core = HpcOpsRunnerCore(config)
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
