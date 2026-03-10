@@ -193,13 +193,18 @@ class DmdDenoisingStage(DenoisingStage):
                         else:
                             latents = pred_video
 
-                        # Update progress bar
+                        # Update progress bar (add scheduler.order per update so total
+                        # reaches len(timesteps); e.g. DPM-Solver order=2 -> 10*2=20)
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps
                             and (i + 1) % self.scheduler.order == 0
                             and progress_bar is not None
                         ):
-                            progress_bar.update()
+                            n = min(
+                                self.scheduler.order,
+                                len(timesteps) - progress_bar.n,
+                            )
+                            progress_bar.update(n)
 
                     self.step_profile()
 

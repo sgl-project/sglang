@@ -244,9 +244,7 @@ class Gemma2DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            self.hidden_size, eps=arch.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=arch.rms_norm_eps
         )

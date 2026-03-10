@@ -1097,13 +1097,18 @@ class DenoisingStage(PipelineStage):
                             trajectory_timesteps.append(t_host)
                             trajectory_latents.append(latents)
 
-                        # Update progress bar
+                        # Update progress bar (add scheduler.order per update so total
+                        # reaches num_inference_steps; e.g. DPM-Solver order=2 -> 10*2=20)
                         if i == num_timesteps - 1 or (
                             (i + 1) > num_warmup_steps
                             and (i + 1) % self.scheduler.order == 0
                             and progress_bar is not None
                         ):
-                            progress_bar.update()
+                            n = min(
+                                self.scheduler.order,
+                                num_inference_steps - progress_bar.n,
+                            )
+                            progress_bar.update(n)
 
                         if not is_warmup:
                             self.step_profile()
