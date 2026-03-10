@@ -611,15 +611,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
                 if isinstance(output_item, ResponseOutputMessage):
-                    text_parts = []
-                    for content in output_item.content:
-                        if isinstance(content, ResponseOutputText) and content.text:
-                            text_parts.append(content.text)
-                    if text_parts:
+                    assistant_content = "".join(
+                        content.text
+                        for content in output_item.content
+                        if isinstance(content, ResponseOutputText) and content.text
+                    )
+                    if assistant_content:
                         messages.append(
                             {
                                 "role": "assistant",
-                                "content": "".join(text_parts),
+                                "content": assistant_content,
                             }
                         )
 
