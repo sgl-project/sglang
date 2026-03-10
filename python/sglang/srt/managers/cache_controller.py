@@ -882,18 +882,31 @@ class HiCacheController:
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
+    def _get_nsa_extra_buffers(
+        self, host_indices: torch.Tensor, num_pages: Optional[int] = None
+    ) -> List[torch.Tensor]:
+        if num_pages is not None:
+            host_indices = host_indices[: num_pages * self.page_size]
+        return self.mem_pool_host.get_indexer_page_views(host_indices)
+
+    def _storage_hit_page_num(self, batch_hashes, extra_info=None) -> int:
+        hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+        if self.nsa_extra_supported:
+            hit_page_num = min(
+                hit_page_num,
+                self.storage_backend.batch_exists_extra(batch_hashes, extra_info),
+            )
+        return hit_page_num
+
     def _page_get_nsa_extra(
         self, operation, hash_values, host_indices, extra_info=None
     ):
         kv_pages = self._kv_get_pages(hash_values, host_indices, extra_info)
         if kv_pages == 0:
             return
-        num_pages = kv_pages
-        buffers = self.mem_pool_host.get_indexer_page_views(
-            host_indices[: num_pages * self.page_size]
-        )
+        buffers = self._get_nsa_extra_buffers(host_indices, kv_pages)
         results = self.storage_backend.batch_get_extra(
-            hash_values[:num_pages], buffers, extra_info
+            hash_values[:kv_pages], buffers, extra_info
         )
         idx_pages = self._count_consecutive_true(results)
         completed_pages = min(kv_pages, idx_pages)
@@ -902,7 +915,7 @@ class HiCacheController:
     def _page_set_nsa_extra(self, hash_values, host_indices, extra_info=None) -> bool:
         if not self._kv_set_pages(hash_values, host_indices, extra_info):
             return False
-        buffers = self.mem_pool_host.get_indexer_page_views(host_indices)
+        buffers = self._get_nsa_extra_buffers(host_indices)
         results = self.storage_backend.batch_set_extra(hash_values, buffers, extra_info)
         return all(results)
 
@@ -1001,12 +1014,7 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
-            if self.nsa_extra_supported:
-                hit_idx_num = self.storage_backend.batch_exists_extra(
-                    batch_hashes, extra_info
-                )
-                hit_page_num = min(hit_page_num, hit_idx_num)
+            hit_page_num = self._storage_hit_page_num(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
