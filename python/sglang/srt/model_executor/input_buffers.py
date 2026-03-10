@@ -4,6 +4,7 @@ from dataclasses import dataclass, fields
 from typing import Dict
 
 import torch
+
 from sglang.srt.utils import is_npu
 
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
