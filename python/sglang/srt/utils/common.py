@@ -94,7 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -845,57 +845,67 @@ def decode_video_base64(video_base64):
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
+    if sr is None:
+        sr = 16000
+
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
+    if isinstance(audio_file, bytes):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str):
+        source = audio_file
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
     import soundfile as sf
     import torch
     import torchaudio
 
-    if sr is None:
-        sr = 16000
-
-    # Load audio data
-    if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
-    elif audio_file.startswith("file://"):
-        audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
-    elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
     else:
-        raise ValueError(f"Invalid audio format: {audio_file}")
+        audio, original_sr = sf.read(source)
 
-    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
-    # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
         else:
-            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
-
+            audio_tensor = audio_tensor.T
         audio_tensor = torchaudio.functional.resample(
             audio_tensor, orig_freq=original_sr, new_freq=sr
         )
-
         if audio_tensor.shape[0] == 1:
             audio = audio_tensor.squeeze(0).numpy()
         else:
-            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
+            audio = audio_tensor.T.numpy()
 
     return audio
 
