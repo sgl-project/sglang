@@ -41,7 +41,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
 
-    assert get_device_count() == NUM_GPUS
+    assert (
+        get_device_count() >= NUM_GPUS
+    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS
