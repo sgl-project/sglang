@@ -52,7 +52,7 @@ def _resolve_kernel_path() -> pathlib.Path:
 
     path = _environment_install() or _package_install()
     if path is None:
-        raise RuntimeError("Cannot find sgl-kernel/jit path")
+        raise RuntimeError("Cannot find sglang.jit_kernel path")
     return path
 
 
