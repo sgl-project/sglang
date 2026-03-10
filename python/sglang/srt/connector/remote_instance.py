@@ -17,7 +17,7 @@ class RemoteInstanceConnector(BaseConnector):
 
     def __init__(self, url: str, device: torch.device = "cpu"):
         assert (
-            device.type == "cuda"
+            device.type == "cuda" or device.type == "npu"
         ), "RemoteInstanceConnector only supports cuda device."
         super().__init__(url)
         self.url = url
@@ -32,7 +32,7 @@ class RemoteInstanceConnector(BaseConnector):
         world_size: int = 2,
     ):
         assert (
-            self.device.type == "cuda"
+            self.device.type == "cuda" or self.device.type == "npu"
         ), "RemoteInstanceConnector only supports cuda device."
         assert (
             gpu_id != -1 and tp_rank != -1

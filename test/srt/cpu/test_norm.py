@@ -222,7 +222,7 @@ class TestLayerNorm(CustomTestCase):
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
 
-        (variance, mean) = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+        variance, mean = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
         x = (x - mean) * torch.rsqrt(variance + variance_epsilon)
         x = x.to(orig_dtype) * weight
         if residual is None:

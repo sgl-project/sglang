@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=300, suite="stage-c-test-large-4-gpu-b200")
+register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."

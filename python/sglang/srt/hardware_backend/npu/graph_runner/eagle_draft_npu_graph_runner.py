@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-""" Run the model with npu graph and torch.compile """
+"""Run the model with npu graph and torch.compile"""
 
 from __future__ import annotations
 

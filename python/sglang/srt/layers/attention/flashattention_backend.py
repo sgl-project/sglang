@@ -1136,6 +1136,14 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -2136,7 +2144,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 default_extend = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
@@ -2147,7 +2155,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
                 metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
 
             metadata.cu_seqlens_q[1:].copy_(

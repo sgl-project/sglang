@@ -220,10 +220,35 @@ def run_combined_tests(
 
     # Raise assertion error if any test failed
     if not all_passed:
-        failed_models = [r["model"] for r in all_results if r["errors"]]
-        raise AssertionError(
-            f"Tests failed for models: {failed_models}. See results above for details."
-        )
+        # Build detailed failure summary
+        failure_lines = []
+        for i, r in enumerate(all_results):
+            # Check for errors OR any failed test result (handles edge case where
+            # a test fails but error is None/empty)
+            has_failed_test = (
+                (r.get("perf_result") and not r["perf_result"].passed)
+                or (r.get("accuracy_result") and not r["accuracy_result"].passed)
+                or (r.get("tool_call_result") and not r["tool_call_result"].passed)
+            )
+            if r["errors"] or has_failed_test:
+                # Identify which test types failed
+                failed_tests = []
+                if r.get("perf_result") and not r["perf_result"].passed:
+                    failed_tests.append("performance")
+                if r.get("accuracy_result") and not r["accuracy_result"].passed:
+                    failed_tests.append("accuracy")
+                if r.get("tool_call_result") and not r["tool_call_result"].passed:
+                    tc = r["tool_call_result"]
+                    failed_tests.append(f"tool_call ({tc.num_passed}/{tc.num_total})")
+
+                failed_test_str = ", ".join(failed_tests) if failed_tests else "unknown"
+                error_str = "; ".join(str(e) for e in r["errors"])
+                failure_lines.append(
+                    f"  Model {i + 1} ({r['model']}): {failed_test_str} - {error_str}"
+                )
+
+        failure_summary = "\n".join(failure_lines)
+        raise AssertionError(f"Tests failed:\n{failure_summary}")
 
     return {
         "all_passed": all_passed,
