@@ -28,23 +28,25 @@ class NunchakuSVDQuantArgs:
     """
 
     enable_svdquant: bool = False
-    quantized_model_path: str | None = None
+    transformer_weights_path: str | None = None
     quantization_precision: str | None = None  # "int4" or "nvfp4"
     quantization_rank: int | None = None
     quantization_act_unsigned: bool = False
 
     def _adjust_config(self) -> None:
         """infer precision and rank from filename if not provided"""
-        if self.quantized_model_path and not self.enable_svdquant:
-            self.enable_svdquant = True
+        if self.transformer_weights_path and not self.enable_svdquant:
+            filename = os.path.basename(self.transformer_weights_path)
+            if re.search(r"svdq-(int4|fp4)_r(\d+)", filename):
+                self.enable_svdquant = True
 
-        if not self.enable_svdquant or not self.quantized_model_path:
+        if not self.enable_svdquant or not self.transformer_weights_path:
             return
 
         inferred_precision = None
         inferred_rank = None
 
-        filename = os.path.basename(self.quantized_model_path)
+        filename = os.path.basename(self.transformer_weights_path)
         # Expected pattern: svdq-{precision}_r{rank}-...
         # e.g., svdq-int4_r32-qwen-image.safetensors
         match = re.search(r"svdq-(int4|fp4)_r(\d+)", filename)
@@ -59,7 +61,7 @@ class NunchakuSVDQuantArgs:
             if inferred_precision:
                 logger.info(
                     f"inferred --quantization-precision: {self.quantization_precision} "
-                    f"from --quantized-model-path: {self.quantized_model_path}"
+                    f"from --transformer-weights-path: {self.transformer_weights_path}"
                 )
 
         if self.quantization_rank is None:
@@ -67,7 +69,7 @@ class NunchakuSVDQuantArgs:
             if inferred_rank:
                 logger.info(
                     f"inferred --quantization-rank: {self.quantization_rank} "
-                    f"from --quantized-model-path: {self.quantized_model_path}"
+                    f"from --transformer-weights-path: {self.transformer_weights_path}"
                 )
 
     def validate(self) -> None:
@@ -101,9 +103,9 @@ class NunchakuSVDQuantArgs:
                 "Disable it with --enable-svdquant false."
             )
 
-        if not self.quantized_model_path:
+        if not self.transformer_weights_path:
             raise ValueError(
-                "--enable-svdquant requires --quantized-model-path to be set"
+                "--enable-svdquant requires --transformer-weights-path to be set"
             )
 
         if not is_nunchaku_available():
@@ -131,12 +133,12 @@ class NunchakuSVDQuantArgs:
             help="Enable Nunchaku SVDQuant (W4A4-style) inference.",
         )
         parser.add_argument(
-            "--quantized-model-path",
+            "--transformer-weights-path",
             type=str,
-            default=NunchakuSVDQuantArgs.quantized_model_path,
+            default=NunchakuSVDQuantArgs.transformer_weights_path,
             help=(
-                "Path to pre-quantized Nunchaku weights. Can be a single .safetensors "
-                "file or a directory containing .safetensors."
+                "Path to pre-quantized transformer weights. Can be a single .safetensors "
+                "file, a directory, or a HuggingFace repo ID. Used by Nunchaku (SVDQuant) and quantized single-file checkpoints."
             ),
         )
         parser.add_argument(
@@ -161,11 +163,14 @@ class NunchakuSVDQuantArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "NunchakuSVDQuantArgs":
         # Map CLI/config keys to dataclass fields (keep backwards compatibility).
+        path = (
+            kwargs.get("transformer_weights_path")
+            or kwargs.get("transformer_quantized_path")
+            or kwargs.get("quantized_model_path")
+        )
         return cls(
             enable_svdquant=bool(kwargs.get("enable_svdquant", cls.enable_svdquant)),
-            quantized_model_path=kwargs.get(
-                "quantized_model_path", cls.quantized_model_path
-            ),
+            transformer_weights_path=path,
             quantization_precision=kwargs.get("quantization_precision"),
             quantization_rank=kwargs.get("quantization_rank"),
             quantization_act_unsigned=bool(

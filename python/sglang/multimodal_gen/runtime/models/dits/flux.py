@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import AttentionModuleMixin, FeedForward
+from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
     AdaLayerNormContinuous,
@@ -29,13 +29,12 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-
-# from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -255,13 +254,25 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             )
         else:
             self.to_q = ColumnParallelLinear(
-                query_dim, self.inner_dim, bias=bias, gather_output=True
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
             self.to_k = ColumnParallelLinear(
-                query_dim, self.inner_dim, bias=bias, gather_output=True
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
             self.to_v = ColumnParallelLinear(
-                query_dim, self.inner_dim, bias=bias, gather_output=True
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -296,18 +307,21 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     self.inner_dim,
                     bias=added_proj_bias,
                     gather_output=True,
+                    quant_config=quant_config,
                 )
                 self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=added_proj_bias,
                     gather_output=True,
+                    quant_config=quant_config,
                 )
                 self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=added_proj_bias,
                     gather_output=True,
+                    quant_config=quant_config,
                 )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
@@ -453,7 +467,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.attn" if prefix else "attn",
             )
-            if NunchakuAdaLayerNormZeroSingle is not None:
+            if is_nunchaku_available():
                 self.norm = NunchakuAdaLayerNormZeroSingle(self.norm, scale_shift=0)
         else:
             self.proj_mlp = ColumnParallelLinear(
@@ -461,6 +475,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 self.mlp_hidden_dim,
                 bias=True,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.act_mlp = nn.GELU(approximate="tanh")
             self.proj_out = ColumnParallelLinear(
@@ -468,6 +483,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 dim,
                 bias=True,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -477,6 +493,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 eps=1e-6,
                 pre_only=True,
+                quant_config=quant_config,
             )
 
     def forward(
@@ -579,12 +596,13 @@ class FluxTransformerBlock(nn.Module):
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "svdquant"
             and is_nunchaku_available()
-            and NunchakuFeedForward is not None
         )
         self.use_nunchaku_structure = nunchaku_enabled
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
         self.ff_context = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
         )
         if nunchaku_enabled:
             nunchaku_kwargs = {
@@ -594,11 +612,10 @@ class FluxTransformerBlock(nn.Module):
             }
             self.ff = NunchakuFeedForward(self.ff, **nunchaku_kwargs)
             self.ff_context = NunchakuFeedForward(self.ff_context, **nunchaku_kwargs)
-            if NunchakuAdaLayerNormZero is not None:
-                self.norm1 = NunchakuAdaLayerNormZero(self.norm1, scale_shift=0)
-                self.norm1_context = NunchakuAdaLayerNormZero(
-                    self.norm1_context, scale_shift=0
-                )
+            self.norm1 = NunchakuAdaLayerNormZero(self.norm1, scale_shift=0)
+            self.norm1_context = NunchakuAdaLayerNormZero(
+                self.norm1_context, scale_shift=0
+            )
 
     def forward(
         self,

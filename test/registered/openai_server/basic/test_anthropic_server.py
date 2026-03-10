@@ -11,6 +11,7 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_error_empty_messages
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_non_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_streaming
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
 """
 
 import json
@@ -18,6 +19,8 @@ import unittest
 
 import requests
 
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -79,6 +82,70 @@ class TestAnthropicServer(CustomTestCase):
         return payload
 
     # ---- Non-streaming tests ----
+
+    def test_tool_result_image_content_conversion(self):
+        """Tool-result image blocks should be preserved as OpenAI image_url content."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "I have called read_file to get an image. What color is it?",
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_123",
+                            "name": "read_file",
+                            "input": {"file_path": "/test.png"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_123",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "abcd",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        tool_messages = [m for m in converted["messages"] if m.get("role") == "tool"]
+        self.assertEqual(
+            len(tool_messages),
+            1,
+            f"Expected one tool message, got: {converted['messages']}",
+        )
+
+        tool_message = tool_messages[0]
+        self.assertEqual(tool_message["tool_call_id"], "call_123")
+        self.assertIsInstance(tool_message["content"], list)
+        self.assertEqual(len(tool_message["content"]), 1)
+        self.assertEqual(tool_message["content"][0]["type"], "image_url")
+        self.assertEqual(
+            tool_message["content"][0]["image_url"]["url"],
+            "data:image/png;base64,abcd",
+        )
 
     def test_simple_messages(self):
         """Test basic non-streaming message request."""

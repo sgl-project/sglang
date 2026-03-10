@@ -16,7 +16,7 @@ classifiers = [
 
 dependencies = [
   "torch==2.9.0",
-  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
+  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. torch==2.9.0 on XPU uses 0.9.1
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchaudio==2.9.0",
   "torchvision",
@@ -28,7 +28,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "decord",
   "einops",
   "fastapi",
   "gguf",
@@ -67,7 +66,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto>=0.4.1",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
 ]
@@ -96,6 +95,9 @@ dev = ["sglang[test]"]
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
