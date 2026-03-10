@@ -1259,6 +1259,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            self.maybe_send_health_check_signal()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -1314,6 +1316,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            self.maybe_send_health_check_signal()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -2617,7 +2621,6 @@ class Scheduler(
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
