@@ -104,10 +104,11 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t chunk_size,
     int64_t topk) {
   uint32_t m;
-  if (a_tensors.dim() == 3) {  // low-latency 3d input
-    m = 16;                    // small batch_size
+  if (a_tensors.dim() == 3) {  // for decode with ep
+    m = 16;
   } else {
-    m = a_tensors.size(0) / b_tensors.size(0);  // for 2d input, the average per-expert m
+    m = a_tensors.size(0);  // The number of experts = b_tensors.size(0) * ep-size
+                            // for prefill with ep, and for tp
   }
 
   uint32_t const n = d_tensors.size(-1);
@@ -115,47 +116,36 @@ void dispatch_w4a8_moe_mm_sm90(
 
   if (n == 4096 && k == 7168) {
     // group gemm 1 for ep
-    if (m <= 16) {
+    if (m <= 16) {  // for decode
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 1024) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
-    } else if (m <= 4096) {
-      // Optimized for prefill: seq_len up to 4096 (m=4096 with topk=1)
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else {
-      // Optimized for prefill: seq_len up to 8192 (m=8192 with topk=1)
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
     }
   } else if (n == 7168 && k == 2048) {
     // group gemm 2 for ep
-    if (m <= 16) {
+    if (m <= 16) {  // for decode
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 4096) {
-      // Optimized for prefill: larger cluster for better throughput
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    } else if (m <= 1024) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
     }
   } else if (n == 512 && k == 7168) {
     // group gemm 1 for tp
-    if (m <= 16) {
+    if (m <= 512) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 128) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 1024) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    } else if (m <= 4096) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
     }
   } else if (n == 7168 && k == 256) {
     // group gemm 2 for tp
-    if (m <= 16) {
+    if (m <= 512) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 1, 1, 1>));
-    } else if (m <= 128) {
+    } else if (m <= 4096) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
     } else {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
@@ -163,20 +153,17 @@ void dispatch_w4a8_moe_mm_sm90(
   } else {
     if (k % 512 == 0) {
       // For large m (prefill), prefer larger cluster
-      if (m <= 16) {
-        // Decode: target batch size (16-32) - use cluster size 1 for better latency
+      if (m <= 1024) {
         INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-      } else if (m <= 128) {
-        // Decode: large batch or small prefill
-        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+      } else if (m <= 4096) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
       } else {
-        // Prefill: large sequence length - prefer larger cluster
-        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
       }
     } else {
-      if (m <= 16) {
-        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 2, 1, 1>));  // PP has some bug when k = 128
-      } else if (m <= 128) {
+      if (m <= 1024) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 1, 1, 1>));  // PP has some bug when k = 128
+      } else if (m <= 4096) {
         INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
       } else {
         INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 128, 1, 1, 1>));
