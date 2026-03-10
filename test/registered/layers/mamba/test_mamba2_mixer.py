@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=50, suite="stage-b-test-large-2-gpu")
-
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
 
@@ -17,6 +13,9 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=50, suite="stage-b-test-large-2-gpu")
 
 NUM_GPUS = 2
 
@@ -41,7 +40,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
-    assert torch.cuda.device_count() == NUM_GPUS
+    assert (
+        torch.cuda.device_count() >= NUM_GPUS
+    ), f"This test requires at least {NUM_GPUS} GPUs, but only {torch.cuda.device_count()} available"
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs)
-register_cuda_ci(est_time=200, suite="stage-c-test-large-4-gpu")
+register_cuda_ci(est_time=200, suite="stage-c-test-4-gpu-h100")
 
 
 class TestEAGLE3EngineDPAttention(CustomTestCase):
@@ -55,12 +56,15 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--cuda-graph-max-bs",
             "64",
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):

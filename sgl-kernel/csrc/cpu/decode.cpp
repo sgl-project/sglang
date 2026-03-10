@@ -31,7 +31,13 @@ inline void pack_vnni_Nx32(
   __m512i vinputs[16];
   int n = 0;
   for (; n < N; ++n) {
-    MM512_LOAD_VEC(src, src_scale, ld_src, ind[n], vinputs[n]);
+    MM512_LOAD_VEC(
+        src,
+        src_scale,
+        ld_src,
+        ind[n],
+        [](const packed_t* __restrict__ x) { return _mm512_loadu_si512(x); },
+        vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -1157,7 +1163,7 @@ void decode_attention_kernel_impl(
     int64_t k_strideH,
     int64_t v_strideN,
     int64_t v_strideH,
-    float scaling,
+    float sm_scale,
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
@@ -1212,7 +1218,7 @@ void decode_attention_kernel_impl(
             /* B_scale */ k_scale,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
-            /* scl */ scaling,
+            /* scl */ sm_scale,
             /* M   */ 1,
             /* N   */ n_size,
             /* K   */ head_size,
@@ -1304,7 +1310,7 @@ void decode_attention_mla_kernel_impl(
     int64_t k_strideH,
     int64_t v_strideN,
     int64_t v_strideH,
-    float scaling,
+    float sm_scale,
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
@@ -1404,7 +1410,7 @@ void decode_attention_mla_kernel_impl(
             /* B     */ Btmp0,
             /* C     */ s_i);
 
-        const Vec scale_vec = Vec(scaling);
+        const Vec scale_vec = Vec(sm_scale);
         for (int64_t h = 0; h < h_size; ++h) {
           // s_i <- s_i * scale
           at::vec::map<float>(
@@ -1499,7 +1505,7 @@ void decode_attention_grouped_kernel_impl(
     int64_t k_strideH,
     int64_t v_strideN,
     int64_t v_strideH,
-    float scaling,
+    float sm_scale,
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
@@ -1573,7 +1579,7 @@ void decode_attention_grouped_kernel_impl(
             /* B_scale */ k_scale,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
-            /* scl */ scaling,
+            /* scl */ sm_scale,
             /* M   */ h_size,
             /* N   */ n_size,
             /* K   */ head_size,
@@ -1590,7 +1596,7 @@ void decode_attention_grouped_kernel_impl(
               BLOCK_H * BLOCK_N);
         }
 
-        // update the scaling coefficients
+        // update the sm_scale coefficients
         for (int64_t h = 0; h < h_size; ++h) {
           // m_i: max value per row
           float m_i = at::vec::reduce_all<float>(

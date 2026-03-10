@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
     _is_transformer_layer,
 )
@@ -340,6 +341,20 @@ def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Te
     return prompt_embeds
 
 
+def flux2_klein_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor:
+    hidden_states_layers: list[int] = [9, 18, 27]
+
+    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
+    batch_size, num_channels, seq_len, hidden_dim = out.shape
+    prompt_embeds = out.permute(0, 2, 1, 3).reshape(
+        batch_size, seq_len, num_channels * hidden_dim
+    )
+
+    return prompt_embeds
+
+
 @dataclass
 class Flux2MistralTextArchConfig(TextEncoderArchConfig):
     stacked_params_mapping: list[tuple[str, str, str]] = field(
@@ -458,13 +473,23 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def calculate_condition_image_size(
         self, image, width, height
     ) -> Optional[tuple[int, int]]:
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2
+
         target_area: int = 1024 * 1024
         if width is not None and height is not None:
+            new_width, new_height = width, height
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
-                width = int(width * scale)
-                height = int(height * scale)
-                return width, height
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+
+            # Flux requires multiples of (VAE scale 8 * Patch size 2)
+            new_width = (new_width // multiple_of) * multiple_of
+            new_height = (new_height // multiple_of) * multiple_of
+
+            if new_width != width or new_height != height:
+                return new_width, new_height
 
         return None
 
@@ -484,12 +509,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size
-        # get image_latent_ids right after scale & shift
-        image_latent_ids = _prepare_image_ids([latent_condition])
-        image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
-        image_latent_ids = image_latent_ids.to(get_local_torch_device())
-        batch.condition_image_latent_ids = image_latent_ids
-
         # latent: (1, 128, 32, 32)
         packed = self.maybe_pack_latents(
             latent_condition, None, batch
@@ -501,14 +520,15 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latents = image_latents.repeat(batch_size, 1, 1)
         return image_latents
 
+    def prepare_condition_image_latent_ids(self, image_latents, batch):
+        image_latent_ids = _prepare_image_ids(image_latents)
+        image_latent_ids = image_latent_ids.repeat(batch.batch_size, 1, 1)
+        batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
+
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
-        if batch.image_latent is not None:
-            image_latent_ids = batch.condition_image_latent_ids
-            img_ids = torch.cat([img_ids, image_latent_ids], dim=1).to(device=device)
-
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
         if txt_ids.ndim == 3:
@@ -518,6 +538,16 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         img_cos, img_sin = rotary_emb.forward(img_ids)
         img_cos = shard_rotary_emb_for_sp(img_cos)
         img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        if batch.image_latent is not None:
+            cond_ids = batch.condition_image_latent_ids
+            if cond_ids.ndim == 3:
+                cond_ids = cond_ids[0]
+            cond_cos, cond_sin = rotary_emb.forward(cond_ids)
+            cond_cos = shard_rotary_emb_for_sp(cond_cos)
+            cond_sin = shard_rotary_emb_for_sp(cond_sin)
+            img_cos = torch.cat([img_cos, cond_cos], dim=0)
+            img_sin = torch.cat([img_sin, cond_sin], dim=0)
 
         txt_cos, txt_sin = rotary_emb.forward(txt_ids)
 
@@ -607,3 +637,60 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # remove noise over input image
         noise = noise[:, : latents.size(1) :]
         return noise
+
+
+@dataclass
+class Flux2KleinPipelineConfig(Flux2PipelineConfig):
+    # Klein is distilled, so no guidance embeddings
+    should_use_guidance: bool = False
+
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (Qwen3TextConfig(),)
+    )
+
+    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (preprocess_text,),
+    )
+
+    postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (flux2_klein_postprocess_text,)
+    )
+
+    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
+        if prompts and isinstance(prompts[0], list):
+            prompts = [p for prompt in prompts for p in prompt]
+
+        def _apply_chat_template(prompt: str) -> str:
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+        texts = [_apply_chat_template(prompt) for prompt in prompts]
+
+        tok_kwargs = dict(tok_kwargs or {})
+        max_length = tok_kwargs.pop("max_length", 512)
+        padding = tok_kwargs.pop("padding", "max_length")
+        truncation = tok_kwargs.pop("truncation", True)
+        return_tensors = tok_kwargs.pop("return_tensors", "pt")
+
+        return tokenizer(
+            texts,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            return_tensors=return_tensors,
+            **tok_kwargs,
+        )

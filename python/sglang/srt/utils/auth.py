@@ -155,31 +155,54 @@ def add_api_key_middleware(
     """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
+    from starlette.requests import Request
 
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        path = request.url.path
-        authz = request.headers.get("Authorization")
-        level = _get_auth_level_from_app_and_scope(request.app, request.scope)
-        decision = decide_request_auth(
-            method=request.method,
-            path=path,
-            authorization_header=authz,
-            api_key=api_key,
-            admin_api_key=admin_api_key,
-            auth_level=level,
-        )
+    class _ApiKeyASGIMiddleware:
+        """ASGI-native middleware to preserve client disconnect events."""
 
-        if not decision.allowed:
-            return ORJSONResponse(
-                content={
-                    "error": (
-                        "Unauthorized"
-                        if decision.error_status_code == 401
-                        else "Forbidden"
-                    )
-                },
-                status_code=decision.error_status_code,
+        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+            self.app = app
+            self.api_key = api_key
+            self.admin_api_key = admin_api_key
+            self.fastapi_app = fastapi_app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            request = Request(scope, receive=receive)
+            path = request.url.path
+            authz = request.headers.get("Authorization")
+            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            decision = decide_request_auth(
+                method=request.method,
+                path=path,
+                authorization_header=authz,
+                api_key=self.api_key,
+                admin_api_key=self.admin_api_key,
+                auth_level=level,
             )
 
-        return await call_next(request)
+            if not decision.allowed:
+                response = ORJSONResponse(
+                    content={
+                        "error": (
+                            "Unauthorized"
+                            if decision.error_status_code == 401
+                            else "Forbidden"
+                        )
+                    },
+                    status_code=decision.error_status_code,
+                )
+                await response(scope, receive, send)
+                return
+
+            await self.app(scope, receive, send)
+
+    app.add_middleware(
+        _ApiKeyASGIMiddleware,
+        api_key=api_key,
+        admin_api_key=admin_api_key,
+        fastapi_app=app,
+    )

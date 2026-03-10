@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=283, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=404, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
@@ -60,7 +59,13 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         launch_args.extend(cls.other_launch_args)
         with envs.SGLANG_ENABLE_SPEC_V2.override(
             True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
+            1
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
