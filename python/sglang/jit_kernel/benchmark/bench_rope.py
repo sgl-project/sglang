@@ -70,7 +70,7 @@ def sglang_pos_enc_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.pos_enc import rotary_embedding_with_key
+    from sglang.jit_kernel.rope import rotary_embedding_with_key
 
     head_size = q.shape[-1]
     rotary_embedding_with_key(
