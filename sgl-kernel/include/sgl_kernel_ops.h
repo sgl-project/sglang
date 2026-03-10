@@ -376,7 +376,8 @@ void prepare_moe_input(
     torch::Tensor& output_permutation,
     const int64_t num_experts,
     const int64_t n,
-    const int64_t k);
+    const int64_t k,
+    bool swap_mn = false);
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
