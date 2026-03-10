@@ -49,11 +49,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
+    dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
-    triton_mxfp8_blockscaled_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -71,6 +72,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -268,7 +270,12 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+        self.w8a8_block_fp8_linear = None
+        self.w8a8_mxfp8_linear = None
+        if self.use_mxfp8:
+            self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
+        else:
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -441,6 +448,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # Keep parameter object to preserve weight_loader attrs for hot reload.
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
+            self._process_mxfp8_linear_weight_scale(layer)
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
@@ -474,6 +482,25 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+    def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
+        if not self.use_mxfp8:
+            return
+
+        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            from flashinfer import block_scale_interleave
+
+            scale_u8 = layer.weight_scale_inv.data
+            new_swizzled = block_scale_interleave(scale_u8.contiguous()).contiguous()
+        else:
+            # Triton path consumes canonical 2D UE8M0 scales directly.
+            return
+
+        copy_or_rebind_param(layer, "weight_scale_inv_swizzled", new_swizzled)
+        layer._weight_scale_inv_swizzled_src_version = layer.weight_scale_inv._version
+        layer._weight_scale_inv_swizzled_src_data_ptr = (
+            layer.weight_scale_inv.data_ptr()
+        )
+
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
@@ -489,6 +516,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
             )
         layer.weight_scale_inv.format_ue8m0 = True
+        self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -621,18 +649,22 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+                weight_scale = layer.weight_scale_inv_swizzled
+            else:
+                weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
-                return triton_mxfp8_blockscaled_linear(
+                return self.w8a8_mxfp8_linear(
                     input=x[0],
                     weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                 )
-            return triton_mxfp8_blockscaled_linear(
+            return self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
             )
@@ -1105,6 +1137,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale = _swizzle_with_triton_kernel(weight.shape, scale)
             return qweight, scale
 
+        def _quantize_with_flashinfer_trtllm(weight: torch.Tensor):
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            from flashinfer import mxfp8_quantize
+
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale = mxfp8_quantize(weight_flat, False)
+            scale_u8 = (
+                scale.view(torch.uint8).contiguous().view(num_experts, m, k // 32)
+            )
+            return qweight.view_as(weight), scale_u8
+
         if quantize:
             if get_moe_runner_backend().is_cutlass():
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
@@ -1113,6 +1158,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
+            elif (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
+                # Match FlashInfer TRT-LLM MoE test contracts:
+                # 1) quantize in canonical (non-swizzled) scale layout, and
+                # 2) do row/layout shuffling in align_mxfp8_moe_weights_for_flashinfer_trtllm.
+                w13_q, w13_s = _quantize_with_flashinfer_trtllm(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_with_flashinfer_trtllm(layer.w2_weight.data)
             else:
                 w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w13_weight.data
@@ -1121,14 +1175,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data
                 )
         else:
-            w13_q = layer.w13_weight.data
-            w2_q = layer.w2_weight.data
-            w13_s = _swizzle_with_triton_kernel(
-                layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
-            )
-            w2_s = _swizzle_with_triton_kernel(
-                layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
-            )
+            if (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            else:
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = _swizzle_with_triton_kernel(
+                    layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
+                )
+                w2_s = _swizzle_with_triton_kernel(
+                    layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
+                )
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
@@ -1153,6 +1216,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv.format_ue8m0 = True
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                align_mxfp8_moe_weights_for_flashinfer_trtllm,
+            )
+
+            align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
@@ -1376,6 +1449,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1504,9 +1578,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
-        elif self.runner.runner_backend.is_flashinfer_trtllm():
+        elif (
+            self.runner.runner_backend.is_flashinfer_trtllm()
+            or self.runner.runner_backend.is_flashinfer_trtllm_routed()
+        ):
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
             # router logits directly (no separate apply_with_router_logits needed).
+            # FlashInfer TRT-LLM routed backend consumes SGLang-computed
+            # top-k ids/weights (packed into int32) instead of router logits.
             global_num_experts = int(getattr(layer, "num_experts"))
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
@@ -1522,6 +1601,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
                 ),
                 block_quant=self.block_quant,
+                use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 weight_block_k=(
                     None
                     if self.quant_config.weight_block_size is None
