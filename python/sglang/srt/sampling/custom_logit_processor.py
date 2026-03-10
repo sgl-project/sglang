@@ -120,6 +120,14 @@ class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 198
 
 
+class Glm5ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """A logit processor that controls the length of thinking for GLM-5 models."""
+
+    THINKING_START_TOKEN_ID: int = 154841
+    THINKING_END_TOKEN_ID: int = 154842
+    NEW_LINE_TOKEN_ID: int = 198
+
+
 class Qwen3ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     """A logit processor that controls the length of thinking for Qwen3 models."""
 
