@@ -147,7 +147,7 @@ class NgramEmbedding(torch.nn.Module):
                 ne_weights=self.oe_weights,
                 ne_mods=self.oe_mods,
                 tokens=input_ids.to(torch.int32),
-                exclusive_ne_embeder_size_sums=self.exclusive_oe_embeder_size_sums,
+                exclusive_ne_embedder_size_sums=self.exclusive_oe_embeder_size_sums,
                 exclusive_req_len_sums=self.exclusive_req_len_sums[
                     : forward_batch.batch_size + 1
                 ],
