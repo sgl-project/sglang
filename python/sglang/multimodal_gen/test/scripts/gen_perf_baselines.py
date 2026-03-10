@@ -10,8 +10,6 @@ from openai import OpenAI
 
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -20,7 +18,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    is_image_url,
     wait_for_req_perf_record,
 )
 
@@ -64,12 +61,18 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
         a += " --dit-layerwise-offload true"
     if server_args.dit_offload_prefetch_size:
         a += f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+    if server_args.text_encoder_cpu_offload:
+        a += " --text-encoder-cpu-offload"
     if server_args.ring_degree is not None:
         a += f" --ring-degree {server_args.ring_degree}"
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
-    if server_args.enable_warmup:
-        a += " --enable-warmup"
+
+    # default warmup
+    a += " --warmup"
+
+    for extra_arg in server_args.extras:
+        a += f" {extra_arg}"
     return a
 
 
@@ -89,9 +92,9 @@ def _torch_cleanup() -> None:
     try:
         import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        if torch.get_device_module().is_available():
+            torch.get_device_module().synchronize()
+            torch.get_device_module().empty_cache()
     except Exception:
         pass
 
@@ -110,42 +113,13 @@ def _run_case(case: DiffusionTestCase) -> dict:
     try:
         sp = case.sampling_params
         output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
-        w = WarmupRunner(
-            port=ctx.port,
-            model=case.server_args.model_path,
-            prompt=sp.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sp.output_format,
-        )
-        if case.server_args.warmup > 0:
-            if sp.image_path and sp.prompt:
-                image_path_list = sp.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-                new_image_path_list = []
-                for p in image_path_list:
-                    if is_image_url(p):
-                        new_image_path_list.append(download_image_from_url(str(p)))
-                    else:
-                        pp = Path(p)
-                        if not pp.exists():
-                            raise FileNotFoundError(str(pp))
-                        new_image_path_list.append(pp)
-                w.run_edit_warmups(
-                    count=case.server_args.warmup,
-                    edit_prompt=sp.prompt,
-                    image_path=new_image_path_list,
-                )
-            else:
-                w.run_text_warmups(case.server_args.warmup)
-
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=sp,
         )
-        rid = gen(case.id, client)
+        rid, _ = gen(case.id, client)
         rec = wait_for_req_perf_record(
             rid,
             ctx.perf_log_path,

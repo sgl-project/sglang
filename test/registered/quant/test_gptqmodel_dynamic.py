@@ -5,7 +5,7 @@ import requests
 import torch
 
 from sglang.srt.server_args import set_global_server_args_for_scheduler
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -49,7 +49,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     model_config = ModelConfig.from_server_args(server_args)
 
     load_config = LoadConfig()
-    device_config = DeviceConfig("cuda")
+    device_config = DeviceConfig(get_device())
     model = get_model(
         model_config=model_config, load_config=load_config, device_config=device_config
     )
