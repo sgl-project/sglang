@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -37,21 +38,6 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
-
-
-class Gemma2RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
 
 
 class Gemma2MLP(nn.Module):
@@ -257,14 +243,14 @@ class Gemma2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = Gemma2RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
-        self.post_attention_layernorm = Gemma2RMSNorm(
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             self.hidden_size, eps=arch.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = Gemma2RMSNorm(
+        self.pre_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=arch.rms_norm_eps
         )
-        self.post_feedforward_layernorm = Gemma2RMSNorm(
+        self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=arch.rms_norm_eps
         )
 
@@ -321,7 +307,7 @@ class Gemma2Model(nn.Module):
             ]
         )
 
-        self.norm = Gemma2RMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
+        self.norm = RMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_scale
@@ -415,8 +401,15 @@ class Gemma2Model(nn.Module):
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                # Gemma2 RMSNorm uses (1+weight) with zeros init; sglang RMSNorm uses
+                # weight with ones init. Transform: sglang.weight = 1 + hf.weight
+                if name.endswith("layernorm.weight") or name == "norm.weight":
+                    param.data.copy_((loaded_weight + 1.0).to(param.dtype))
+                else:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
             loaded_params.add(name)
         return loaded_params

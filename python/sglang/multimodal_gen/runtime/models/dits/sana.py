@@ -5,8 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -49,12 +51,12 @@ class SanaAdaLayerNormSingle(nn.Module):
 class SanaModulatedNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.norm = LayerNorm(dim, elementwise_affine=False, eps=eps)
 
     def forward(self, x, temb, scale_shift_table):
         x = self.norm(x)
         shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
-        x = x * (1 + scale) + shift
+        x = fuse_scale_shift_kernel(x, scale, shift)
         return x
 
 
@@ -196,7 +198,7 @@ class SanaTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        self.norm1 = LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
         self.attn1 = SanaLinearAttention(
             query_dim=dim,
             num_heads=num_attention_heads,
@@ -205,7 +207,7 @@ class SanaTransformerBlock(nn.Module):
             bias=attention_bias,
         )
 
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
         self.attn2 = SanaCrossAttention(
             query_dim=dim,
             cross_attention_dim=cross_attention_dim,
@@ -215,6 +217,8 @@ class SanaTransformerBlock(nn.Module):
         )
 
         self.ff = GLUMBConv(in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio)
+
+        self.fuse_mul_add = MulAdd()
 
     def forward(
         self,
@@ -232,9 +236,9 @@ class SanaTransformerBlock(nn.Module):
         ).chunk(6, dim=1)
 
         norm_hidden = self.norm1(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_msa) + shift_msa
+        norm_hidden = fuse_scale_shift_kernel(norm_hidden, scale_msa, shift_msa)
         attn_output = self.attn1(norm_hidden)
-        hidden_states = hidden_states + gate_msa * attn_output
+        hidden_states = self.fuse_mul_add(attn_output, gate_msa, hidden_states, k=0)
 
         attn_output = self.attn2(
             hidden_states, encoder_hidden_states, encoder_attention_mask
@@ -242,11 +246,11 @@ class SanaTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         norm_hidden = self.norm2(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_mlp) + shift_mlp
+        norm_hidden = fuse_scale_shift_kernel(norm_hidden, scale_mlp, shift_mlp)
         norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
         ff_output = self.ff(norm_hidden)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = self.fuse_mul_add(ff_output, gate_mlp, hidden_states, k=0)
 
         return hidden_states
 
@@ -333,7 +337,6 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
 
-        # Input validation - fail fast
         if encoder_hidden_states is None:
             raise ValueError("SANA forward pass requires encoder_hidden_states")
 
