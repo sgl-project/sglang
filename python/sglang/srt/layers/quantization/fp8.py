@@ -1582,6 +1582,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner.runner_backend.is_flashinfer_trtllm()
             or self.runner.runner_backend.is_flashinfer_trtllm_routed()
         ):
+            # FlashInfer TRT-LLM backend only supports fused execution and consumes
+            # router logits directly (no separate apply_with_router_logits needed).
+            # FlashInfer TRT-LLM routed backend consumes SGLang-computed
+            # top-k ids/weights (packed into int32) instead of router logits.
             global_num_experts = int(getattr(layer, "num_experts"))
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
