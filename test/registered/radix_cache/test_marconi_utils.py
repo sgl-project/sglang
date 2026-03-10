@@ -21,12 +21,6 @@ from sglang.srt.mem_cache.marconi_utils import (
     get_moe_flops,
 )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_dense_config(
     num_layers=8,
     full_attention_interval=4,
