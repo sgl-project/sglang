@@ -2636,7 +2636,7 @@ class Scheduler(
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + decode inflight
+        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
