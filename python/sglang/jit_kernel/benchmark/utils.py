@@ -1,10 +1,11 @@
 """Common utilities for jit_kernel benchmark files."""
 
-import os
 from typing import Callable, List, Tuple
 
 import torch
 import triton.testing
+
+from sglang.jit_kernel.utils import is_in_ci as jit_kernel_is_in_ci
 
 # Common constants
 DEFAULT_DTYPE = torch.bfloat16
@@ -14,10 +15,7 @@ DEFAULT_QUANTILES = [0.5, 0.2, 0.8]
 
 def is_in_ci() -> bool:
     """Check if running in CI environment."""
-    return (
-        os.getenv("CI", "false").lower() == "true"
-        or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-    )
+    return jit_kernel_is_in_ci()
 
 
 def get_benchmark_range(full_range: List, ci_range: List) -> List:
