@@ -14,6 +14,7 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import math
 import copy
 import dataclasses
 import json
@@ -1831,15 +1832,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
+        sanitized_vals = [
+            (val if math.isfinite(val) else None) for val in token_logprobs_val
+        ]
         if not decode_to_text:
             return [
                 (logprob, token_id, None)
-                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
+                for logprob, token_id in zip(sanitized_vals, token_logprobs_idx)
             ]
         else:
             assert self.tokenizer is not None
             token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+            return list(zip(sanitized_vals, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
         self,
