@@ -107,6 +107,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mla.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
+        TestFile("ascend/test_llada2_mini_ascend.py", 800),
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 3600),

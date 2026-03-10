@@ -40,3 +40,11 @@ def run_benchmark(
     quantiles = quantiles or DEFAULT_QUANTILES
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
+
+def run_benchmark_no_cudagraph(
+    fn: Callable, quantiles: List[float] = None
+) -> Tuple[float, float, float]:
+    quantiles = quantiles or DEFAULT_QUANTILES
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms

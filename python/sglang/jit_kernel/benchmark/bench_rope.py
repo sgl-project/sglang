@@ -64,13 +64,13 @@ def flashinfer_rope(
     )
 
 
-def sglang_rope_v0(
+def sglang_pos_enc_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.pos_enc import rotary_embedding_with_key
+    from sglang.jit_kernel.rope import rotary_embedding_with_key
 
     head_size = q.shape[-1]
     rotary_embedding_with_key(
@@ -83,7 +83,7 @@ def sglang_rope_v0(
     )
 
 
-def sglang_rope_v1(
+def sgl_kernel_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
@@ -102,7 +102,7 @@ def sglang_rope_v1(
     )
 
 
-def sglang_rope_v2(
+def sglang_fused_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
@@ -118,7 +118,7 @@ def sglang_rope_v2(
 # ---------------------------------------------------------------------------
 
 
-def rope_v0_store(
+def jit_rope_then_store(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -150,7 +150,7 @@ def rope_v0_store(
     )
 
 
-def rope_v1_store(
+def sgl_kernel_fused_rope_store(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -181,7 +181,7 @@ def rope_v1_store(
     )
 
 
-def rope_v2_store(
+def jit_fused_rope_store(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -221,8 +221,13 @@ IS_NEOX_RANGE = get_benchmark_range(
 # Benchmark 1: RoPE only
 # ---------------------------------------------------------------------------
 
-ROPE_LINE_VALS = ["fi", "rope_v0", "rope_v1", "rope_v2"]
-ROPE_LINE_NAMES = ["FlashInfer", "SGL RoPE v0", "SGL RoPE v1", "SGL RoPE v2"]
+ROPE_LINE_VALS = ["flashinfer", "jit_pos_enc", "sgl_kernel", "jit_fused_rope"]
+ROPE_LINE_NAMES = [
+    "FlashInfer",
+    "SGL JIT PosEnc",
+    "sgl-kernel",
+    "SGL JIT Fused RoPE",
+]
 ROPE_STYLES = [("green", "-."), ("red", "-"), ("orange", "-"), ("blue", "--")]
 
 rope_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
@@ -263,10 +268,10 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "fi": flashinfer_rope,
-        "rope_v0": sglang_rope_v0,
-        "rope_v1": sglang_rope_v1,
-        "rope_v2": sglang_rope_v2,
+        "flashinfer": flashinfer_rope,
+        "jit_pos_enc": sglang_pos_enc_rope,
+        "sgl_kernel": sgl_kernel_rope,
+        "jit_fused_rope": sglang_fused_rope,
     }
     fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
     return run_benchmark(fn)
@@ -276,8 +281,12 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
 # Benchmark 2: RoPE + KV cache store
 # ---------------------------------------------------------------------------
 
-STORE_LINE_VALS = ["rope_v0_store", "rope_v1_store", "rope_v2_store"]
-STORE_LINE_NAMES = ["SGL RoPE v0 + Store", "SGL RoPE v1 + Store", "SGL RoPE v2 + Store"]
+STORE_LINE_VALS = ["jit_rope_then_store", "sgl_kernel_fused_store", "jit_fused_store"]
+STORE_LINE_NAMES = [
+    "SGL JIT RoPE + Store",
+    "sgl-kernel Fused RoPE + Store",
+    "SGL JIT Fused RoPE + Store",
+]
 STORE_STYLES = [("red", "-"), ("orange", "-"), ("blue", "--")]
 
 store_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
@@ -333,9 +342,9 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "rope_v0_store": rope_v0_store,
-        "rope_v1_store": rope_v1_store,
-        "rope_v2_store": rope_v2_store,
+        "jit_rope_then_store": jit_rope_then_store,
+        "sgl_kernel_fused_store": sgl_kernel_fused_rope_store,
+        "jit_fused_store": jit_fused_rope_store,
     }
     fn = lambda: FN_MAP[provider](
         q, k, v, k_cache, v_cache, positions, out_loc, is_neox

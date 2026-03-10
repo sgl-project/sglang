@@ -5,6 +5,7 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm as jit_fn
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.test.test_marlin_utils import marlin_quantize
@@ -27,7 +28,6 @@ def stack_and_dev(tensors):
     return torch.stack(tensors, dim=0).to(dev)
 
 
-# Fixed problem dimensions
 E = 8
 SIZE_K = 4096
 SIZE_N = 4096
@@ -37,7 +37,6 @@ QUANT_TYPE = scalar_types.uint4b8
 DTYPE = torch.float16
 BLOCK_SIZE_M = 64
 
-# Quantize weights once (per-expert)
 torch.manual_seed(0)
 _qweight_l, _scales_l, _w_ref_l = [], [], []
 for i in range(E):
@@ -215,8 +214,6 @@ def benchmark(size_m, provider):
         _make_inputs(size_m)
     )
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "jit":
         fn = lambda: _run_jit(
             a,
@@ -242,8 +239,7 @@ def benchmark(size_m, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
