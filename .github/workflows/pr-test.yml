@@ -831,6 +831,32 @@ jobs:
           cd python/sglang/jit_kernel
           pytest tests/
 
+  jit-kernel-unit-test-nightly:
+    needs: [check-changes]
+    if: |
+      github.event_name == 'schedule' &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run full nightly test
+        timeout-minutes: 60
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
+
   jit-kernel-benchmark-test:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs and when target_stage is set
@@ -1742,6 +1768,7 @@ jobs:
         wait-for-stage-b,
 
         jit-kernel-unit-test,
+        jit-kernel-unit-test-nightly,
         jit-kernel-benchmark-test,
 
         multimodal-gen-test-1-gpu,
