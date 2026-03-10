@@ -67,8 +67,12 @@ CSV_FIELDS = [
     "tp_size",
     "concurrency",
     "num_prompts",
+    "status",
     *BENCH_METRIC_KEYS,
 ]
+
+MAX_RETRIES = 2
+RETRY_BACKOFF_SECS = [15, 30]
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +81,13 @@ CSV_FIELDS = [
 
 
 def _num_prompts_for_concurrency(concurrency: int) -> int:
-    """Scale down num-prompts for low concurrency to keep wall-clock reasonable."""
-    if concurrency <= 4:
-        return 128
-    if concurrency <= 32:
-        return 512
-    return 2048
+    """Return num-prompts for a given concurrency level.
+
+    Uses max(concurrency, 32) to ensure at least 32 data points for
+    stable latency percentiles while matching the canonical pattern of
+    num-prompt == max-concurrency at higher values.
+    """
+    return max(concurrency, 32)
 
 
 def _build_server_args(
@@ -181,6 +186,31 @@ def run_bench_serving(
             os.remove(output_file)
         except OSError:
             pass
+
+
+def _server_alive(base_url: str, timeout: float = 5.0) -> bool:
+    """Quick health check — True if the server responds to /get_server_info."""
+    import requests
+
+    try:
+        r = requests.get(f"{base_url}/get_server_info", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _make_fail_row(
+    backend: str, ep_size: int, tp_size: int, conc: int, num_prompts: int, status: str
+) -> dict[str, Any]:
+    return {
+        "backend": backend,
+        "ep_size": ep_size,
+        "tp_size": tp_size,
+        "concurrency": conc,
+        "num_prompts": num_prompts,
+        "status": status,
+        **{k: "" for k in BENCH_METRIC_KEYS},
+    }
 
 
 def _print_header(title: str) -> None:
@@ -326,6 +356,8 @@ def main() -> None:
             )
 
             try:
+                server_dead = False
+
                 # -- MMLU sanity check --
                 print(f"\n[MMLU] Running {args.mmlu_examples}-example sanity check ...")
                 try:
@@ -341,67 +373,112 @@ def main() -> None:
                 except Exception as e:
                     print(f"[MMLU] {label}: FAILED ({e})")
                     mmlu_results[(backend, ep_size)] = float("nan")
+                    if not _server_alive(args.base_url):
+                        print(f"[MMLU] Server dead after MMLU, skipping sweep")
+                        server_dead = True
 
                 # -- Warmup --
-                print(f"\n[WARMUP] concurrency=32, 64 prompts (discarded) ...")
-                try:
-                    run_bench_serving(
-                        base_url=args.base_url,
-                        num_prompts=64,
-                        max_concurrency=32,
-                        random_input_len=args.random_input_len,
-                        random_output_len=args.random_output_len,
-                        random_range_ratio=args.random_range_ratio,
-                    )
-                    print("[WARMUP] done")
-                except Exception as e:
-                    print(f"[WARMUP] failed ({e}), continuing anyway")
+                if not server_dead:
+                    print(f"\n[WARMUP] concurrency=32, 64 prompts (discarded) ...")
+                    try:
+                        run_bench_serving(
+                            base_url=args.base_url,
+                            num_prompts=64,
+                            max_concurrency=32,
+                            random_input_len=args.random_input_len,
+                            random_output_len=args.random_output_len,
+                            random_range_ratio=args.random_range_ratio,
+                        )
+                        print("[WARMUP] done")
+                    except Exception as e:
+                        print(f"[WARMUP] failed ({e})")
+                        if not _server_alive(args.base_url):
+                            print("[WARMUP] Server dead after warmup, skipping sweep")
+                            server_dead = True
 
                 # -- Concurrency sweep --
                 for conc in concurrency_values:
                     num_prompts = _num_prompts_for_concurrency(conc)
                     done += 1
+
+                    if server_dead:
+                        print(
+                            f"\n[BENCH {done}/{total_bench_runs}] "
+                            f"{label} | concurrency={conc} | SKIPPED (server dead)"
+                        )
+                        all_rows.append(
+                            _make_fail_row(
+                                backend,
+                                ep_size,
+                                args.tp_size,
+                                conc,
+                                num_prompts,
+                                "server_dead",
+                            )
+                        )
+                        continue
+
                     print(
                         f"\n[BENCH {done}/{total_bench_runs}] "
                         f"{label} | concurrency={conc} | num_prompts={num_prompts}"
                     )
 
-                    try:
-                        result = run_bench_serving(
-                            base_url=args.base_url,
-                            num_prompts=num_prompts,
-                            max_concurrency=conc,
-                            random_input_len=args.random_input_len,
-                            random_output_len=args.random_output_len,
-                            random_range_ratio=args.random_range_ratio,
-                        )
-                        row: dict[str, Any] = {
-                            "backend": backend,
-                            "ep_size": ep_size,
-                            "tp_size": args.tp_size,
-                            "concurrency": conc,
-                            "num_prompts": num_prompts,
-                        }
-                        for key in BENCH_METRIC_KEYS:
-                            row[key] = result.get(key, "")
-                        all_rows.append(row)
-
-                        print(
-                            f"       out_thr={row['output_throughput']:.2f} tok/s, "
-                            f"mean_tpot={row['mean_tpot_ms']:.3f} ms, "
-                            f"mean_ttft={row['mean_ttft_ms']:.2f} ms"
-                        )
-                    except Exception as e:
-                        print(f"       FAILED: {e}")
-                        all_rows.append(
-                            {
+                    succeeded = False
+                    for attempt in range(1 + MAX_RETRIES):
+                        try:
+                            result = run_bench_serving(
+                                base_url=args.base_url,
+                                num_prompts=num_prompts,
+                                max_concurrency=conc,
+                                random_input_len=args.random_input_len,
+                                random_output_len=args.random_output_len,
+                                random_range_ratio=args.random_range_ratio,
+                            )
+                            row: dict[str, Any] = {
                                 "backend": backend,
                                 "ep_size": ep_size,
                                 "tp_size": args.tp_size,
                                 "concurrency": conc,
                                 "num_prompts": num_prompts,
-                                **{k: "" for k in BENCH_METRIC_KEYS},
+                                "status": "ok",
                             }
+                            for key in BENCH_METRIC_KEYS:
+                                row[key] = result.get(key, "")
+                            all_rows.append(row)
+                            print(
+                                f"       out_thr={row['output_throughput']:.2f} tok/s, "
+                                f"mean_tpot={row['mean_tpot_ms']:.3f} ms, "
+                                f"mean_ttft={row['mean_ttft_ms']:.2f} ms"
+                            )
+                            succeeded = True
+                            break
+                        except Exception as e:
+                            if attempt < MAX_RETRIES and _server_alive(args.base_url):
+                                wait = RETRY_BACKOFF_SECS[attempt]
+                                print(
+                                    f"       FAILED: {e}\n"
+                                    f"       Retry {attempt + 1}/{MAX_RETRIES} "
+                                    f"in {wait}s ..."
+                                )
+                                time.sleep(wait)
+                            else:
+                                print(f"       FAILED: {e}")
+                                if not _server_alive(args.base_url):
+                                    print("       Server dead, skipping remaining")
+                                    server_dead = True
+                                break
+
+                    if not succeeded:
+                        status = "server_dead" if server_dead else "failed"
+                        all_rows.append(
+                            _make_fail_row(
+                                backend,
+                                ep_size,
+                                args.tp_size,
+                                conc,
+                                num_prompts,
+                                status,
+                            )
                         )
 
             finally:
@@ -466,12 +543,13 @@ def main() -> None:
             parts = [f"{conc:6d}", f"{_num_prompts_for_concurrency(conc):10d}"]
             for bk in backends_present:
                 data = pivot[conc].get(bk)
-                if data and data.get("output_throughput") != "":
+                if data and data.get("status") == "ok":
                     parts.append(f"{float(data['output_throughput']):14.2f}")
                     parts.append(f"{float(data['mean_tpot_ms']):12.3f}")
                 else:
-                    parts.append(f"{'FAIL':>14s}")
-                    parts.append(f"{'FAIL':>12s}")
+                    tag = data.get("status", "fail") if data else "miss"
+                    parts.append(f"{tag:>14s}")
+                    parts.append(f"{tag:>12s}")
             print(" | ".join(parts))
 
     print(f"\nResults written to: {csv_path}")
