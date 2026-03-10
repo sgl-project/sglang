@@ -2940,10 +2940,10 @@ class ServerArgs:
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB devices, JSON mapping string, or a JSON file path.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            Original device string (comma-separated, JSON mapping, or file path), or None if input is None.
         """
         if device_str is None:
             logger.warning(
@@ -2951,14 +2951,63 @@ class ServerArgs:
             )
             return None
 
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
-            raise ValueError("No valid IB devices specified")
+        def _parse_device_list(value: Any, context: str) -> list[str]:
+            if isinstance(value, str):
+                devices = [d.strip() for d in value.split(",") if d.strip()]
+            elif isinstance(value, list):
+                devices = [str(d).strip() for d in value if str(d).strip()]
+            else:
+                raise ValueError(
+                    f"Invalid IB device entry in {context}: {value!r}. "
+                    "Expected a comma-separated string or a list of device names."
+                )
 
-        # Check for duplicates
-        if len(devices) != len(set(devices)):
-            raise ValueError(f"Duplicate IB devices specified: {device_str}")
+            if len(devices) == 0:
+                raise ValueError(f"No valid IB devices specified in {context}.")
+            if len(devices) != len(set(devices)):
+                raise ValueError(
+                    f"Duplicate IB devices specified in {context}: {value!r}"
+                )
+            return devices
+
+        parsed_mapping = None
+        mapping_source = "string"
+        if os.path.isfile(device_str):
+            with open(device_str, "r", encoding="utf-8") as f:
+                content = f.read()
+            try:
+                parsed_mapping = json.loads(content)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON in IB device mapping file '{device_str}': {e}"
+                ) from e
+            mapping_source = "file"
+        else:
+            stripped = device_str.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    parsed_mapping = json.loads(stripped)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON for IB devices: {e}") from e
+
+        if parsed_mapping is not None:
+            if isinstance(parsed_mapping, dict):
+                groups = list(parsed_mapping.values())
+            elif isinstance(parsed_mapping, list):
+                if all(not isinstance(x, (list, dict)) for x in parsed_mapping):
+                    groups = [parsed_mapping]
+                else:
+                    groups = parsed_mapping
+            else:
+                groups = [parsed_mapping]
+
+            device_groups = [
+                _parse_device_list(group, f"{mapping_source} mapping[{i}]")
+                for i, group in enumerate(groups)
+            ]
+            devices = [d for group in device_groups for d in group]
+        else:
+            devices = _parse_device_list(device_str, "device string")
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
@@ -2980,7 +3029,7 @@ class ServerArgs:
                 f"Available devices: {sorted(available_devices)}"
             )
 
-        return ",".join(devices)
+        return device_str
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -4638,8 +4687,8 @@ class ServerArgs:
             "--mooncake-ib-device",
             type=str,
             default=ServerArgs.mooncake_ib_device,
-            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
-            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            help="The InfiniBand devices for Mooncake Backend transfer. Accepts multiple comma-separated devices "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1), a JSON mapping string, or a JSON file path. "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
 
@@ -5338,8 +5387,9 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            help="The InfiniBand devices for disaggregation transfer. Accepts a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), multiple comma-separated devices "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a JSON mapping string, or a JSON file path. "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
