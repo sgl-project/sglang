@@ -210,6 +210,15 @@ class TestEpToTpTransform(unittest.TestCase):
         torch.cuda.set_device(device)
         initialize_model_parallel(tensor_model_parallel_size=cls.world_size)
 
+        # Initialize dp attention globals (not using DP attention, just set defaults)
+        import sglang.srt.layers.dp_attention as dp_attn
+
+        dp_attn._ATTN_DP_SIZE = 1
+        dp_attn._ATTN_DP_RANK = 0
+        dp_attn._LOCAL_ATTN_DP_SIZE = 1
+        dp_attn._LOCAL_ATTN_DP_RANK = 0
+        dp_attn._ENABLE_DP_ATTENTION_FLAG = False
+
     @classmethod
     def tearDownClass(cls):
         destroy_model_parallel()
