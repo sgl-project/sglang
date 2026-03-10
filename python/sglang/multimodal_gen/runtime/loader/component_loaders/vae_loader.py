@@ -128,9 +128,11 @@ class VAELoader(ComponentLoader):
 
         safetensors_list = _list_safetensors_files(component_model_path)
         assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
+            len(safetensors_list) >= 1
+        ), f"Found no safetensors files in {component_model_path}"
+        loaded = {}
+        for sf_path in safetensors_list:
+            loaded.update(safetensors_load_file(sf_path))
         vae.load_state_dict(loaded, strict=False)
 
         state_keys = set(vae.state_dict().keys())

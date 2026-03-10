@@ -459,6 +459,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "sana_image_t2i",
+        DiffusionServerArgs(
+            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            modality="image",
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
