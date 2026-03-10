@@ -5,6 +5,7 @@
 /python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
+/python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
@@ -13,6 +14,7 @@
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
+/python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
@@ -27,6 +29,7 @@
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/nsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @hlu1 @rainj-me
+/python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang

@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -78,7 +79,7 @@ async def get_models(request: Request):
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, model_id=server_args.model_id)
 
     response = {
         "model_path": server_args.model_path,
@@ -93,6 +94,63 @@ async def get_models(request: Request):
         response["pipeline_class"] = model_info.pipeline_cls.__name__
 
     return response
+
+
+@health_router.get("/server_info")
+async def server_info_endpoint(request: Request):
+    """Get server information.
+
+    Returns fields compatible with the LLM engine's /server_info so that
+    the model gateway can discover diffusion workers.
+    """
+    server_args: ServerArgs = request.app.state.server_args
+
+    return {
+        "model_path": server_args.model_path,
+        "served_model_name": server_args.model_id or server_args.model_path,
+        "tp_size": server_args.tp_size,
+        "dp_size": server_args.dp_size,
+        "version": __version__,
+    }
+
+
+@health_router.get("/model_info")
+async def model_info_endpoint(request: Request):
+    """Get model information.
+
+    Returns fields compatible with the LLM engine's /model_info so that
+    the model gateway can detect capabilities for diffusion workers.
+    """
+    from sglang.multimodal_gen.registry import get_model_info
+
+    server_args: ServerArgs = request.app.state.server_args
+    task_type = server_args.pipeline_config.task_type
+
+    try:
+        registry_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+    except Exception:
+        logger.warning("Failed to resolve model info from registry", exc_info=True)
+        registry_info = None
+
+    return {
+        # Fields consumed by the model gateway for worker discovery
+        "model_path": server_args.model_path,
+        "is_generation": True,
+        "model_type": "diffusion",
+        "architectures": (
+            [registry_info.pipeline_cls.__name__] if registry_info else None
+        ),
+        # Fields matching the LLM engine's /model_info shape
+        "has_image_understanding": task_type.accepts_image_input(),
+        "has_audio_understanding": False,
+        # Diffusion-specific fields
+        "task_type": task_type.name,
+        "is_image_gen": task_type.is_image_gen(),
+    }
 
 
 @health_router.get("/health_generate")
@@ -141,6 +199,13 @@ async def forward_to_scheduler(
                 lambda _idx: output_file_path,
                 audio=response.audio,
                 audio_sample_rate=response.audio_sample_rate,
+                enable_frame_interpolation=sp.enable_frame_interpolation,
+                frame_interpolation_exp=sp.frame_interpolation_exp,
+                frame_interpolation_scale=sp.frame_interpolation_scale,
+                frame_interpolation_model_path=sp.frame_interpolation_model_path,
+                enable_upscaling=sp.enable_upscaling,
+                upscaling_model_path=sp.upscaling_model_path,
+                upscaling_scale=sp.upscaling_scale,
             )
 
         if hasattr(response, "model_dump"):
@@ -210,11 +275,12 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
 
     app.state.server_args = server_args
