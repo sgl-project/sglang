@@ -36,6 +36,7 @@ try:
 except ImportError:
     pass
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -780,7 +781,12 @@ def biased_grouped_topk_gpu(
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
-    fused_topk_deepseek = None
+    if get_forward_context() is not None:
+        context = get_forward_context()
+        forward_batch = context.forward_batch
+        if forward_batch.forward_mode.is_extend():
+            fused_topk_deepseek = None
+
     if (
         _is_cuda
         and fused_topk_deepseek is not None

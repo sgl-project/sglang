@@ -169,13 +169,18 @@ class DeepEPMoE(FusedMoE):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
+
+            output = torch.empty_like(hidden_states)
+            moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
                 topk_output.router_logits,
+                output,
                 self.layer_id,
             )
+
+            return output
         else:
             return self.forward_impl(hidden_states, topk_output)
 
