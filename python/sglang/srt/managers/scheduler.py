@@ -1495,7 +1495,7 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # If it is a health check generation request and there are running requests, ignore it.
+            # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
@@ -2647,8 +2647,8 @@ class Scheduler(
             )
 
         if not for_health_check:
-            # NOTE: we do not check the gramma queue and prefill transferring queue
-            # As they may do not have batch result to be processed instantly
+            # Grammar queue and prefill inflight queue may not produce batch results
+            # instantly, but they still indicate the server is not fully idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
