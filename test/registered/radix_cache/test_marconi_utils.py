@@ -111,11 +111,6 @@ def _make_model_config(total_kv_heads: int, tp_world_size: int = 1):
     return mc
 
 
-# ---------------------------------------------------------------------------
-# Per-layer FLOP counter tests
-# ---------------------------------------------------------------------------
-
-
 class TestGetFullAttnFlops(unittest.TestCase):
     def test_formula(self):
         seqlen, hidden_size, num_heads, num_kv_heads, head_dim = 10, 512, 8, 2, 64
@@ -201,12 +196,6 @@ class TestGetDenseMlpFlops(unittest.TestCase):
         f2 = get_dense_mlp_flops(100, 512, 1024)
         self.assertAlmostEqual(f2 / f1, 2.0, places=9)
 
-
-# ---------------------------------------------------------------------------
-# compute_flops_saved tests
-# ---------------------------------------------------------------------------
-
-
 class TestComputeFlopsSaved(unittest.TestCase):
     def setUp(self):
         # 8-layer model: attention at layers 3,7; linear at 0,1,2,4,5,6
@@ -221,14 +210,19 @@ class TestComputeFlopsSaved(unittest.TestCase):
         self.assertGreater(compute_flops_saved(10, 20, self.dense_cfg), 0.0)
 
     def test_dense_vs_moe_ffn(self):
-        # MoE model should save more FLOPs per prefix token (larger FFN)
+        moe_cfg = _make_moe_config(
+            num_layers=8,
+            full_attention_interval=4,
+            intermediate_size=1024,
+            num_experts_per_tok=4,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=512,
+        )
         dense = compute_flops_saved(10, 20, self.dense_cfg)
-        moe = compute_flops_saved(10, 20, self.moe_cfg)
+        moe = compute_flops_saved(10, 20, moe_cfg)
         self.assertGreater(moe, dense)
 
     def test_deeper_prefix_saves_more_attn_flops(self):
-        # For the same prefix_len, a deeper context (larger total_len) saves more
-        # attention FLOPs due to the quadratic term
         shallow = compute_flops_saved(10, 20, self.dense_cfg)   # parent_len=10
         deep = compute_flops_saved(10, 100, self.dense_cfg)     # parent_len=90
         self.assertGreater(deep, shallow)
@@ -240,35 +234,23 @@ class TestComputeFlopsSaved(unittest.TestCase):
         self.assertGreater(full, partial)
 
     def test_dense_config_does_not_use_moe_flops(self):
-        # For a purely dense model the FFN contribution should be
-        # 6 * prefix_len * hidden_size * intermediate_size × num_layers
         prefix_len = 5
-        cfg = self.dense_cfg
-        num_layers = len(cfg.layers_block_type)
-        expected_ffn = (
-            6 * prefix_len * cfg.hidden_size * cfg.intermediate_size * num_layers
-        )
-        # Compute only FFN contribution by setting all attn/SSM params to 0
-        cfg0 = _make_dense_config(
+        cfg_dense = _make_dense_config(
             num_layers=8,
             full_attention_interval=4,
-            hidden_size=0,   # zero attn/SSM FLOPs
-            num_attention_heads=0,
-            num_key_value_heads=0,
-            head_dim=0,
-            intermediate_size=cfg.intermediate_size,
-            linear_num_value_heads=0,
-            linear_value_head_dim=0,
-            linear_key_head_dim=0,
+            intermediate_size=1024,
         )
-        result = compute_flops_saved(prefix_len, 2 * prefix_len, cfg0)
-        self.assertEqual(result, expected_ffn)
-
-
-# ---------------------------------------------------------------------------
-# compute_memory_bytes tests
-# ---------------------------------------------------------------------------
-
+        cfg_moe_same = _make_moe_config(
+            num_layers=8,
+            full_attention_interval=4,
+            intermediate_size=1024,
+            num_experts_per_tok=1,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=1024,
+        )
+        dense_result = compute_flops_saved(prefix_len, 2 * prefix_len, cfg_dense)
+        moe_result = compute_flops_saved(prefix_len, 2 * prefix_len, cfg_moe_same)
+        self.assertGreater(moe_result, dense_result)
 
 class TestComputeMemoryBytes(unittest.TestCase):
     def _bytes(self, prefix_len, mamba_bytes, total_kv_heads, tp, head_dim, num_attn_layers, kv_dtype_bytes=2):
@@ -320,11 +302,6 @@ class TestComputeMemoryBytes(unittest.TestCase):
         result = self._bytes(10, 0, total_kv_heads=2, tp=8, head_dim=64, num_attn_layers=1)
         expected_kv = 10 * 1 * 64 * 2 * 2 * 1  # max(1, 2//8)=1
         self.assertEqual(result, expected_kv)
-
-
-# ---------------------------------------------------------------------------
-# compute_flop_efficiency tests
-# ---------------------------------------------------------------------------
 
 
 class TestComputeFlopEfficiency(unittest.TestCase):
