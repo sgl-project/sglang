@@ -649,26 +649,41 @@ class FusedMoE(torch.nn.Module):
                 # routed: [R, ..., full_I, ...] -> [tp_size, R, ..., I/P, ...] -> [tp_size*R, ..., I/P, ...]
                 chunks = routed.chunk(tp_size, dim=shard_dim)
                 stacked = torch.stack(chunks, dim=0)  # [P, R, ...]
-                # Flatten first two dims
+                del chunks
                 new_shape = (tp_size * num_routed_local,) + stacked.shape[2:]
                 send_buf = stacked.reshape(new_shape).contiguous()
+                del stacked
+
+                # Free original param data before the collective
+                param.data = torch.empty(0, dtype=data.dtype, device=data.device)
+                del data, routed
 
                 recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
                 dist.all_to_all_single(recv_buf, send_buf, group=tp_group)
+                del send_buf
 
                 if num_shared > 0:
-                    # Slice shared experts' intermediate dim for this TP rank
                     shard_size = shared.shape[shard_dim] // tp_size
                     shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
+                    del shared
                     param._ep_to_tp_buf[num_routed_local * tp_size:] = shared_sliced
+                    del shared_sliced
             else:
                 # Expert-only dimension (scales with no intermediate dim to shard)
                 # Just all_gather along expert dim
+                routed_contig = routed.contiguous()
+
+                # Free original param data before the collective
+                param.data = torch.empty(0, dtype=data.dtype, device=data.device)
+                del data, routed
+
                 recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
-                dist.all_gather_into_tensor(recv_buf, routed.contiguous(), group=tp_group)
+                dist.all_gather_into_tensor(recv_buf, routed_contig, group=tp_group)
+                del routed_contig
 
                 if num_shared > 0:
                     param._ep_to_tp_buf[num_routed_local * tp_size:] = shared
+                    del shared
 
             # Swap buffer into param
             param.data = param._ep_to_tp_buf
