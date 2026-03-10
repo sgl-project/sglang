@@ -78,7 +78,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_hip,
     is_npu,
     is_sm90_supported,
@@ -108,9 +107,6 @@ if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
-
-if is_flashinfer_available():
-    from flashinfer import block_scale_interleave as flashinfer_block_scale_interleave
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -489,11 +485,12 @@ class Fp8LinearMethod(LinearMethodBase):
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
             return
+
         if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            from flashinfer import block_scale_interleave
+
             scale_u8 = layer.weight_scale_inv.data
-            new_swizzled = flashinfer_block_scale_interleave(
-                scale_u8.contiguous()
-            ).contiguous()
+            new_swizzled = block_scale_interleave(scale_u8.contiguous()).contiguous()
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
