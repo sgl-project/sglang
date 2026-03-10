@@ -63,6 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
@@ -98,6 +99,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
@@ -794,6 +796,21 @@ def _register_configs():
         hf_model_paths=[
             "BestWishYsh/Helios-Distilled",
         ],
+    )
+
+    # SANA
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
     )
 
 
