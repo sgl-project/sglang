@@ -125,7 +125,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self._is_idle_for_hicache_storage_op()
+            self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
