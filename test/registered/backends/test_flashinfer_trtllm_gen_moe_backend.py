@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=500, suite="nightly-4-gpu-b200", nightly=True)
 
 
-class TestFlashinferTrtllmGenMoeBackendFP8Base:
+class FlashinferTrtllmGenMoeBackendFP8Base:
     backend = None
 
     @classmethod
@@ -62,7 +62,7 @@ class TestFlashinferTrtllmGenMoeBackendFP8Base:
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestFlashinferTrtllmGenMoeBackendBF16Base:
+class FlashinferTrtllmGenMoeBackendBF16Base:
     backend = None
 
     @classmethod
@@ -110,7 +110,7 @@ class TestFlashinferTrtllmGenMoeBackendBF16Base:
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestFlashinferTrtllmGenMoeBackendMXFP8Base:
+class FlashinferTrtllmGenMoeBackendMXFP8Base:
     backend = None
 
     @classmethod
@@ -158,31 +158,31 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Base:
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8(
-    TestFlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8(
-    TestFlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
 
 
 class TestFlashinferTrtllmGenMoeBackendBF16(
-    TestFlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8Routed(
-    TestFlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
-    TestFlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 
