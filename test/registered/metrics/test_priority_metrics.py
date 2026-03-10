@@ -1,10 +1,12 @@
 import unittest
 from typing import Dict, List
+from unittest.mock import Mock
 
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -14,7 +16,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(
+    est_time=60,
+    suite="stage-b-test-small-1-gpu",
+)
 register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -39,6 +44,36 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
         if all(sample.labels.get(k) == v for k, v in labels.items()):
             return sample.value
     raise KeyError(f"No sample found with labels {labels}")
+
+
+class TestQueueCount(CustomTestCase):
+    """Unit tests for QueueCount (no server needed)."""
+
+    def test_queue_count_from_reqs(self):
+        """QueueCount correctly counts per-priority breakdown."""
+        reqs = [
+            Mock(priority=1),
+            Mock(priority=1),
+            Mock(priority=5),
+            Mock(priority=5),
+            Mock(priority=10),
+        ]
+        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
+        self.assertEqual(qc.total, 5)
+        self.assertEqual(qc.by_priority, {1: 2, 5: 2, 10: 1})
+
+    def test_queue_count_from_reqs_disabled(self):
+        """Priority scheduling disabled → no breakdown."""
+        reqs = [Mock(priority=1), Mock(priority=5)]
+        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=False)
+        self.assertEqual(qc.total, 2)
+        self.assertIsNone(qc.by_priority)
+
+    def test_queue_count_empty(self):
+        """Empty request list."""
+        qc = QueueCount.from_reqs([], enable_priority_scheduling=True)
+        self.assertEqual(qc.total, 0)
+        self.assertEqual(qc.by_priority, {})
 
 
 class TestPriorityMetrics(CustomTestCase):
@@ -118,27 +153,39 @@ class TestPriorityMetrics(CustomTestCase):
         self.assertEqual(metrics_response.status_code, 200)
         metrics = _parse_prometheus_metrics(metrics_response.text)
 
-        # Check histogram metrics have priority label
+        # Check histogram metrics have priority label with per-priority breakdown
         histogram_metrics = [
             "sglang:time_to_first_token_seconds",
             "sglang:e2e_request_latency_seconds",
         ]
         for metric_name in histogram_metrics:
             # Histogram metrics are emitted as _sum, _count, _bucket
-            sum_name = f"{metric_name}_sum"
             count_name = f"{metric_name}_count"
-            for suffix_name in [sum_name, count_name]:
-                samples = _get_samples_by_name(metrics, suffix_name)
-                if not samples:
-                    continue
-                # At least one sample should have a non-empty priority label
-                priority_values = {s.labels.get("priority", "") for s in samples}
-                non_empty = priority_values - {""}
+            samples = _get_samples_by_name(metrics, count_name)
+            self.assertGreater(len(samples), 0, f"No samples found for {count_name}")
+            # At least one sample should have a non-empty priority label
+            priority_values = {s.labels.get("priority", "") for s in samples}
+            non_empty = priority_values - {""}
+            self.assertGreater(
+                len(non_empty),
+                0,
+                f"{count_name}: expected per-priority samples, "
+                f"got priority labels: {priority_values}",
+            )
+            # Verify that both priority="1" and priority="5" have count > 0
+            for expected_priority in ["1", "5"]:
+                matching = [
+                    s for s in samples if s.labels.get("priority") == expected_priority
+                ]
                 self.assertGreater(
-                    len(non_empty),
+                    len(matching),
                     0,
-                    f"{suffix_name}: expected per-priority samples, "
-                    f"got priority labels: {priority_values}",
+                    f"{count_name}: no sample with priority='{expected_priority}'",
+                )
+                self.assertGreater(
+                    matching[0].value,
+                    0,
+                    f"{count_name}: priority='{expected_priority}' count should be > 0",
                 )
 
     def test_default_priority_value(self):

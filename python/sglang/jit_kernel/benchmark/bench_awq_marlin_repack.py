@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import torch
 import triton
@@ -9,6 +7,7 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_repack as jit_awq_marlin_repack,
 )
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
 try:
@@ -18,12 +17,8 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
-# Fixed problem dimensions
 SIZE_K = 4096
 SIZE_N = 4096
 NUM_BITS = 4
@@ -43,7 +38,6 @@ def awq_pack(q_w, num_bits, size_k, size_n):
     return pack_cols(q_w, num_bits, size_k, size_n)
 
 
-# Quantize weights once
 _b_weight = torch.randn((SIZE_K, SIZE_N), dtype=torch.float16, device="cuda")
 _w_ref, _q_w, _s, _zp = quantize_weights(
     _b_weight, scalar_types.uint4, GROUP_SIZE, zero_points=True
@@ -99,8 +93,6 @@ def benchmark(size_k, size_n, num_bits, provider):
     )
     q_w_awq = awq_pack(q_w, num_bits, size_k, size_n)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "jit":
         fn = lambda: jit_awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
     elif provider == "aot":
@@ -108,8 +100,7 @@ def benchmark(size_k, size_n, num_bits, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

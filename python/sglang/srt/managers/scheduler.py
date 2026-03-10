@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -33,6 +33,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
+from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -199,6 +200,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    get_numa_node,
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -208,6 +210,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -222,6 +225,8 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -310,10 +315,6 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
-        self.enable_metrics = server_args.enable_metrics
-        self.enable_metrics_for_all_schedulers = (
-            server_args.enable_metrics_for_all_schedulers
-        )
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -394,6 +395,9 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
 
+        # Init Ngram Embedding
+        self.maybe_init_ngram_embedding()
+
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
@@ -413,6 +417,24 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        if _is_npu:
+            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
+            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
+            from sglang.srt.dllm.config import DllmConfig
+
+            self.dllm_config = (  # For diffusion LLM
+                DllmConfig.from_server_args(self.server_args)
+                if self.server_args.dllm_algorithm is not None
+                else None
+            )
+            if self.dllm_config:
+                if self.dllm_config.block_size < self.page_size:
+                    logger.warning(
+                        "WARNING: "
+                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
+                        f"Page size now falls back to {self.dllm_config.block_size}"
+                    )
+                    self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -694,9 +716,20 @@ class Scheduler(
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
-                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                if self.is_hybrid_ssm:
+                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
+                        HiMambaRadixCache,
+                    )
 
-                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                    self.tree_cache = HiMambaRadixCache(
+                        params=params, server_args=server_args
+                    )
+                else:
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    self.tree_cache = HiRadixCache(
+                        params=params, server_args=server_args
+                    )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -1021,6 +1054,57 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+    def maybe_init_ngram_embedding(self):
+        self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
+        if self.use_ngram_embedding:
+            self.token_table = self.tp_worker.model_runner.token_table
+            hf_config = self.tp_worker.model_config.hf_config
+            self.ngram_embedding_n = hf_config.ngram_embedding_n
+            self.ngram_embedding_k = hf_config.ngram_embedding_k
+
+    def _maybe_prepare_ngram_embedding(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        """Fill the token table for ngram embedding before a forward pass."""
+        if batch is None or not self.use_ngram_embedding:
+            return batch
+        batch.ne_token_table = self.token_table
+        if batch.forward_mode == ForwardMode.EXTEND:
+            all_tokens = []
+            column_starts = []
+            request_lengths = []
+            for req in batch.reqs:
+                start = len(req.prefix_indices)
+                end = start + req.extend_input_len
+                fill_ids = req.origin_input_ids + req.output_ids
+                if start == 0:
+                    tokens = fill_ids[start:end]
+                    column_starts.append(0)
+                elif start < self.ngram_embedding_n:
+                    tokens = fill_ids[0:end]
+                    column_starts.append(0)
+                else:
+                    # Prepend n-1 tokens before prefix_len for n-gram context
+                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
+                    column_starts.append(start - self.ngram_embedding_n + 1)
+                all_tokens.extend(tokens)
+                request_lengths.append(len(tokens))
+            dtype = self.token_table.dtype
+            device = self.token_table.device
+            update_token_table(
+                ne_token_table=self.token_table,
+                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                row_indices=batch.req_pool_indices,
+                column_starts=torch.tensor(
+                    column_starts, dtype=torch.int32, device=device
+                ),
+                req_lens=torch.tensor(
+                    request_lengths, dtype=torch.int32, device=device
+                ),
+                ignore_tokens=None,
+            )
+        return batch
+
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
@@ -1111,6 +1195,45 @@ class Scheduler(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
+    def get_init_info(self) -> Dict[str, Any]:
+        """Return scheduler initialization info for handshake.
+
+        This method provides the initialization info needed by the tokenizer manager
+        and other components to verify the scheduler is ready.
+        """
+        result_dict = {
+            "status": "ready",
+            "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_input_len": self.max_req_input_len,
+        }
+
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            (
+                remote_instance_transfer_engine_session_id,
+                remote_instance_transfer_engine_weights_info_dict,
+            ) = self.get_remote_instance_transfer_engine_info()
+            result_dict.update(
+                {
+                    "tp_rank": self.tp_rank,
+                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
+                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
+                }
+            )
+
+        return result_dict
+
+    def run_event_loop(self) -> None:
+        """Run the scheduler's event loop.
+
+        Sets up the schedule stream and dispatches to the appropriate event loop.
+        The event loop blocks until shutdown.
+        """
+        self.schedule_stream = self.device_module.Stream(priority=0)
+        if self.device == "cpu":
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        with CudaStreamContext(self.schedule_stream):
+            dispatch_event_loop(self)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1119,6 +1242,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
@@ -1173,6 +1297,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
@@ -1365,14 +1490,34 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None
-                or self.dllm_manager.any_staging_reqs()
-                or not self.running_batch.is_empty()
-                or len(self.offload_tags) > 0
-            ):
-                self.return_health_check_ct += 1
-                continue
+            if is_health_check_generate_req(recv_req):
+                # Check if there are requests being processed
+                has_running_requests = (
+                    self.chunked_req is not None
+                    or self.dllm_manager.any_staging_reqs()
+                    or not self.running_batch.is_empty()
+                    or len(self.offload_tags) > 0
+                )
+
+                # In PD disaggregation mode, also check if health check would be blocked
+                # in special queues (bootstrap/prealloc) due to external factors
+                will_block_in_pd_queue = False
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # If bootstrap queue has backlog, health check will also be blocked there
+                    will_block_in_pd_queue = (
+                        len(self.disagg_prefill_bootstrap_queue.queue) > 0
+                        or len(self.disagg_prefill_inflight_queue) > 0
+                    )
+                elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                    # If prealloc/transfer queue has backlog, health check will also be blocked there
+                    will_block_in_pd_queue = (
+                        len(self.disagg_decode_prealloc_queue.queue) > 0
+                        or len(self.disagg_decode_transfer_queue.queue) > 0
+                    )
+
+                if has_running_requests or will_block_in_pd_queue:
+                    self.return_health_check_ct += 1
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1666,22 +1811,25 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
-                last_hash = req.last_host_node.get_last_hash_value()
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            last_host_node = (
+                req.last_host_backup_node
+                if req.last_host_backup_node is not None
+                else req.last_host_node
+            )
+            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
-                    req.last_node.get_prefix_hash_values(req.last_node.parent)
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    req.last_host_node,
+                    last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
@@ -1961,6 +2109,9 @@ class Scheduler(
 
         # Handle DP attention and log stats
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+
+        # Handle ngram embedding
+        ret = self._maybe_prepare_ngram_embedding(ret)
 
         if ret:
             set_schedule_time_batch(ret)
@@ -2324,7 +2475,7 @@ class Scheduler(
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx:
+                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
@@ -2400,7 +2551,7 @@ class Scheduler(
 
             if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
-                with self.forward_stream_ctx:
+                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
@@ -3110,23 +3261,26 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
-def run_scheduler_process(
+def configure_scheduler(
     server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
     tp_rank: int,
     attn_cp_rank: int,
     moe_dp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
-    pipe_writer,
-):
+) -> Optional[int]:
+    """Configure scheduler worker: logging, process title, etc.
+
+    Returns:
+        dp_rank
+    """
     # Generate the logger prefix
-    prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+
+    prefix = ""
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
@@ -3143,22 +3297,46 @@ def run_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
-    kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+
+    return dp_rank
+
+
+def run_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+):
+    dp_rank = configure_scheduler(
+        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    )
+
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if (
-        numa_node := server_args.numa_node
-    ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node[gpu_id])
+    numa_node = None
+    if (numa_nodes := server_args.numa_node) is not None:
+        numa_node = numa_nodes[gpu_id]
+    elif envs.SGLANG_AUTO_NUMA_BIND.get():
+        numa_node = get_numa_node(gpu_id)
+        logger.info(f"auto get NUMA node {numa_node} for GPU {gpu_id}")
+    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:
@@ -3183,31 +3361,12 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
-        result_dict = {
-            "status": "ready",
-            "max_total_num_tokens": scheduler.max_total_num_tokens,
-            "max_req_input_len": scheduler.max_req_input_len,
-        }
-        if server_args.remote_instance_weight_loader_use_transfer_engine():
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            result_dict.update(
-                {
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
 
-        pipe_writer.send(result_dict)
+        # Send initialization info back to the parent process
+        pipe_writer.send(scheduler.get_init_info())
 
-        scheduler.schedule_stream = scheduler.device_module.Stream(priority=0)
-        if scheduler.device == "cpu":
-            scheduler.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with CudaStreamContext(scheduler.schedule_stream):
-            dispatch_event_loop(scheduler)
+        # Run the event loop (blocks until shutdown)
+        scheduler.run_event_loop()
 
     except Exception:
         traceback = get_exception_traceback()
