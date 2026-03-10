@@ -1686,7 +1686,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_crop = (
             torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(torch.long)
+            .type(target_dtype)
             .to(device=pixel_values.device)
         )
         images_spatial_crop = (
