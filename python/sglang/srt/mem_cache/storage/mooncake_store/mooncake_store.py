@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    NSAExtraStorageMixin,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     HostKVCache,
@@ -278,7 +279,7 @@ class MooncakeBaseStore:
             )
 
 
-class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):

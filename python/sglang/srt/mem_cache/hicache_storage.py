@@ -186,7 +186,35 @@ class HiCacheStorage(ABC):
         return None
 
 
-class HiCacheFile(HiCacheStorage):
+class NSAExtraStorageMixin(ABC):
+    @abstractmethod
+    def batch_get_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        pass
+
+    @abstractmethod
+    def batch_set_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        pass
+
+    @abstractmethod
+    def batch_exists_extra(
+        self,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
+        pass
+
+
+class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):

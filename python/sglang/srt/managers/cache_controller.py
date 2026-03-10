@@ -24,6 +24,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    NSAExtraStorageMixin,
 )
 
 if TYPE_CHECKING:
@@ -279,6 +280,7 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self.nsa_extra_supported = False
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
@@ -488,20 +490,9 @@ class HiCacheController:
                 self.page_set_func = self._page_set_zero_copy
 
             self.nsa_extra_supported = (
-                isinstance(self.mem_pool_host, NSATokenToKVPoolHost)
-                and self.mem_pool_host.layout
-                in (
-                    "page_first",
-                    "page_first_direct",
-                )
-                and all(
-                    hasattr(self.storage_backend, fn)
-                    for fn in (
-                        "batch_get_extra",
-                        "batch_set_extra",
-                        "batch_exists_extra",
-                    )
-                )
+                isinstance(self.storage_backend, NSAExtraStorageMixin)
+                and isinstance(self.mem_pool_host, NSATokenToKVPoolHost)
+                and self.mem_pool_host.layout in ["page_first", "page_first_direct"]
             )
             if self.nsa_extra_supported:
                 self.page_get_func = self._page_get_nsa_extra
@@ -1011,7 +1002,7 @@ class HiCacheController:
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
-            if getattr(self, "nsa_extra_supported", False):
+            if self.nsa_extra_supported:
                 hit_idx_num = self.storage_backend.batch_exists_extra(
                     batch_hashes, extra_info
                 )
