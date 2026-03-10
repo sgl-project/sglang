@@ -209,8 +209,14 @@ __global__ void fusedQKNormRopeKernel(
 
 // ---------------------------------------------------------------------------
 // Host-side tvm-ffi entry point
+//
+// HEAD_DIM and INTERLEAVE are compile-time template parameters, passed as
+// template arguments from Python via the cuda_wrappers specialisation in
+// fused_qknorm_rope.py (e.g. fused_qk_norm_rope<128, false>).  This avoids
+// both runtime dispatch and macro-based specialisation.
 // ---------------------------------------------------------------------------
 
+template <int HEAD_DIM, bool INTERLEAVE>
 void fused_qk_norm_rope(
     tvm::ffi::TensorView qkv,           // [num_tokens, (nq+nk+nv)*head_dim] bf16
     tvm::ffi::TensorView q_weight,      // [head_dim] bf16
@@ -219,16 +225,16 @@ void fused_qk_norm_rope(
     int num_heads_q,
     int num_heads_k,
     int num_heads_v,
-    int head_dim,
     float eps,
     float base,
-    int is_neox,  // 0 = interleave style, 1 = NeoX style
     float factor,
     float low,
     float high,
     float attention_factor,
     int rotary_dim) {
   using namespace host;
+
+  static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "HEAD_DIM must be 64, 128, or 256");
 
   RuntimeCheck(qkv.device().device_type == kDLCUDA, "qkv must be a CUDA tensor");
   RuntimeCheck(qkv.is_contiguous(), "qkv must be contiguous");
@@ -238,12 +244,12 @@ void fused_qk_norm_rope(
   RuntimeCheck(q_weight.is_contiguous(), "q_weight must be contiguous");
   RuntimeCheck(q_weight.dtype().code == kDLBfloat && q_weight.dtype().bits == 16, "q_weight must be bfloat16");
   RuntimeCheck(
-      q_weight.ndim() == 1 && static_cast<int>(q_weight.size(0)) == head_dim, "q_weight must be 1D of size head_dim");
+      q_weight.ndim() == 1 && static_cast<int>(q_weight.size(0)) == HEAD_DIM, "q_weight must be 1D of size head_dim");
 
   RuntimeCheck(k_weight.is_contiguous(), "k_weight must be contiguous");
   RuntimeCheck(k_weight.dtype().code == kDLBfloat && k_weight.dtype().bits == 16, "k_weight must be bfloat16");
   RuntimeCheck(
-      k_weight.ndim() == 1 && static_cast<int>(k_weight.size(0)) == head_dim, "k_weight must be 1D of size head_dim");
+      k_weight.ndim() == 1 && static_cast<int>(k_weight.size(0)) == HEAD_DIM, "k_weight must be 1D of size head_dim");
 
   RuntimeCheck(position_ids.device().device_type == kDLCUDA, "position_ids must be a CUDA tensor");
   RuntimeCheck(position_ids.is_contiguous(), "position_ids must be contiguous");
@@ -253,14 +259,13 @@ void fused_qk_norm_rope(
   int num_tokens = static_cast<int>(qkv.size(0));
   int total_heads = num_heads_q + num_heads_k + num_heads_v;
   RuntimeCheck(
-      static_cast<int>(qkv.size(1)) == total_heads * head_dim, "qkv.size(1) must equal (nq + nk + nv) * head_dim");
+      static_cast<int>(qkv.size(1)) == total_heads * HEAD_DIM, "qkv.size(1) must equal (nq + nk + nv) * head_dim");
   RuntimeCheck(static_cast<int>(position_ids.size(0)) == num_tokens, "position_ids must have num_tokens elements");
 
-  int numElemsPerThread = head_dim / 32;
+  constexpr int numElemsPerThread = HEAD_DIM / 32;
   RuntimeCheck(rotary_dim % numElemsPerThread == 0, "rotary_dim must be divisible by (head_dim / 32)");
 
-  bool neox = static_cast<bool>(is_neox);
-  if (neox) {
+  if constexpr (!INTERLEAVE) {
     // NeoX uses __shfl_xor_sync which requires half_rotary_lanes to be a power of 2
     int rotary_lanes = rotary_dim / numElemsPerThread;
     int half_rotary_lanes = rotary_lanes / 2;
@@ -276,47 +281,27 @@ void fused_qk_norm_rope(
   int totalWarps = num_tokens * totalQKHeads;
   int gridSize = host::div_ceil(totalWarps, warpsPerBlock);
 
-  bool interleave = !neox;
-
   auto* qkv_ptr = reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr());
   auto const* qw_ptr = reinterpret_cast<__nv_bfloat16 const*>(q_weight.data_ptr());
   auto const* kw_ptr = reinterpret_cast<__nv_bfloat16 const*>(k_weight.data_ptr());
   auto const* pos_ptr = reinterpret_cast<int const*>(position_ids.data_ptr());
 
-#define LAUNCH_KERNEL(HD, IL)                                        \
-  fusedQKNormRopeKernel<HD, IL><<<gridSize, blockSize, 0, stream>>>( \
-      qkv_ptr,                                                       \
-      num_heads_q,                                                   \
-      num_heads_k,                                                   \
-      num_heads_v,                                                   \
-      eps,                                                           \
-      qw_ptr,                                                        \
-      kw_ptr,                                                        \
-      base,                                                          \
-      pos_ptr,                                                       \
-      num_tokens,                                                    \
-      factor,                                                        \
-      low,                                                           \
-      high,                                                          \
-      attention_factor,                                              \
-      rotary_dim)
-
-  RuntimeCheck(head_dim == 64 || head_dim == 128 || head_dim == 256, "head_dim must be 64, 128, or 256");
-  if (head_dim == 64 && interleave) {
-    LAUNCH_KERNEL(64, true);
-  } else if (head_dim == 64 && !interleave) {
-    LAUNCH_KERNEL(64, false);
-  } else if (head_dim == 128 && interleave) {
-    LAUNCH_KERNEL(128, true);
-  } else if (head_dim == 128 && !interleave) {
-    LAUNCH_KERNEL(128, false);
-  } else if (head_dim == 256 && interleave) {
-    LAUNCH_KERNEL(256, true);
-  } else {
-    LAUNCH_KERNEL(256, false);
-  }
-
-#undef LAUNCH_KERNEL
+  fusedQKNormRopeKernel<HEAD_DIM, INTERLEAVE><<<gridSize, blockSize, 0, stream>>>(
+      qkv_ptr,
+      num_heads_q,
+      num_heads_k,
+      num_heads_v,
+      eps,
+      qw_ptr,
+      kw_ptr,
+      base,
+      pos_ptr,
+      num_tokens,
+      factor,
+      low,
+      high,
+      attention_factor,
+      rotary_dim);
 }
 
 }  // namespace

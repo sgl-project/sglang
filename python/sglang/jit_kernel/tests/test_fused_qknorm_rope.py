@@ -8,7 +8,6 @@ available) the sgl_kernel AOT implementation.
 import pytest
 import torch
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.fused_qknorm_rope import fused_qk_norm_rope
 
 try:
@@ -18,20 +17,8 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# CI / full-range helpers
-# ---------------------------------------------------------------------------
-
-_is_ci = is_in_ci()
-
-HEAD_DIMS_FULL = [64, 128, 256]
-HEAD_DIMS_CI = [128]
-
-NUM_TOKENS_FULL = [1, 16, 128]
-NUM_TOKENS_CI = [1, 64]
-
-HEAD_DIMS = HEAD_DIMS_CI if _is_ci else HEAD_DIMS_FULL
-NUM_TOKENS = NUM_TOKENS_CI if _is_ci else NUM_TOKENS_FULL
+HEAD_DIMS = [64, 128, 256]
+NUM_TOKENS = [1, 16, 128]
 
 
 # ---------------------------------------------------------------------------

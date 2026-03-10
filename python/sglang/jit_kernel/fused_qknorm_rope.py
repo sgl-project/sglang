@@ -13,11 +13,16 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_fused_qknorm_rope_module() -> Module:
+def _jit_fused_qknorm_rope_module(head_dim: int, is_neox: bool) -> Module:
+    interleave = "false" if is_neox else "true"
     return load_jit(
         "fused_qknorm_rope",
+        head_dim,
+        int(is_neox),
         cuda_files=["elementwise/fused_qknorm_rope.cuh"],
-        cuda_wrappers=[("fused_qk_norm_rope", "fused_qk_norm_rope")],
+        cuda_wrappers=[
+            ("fused_qk_norm_rope", f"fused_qk_norm_rope<{head_dim}, {interleave}>")
+        ],
         extra_cuda_cflags=["--use_fast_math"],
     )
 
@@ -67,7 +72,7 @@ def fused_qk_norm_rope_out(
         attention_factor: scale applied to the rotary component
         rotary_dim:       number of elements per head to apply RoPE to
     """
-    module = _jit_fused_qknorm_rope_module()
+    module = _jit_fused_qknorm_rope_module(head_dim, is_neox)
     module.fused_qk_norm_rope(
         qkv,
         q_weight,
@@ -76,10 +81,8 @@ def fused_qk_norm_rope_out(
         num_heads_q,
         num_heads_k,
         num_heads_v,
-        head_dim,
         eps,
         base,
-        1 if is_neox else 0,
         factor,
         low,
         high,
@@ -108,7 +111,7 @@ def can_use_fused_qk_norm_rope(
         logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
         return False
     try:
-        _jit_fused_qknorm_rope_module()
+        _jit_fused_qknorm_rope_module(head_dim, is_neox)
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT fused_qk_norm_rope kernel: {e}")
