@@ -168,8 +168,8 @@ def _create_model_and_load(
 
     env_patch = {"SGLANG_EP_LOAD_FOR_TP": "1" if ep_load else "0"}
     with patch.dict(os.environ, env_patch):
-        model = DeepseekV3ForCausalLM(config, quant_config=None)
-        model = model.to("cuda")
+        with torch.device("cuda"):
+            model = DeepseekV3ForCausalLM(config, quant_config=None)
 
         # load_weights expects an iterator; make a fresh copy each time
         def weight_iter():
@@ -246,8 +246,8 @@ class TestEpToTpTransform(unittest.TestCase):
         weights = _generate_checkpoint_weights(config)
 
         with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
-            model = DeepseekV3ForCausalLM(config, quant_config=None)
-            model = model.to("cuda")
+            with torch.device("cuda"):
+                model = DeepseekV3ForCausalLM(config, quant_config=None)
 
             def weight_iter():
                 for name, tensor in weights:
