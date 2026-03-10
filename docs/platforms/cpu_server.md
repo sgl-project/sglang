@@ -192,13 +192,23 @@ Notes:
     the system will automatically utilize the first `n` SNCs.
     Note that `n` cannot exceed the total SNC number, doing so will result in an error.
 
-    To specify the cores to be used, we need to explicitly set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
+    To support more flexible binding between TP ranks and CPU cores, an environment variable `SGLANG_CPU_OMP_THREADS_BIND` is provided.
+    To explicitly specify which CPU cores should be used, set the set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
     For example, if we want to run the SGLang service using the first 40 cores of each SNC on a Xeon® 6980P server,
     which has 43-43-42 cores on the 3 SNCs of a socket, we should set:
 
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
+
+    As another example, suppose we want to run the SGLang service with tp=2, using 96 cores cross 3 SNCs on a Xeon® 6972P server,
+    which has 32-32-32 cores on the 3 SNCs in a socket, we should set:
+    ```bash
+    export SGLANG_CPU_OMP_THREADS_BIND="0-95|96-191"
+    ```
+    This configuration is equivalent to:
+    - rank 0: `numactl -C 0-95 -m 0-2`
+    - rank 1: `numactl -C 96-191 -m 3-5`
 
     Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
     the available memory amounts of the ranks may not be determined in prior.
