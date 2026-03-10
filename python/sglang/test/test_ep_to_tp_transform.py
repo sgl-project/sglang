@@ -211,6 +211,7 @@ class TestEpToTpTransform(unittest.TestCase):
         initialize_model_parallel(tensor_model_parallel_size=cls.world_size)
 
         # Initialize dp attention globals (not using DP attention, just set defaults)
+        # Hack to avoid using top-level APIs in unit test.
         import sglang.srt.layers.dp_attention as dp_attn
 
         dp_attn._ATTN_DP_SIZE = 1

@@ -644,10 +644,28 @@ class FusedMoE(torch.nn.Module):
             # Determine which dim holds intermediate_size to split
             shard_dim = self._get_ep_to_tp_shard_dim(name)
 
+            is_w13 = "w13" in name
+
             if shard_dim is not None:
-                # Split along shard_dim into tp_size chunks, move to dim 0, flatten
-                # routed: [R, ..., full_I, ...] -> [tp_size, R, ..., I/P, ...] -> [tp_size*R, ..., I/P, ...]
-                chunks = routed.chunk(tp_size, dim=shard_dim)
+                # For w13 params, the shard dim contains fused [gate | up].
+                # TP shards each half independently, so we must split into
+                # gate/up, chunk each by tp_size, then interleave:
+                #   rank i gets [gate_shard_i | up_shard_i]
+                if is_w13:
+                    half = routed.shape[shard_dim] // 2
+                    gate = routed.narrow(shard_dim, 0, half)
+                    up = routed.narrow(shard_dim, half, half)
+                    gate_chunks = gate.chunk(tp_size, dim=shard_dim)
+                    up_chunks = up.chunk(tp_size, dim=shard_dim)
+                    # chunks[i] = cat(gate_shard_i, up_shard_i) along shard_dim
+                    chunks = [
+                        torch.cat([g, u], dim=shard_dim)
+                        for g, u in zip(gate_chunks, up_chunks)
+                    ]
+                    del gate, up, gate_chunks, up_chunks
+                else:
+                    chunks = list(routed.chunk(tp_size, dim=shard_dim))
+
                 stacked = torch.stack(chunks, dim=0)  # [P, R, ...]
                 del chunks
                 new_shape = (tp_size * num_routed_local,) + stacked.shape[2:]
@@ -663,8 +681,17 @@ class FusedMoE(torch.nn.Module):
                 del send_buf
 
                 if num_shared > 0:
-                    shard_size = shared.shape[shard_dim] // tp_size
-                    shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
+                    if is_w13:
+                        # Shared experts also have fused [gate | up] — shard each half
+                        shared_half = shared.shape[shard_dim] // 2
+                        shared_shard = shared_half // tp_size
+                        sg = shared.narrow(shard_dim, tp_rank * shared_shard, shared_shard)
+                        su = shared.narrow(shard_dim, shared_half + tp_rank * shared_shard, shared_shard)
+                        shared_sliced = torch.cat([sg, su], dim=shard_dim).contiguous()
+                        del sg, su
+                    else:
+                        shard_size = shared.shape[shard_dim] // tp_size
+                        shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
                     del shared
                     param._ep_to_tp_buf[num_routed_local * tp_size:] = shared_sliced
                     del shared_sliced
