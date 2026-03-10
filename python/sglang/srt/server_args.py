@@ -2067,6 +2067,20 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
+        # Workaround for TopKTopPSamplingFromProbs illegal memory access with FP4
+        # quantized models (modelopt_fp4, petit_nvfp4). See sgl-project/sglang#19383
+        # and flashinfer-ai/flashinfer#1575.
+        if self.sampling_backend == "flashinfer" and self.quantization in (
+            "modelopt_fp4",
+            "petit_nvfp4",
+        ):
+            self.sampling_backend = "pytorch"
+            logger.warning(
+                "Sampling backend set to pytorch for %s quantization to avoid "
+                "TopKTopPSamplingFromProbs illegal memory access (sgl-project/sglang#19383).",
+                self.quantization,
+            )
+
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """
         Auto select the fastest attention backend.
