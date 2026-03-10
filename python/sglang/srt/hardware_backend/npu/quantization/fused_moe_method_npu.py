@@ -241,12 +241,10 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
         layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).to(torch.bfloat16),
-            requires_grad=False,
+            layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1).to(torch.bfloat16),
-            requires_grad=False,
+            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
@@ -316,8 +314,8 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
             expert_tokens = expert_tokens.to(torch.int64)
 
-            w1_scale = [layer.w13_weight_scale]
-            w2_scale = [layer.w2_weight_scale]
+            w1_scale = [layer.w13_weight_scale.to(torch.bfloat16)]
+            w2_scale = [layer.w2_weight_scale.to(torch.bfloat16)]
             _output_dtype = torch.bfloat16
 
             hidden_states = torch.ops.npu.npu_grouped_matmul(
