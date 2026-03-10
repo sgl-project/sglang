@@ -738,6 +738,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -772,7 +775,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
+        aux_hidden_states = []
         for layer_idx in range(self.start_layer, self.end_layer):
+            if layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -811,7 +820,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -1129,6 +1129,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -1325,6 +1338,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1332,6 +1349,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
