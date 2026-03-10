@@ -28,6 +28,7 @@
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/nsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @hlu1 @rainj-me
+/python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang

@@ -6,7 +6,6 @@ from typing import List
 
 import numpy as np
 import torch
-from decord import VideoReader, cpu, gpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import (
@@ -20,6 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -205,14 +205,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
         return torch.stack(tiles).to(torch.bfloat16)
 
     @staticmethod
-    def _open_video_reader(path: str) -> VideoReader:
-        try:
-            return VideoReader(path, ctx=gpu(0), num_threads=1)
-        except (RuntimeError, OSError) as e:
-            logger.warning(
-                "[internvl] VideoReader gpu decode failed (%s), fallback CPU", e
-            )
-            return VideoReader(path, ctx=cpu(0), num_threads=1)
+    def _open_video_reader(path: str):
+        return VideoDecoderWrapper(path)
 
     def _ensure_placeholders_before_assistant(
         self, prompt: str, placeholder: str, want: int
@@ -488,11 +482,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         if base_output.videos and num_frames > 0 and self.video_token_id is not None:
             for video in base_output.videos:
-                vr = (
-                    video
-                    if isinstance(video, VideoReader)
-                    else self._open_video_reader(str(video))
-                )
+                is_video_obj = isinstance(video, VideoDecoderWrapper)
+                vr = video if is_video_obj else self._open_video_reader(str(video))
                 max_frame = len(vr) - 1
                 frame_indices = (
                     [0]
@@ -503,12 +494,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 per_video_tiles = []
                 per_video_patch_cnt = []
                 for fi in frame_indices:
-                    frame = vr[int(fi)]
-                    img_np = (
-                        frame.asnumpy()
-                        if hasattr(frame, "asnumpy")
-                        else np.array(frame)
-                    )
+                    img_np = vr[int(fi)]
                     frame_t = (
                         torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
                     )
