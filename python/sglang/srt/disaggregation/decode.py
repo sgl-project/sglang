@@ -980,6 +980,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
+            self.maybe_send_health_check_signal()
+
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
@@ -1016,6 +1018,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+            self.maybe_send_health_check_signal()
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
