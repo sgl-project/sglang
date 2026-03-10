@@ -2270,6 +2270,34 @@ def set_gpu_proc_affinity(
     nnodes_per_tp_group = max(nnodes // pp_size, 1)
     tp_size_per_node = tp_size // nnodes_per_tp_group
 
+    # If the process is already restricted (e.g., cgroup/cpuset), honor it.
+    allowed_cpu_ids = None
+    try:
+        allowed_cpu_ids = p.cpu_affinity()
+    except (AttributeError, NotImplementedError, psutil.AccessDenied):
+        allowed_cpu_ids = None
+    if allowed_cpu_ids:
+        allowed_cpu_ids = sorted(set(allowed_cpu_ids))
+        total_allowed = len(allowed_cpu_ids)
+        num_cores_bind = max(total_allowed // tp_size_per_node, 1)
+        start_idx = (gpu_id * num_cores_bind) % total_allowed
+        end_idx = start_idx + num_cores_bind
+        if end_idx <= total_allowed:
+            bind_cpu_ids = allowed_cpu_ids[start_idx:end_idx]
+        else:
+            bind_cpu_ids = (
+                allowed_cpu_ids[start_idx:]
+                + allowed_cpu_ids[: end_idx - total_allowed]
+            )
+        p.cpu_affinity(bind_cpu_ids)
+        logger.info(
+            "Process %s gpu_id %s is running on CPUs: %s",
+            pid,
+            gpu_id,
+            p.cpu_affinity(),
+        )
+        return
+
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
     # physical cores per TP (N.B. more Cores than GPUs on node)
