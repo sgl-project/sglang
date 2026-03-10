@@ -1496,7 +1496,7 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req) and self.is_fully_idle(
+            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
                 self.return_health_check_ct += 1
@@ -2628,8 +2628,8 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is not None
-            and self.dllm_manager.any_staging_reqs()
+            and self.chunked_req is None
+            and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
