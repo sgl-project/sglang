@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -227,7 +227,7 @@ class GenerateReqInput(BaseReq):
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
-    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
+    num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -732,7 +732,7 @@ class TokenizedGenerateReqInput(BaseReq):
     return_entropy: bool = False
 
     need_wait_for_mm_inputs: bool = False
-    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
+    num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None

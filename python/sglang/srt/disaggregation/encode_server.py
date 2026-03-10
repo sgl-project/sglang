@@ -178,23 +178,6 @@ class MMEncoder:
         self.model_config = ModelConfig.from_server_args(
             server_args,
         )
-        vision_config = (
-            server_args.mm_process_config.get("vision_config", {})
-            if server_args.mm_process_config is not None
-            else {}
-        )
-        if not vision_config:
-            # keep default values as qwen_vl.py
-            self.video_config = {
-                "fps": 2.0,
-                "max_frames": 768,
-                "min_frames": 4,
-            }
-        else:
-            self.video_config = vision_config
-        # default support cuda
-        self.video_config["device"] = "cuda"
-
         self.load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
@@ -355,6 +338,11 @@ class MMEncoder:
             if self.use_image_processor_gpu:
                 self.vision_config[modality_str]["device"] = self.device
 
+            if modality_str == "video":
+                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
+                for k, v in video_defaults.items():
+                    self.vision_config["video"].setdefault(k, v)
+
             if modality_str == "audio":
                 if "return_attention_mask" not in self.vision_config["audio"]:
                     self.vision_config["audio"]["return_attention_mask"] = True
@@ -510,7 +498,9 @@ class MMEncoder:
         if "qwen" in self.model_type:
             # for qwen-series model, do sample frames before preprocess
             video_processed = [
-                await preprocess_video(video, video_config=self.video_config)
+                await preprocess_video(
+                    video, video_config=self.vision_config.get("video", {})
+                )
                 for video in video_items
             ]
             videos, video_metadata = map(list, zip(*video_processed))
