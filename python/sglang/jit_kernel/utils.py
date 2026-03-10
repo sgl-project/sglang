@@ -13,6 +13,15 @@ if TYPE_CHECKING:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def is_in_ci() -> bool:
+    ci_env_vars = ("SGLANG_IS_IN_CI", "CI", "GITHUB_ACTIONS")
+    return any(os.getenv(env_var, "false").lower() == "true" for env_var in ci_env_vars)
+
+
+def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
+    return ci_range if is_in_ci() else full_range
+
+
 def cache_once(fn: F) -> F:
     """
     NOTE: `functools.lru_cache` is not compatible with `torch.compile`
