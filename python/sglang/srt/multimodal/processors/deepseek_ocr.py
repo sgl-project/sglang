@@ -12,7 +12,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         _processor.image_size = 640
-        is_ocr2 = (
+        _processor.ocr2_mode = (
             str(
                 getattr(getattr(hf_config, "vision_config", None), "model_name", "")
             ).lower()
@@ -20,9 +20,6 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
             or getattr(getattr(hf_config, "projector_config", None), "input_dim", None)
             == 896
         )
-        _processor.ocr2_mode = is_ocr2
-        if is_ocr2:
-            _processor.downsample_ratio = 4
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image>", image_token_id=self._processor.image_token_id
