@@ -1165,10 +1165,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
-            elif (
-                get_moe_runner_backend().is_flashinfer_trtllm()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            ):
+            elif get_moe_runner_backend().is_flashinfer_trtllm():
                 # Match FlashInfer TRT-LLM MoE test contracts:
                 # 1) quantize in canonical (non-swizzled) scale layout, and
                 # 2) do row/layout shuffling in align_mxfp8_moe_weights_for_flashinfer_trtllm.
@@ -1182,10 +1179,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data
                 )
         else:
-            if (
-                get_moe_runner_backend().is_flashinfer_trtllm()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            ):
+            if get_moe_runner_backend().is_flashinfer_trtllm():
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -1224,10 +1218,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_mxfp8_moe_weights_for_flashinfer_trtllm,
             )
@@ -1456,7 +1447,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
-            or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1585,14 +1575,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
-        elif (
-            self.runner.runner_backend.is_flashinfer_trtllm()
-            or self.runner.runner_backend.is_flashinfer_trtllm_routed()
-        ):
-            # FlashInfer TRT-LLM backend only supports fused execution and consumes
-            # router logits directly (no separate apply_with_router_logits needed).
-            # FlashInfer TRT-LLM routed backend consumes SGLang-computed
-            # top-k ids/weights (packed into int32) instead of router logits.
+        elif self.runner.runner_backend.is_flashinfer_trtllm():
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+
             global_num_experts = int(getattr(layer, "num_experts"))
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
@@ -1604,8 +1589,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=int(
-                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                routing_method_type=(
+                    int(
+                        getattr(
+                            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
+                        )
+                    )
+                    if TopKOutputChecker.format_is_bypassed(dispatch_output.topk_output)
+                    else None
                 ),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),

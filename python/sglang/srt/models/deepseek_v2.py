@@ -418,6 +418,7 @@ class DeepseekV2MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+            bypassed_topk_supported=True,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
             output_format=(

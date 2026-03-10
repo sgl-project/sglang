@@ -151,6 +151,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    bypassed_topk_supported: bool = False
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -237,6 +238,10 @@ class TopK(MultiPlatformOp):
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: scaling factor for fused shared experts on AMD-platform.
+    --output_format: the format of the topk output. If not specified, the output format will be determined by the backend.
+    --bypassed_topk_supported: whether the monolithic flashinfer trtllm kernel supports this model's routing method.
+        When True and the flashinfer_trtllm backend is active, TopK routing is bypassed (deferred to the kernel).
+        When False (default), TopK computes routing first and the modular routed kernel is used.
     """
 
     def __init__(
@@ -257,6 +262,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        bypassed_topk_supported: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -280,6 +286,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            bypassed_topk_supported=bypassed_topk_supported,
         )
 
     def forward_native(
@@ -312,10 +319,15 @@ class TopK(MultiPlatformOp):
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
-        elif (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
-        ):
+        elif get_moe_runner_backend().is_flashinfer_trtllm():
+            # Bypass TopK routing when the monolithic flashinfer trtllm kernel
+            # supports this model's routing method. Otherwise, TopK computes
+            # routing first and the modular routed kernel is used.
+            if self.topk_config.bypassed_topk_supported:
+                output_format = TopKOutputFormat.BYPASSED
+            else:
+                output_format = TopKOutputFormat.STANDARD
+        elif get_moe_runner_backend().is_flashinfer_mxfp4():
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
@@ -1051,11 +1063,11 @@ def select_experts(
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         if (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            get_moe_runner_backend().is_flashinfer_trtllm()
             and scoring_func == "softmax"
             and correction_bias is None
         ):
-            # flashinfer_trtllm_routed uses raw-logits topk
+            # flashinfer_trtllm routed path uses raw-logits topk
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

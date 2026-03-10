@@ -983,32 +983,29 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            and TopKOutputChecker.format_is_bypassed(topk_output)
-        ):
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp8MoeQuantInfo,
                 fused_experts_none_to_flashinfer_trtllm_fp8,
             )
             from sglang.srt.layers.moe.utils import RoutingMethodType
 
-            topk_config = topk_output.topk_config
-
             # Constraints for ModelOpt FP8 MoE
             assert (
                 self.moe_runner_config.activation == "silu"
             ), "Only silu is supported for flashinfer fp8 moe"
 
-            # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
-            # TODO(brayden): support other routing methods
-            assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
-            assert (
-                not topk_config.num_expert_group
-            ), "ModelOpt FP8 MoE does not support expert grouping"
-            assert (
-                not topk_config.topk_group
-            ), "ModelOpt FP8 MoE does not support grouped top-k"
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                topk_config = topk_output.topk_config
+                # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
+                # TODO(brayden): support other routing methods
+                assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
+                assert (
+                    not topk_config.num_expert_group
+                ), "ModelOpt FP8 MoE does not support expert grouping"
+                assert (
+                    not topk_config.topk_group
+                ), "ModelOpt FP8 MoE does not support grouped top-k"
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,

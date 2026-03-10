@@ -143,6 +143,7 @@ class Step3p5MoEMLP(nn.Module):
             correction_bias=self.router_bias,
             apply_routed_scaling_factor_on_output=False,
             layer_id=layer_id,
+            bypassed_topk_supported=True,
         )
 
         self.experts = get_moe_impl_class(quant_config)(

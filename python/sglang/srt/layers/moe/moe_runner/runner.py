@@ -39,10 +39,7 @@ class MoeRunner:
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
-        elif (
-            runner_backend.is_flashinfer_trtllm()
-            or runner_backend.is_flashinfer_trtllm_routed()
-        ):
+        elif runner_backend.is_flashinfer_trtllm():
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")

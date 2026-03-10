@@ -160,31 +160,22 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
 class TestFlashinferTrtllmGenMoeBackendFP8(
     FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
 ):
+    # Uses routed moe kernel
     backend = "flashinfer_trtllm"
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8(
     FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
 ):
+    # Uses monolithic moe kernel (bypassed topk)
     backend = "flashinfer_trtllm"
 
 
 class TestFlashinferTrtllmGenMoeBackendBF16(
     FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
 ):
+    # Uses monolithic moe kernel (bypassed topk)
     backend = "flashinfer_trtllm"
-
-
-class TestFlashinferTrtllmGenMoeBackendFP8Routed(
-    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm_routed"
-
-
-class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
-    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm_routed"
 
 
 if __name__ == "__main__":

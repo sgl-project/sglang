@@ -179,7 +179,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
-    "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -2480,11 +2479,9 @@ class ServerArgs:
             elif self.moe_runner_backend not in [
                 "cutlass",
                 "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
             ]:
                 logger.warning(
-                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                    "or flashinfer_trtllm_routed backends. "
+                    "mxfp8 quantization supports only cutlass or flashinfer_trtllm backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
                 self.moe_runner_backend = "flashinfer_trtllm"
@@ -2514,16 +2511,6 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-            )
-
-        if self.moe_runner_backend == "flashinfer_trtllm_routed":
-            assert self.quantization in [
-                "fp8",
-                "mxfp8",
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
@@ -2739,8 +2726,7 @@ class ServerArgs:
         if self.speculative_moe_runner_backend is None:
             self.speculative_moe_runner_backend = (
                 "auto"
-                if self.moe_runner_backend
-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
+                if self.moe_runner_backend == "flashinfer_trtllm"
                 else self.moe_runner_backend
             )
         else:

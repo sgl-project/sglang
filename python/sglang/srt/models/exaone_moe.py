@@ -192,6 +192,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
+            bypassed_topk_supported=True,
         )
 
         if config.num_shared_experts is not None:

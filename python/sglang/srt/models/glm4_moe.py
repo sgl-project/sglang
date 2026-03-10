@@ -398,6 +398,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
             fused_shared_experts_scaling_factor=1,
+            bypassed_topk_supported=True,
         )
 
         # shared expert

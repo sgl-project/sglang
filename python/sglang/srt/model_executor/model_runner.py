@@ -1864,16 +1864,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            set_flashinfer_autotune,
+        )
+
         logger.info("Running FlashInfer autotune...")
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune():
-                self._dummy_run(
-                    batch_size=self.req_to_token_pool.size, run_ctx=autotune()
-                )
+            set_flashinfer_autotune(True)
+            try:
+                with torch.inference_mode(), autotune():
+                    self._dummy_run(
+                        batch_size=self.req_to_token_pool.size, run_ctx=autotune()
+                    )
+            finally:
+                set_flashinfer_autotune(False)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 

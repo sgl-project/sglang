@@ -166,6 +166,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
+            bypassed_topk_supported=True,
         )
 
         self.experts = get_moe_impl_class(quant_config)(

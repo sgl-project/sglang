@@ -44,6 +44,14 @@ elif is_cuda_alike():
 else:
     fp4_quantize = None
 
+# Global flag set during flashinfer autotuning.
+_is_flashinfer_autotune: bool = False
+
+
+def set_flashinfer_autotune(value: bool) -> None:
+    global _is_flashinfer_autotune
+    _is_flashinfer_autotune = value
+
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
     layer: Module, swap_w13_halves: bool = False
@@ -298,7 +306,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-    use_routed_topk: bool = False,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
@@ -311,6 +318,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
@@ -358,18 +366,24 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             symm_output = torch.empty(
                 hidden_states.shape[0],
                 hidden_states.shape[1],
-                dtype=torch.bfloat16,
+                dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
 
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
-        if use_routed_topk:
+        if TopKOutputChecker.format_is_standard(topk_output):
+            # Non-bypassed: routing already computed, use routed kernel.
+            if _is_flashinfer_autotune:
+                # Autotune mode doesn't support routed kernel, return empty output.
+                # https://github.com/flashinfer-ai/flashinfer/issues/2749
+                return StandardCombineInput(
+                    hidden_states=torch.zeros_like(hidden_states)
+                )
             assert (
                 runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            assert TopKOutputChecker.format_is_standard(topk_output)
+            ), "runner_config.top_k is required for flashinfer_trtllm routed path."
             packed_topk_ids = _pack_topk_for_flashinfer_routed(
                 topk_ids=topk_output.topk_ids,
                 topk_weights=topk_output.topk_weights,
@@ -391,16 +405,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 intermediate_size=quant_info.intermediate_size,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                routing_method_type=(
-                    RoutingMethodType.TopK
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else routing_method_type
-                ),
+                routed_scaling_factor=None,
+                routing_method_type=1,  # Unused, but must be 1 to pass validation.
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
@@ -438,9 +444,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
             )
+        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output and remove this copy.
         symm_output.copy_(output)
         output = symm_output
     else:
+        # There is no "routed" path for per-tensor scale, require bypassed topk output.
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
         assert quant_info.output1_scales_gate_scalar is not None
@@ -741,22 +750,4 @@ def fused_experts_none_to_flashinfer_trtllm(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
-    )
-
-
-@register_fused_func("none", "flashinfer_trtllm_routed")
-def fused_experts_none_to_flashinfer_trtllm_routed(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
-        return fused_experts_none_to_flashinfer_trtllm_fp8(
-            dispatch_output,
-            quant_info,
-            runner_config,
-            use_routed_topk=True,
-        )
-    raise TypeError(
-        f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
