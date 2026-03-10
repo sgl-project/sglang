@@ -466,7 +466,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
-    fp4_gemm_runner_backend: str = "flashinfer_cutlass"
+    fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
@@ -1406,12 +1406,35 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_NSA_FORCE_MLA.set(True)
+                    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
+                else:
+                    if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+                        logger.warning(
+                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
+                        )
+                    else:
+                        # When threshold is not manually set, set it to the index topk of model
+                        from sglang.srt.configs.model_config import get_nsa_index_topk
+
+                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            get_nsa_index_topk(hf_config)
+                        )
+                        logger.warning(
+                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
+                        )
+                    if self.nsa_prefill_backend == "trtllm":
+                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
+                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            128 * 1024
+                        )
+                        logger.warning(
+                            "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
+                        )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -3124,6 +3147,12 @@ class ServerArgs:
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
                 self.attention_backend = "triton"
+        elif is_npu():
+            if self.attention_backend != "ascend":
+                logger.warning(
+                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
+                )
+                self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
             if self.attention_backend != "flashinfer":
                 logger.warning(
@@ -4302,8 +4331,8 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'flashinfer_cutlass' (default), "
-            "'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "

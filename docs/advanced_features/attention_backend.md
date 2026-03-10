@@ -20,14 +20,14 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FlashInfer**                  | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ❌             |
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
 | **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ✅             |
-| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅              | ✅                 | ✅             |
+| **Triton**                      | ❌                          | ✅               | ✅              | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ✅               | ✅              | ❌              | ❌              | ❌                 | ✅             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
 | **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ✅              | ❌              | ✅                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ✅               | ❌              | ✅              | ✅              | ❌                 | ✅             |
+| **AITER (ROCm)**                | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ❌                 | ✅             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ✅                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 | **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
 
@@ -41,7 +41,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **FA3 (FlashAttention 3)** | n/a                       | ❌               | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
 | **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
-| **FA4**                    | 1                         | ❌               | ✅               | ❌                       | ❌              | ❌              |
+| **FA4**                    | 1                         | ❌               | ✅               | ✅                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ❌               | ❌                       | ❌              | ❌              |
 
 ```{note}
@@ -49,7 +49,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). On SM90, `page_size` must be 128.
+- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
@@ -65,8 +65,16 @@ For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-back
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 ```
 
+```{note}
+**Speculative Decoding V2 (Spec V2):** Spec V2 uses overlap scheduling (`SGLANG_ENABLE_SPEC_V2=True`) that benefits various attention backends. Requires `--speculative-eagle-topk 1` and currently applies to EAGLE and EAGLE3.
+
+**Verified backends:** TRTLLM MLA, TRTLLM MHA, FA3, Ascend (NPU), Triton.
+
+**Limited support:** FlashInfer can run under Spec V2, but its plan stream (used for split-KV optimization) introduces a synchronization point that limits overlap benefits.
+```
+
 ```{tip}
-Page size controls how many tokens are grouped into a KV cache block. For the prefix cache to take effect, the number of tokens must fill at least one complete page. For example, if your prompt is only 32 tokens and `page_size = 64`, it won't fill a complete page and cannot be matched in the prefix cache (pages cannot be padded). With 65 tokens and `page_size = 64`, only the first page of 64 tokens will be cached and matched; the remaining 1 token is discarded. Use `page_size = 1` for maximum prefix reuse (token-level matching).
+Page size controls how many tokens are grouped into a KV cache block. For the prefix cache to take effect, the number of tokens must fill at least one complete page. For example, if your prompt is only 32 tokens and `page_size = 64`, it won't fill a complete page and cannot be matched in the prefix cache (pages cannot be padded). With 65 tokens and `page_size = 64`, only the first page of 64 tokens will be cached and matched; the remaining 1 token is discarded. Use `page_size = 1` for maximum prefix reuse (token-level matching). Note that higher page sizes generally improve attention kernel performance, so prefer `page_size > 1` when prefix cache reuse is not critical.
 ```
 
 Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
@@ -150,7 +158,7 @@ If the `--attention-backend` argument is not specified, SGLang automatically sel
 
 **2. MLA Models (e.g., DeepSeek V3)**
 - **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
-- **Blackwell**: Defaults to `trtllm_mla`.
+- **Blackwell**: Defaults to `flashinfer`; `trtllm_mla` is auto-selected for DeepSeek V3 models specifically.
 - **Other Architectures**: Defaults to `triton`.
 
 
@@ -238,7 +246,7 @@ python3 -m sglang.launch_server \
 ```
 
 - TRTLLM MHA (XQA backend) (Optimized for SM90 and SM120, e.g., H20, H200, 5090)
-Note that TRTLLM XQA backend only works well for pagesize 64.
+  Note that TRTLLM XQA backend only works well for pagesize 64.
 ```bash
 python3 -m sglang.launch_server \
   --tp 4 \
@@ -324,23 +332,23 @@ Linear attention kernel backends (GDN, KDA) follow a different pattern. They imp
 ```
 
 1. Run without cuda graph. Support the two forward functions
-    - forward_extend
-        - Will be used for prefill, prefill with KV cache, and target verification
-        - It will be called once per layer
-    - forward_decode
-        - Will be used for normal decode, and draft decode
-        - It will be called once per layer
-    - init_forward_metadata
-        - Initialize the class and common metadata shared by all layers
-        - Call the plan function for optimizations like split_kv
-        - It will be called once per forward
+- forward_extend
+  - Will be used for prefill, prefill with KV cache, and target verification
+  - It will be called once per layer
+- forward_decode
+  - Will be used for normal decode, and draft decode
+  - It will be called once per layer
+- init_forward_metadata
+  - Initialize the class and common metadata shared by all layers
+  - Call the plan function for optimizations like split_kv
+  - It will be called once per forward
 2. Run with cuda graph. It has two phases (capture and replay) and you need to implement three functions
-    - init_cuda_graph_state
-        - It will be called once during life time
-        - Create all common shared buffers
-    - init_forward_metadata_capture_cuda_graph
-        - It will be called before capturing a cuda graph
-        - It is similar to init_forward_metadata but write the medatada to some pre-defined buffers
-    - init_forward_metadata_replay_cuda_graph
-        - It will be called before replaying a cuda graph
-        - This function is in the critical path and needs to be fast
+- init_cuda_graph_state
+  - It will be called once during life time
+  - Create all common shared buffers
+- init_forward_metadata_capture_cuda_graph
+  - It will be called before capturing a cuda graph
+  - It is similar to init_forward_metadata but write the medatada to some pre-defined buffers
+- init_forward_metadata_replay_cuda_graph
+  - It will be called before replaying a cuda graph
+  - This function is in the critical path and needs to be fast
