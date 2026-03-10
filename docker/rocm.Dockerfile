@@ -201,11 +201,13 @@ RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         else \
-          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 

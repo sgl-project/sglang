@@ -5,6 +5,7 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm as jit_gptq_marlin_gemm
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 from sglang.test.test_marlin_utils import marlin_quantize
@@ -21,13 +22,11 @@ IS_CI = (
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
-# Fixed problem dimensions
 SIZE_K = 4096
 SIZE_N = 4096
 GROUP_SIZE = 128
 QUANT_TYPE = scalar_types.uint4b8
 
-# Quantize weights once
 _b_weight = torch.randn((SIZE_K, SIZE_N), dtype=torch.float16, device="cuda")
 _w_ref, _marlin_q_w, _marlin_s, _g_idx, _sort_indices, _ = marlin_quantize(
     _b_weight, QUANT_TYPE, GROUP_SIZE, act_order=False
@@ -100,8 +99,6 @@ def benchmark(size_m, provider):
     device = torch.device("cuda")
     a = torch.randn((size_m, SIZE_K), dtype=torch.float16, device=device)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "jit":
         fn = lambda: _run_gemm(jit_gptq_marlin_gemm, a)
     elif provider == "aot":
@@ -109,8 +106,7 @@ def benchmark(size_m, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
