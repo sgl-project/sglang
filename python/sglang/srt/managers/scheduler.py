@@ -1496,34 +1496,11 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req):
-                # Check if there are requests being processed
-                has_running_requests = (
-                    self.chunked_req is not None
-                    or self.dllm_manager.any_staging_reqs()
-                    or not self.running_batch.is_empty()
-                    or len(self.offload_tags) > 0
-                )
-
-                # In PD disaggregation mode, also check if health check would be blocked
-                # in special queues (bootstrap/prealloc) due to external factors
-                will_block_in_pd_queue = False
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                    # If bootstrap queue has backlog, health check will also be blocked there
-                    will_block_in_pd_queue = (
-                        len(self.disagg_prefill_bootstrap_queue.queue) > 0
-                        or len(self.disagg_prefill_inflight_queue) > 0
-                    )
-                elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                    # If prealloc/transfer queue has backlog, health check will also be blocked there
-                    will_block_in_pd_queue = (
-                        len(self.disagg_decode_prealloc_queue.queue) > 0
-                        or len(self.disagg_decode_transfer_queue.queue) > 0
-                    )
-
-                if has_running_requests or will_block_in_pd_queue:
-                    self.return_health_check_ct += 1
-                    continue
+            if is_health_check_generate_req(recv_req) and self.is_fully_idle(
+                for_health_check=True
+            ):
+                self.return_health_check_ct += 1
+                continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -2647,32 +2624,36 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def is_fully_idle(self) -> bool:
-        no_request = (
+    def is_fully_idle(self, for_health_check=False) -> bool:
+        # Batch running status
+        idle = (
             self.running_batch.is_empty()
+            and self.chunked_req is not None
+            and self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
+
+        # Waiting queues: waiting + bootstrapping + preallocation + decode inflight
+        idle &= len(self.waiting_queue) == 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            no_request &= (
-                len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                and len(self.disagg_prefill_inflight_queue) == 0
-            )
+            idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            no_request &= (
+            idle &= (
                 len(self.disagg_decode_prealloc_queue.queue) == 0
                 and len(self.disagg_decode_transfer_queue.queue) == 0
             )
 
-        if not no_request:
-            return False
-        if len(self.waiting_queue) != 0:
-            return False
-        if len(self.grammar_manager.grammar_queue) != 0:
-            return False
-        return True
+        if not for_health_check:
+            # NOTE: we do not check the gramma queue and prefill transferring queue
+            # As they may do not have batch result to be processed instantly
+            idle &= len(self.grammar_manager.grammar_queue) == 0
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                idle &= len(self.disagg_prefill_inflight_queue) == 0
+
+        return idle
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
