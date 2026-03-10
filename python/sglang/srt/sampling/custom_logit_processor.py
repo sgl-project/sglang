@@ -112,20 +112,24 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
         return logits
 
 
-class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+class GlmThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """Base logit processor for GLM models with shared NEW_LINE_TOKEN_ID."""
+
+    NEW_LINE_TOKEN_ID: int = 198
+
+
+class Glm4MoeThinkingBudgetLogitProcessor(GlmThinkingBudgetLogitProcessor):
     """A logit processor that controls the length of thinking for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V models."""
 
     THINKING_START_TOKEN_ID: int = 151350
     THINKING_END_TOKEN_ID: int = 151351
-    NEW_LINE_TOKEN_ID: int = 198
 
 
-class Glm5ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+class Glm5ThinkingBudgetLogitProcessor(GlmThinkingBudgetLogitProcessor):
     """A logit processor that controls the length of thinking for GLM-5 models."""
 
     THINKING_START_TOKEN_ID: int = 154841
     THINKING_END_TOKEN_ID: int = 154842
-    NEW_LINE_TOKEN_ID: int = 198
 
 
 class Qwen3ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
