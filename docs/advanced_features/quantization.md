@@ -45,6 +45,38 @@ The following table summarizes quantization method support across NVIDIA and AMD
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
 
+## GEMM Backends for FP4/FP8 Quantization
+
+:::{note}
+Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+:::
+
+### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
+
+| Backend | Hardware | Description |
+|---------|----------|-------------|
+| `auto` | All | Auto-selects based on hardware |
+| `deep_gemm` | SM90, SM100 | JIT-compiled; enabled when DeepGEMM is installed |
+| `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend; optimal for low-latency |
+| `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS groupwise FP8 GEMM |
+| `flashinfer_deepgemm` | SM90 | Uses swapAB optimization for small M dimensions in decoding |
+| `cutlass` | SM90, SM100/120 | sgl-kernel CUTLASS |
+| `triton` | All | Fallback; widely compatible |
+| `aiter` | ROCm | AMD AITER backend |
+
+**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+
+### `--fp4-gemm-backend` (NVFP4 GEMM)
+
+| Backend | Hardware | Description |
+|---------|----------|-------------|
+| `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
+| `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
+| `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
+
+When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
+
 ## Offline Quantization
 
 To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline,
