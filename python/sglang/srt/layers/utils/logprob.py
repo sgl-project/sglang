@@ -68,11 +68,11 @@ def get_top_logprobs_raw(
     top_logprobs_nums: List[int],
     stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
-    delay_cpu_copy: bool = False,
+    no_copy_to_cpu: bool = False,
 ):
     max_k = max(top_logprobs_nums)
     values, indices = logprobs.topk(max_k, dim=-1)
-    if not delay_cpu_copy:
+    if not no_copy_to_cpu:
         values = values.tolist()
         indices = indices.tolist()
 
@@ -112,13 +112,13 @@ def get_top_logprobs_prefill(
 def get_top_logprobs(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
-    delay_cpu_copy: bool = False,
+    no_copy_to_cpu: bool = False,
 ):
     return get_top_logprobs_raw(
         logprobs,
         top_logprobs_nums,
         stage=LogprobStage.DECODE,
-        delay_cpu_copy=delay_cpu_copy,
+        no_copy_to_cpu=no_copy_to_cpu,
     )
 
 
@@ -127,7 +127,7 @@ def get_token_ids_logprobs_raw(
     token_ids_logprobs_list: List[Optional[List[int]]],
     stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
-    delay_cpu_copy: bool = False,
+    no_copy_to_cpu: bool = False,
 ):
     vals, idxs = [], []
     if stage == LogprobStage.DECODE:
@@ -140,7 +140,7 @@ def get_token_ids_logprobs_raw(
                     logprobs.device, non_blocking=True
                 )
                 row = logprobs[i, token_ids_tensor]
-                vals.append(row if delay_cpu_copy else row.tolist())
+                vals.append(row if no_copy_to_cpu else row.tolist())
                 idxs.append(token_ids)
     else:  # prefill
         pt = 0
@@ -155,30 +155,30 @@ def get_token_ids_logprobs_raw(
                 logprobs.device, non_blocking=True
             )
             pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
-            vals.append(pos_logprobs if delay_cpu_copy else pos_logprobs.tolist())
+            vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
             idxs.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
     return vals, idxs
 
 
 def get_token_ids_logprobs_prefill(
-    all_logprobs, logits_metadata: LogitsMetadata, delay_cpu_copy=False
+    all_logprobs, logits_metadata: LogitsMetadata, no_copy_to_cpu=False
 ):
     return get_token_ids_logprobs_raw(
         all_logprobs,
         logits_metadata.token_ids_logprobs,
         stage=LogprobStage.PREFILL,
         extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-        delay_cpu_copy=delay_cpu_copy,
+        no_copy_to_cpu=no_copy_to_cpu,
     )
 
 
-def get_token_ids_logprobs(logprobs, token_ids_logprobs, delay_cpu_copy=False):
+def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
     return get_token_ids_logprobs_raw(
         logprobs,
         token_ids_logprobs,
         stage=LogprobStage.DECODE,
-        delay_cpu_copy=delay_cpu_copy,
+        no_copy_to_cpu=no_copy_to_cpu,
     )
 
 

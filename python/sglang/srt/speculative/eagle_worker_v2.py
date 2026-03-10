@@ -880,7 +880,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
             ) = get_top_logprobs(
-                gathered_logprobs, top_logprobs_nums_expanded, delay_cpu_copy=True
+                gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
             )
 
         if batch.token_ids_logprobs and any(
@@ -893,7 +893,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                gathered_logprobs, token_ids_logprobs_expanded, delay_cpu_copy=True
+                gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
             )
 
     def _mamba_verify_update(
