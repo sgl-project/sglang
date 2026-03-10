@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.configs.mamba_utils import BaseLinearStateParams
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -36,3 +38,8 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    # Marconi FLOP-aware eviction 
+    marconi_eff_weight: float = 0.5
+    model_config: Optional["ModelConfig"] = None
+    mamba_cache_params: Optional["BaseLinearStateParams"] = None

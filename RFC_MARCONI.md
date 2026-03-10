@@ -2,15 +2,15 @@
 
 Related Paper: [Marconi: Prefix Caching for the Era of Hybrid LLMs](https://arxiv.org/pdf/2411.19379)
 
-Related Code: https://github.com/ruipeterpan/marconi/tree/main 
+Related Code: https://github.com/ruipeterpan/marconi/tree/main
 
 ---
 
 ## 1. Summary
 
-This RFC proposes integrating Marconi's prefix caching into SGLang. We extend the SGLang's existing support for Hybrid Architecture with Marconi's cache admission and eviction policy.
+This RFC proposes integrating Marconi's prefix caching into SGLang. We extend SGLang's existing support for Hybrid Architecture with Marconi's FLOP-efficiency-weighted cache eviction policy.
 
-Target Model: `Qwen/Qwen3-Next-80B-A3B-Instruct`
+Target Model: `Qwen/Qwen3.5-27B`
 
 ---
 
@@ -24,9 +24,9 @@ Each `TreeNode` is shared across RadixTree and both LRU lists.
 
 ```python
 class TreeNode:
-    children: defaultdict[int, TreeNode]  
+    children: defaultdict[int, TreeNode]
     parent: TreeNode
-    key: RadixKey           
+    key: RadixKey
 
     # --- Cache state ---
     value: Optional[Tensor]       # indices into TokenToKVPool (attention KV cache)
@@ -34,7 +34,7 @@ class TreeNode:
 
     # --- Lock reference counts ---
     full_lock_ref: int   # KV lock
-    mamba_lock_ref: int  # SSM lock 
+    mamba_lock_ref: int  # SSM lock
 
     # --- LRU linked-list pointers ---
     prev, next: TreeNode                  # for full_lru_list (KV eviction)
@@ -44,17 +44,17 @@ class TreeNode:
 
 ### 2.2 MambaRadixCache
 
-`MambaRadixCache` holds a radix tree of `TreeNode`s, two independent LRU lists, and references to the index allocators:
+`MambaRadixCache` holds a single radix tree of `TreeNode`s, two independent LRU lists, and references to the index allocators:
 
 ```python
 class MambaRadixCache(BasePrefixCache):
-    root_node: TreeNode                                    # root
+    root_node: TreeNode                                    # root of single radix tree
 
     # Free list tracker to store which slots are in use vs available
     req_to_token_pool: HybridReqToTokenPool                # free pages management for SSM slots
     token_to_kv_pool_allocator: TokenToKVPoolAllocator     # free_pages management for KV slots
 
-    # Two LRU lists for eviction ordering
+    # Two LRU lists for eviction ordering over the same set of nodes
     full_lru_list: LRUList    # LRU list for KV Cache, can evict leaf nodes only
     mamba_lru_list: LRUList   # LRU list for SSM state cache, can evict any node (including tombstoning)
 ```
@@ -70,54 +70,60 @@ We will be replacing this eviction path with Marconi's FLOP-efficiency-weighted 
 k_buffer = [torch.zeros(total_slots, head_num, head_dim) for _ in range(num_attn_layers)]
 v_buffer = [torch.zeros(total_slots, head_num, head_dim) for _ in range(num_attn_layers)]
 
-# Free-list in TokenToKVPoolAllocator 
-free_pages: Tensor[int64]  
+# Free-list in TokenToKVPoolAllocator
+free_pages: Tensor[int64]
 ```
 
 **Pool 2 — SSM State** (for linear-attention/Mamba layers):
 ```python
-# Pre-allocated GPU tensors in MambaPool 
+# Pre-allocated GPU tensors in MambaPool
 conv_state     = torch.zeros(num_mamba_layers, pool_size, conv_dim/tp, conv_kernel-1)
 temporal_state = torch.zeros(num_mamba_layers, pool_size, num_heads/tp, head_dim, state_size)
 
-# Free-list also in MambaPool 
-free_slots: Tensor[int64]  
+# Free-list also in MambaPool
+free_slots: Tensor[int64]
 ```
+
+### 2.4 KV and SSM State Eviction Invariant
+
+- **SSM can be evicted without KV** (tombstoning)
+- **KV cannot be evicted without also evicting SSM**
+
+Whenever a node's KV cache is evicted, its SSM state must be freed simultaneously.
 
 ## 3. Scope
 
-We will be adding a scoring layer into the eviction decision of `MambaRadixCache`.
+We will add a scoring layer into the eviction decision of `MambaRadixCache`.
 
 ### In Scope
 
-- **Cache admission policy**: 
-  - **Input-only**: Track incoming request prefixes to identify hot common prefixes; only cache SSM states at nodes with high reuse likelihood
-  - **Input-and-output**: Only cache SM states that represent the last decoded token between conversation rounds
-- **SSM state eviction**: Replace pure LRU with FLOP-efficiency-weighted scoring in `evict_mamba()`
+- **Cache eviction policy**: Replace pure LRU with FLOP-efficiency-weighted scoring in `evict_mamba()` and `evict()`
 - **FLOP utility functions**: New `marconi_utils.py` with FLOP/memory calculations for Qwen3-Next
 - **Timestamp update**: Update only the terminal node on prefix match (not all ancestors)
+
+### Out of Scope
+
+- **Cache admission policy**: No changes to when SSM states are cached
 
 ## 4. API Summary
 ```bash
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-Next-80B-A3B-Instruct \
     --eviction-policy marconi \
-    --marconi-eff-weight 0.7 \
-    --marconi-min-reuse-count 2
+    --marconi-eff-weight 0.7
 ```
 ### 5. Backward Compatibility
 
-- Default `eviction_policy="lru"` 
+- Default `eviction_policy="lru"`
 - No changes to `MambaRadixCache`'s public API (`match_prefix`, `insert`, `evict`, `cache_finished_req`, `cache_unfinished_req`)
 - All existing hybrid models (Falcon-H1, Nemotron-H, LFM2, etc.) continue to use LRU
 
-## 6 Changes Required
+## 6. Changes Required
 
 ### 6.1 Add Server Args and CacheInitParams
 
 **`server_args.py`** — new CLI arguments:
 ```python
-# existing
 parser.add_argument(
     "--eviction-policy",
     type=str, default="lru", choices=["lru", "marconi"],
@@ -128,11 +134,6 @@ parser.add_argument(
     "--marconi-eff-weight",
     type=float, default=0.5,
     help="Weight for FLOP efficiency term in Marconi eviction score [0.0, 2.0]."
-)
-parser.add_argument(
-    "--marconi-min-reuse-count",
-    type=int, default=2,
-    help="Minimum prefix reuse count before caching SSM state."
 )
 ```
 
@@ -165,11 +166,8 @@ class TreeNode:
     # sequence length at this node for computing FLOPs saved relative to parent
     num_cached_tokens: int = 0
 
-    # cached FLOP efficiency score (FLOPs_saved / bytes_used)
+    # cached FLOP efficiency score (FLOPs_saved / bytes_used), invalidated on access
     _flop_efficiency: Optional[float] = None
-
-    # track how often each prefix is seen
-    prefix_frequency: dict[tuple, int]
 ```
 
 ### 6.3 Add FLOP Utility Functions
@@ -190,25 +188,42 @@ def get_linear_attn_flops(seqlen, num_heads, head_dim, state_size) -> float:
     return ssm_scan_flops + proj_flops
 
 def get_moe_flops(seqlen, hidden_size, num_experts_per_tok, expert_intermediate_size) -> float:
-    """FLOPs for one MoE FFN layer on seqlen tokens."""
+    """FLOPs for one MoE FFN layer on seqlen tokens.
+    MoE FLOPs are included in the efficiency formula: they are genuinely saved by
+    prefix caching and constitute the dominant term for large MoE models like Qwen3-Next.
+    """
     return 4 * seqlen * hidden_size * expert_intermediate_size * num_experts_per_tok
 
 def compute_flops_saved(prefix_len, total_len, config) -> float:
-    """Total FLOPs saved by reusing a cached prefix."""
+    """Total FLOPs saved by reusing a cached prefix of prefix_len tokens,
+    for a request of estimated total_len tokens (= 2 * prefix_len by default).
+    Marginal attention savings are computed as attn_flops(total_len) - attn_flops(total_len - prefix_len)
+    to account for the quadratic benefit of skipping tokens in a longer context.
+    Includes full-attention, Mamba2/linear-attention, and MoE FFN layers.
+    """
     # ... sums across all layer types using config fields ...
 
-  def compute_memory_bytes(prefix_len, cache_params, config, model_config, tp_world_size) -> float:
-      ssm_bytes = cache_params.mamba_cache_per_req
-      num_kv_heads_per_gpu = model_config.get_num_kv_heads(tp_world_size)  # handles max(1, n//tp)
-      kv_bytes = prefix_len * num_kv_heads_per_gpu * head_dim * 2 * kv_dtype_bytes * num_attn_layers
-      return ssm_bytes + kv_bytes
+def compute_memory_bytes(prefix_len, cache_params, config, model_config, tp_world_size) -> float:
+    """Total per-GPU memory for one cached node: SSM state (fixed) + KV cache (proportional to prefix_len).
+    Both terms are TP-sharded (per-GPU bytes):
+    - mamba_cache_per_req is already sharded via Mamba2StateShape.create(tp_world_size=...)
+    - get_num_kv_heads(tp_world_size) uses max(1, total // tp) to handle head replication
+    """
+    ssm_bytes = cache_params.mamba_cache_per_req
+    num_kv_heads_per_gpu = model_config.get_num_kv_heads(tp_world_size)
+    kv_bytes = prefix_len * num_kv_heads_per_gpu * head_dim * 2 * kv_dtype_bytes * num_attn_layers
+    return ssm_bytes + kv_bytes
 
-def compute_flop_efficiency(prefix_len, total_len, cache_params, config) -> float:
+def compute_flop_efficiency(prefix_len, total_len, cache_params, config, model_config, tp_world_size) -> float:
     """Marconi efficiency score: FLOPs_saved / memory_bytes."""
-    return compute_flops_saved(...) / (compute_memory_bytes(...) + 1e-8)
+    return compute_flops_saved(prefix_len, total_len, config) / (
+        compute_memory_bytes(prefix_len, cache_params, config, model_config, tp_world_size) + 1e-8
+    )
 ```
 
 ### 6.4 Implement Marconi FLOP-Aware Cache Eviction Policy
+
+Both `evict_mamba()` (SSM pressure) and `evict()` (KV pressure) are updated. When KV is evicted, SSM is freed simultaneously per the invariant in §2.4.
 
 ```python
 def evict_mamba(self, mamba_num: int) -> int:
@@ -218,21 +233,16 @@ def evict_mamba(self, mamba_num: int) -> int:
 ```
 
 Add `_evict_mamba_marconi()` — FLOP-aware eviction:
-1. Collect all unlocked candidates from `mamba_lru_list`
-2. Compute `efficiency_score` (via `compute_flop_efficiency`) and `recency_score`
-4. Evict the candidate with the lowest `eff_weight * efficiency + recency`
-5. Evict via existing `_evict_leaf_node()` or tombstone internal nodes
+1. Collect all unlocked candidates from `mamba_lru_list` — **leaf and internal nodes with any number of children**
+2. For each candidate, compute `efficiency_score` via `compute_flop_efficiency(prefix_len=node.num_cached_tokens, total_len=2*node.num_cached_tokens, ...)`
+3. Compute `recency_score = 1 / (current_ts - node.last_access_time)`
+4. Normalize both scores to [0, 1] with min-max normalization (degenerate case: all equal → uniform scores, falls back to recency-only)
+5. Compute `utility = eff_weight * normalized_efficiency + normalized_recency`
+6. Evict the candidate with the lowest utility:
+   - `len(node.children) == 0` (leaf): `_evict_leaf_node()` — frees both SSM and KV per §2.4
+   - `len(node.children) > 0` (internal): `_tombstone_internal_node()` — frees SSM only, KV kept
 
-### 6.5 Implement Cache Admission Policy
-
-**Input-only admission** — Only cache SSM states for prefixes likely to be reused:
-- In `cache_unfinished_req()`, check frequency before calling `mamba_pool.fork_from()` 
-
-**Input-and-output admission** — Only cache SSM states that capture complete conversation turns:
-- In `cache_finished_req()`: current behaviors cache SSM state at the leaf node, no change needed
-- The `_split_node()` path (branchoff): Only cache SSM state this if the branchoff node's prefix has high reuse frequency
-
-### 6.6 Timestamp Update Optimization
+### 6.5 Timestamp Update Optimization
 
 In `_match_prefix_helper`, only update `last_access_time` on the terminal node instead of every ancestor:
 
@@ -248,34 +258,34 @@ else:
         node = node.parent
 ```
 
-## 6. Testing Plan
+## 7. Testing Plan
 
 ### Unit Tests
 
 1. **FLOP utility tests** (`test_marconi_utils.py`):
+   - Validate `get_full_attn_flops`, `get_linear_attn_flops`, `get_moe_flops` against paper formulas
+   - Verify `compute_memory_bytes` matches `mamba_cache_per_req` for standard configs
+   - Verify `compute_memory_bytes` with `tp_world_size > 1` correctly shards KV head count
+   - Test edge cases: `prefix_len = 0`, `prefix_len = total_len`
 
 2. **Eviction policy tests** (`test_mamba_radix_cache_marconi.py`):
+   - Insert entries with known efficiency profiles; verify higher-efficiency entries survive eviction
+   - Verify LRU behavior is unchanged when `eviction_policy="lru"`
+   - Test intermediate node eviction (tombstoning) with Marconi scoring
+   - Test score normalization edge cases (all equal efficiencies → recency-only)
+   - Verify SSM state is freed whenever KV cache is evicted (no orphaned SSM state)
 
 3. **Integration tests**:
+   - Full `cache_finished_req` / `cache_unfinished_req` / `match_prefix` cycle with `eviction_policy="marconi"`
+   - Verify `mamba_cache_per_req` bytes accounting remains consistent
 
 ### Benchmarks
 
 Metrics to track against baseline LRU:
 
-**SSM state hit rate**: ≥ 2× improvement (paper shows 4.5–34.4× on LMSys)     
-**TTFT for cacheable requests**: ≥ 10% reduction                                              
-**Eviction overhead (latency)**: < 1ms per eviction call   
-
----
-
-## 7. Open Questions
-
-1. **KV cache eviction**: Should we also apply Marconi-style scoring to KV cache? 
-
-2. **eff-weight**: Regarding adaptive config tunning mentioned in the paper, this code seems to be out of scope for sglang? We're adding a cli arg for eff-weight and default it as 0.5, and user can tune this parameter and set it accordingly
-
-3. **`total_len` estimation**: To compute Marconi's flop efficiency score, we need an estimate of future request length. Currently I'm using a 2*cached prefix length as a default, should we consider tracking a rolling average of the actual request lengths? and should this tracked globally across all requests, or per radix tree node
-
-4. **MoE FLOP treatment**: In the efficiency formula, MoE FFN FLOPs are included. Since MoE FLOPs dominate for large models, should MoE FLOPs be excluded from the efficiency formula?
+**SSM state hit rate**: ≥ 2× improvement (paper shows 4.5–34.4× on LMSys)
+**TTFT for cacheable requests**: ≥ 10% reduction
+**TTFT regression on non-cacheable**: < 1% (should be zero)
+**Eviction overhead (latency)**: < 1ms per eviction call
 
 ---

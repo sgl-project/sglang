@@ -667,6 +667,14 @@ class Scheduler(
                 else self.tp_cpu_group
             ),
             eviction_policy=server_args.radix_eviction_policy,
+            marconi_eff_weight=server_args.marconi_eff_weight,
+            model_config=self.model_config if server_args.radix_eviction_policy == "marconi" else None,
+            mamba_cache_params=(
+                self.model_config.hf_text_config.mamba2_cache_params
+                if server_args.radix_eviction_policy == "marconi"
+                and hasattr(self.model_config.hf_text_config, "mamba2_cache_params")
+                else None
+            ),
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
