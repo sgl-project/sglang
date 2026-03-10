@@ -105,6 +105,14 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
+    # torch.compiler.is_dynamo_compiling(): FlashInfer norm paths are not safe under
+    # torch.compile(..., fullgraph=True). Dynamo traces into FlashInfer's JIT module
+    # loading path, which calls Path.exists() / os.stat() — both untraceable — causing
+    # the entire compilation to fail. We fall back to the internal implementation while
+    # tracing as a temporary workaround. Once the upstream fix is merged and we upgrade
+    # FlashInfer, this check can be removed.
+    # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
+    #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
         input.device.type == "musa"
         or not _has_flashinfer
@@ -146,6 +154,7 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
+    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
         input.device.type == "musa"
         or not _has_flashinfer
@@ -188,6 +197,7 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
+    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
         input.device.type == "musa"
         or not _has_flashinfer
@@ -229,6 +239,7 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
+    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
         input.device.type == "musa"
         or not _has_flashinfer
