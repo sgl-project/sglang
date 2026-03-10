@@ -37,9 +37,7 @@ from sglang.multimodal_gen.utils import set_mixed_precision_policy
 logger = init_logger(__name__)
 
 
-def _make_param_like(
-    actual_param: torch.nn.Parameter, tensor: torch.Tensor
-) -> torch.nn.Parameter:
+def _make_param_like(actual_param: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
     cls = actual_param.__class__
     # nn.Parameter defaults to requires_grad=True, which is illegal for non-floating/complex dtypes (e.g., int8/FP8
     # quantized weights).
@@ -245,6 +243,7 @@ def load_model_from_full_model_state_dict(
 
     """
     meta_sd = model.state_dict()
+    param_names = {name for name, _ in model.named_parameters()}
     param_dict = dict(chain(model.named_parameters(), model.named_buffers()))
 
     # map names from checkpoint to customized names
@@ -279,20 +278,12 @@ def load_model_from_full_model_state_dict(
 
         # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
         # for non-quantized models meta dtype equals param_dtype anyway
-        if meta_sharded_param is None:
-            # for nunchaku, some scales are patched later
-            target_dtype = full_tensor.dtype
-        else:
-            target_dtype = meta_sharded_param.dtype
+        target_dtype = meta_sharded_param.dtype
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
-            weight_loader = (
-                getattr(actual_param, "weight_loader", None)
-                if actual_param is not None
-                else None
-            )
+            weight_loader = getattr(actual_param, "weight_loader", None)
             if weight_loader is not None:
                 assert actual_param is not None
                 sharded_tensor = torch.empty_like(
@@ -333,10 +324,13 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
 
-        requires_grad = False
-        sharded_sd[target_param_name] = nn.Parameter(
-            sharded_tensor, requires_grad=requires_grad
-        )
+        if target_param_name in param_names:
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=False
+            )
+        else:
+            # Registered buffer: keep as plain tensor to preserve buffer semantics
+            sharded_sd[target_param_name] = sharded_tensor
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 
