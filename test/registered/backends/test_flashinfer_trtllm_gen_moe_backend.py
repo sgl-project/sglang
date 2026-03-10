@@ -188,7 +188,7 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
 
 
 class TestFlashinferTrtllmGenMoeBackendBF16Routed(
-    TestFlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
+    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 
