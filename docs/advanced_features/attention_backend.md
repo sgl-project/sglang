@@ -43,6 +43,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
 | **FA4**                    | 1                         | ❌               | ✅               | ✅                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ❌               | ❌                       | ❌              | ❌              |
+| **NSA (DSA)**              | any                       | ✅               | ❌               | ✅                       | ✅              | ❌              |
 
 ```{note}
 Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
@@ -105,6 +106,47 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **NPU (Ascend)**: `ascend` only.
 - **AMD (ROCm)**: `triton` recommended.
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
+```
+
+### DSA Attention Backend (NSA)
+
+DSA (Dynamic Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it (i.e., when `is_deepseek_nsa` is true) and is selected via `--attention-backend nsa`.
+
+Internally, the NSA backend dispatches to different sub-backends for prefill and decode phases. You can override these with `--nsa-prefill-backend` and `--nsa-decode-backend`:
+
+| **Sub-backend**       | **Prefill** | **Decode** | **Notes**                                     |
+|-----------------------|-------------|------------|-----------------------------------------------|
+| **flashmla_sparse**   | ✅          | ❌         | Default prefill on Hopper and Blackwell (bf16) |
+| **flashmla_kv**       | ✅          | ✅         | Default decode for FP8                        |
+| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv   |
+| **fa3**               | ✅          | ✅         | Default decode on Hopper (bf16)               |
+| **trtllm**            | ✅          | ✅         | Default decode on Blackwell (bf16); default for both on Blackwell without DP (FP8) |
+| **tilelang**          | ✅          | ✅         | Default on AMD (ROCm)                         |
+
+```bash
+# DeepSeek V3.2 with NSA on Hopper (auto-selects sub-backends)
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3-0324 \
+  --attention-backend nsa \
+  --trust-remote-code
+
+# DeepSeek V3.2 with FP8 KV cache
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3-0324 \
+  --attention-backend nsa \
+  --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
+
+# Explicit sub-backend override
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3-0324 \
+  --attention-backend nsa \
+  --nsa-prefill-backend flashmla_sparse \
+  --nsa-decode-backend trtllm \
+  --trust-remote-code
 ```
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
