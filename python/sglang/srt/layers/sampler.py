@@ -51,8 +51,6 @@ class Sampler(nn.Module):
         self.enable_deterministic = (
             get_global_server_args().enable_deterministic_inference
         )
-        # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-        self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
         self.output_logprob_processor = OutputLogprobProcessor(
             use_nan_detection=self.use_nan_detection,
@@ -83,89 +81,65 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
-        # Preprocess logits (custom processors and NaN handling)
-        logits = self.output_logprob_processor.preprocess_logits(logits, sampling_info)
+        # Preprocess logits and compute logprobs / probs
+        logits, output_logprobs, sampling_input = self.output_logprob_processor(
+            logits,
+            sampling_info,
+            return_logprob,
+            sampling_info.is_all_greedy,
+            SGLANG_RETURN_ORIGINAL_LOGPROB,
+            self.rl_on_policy_target is not None,
+            self.use_ascend_backend,
+        )
 
+        # Sample
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
-            if return_logprob:
-                logprobs = self.output_logprob_processor.compute_logprobs_from_logits(
-                    logits
-                )
+        elif self.use_ascend_backend:
+            simple_sampling_case = (
+                not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            )
+            # Ascend backend: sample from logits directly.
+            batch_next_token_ids, _ = self._forward_ascend_backend(
+                logits, sampling_info, simple_sampling_case, return_logprob=False
+            )
         else:
             simple_sampling_case = (
                 not sampling_info.need_top_p_sampling
                 and not sampling_info.need_top_k_sampling
                 and not sampling_info.need_min_p_sampling
             )
-
-            # If requested, cache original logprobs before temperature scaling.
-            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
-                original_logprobs = (
-                    self.output_logprob_processor.compute_logprobs_from_logits(logits)
-                )
-
-            # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-            logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
-                logprobs_via_logsoftmax_kernel = (
-                    self.output_logprob_processor.compute_logprobs_from_logits(
-                        logits_div_temperature
-                    )
-                )
-                del logits_div_temperature
-
-            if self.use_ascend_backend:
-                # Ascend backend: sample from logits directly.
-                batch_next_token_ids, logprobs = self._forward_ascend_backend(
-                    logits, sampling_info, simple_sampling_case, return_logprob
-                )
-            elif (
-                self.use_log_softmax_logprob
+            if (
+                self.rl_on_policy_target is not None
                 and self.enable_deterministic
                 and simple_sampling_case
             ):
                 # RL on-policy path: sample from logprobs to match the trainer.
                 batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs_via_logsoftmax_kernel,
+                    sampling_input,
                     sampling_info,
                     positions,
                 )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = logprobs_via_logsoftmax_kernel
             else:
-                # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
-
+                # sampling_input is probs (standard) or logprobs (RL complex)
+                probs = (
+                    torch.exp(sampling_input)
+                    if self.rl_on_policy_target is not None
+                    else sampling_input
+                )
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else self.output_logprob_processor.compute_logprobs_from_probs(
-                            probs
-                        )
-                    )
                 del probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                logprobs = original_logprobs
             self.output_logprob_processor.process_output_logprobs(
                 logits_output,
-                logprobs,
+                output_logprobs,
                 batch_next_token_ids,
                 top_logprobs_nums,
                 token_ids_logprobs,
@@ -347,9 +321,16 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
-        result = self.output_logprob_processor(
+        _, logprobs, _ = self.output_logprob_processor(
             logits_output.next_token_logits,
             sampling_info,
+            return_logprob=True,
+            is_all_greedy=True,
+            return_original_logprob=False,
+            rl_on_policy=False,
+        )
+        result = self.output_logprob_processor.extract_logprobs_for_scoring(
+            logprobs,
             top_logprobs_nums,
             token_ids_logprobs,
             needs_token_ids_logprobs,
