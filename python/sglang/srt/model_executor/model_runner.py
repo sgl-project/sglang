@@ -1748,7 +1748,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
+        # no_grad (not inference_mode) — backends like CuteDSL lazily
+        # allocate persistent buffers during this pass; inference_mode would
+        # tag them as inference tensors, breaking later CUDA graph capture.
+        with torch.no_grad(), autotune():
             self._dummy_run(batch_size=self.req_to_token_pool.size)
 
         logger.info("FlashInfer autotune completed.")
