@@ -22,8 +22,8 @@ These options **do not** affect output quality. The generated images/videos are 
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
 | **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. |
 | **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. **For CFG models with multi-GPU, always prefer `--enable-cfg-parallel` + Ulysses over pure Ulysses** — it is generally faster at the same GPU count due to better compute-to-communication ratio and elimination of sequential branch execution. | Typically faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. |
-| **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch: only 2 DiT layers reside on GPU at a time. Dramatically reduces VRAM. | VRAM reduction from 40 GB → ~11 GB (Wan A14B, 8×GPU) with moderate speed impact | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT (`SGLANG_CACHE_DIT_ENABLED`). Copy stream may slow compute stream for some models. |
-| **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | 0.05–0.1 is the sweet spot for Wan A14B (up to 1.3x vs default offload) | Values ≥ 0.5 approach no-offload VRAM with worse speed. See [PR #17693](https://github.com/sgl-project/sglang/pull/17693) for benchmarks. |
+| **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For **video models** (where per-layer compute >> H2D transfer), the memcpy is completely hidden behind computation — **zero-cost offload** that saves VRAM without speed penalty ([PR #15511](https://github.com/sgl-project/sglang/pull/15511)). | Saves VRAM (40 GB → ~11 GB for Wan A14B); zero or near-zero speed cost for video models | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
+| **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch ahead. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | Tune for cases where default offload has copy stream interference (e.g. image models). 0.05–0.1 is a good starting point. | Values ≥ 0.5 approach no-offload VRAM with worse performance. See [PR #17693](https://github.com/sgl-project/sglang/pull/17693) for benchmarks on image models. |
 | **FSDP Inference** | `--use-fsdp-inference` | Uses PyTorch FSDP to shard model weights across GPUs with prefetch. Low latency, low VRAM. | Reduces per-GPU VRAM | Mutually exclusive with `--dit-layerwise-offload`. More overhead than SP on high-bandwidth interconnects. |
 | **CPU Offload (components)** | `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, `--dit-cpu-offload` | Offloads specific pipeline components to CPU when not in use. | Reduces peak VRAM | Adds H2D transfer latency when the component is needed. Auto-enabled for low-VRAM GPUs (<30 GB). **Tip:** after the first request completes, the console prints a peak VRAM analysis with suggestions on which offload flags can be safely disabled — look for the `"Components that could stay resident"` log line. |
 | **Pin CPU Memory** | `--pin-cpu-memory` | Uses pinned (page-locked) memory for CPU offload transfers. | Faster H2D transfers | Slightly higher host memory usage. Enabled by default; disable only as workaround for CUDA errors. |
@@ -50,25 +50,28 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 
 ## Quick Recipes
 
-### Maximum speed, single GPU, lossless
-
-```bash
-sglang generate --model-path <MODEL> \
-  --enable-torch-compile --warmup \
-  --dit-layerwise-offload false \
-  --prompt "..." --save-output
-```
-
-### Maximum speed, multi-GPU, lossless (Wan A14B, 8 GPUs)
+### Maximum speed, video model, multi-GPU, lossless (Wan A14B, 8 GPUs)
 
 ```bash
 sglang generate --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --num-gpus 8 --enable-cfg-parallel --ulysses-degree 4 \
   --enable-torch-compile --warmup \
   --text-encoder-cpu-offload true \
+  --prompt "..." --save-output
+```
+
+Note: `--dit-layerwise-offload` is enabled by default for Wan/MOVA video models and is zero-cost (H2D fully overlapped with compute). No need to disable it.
+
+### Maximum speed, image model, single GPU, lossless
+
+```bash
+sglang generate --model-path <IMAGE_MODEL> \
+  --enable-torch-compile --warmup \
   --dit-layerwise-offload false \
   --prompt "..." --save-output
 ```
+
+Note: for image models, per-layer compute is smaller, so layerwise offload may not fully hide H2D transfer. Disable it if VRAM allows.
 
 ### Low VRAM, decent speed (single GPU)
 
