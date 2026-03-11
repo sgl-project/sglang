@@ -3,7 +3,6 @@
 import hashlib
 import logging
 import os
-import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -72,80 +71,64 @@ class ObjectStorageModel:
     """
 
     def __init__(self, url: str) -> None:
-        # We moved the directory creation logic partly to __init__ but
-        # we must be careful not to delete it if another process is using it.
-        # This hash is unique to the URL.
-        self.model_hash = hashlib.sha256(str(url).encode()).hexdigest()[:8]
-        base_dir = get_cache_dir()
+        self.dir = ObjectStorageModel.get_path(url)
 
-        # Ensure base cache dir exists
-        os.makedirs(os.path.join(base_dir, "model_streamer"), exist_ok=True)
+        from runai_model_streamer import ObjectStorageModel as RunaiObjectStorageModel
 
-        self.dir = os.path.join(
-            base_dir,
-            "model_streamer",
-            self.model_hash,
-        )
+        self._runai_obj = RunaiObjectStorageModel(model_path=url, dst=self.dir)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._runai_obj.__exit__(exc_type, exc_val, exc_tb)
 
     def pull_files(
         self,
-        model_path: str = "",
         allow_pattern: list[str] | None = None,
         ignore_pattern: list[str] | None = None,
     ) -> None:
+        """Pull files from object storage into the local cache directory.
+
+        Args:
+            allow_pattern: File patterns to include (e.g. ["*.json"]).
+            ignore_pattern: File patterns to exclude.
         """
-        Pull files from object storage into the temporary directory.
-        """
-        from runai_model_streamer import pull_files as runai_pull_files
-
-        # Create the directory
-        # Do not cleanup the directory if it exists
-        os.makedirs(self.dir, exist_ok=True)
-
-        if not model_path.endswith("/"):
-            model_path = model_path + "/"
-
-        try:
-            runai_pull_files(model_path, self.dir, allow_pattern, ignore_pattern)
-            # Create a marker file to indicate success?
-            # Path(os.path.join(self.dir, ".success")).touch()
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
-            # cleanup partial download
-            if os.path.exists(self.dir):
-                shutil.rmtree(self.dir)
-            raise e
-
-        logger.debug(f"Runai Model hash: {self.model_hash}, download complete.")
+        self._runai_obj.pull_files(allow_pattern, ignore_pattern)
 
     @classmethod
     def download_and_get_path(cls, model_path: str) -> str:
         """
         Downloads the model metadata (excluding heavy weights) and returns
-        the local directory path. Safe for concurrent usage.
+        the local directory path. Safe for concurrent usage by multiple processes
         """
-        # 1. Create the object
-        downloader = cls(url=model_path)
-
-        # 2. Pull files with the specific ignore patterns for weights
-        downloader.pull_files(
-            model_path=model_path,
-            ignore_pattern=[
-                "*.pt",
-                "*.safetensors",
-                "*.bin",
-                "*.tensors",
-                "*.pth",
-            ],
-        )
-
-        # 3. Return the local directory path
-        return downloader.dir
+        with cls(url=model_path) as downloader:
+            downloader.pull_files(
+                ignore_pattern=[
+                    "*.pt",
+                    "*.safetensors",
+                    "*.bin",
+                    "*.tensors",
+                    "*.pth",
+                ],
+            )
+            cache_dir = downloader.dir
+            logger.info(f"Runai Model : {cache_dir}, metadata ready.")
+        return cache_dir
 
     @classmethod
     def get_path(cls, model_path: str) -> str:
         """
         Returns the local directory path.
         """
-        downloader = cls(url=model_path)
-        return downloader.dir
+        model_hash = hashlib.sha256(str(model_path).encode()).hexdigest()[:8]
+        base_dir = get_cache_dir()
+
+        # Ensure base cache dir exists
+        os.makedirs(os.path.join(base_dir, "model_streamer"), exist_ok=True)
+
+        return os.path.join(
+            base_dir,
+            "model_streamer",
+            model_hash,
+        )
