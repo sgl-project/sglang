@@ -251,11 +251,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -293,22 +295,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         value_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
 
         # a, b from g/beta: [1, seq, HV] -> [B, T, HV]
-        # But the MTP kernel expects raw a, b (pre-gating), not g, beta.
-        # We need to recover a and b from the gdn_backend caller.
-        # The caller passes them via **kwargs from the dispatcher.
-        a_raw = kwargs.get("a_raw")
-        b_raw = kwargs.get("b_raw")
-        A_log = kwargs.get("A_log")
-        dt_bias = kwargs.get("dt_bias")
-
-        if a_raw is None or b_raw is None or A_log is None or dt_bias is None:
+        if a is None or b is None or A_log is None or dt_bias is None:
             raise RuntimeError(
                 "FlashInfer GDN MTP kernel requires a_raw, b_raw, A_log, "
                 "dt_bias to be passed via kwargs."
             )
 
-        a_mtp = a_raw.view(batch_size, draft_token_num, num_v_heads)
-        b_mtp = b_raw.view(batch_size, draft_token_num, num_v_heads)
+        a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
+        b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
         output_fi, _ = self._mtp_fn(
             q=query_mtp,

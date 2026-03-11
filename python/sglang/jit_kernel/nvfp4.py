@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -274,8 +275,7 @@ def cutlass_fp4_group_mm(
         "layout_sfb", torch.empty((num_experts, 5), dtype=torch.int64, device=device)
     )
 
-    module = _jit_nvfp4_blockwise_moe_module()
-    module.cutlass_fp4_group_mm(
+    _cutlass_fp4_group_mm_custom_op(
         output,
         a_fp4,
         b_fp4,
@@ -297,6 +297,20 @@ def cutlass_fp4_group_mm(
         layout_sfb,
     )
     return output
+
+
+@register_custom_op(
+    op_name="scaled_fp4_quant",
+    mutates_args=["output", "output_scale"],
+)
+def _scaled_fp4_quant_custom_op(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    input_global_scale: torch.Tensor,
+) -> None:
+    module = _jit_nvfp4_quant_module()
+    module.scaled_fp4_quant(output, input, output_scale, input_global_scale)
 
 
 def scaled_fp4_quant(
@@ -330,8 +344,7 @@ def scaled_fp4_quant(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
 
-    module = _jit_nvfp4_quant_module()
-    module.scaled_fp4_quant(output, input, output_scale, input_global_scale)
+    _scaled_fp4_quant_custom_op(input, output, output_scale, input_global_scale)
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
 
@@ -344,6 +357,29 @@ def _shuffle_rows_torch(
     # Keep compatibility when sgl-kernel is slimmed and shuffle_rows may not be present.
     output = input_tensor.index_select(0, dst2src_map.to(dtype=torch.int64))
     return output.view(output_tensor_shape)
+
+
+@register_custom_op(
+    op_name="scaled_fp4_experts_quant",
+    mutates_args=["output", "output_scales"],
+)
+def _scaled_fp4_experts_quant_custom_op(
+    output: torch.Tensor,
+    output_scales: torch.Tensor,
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+) -> None:
+    module = _jit_nvfp4_expert_quant_module()
+    module.scaled_fp4_experts_quant(
+        output,
+        output_scales,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+    )
 
 
 def scaled_fp4_experts_quant(
@@ -394,8 +430,7 @@ def scaled_fp4_experts_quant(
             device=input_tensor.device,
         )
 
-    module = _jit_nvfp4_expert_quant_module()
-    module.scaled_fp4_experts_quant(
+    _scaled_fp4_experts_quant_custom_op(
         output,
         output_scales,
         input_tensor,
@@ -405,6 +440,30 @@ def scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+
+
+@register_custom_op(
+    op_name="scaled_fp4_grouped_quant",
+    mutates_args=["output", "output_scales"],
+)
+def _scaled_fp4_grouped_quant_custom_op(
+    input_tensor: torch.Tensor,
+    output: torch.Tensor,
+    output_scales: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    l, m, k = input_tensor.shape
+    del l, m
+    module = _jit_nvfp4_expert_quant_module()
+    module.silu_and_mul_scaled_fp4_experts_quant(
+        output.view(-1, k // 2),
+        output_scales.view(-1, output_scales.shape[-1]),
+        input_tensor.view(-1, k),
+        input_global_scale,
+        mask,
+        False,
+    )
 
 
 def scaled_fp4_grouped_quant(
@@ -427,14 +486,12 @@ def scaled_fp4_grouped_quant(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
 
-    module = _jit_nvfp4_expert_quant_module()
-    module.silu_and_mul_scaled_fp4_experts_quant(
-        output.view(l * m, k // 2),
-        output_scales.view(l * padded_m, padded_k_int32),
-        input_tensor.view(l * m, k),
+    _scaled_fp4_grouped_quant_custom_op(
+        input_tensor,
+        output,
+        output_scales,
         input_global_scale,
         mask,
-        False,
     )
 
     output = output.permute(1, 2, 0)
@@ -443,6 +500,30 @@ def scaled_fp4_grouped_quant(
     )
     output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
     return output, output_scales
+
+
+@register_custom_op(
+    op_name="silu_and_mul_scaled_fp4_grouped_quant",
+    mutates_args=["output", "output_scales"],
+)
+def _silu_and_mul_scaled_fp4_grouped_quant_custom_op(
+    input_tensor: torch.Tensor,
+    output: torch.Tensor,
+    output_scales: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    l, m, k_by_2 = input_tensor.shape
+    del l, m
+    module = _jit_nvfp4_expert_quant_module()
+    module.silu_and_mul_scaled_fp4_experts_quant(
+        output.view(-1, output.shape[-1]),
+        output_scales.view(-1, output_scales.shape[-1]),
+        input_tensor.view(-1, k_by_2),
+        input_global_scale,
+        mask,
+        True,
+    )
 
 
 def silu_and_mul_scaled_fp4_grouped_quant(
@@ -466,14 +547,12 @@ def silu_and_mul_scaled_fp4_grouped_quant(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
 
-    module = _jit_nvfp4_expert_quant_module()
-    module.silu_and_mul_scaled_fp4_experts_quant(
-        output.view(l * m, k // 2),
-        output_scales.view(l * padded_m, padded_k_int32),
-        input_tensor.view(l * m, k_by_2),
+    _silu_and_mul_scaled_fp4_grouped_quant_custom_op(
+        input_tensor,
+        output,
+        output_scales,
         input_global_scale,
         mask,
-        True,
     )
 
     output = output.permute(1, 2, 0)
@@ -482,6 +561,65 @@ def silu_and_mul_scaled_fp4_grouped_quant(
     )
     output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
     return output, output_scales
+
+
+@register_custom_op(
+    op_name="cutlass_fp4_group_mm",
+    mutates_args=[
+        "output",
+        "a_ptrs",
+        "b_ptrs",
+        "out_ptrs",
+        "a_scales_ptrs",
+        "b_scales_ptrs",
+        "alpha_ptrs",
+        "layout_sfa",
+        "layout_sfb",
+    ],
+)
+def _cutlass_fp4_group_mm_custom_op(
+    output: torch.Tensor,
+    a_fp4: torch.Tensor,
+    b_fp4: torch.Tensor,
+    a_blockscale: torch.Tensor,
+    b_blockscale: torch.Tensor,
+    alphas: torch.Tensor,
+    ab_strides: torch.Tensor,
+    c_strides: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    a_ptrs: torch.Tensor,
+    b_ptrs: torch.Tensor,
+    out_ptrs: torch.Tensor,
+    a_scales_ptrs: torch.Tensor,
+    b_scales_ptrs: torch.Tensor,
+    alpha_ptrs: torch.Tensor,
+    layout_sfa: torch.Tensor,
+    layout_sfb: torch.Tensor,
+) -> None:
+    module = _jit_nvfp4_blockwise_moe_module()
+    module.cutlass_fp4_group_mm(
+        output,
+        a_fp4,
+        b_fp4,
+        a_blockscale,
+        b_blockscale,
+        alphas,
+        ab_strides,
+        c_strides,
+        problem_sizes,
+        expert_offsets,
+        blockscale_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        alpha_ptrs,
+        layout_sfa,
+        layout_sfb,
+    )
 
 
 def suggest_nvfp4_global_scale(x: torch.Tensor) -> torch.Tensor:
