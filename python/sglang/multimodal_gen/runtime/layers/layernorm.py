@@ -14,40 +14,24 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
-_has_sgl_kernel_rmsnorm = False
-if _is_cuda:
-    try:
-        from sgl_kernel import fused_add_rmsnorm, rmsnorm
+_is_musa = current_platform.is_musa()
+_is_windows = current_platform.is_windows()
 
-        _has_sgl_kernel_rmsnorm = True
-    except Exception:
-        _has_sgl_kernel_rmsnorm = False
-        fused_add_rmsnorm = None
-        rmsnorm = None
+_has_sgl_kernel_rmsnorm = False
+if _is_cuda and not _is_windows:
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+    _has_sgl_kernel_rmsnorm = True
 
 if _is_npu:
     import torch_npu
 
-_has_triton_norm = False
-_has_triton_scale_shift = False
-try:
-    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
-    from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import (
-        triton_one_pass_rms_norm,
-    )
+if _is_musa:
+    from sgl_kernel import fused_add_rmsnorm
 
-    _has_triton_norm = True
-except Exception:
-    norm_infer = None
-    rms_norm_fn = None
-    triton_one_pass_rms_norm = None
-
-try:
-    from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-
-    _has_triton_scale_shift = True
-except Exception:
-    fuse_scale_shift_kernel = None
+from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -56,14 +40,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-
-
-def _fuse_scale_shift_fallback(
-    normalized: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> torch.Tensor:
-    if _has_triton_scale_shift:
-        return fuse_scale_shift_kernel(normalized, scale, shift)
-    return normalized * (1 + scale) + shift
 
 
 # Copied and adapted from sglang
@@ -93,8 +69,6 @@ class RMSNorm(CustomOp):
             self._forward_method = self.forward_native
 
     def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-        if not _has_triton_norm:
-            return self.forward_native(x, residual)
         return rms_norm_fn(
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
         )
@@ -120,21 +94,21 @@ class RMSNorm(CustomOp):
             return out
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
-        elif residual is not None and _has_sgl_kernel_rmsnorm:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x.view(shape), residual.view(residual_shape)
+        elif residual is not None:
+            if _has_sgl_kernel_rmsnorm:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x.view(shape), residual.view(residual_shape)
+            out = self.forward_triton(x, residual)
+            return out[0].view(shape), out[1].view(residual_shape)
         else:
-            if x.shape[-1] <= 128 and _has_triton_norm:
+            if x.shape[-1] <= 128:
                 out = triton_one_pass_rms_norm(
                     x, self.weight.data, self.variance_epsilon
                 )
             elif _has_sgl_kernel_rmsnorm:
                 out = rmsnorm(x, self.weight.data, self.variance_epsilon)
             else:
-                out = self.forward_native(x, residual)
-                if residual is not None:
-                    return out[0].view(shape), out[1].view(residual_shape)
-                return out.view(shape)
+                out = self.forward_triton(x, residual=None)
         out = out.view(shape)
 
         return out
@@ -205,6 +179,45 @@ class RMSNorm(CustomOp):
         # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
         return self.forward_native(x, residual)
 
+    def _get_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """Return weight matched to *dtype*.
+
+        MUSA kernels require input and weight to share the same dtype,
+        unlike CUDA kernels which may handle mixed dtypes internally.
+        """
+        weight = self.weight.data
+        if weight.dtype != dtype:
+            weight = weight.to(dtype=dtype)
+        return weight
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        elif residual is not None:
+            # fused_add_rmsnorm requires contiguous inputs.
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if not residual.is_contiguous():
+                residual = residual.contiguous()
+            weight = self._get_weight(x.dtype)
+            fused_add_rmsnorm(x, residual, weight, self.variance_epsilon)
+            return x.view(shape), residual.view(residual_shape)
+        else:
+            weight = self._get_weight(x.dtype)
+            out = F.rms_norm(x, (self.hidden_size,), weight, self.variance_epsilon)
+        out = out.view(shape)
+        return out
+
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"
@@ -253,8 +266,6 @@ class LayerNorm(CustomOp):
         return wf
 
     def forward_triton(self, x: torch.Tensor):
-        if not _has_triton_norm:
-            return self.forward_native(x)
         # Fast inference kernel without residual/dropout branches
         return norm_infer(
             x.view(-1, self.hidden_size),
@@ -295,6 +306,9 @@ class LayerNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self.forward_native(x, residual)
+
+    def forward_musa(self, x: torch.Tensor):
+        return F.layer_norm(x, (self.hidden_size,), self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
@@ -399,6 +413,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_musa(self, *args, **kwargs):
+        # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -426,7 +445,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         else:
             raise ValueError(f"Gate type {type(gate)} not supported")
         normalized = self.norm(residual_output)
-        modulated = _fuse_scale_shift_fallback(normalized, scale, shift)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
         return modulated, residual_output
 
 
@@ -498,11 +517,16 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_musa(self, *args, **kwargs):
+        # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         normalized = self.norm(x)
-        modulated = _fuse_scale_shift_fallback(normalized, scale, shift)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
         return modulated.to(x.dtype)
 
 
@@ -570,18 +594,10 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
 
 # TODO: Workaround, fuse norm with new select01 kernel
 def apply_layernorm_only(x: torch.Tensor, layernorm_scale_shift: LayerNormScaleShift):
-    if _has_triton_norm:
-        return norm_infer(
-            x.view(-1, x.shape[-1]),
-            layernorm_scale_shift.norm.weight,
-            layernorm_scale_shift.norm.bias,
-            eps=layernorm_scale_shift.eps,
-            is_rms_norm=False,
-        ).view(x.shape)
-    return F.layer_norm(
-        x,
-        (x.shape[-1],),
+    return norm_infer(
+        x.view(-1, x.shape[-1]),
         layernorm_scale_shift.norm.weight,
         layernorm_scale_shift.norm.bias,
-        layernorm_scale_shift.eps,
-    )
+        eps=layernorm_scale_shift.eps,
+        is_rms_norm=False,
+    ).view(x.shape)
