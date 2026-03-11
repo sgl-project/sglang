@@ -162,25 +162,40 @@ class QuantizationConfig(ABC):
     def _modelopt_override_quantization_method(
         cls, hf_quant_config, user_quant
     ) -> Optional[str]:
-        """Shared ModelOpt quantization method override logic."""
+        """Shared ModelOpt quantization method override logic.
+
+        On ROCm, NVFP4/FP4 checkpoints are served by PetitNvFp4Config
+        instead of ModelOptFp4Config, so this method returns None for
+        FP4 on ROCm to let PetitNvFp4Config.override_quantization_method
+        handle the dispatch.
+        """
+        from sglang.srt.utils import is_hip
+
         if hf_quant_config is None:
             return None
 
-        # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
+        is_fp4 = "NVFP4" in quant_algo or "FP4" in quant_algo
+
+        # On ROCm, yield FP4 to PetitNvFp4Config
+        if is_hip() and is_fp4:
+            return None
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
             if "FP8" in quant_algo:
                 return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+            elif is_fp4:
                 return "modelopt_fp4"
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.
-        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
+        quant_method = hf_quant_config.get("quant_method", "")
+        if quant_method == "modelopt_fp8":
             return "modelopt_fp8"
-        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+        elif quant_method == "modelopt_fp4":
+            if is_hip():
+                return None  # Let PetitNvFp4Config handle this on ROCm
             return "modelopt_fp4"
 
         return None
