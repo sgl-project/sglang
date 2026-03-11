@@ -811,6 +811,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_extract_routed_dp_rank_from_header_invalid(self):
         """Test that invalid header value raises HTTPException."""
         from fastapi import HTTPException
+
         self.fastapi_request.headers = {"x-data-parallel-rank": "abc"}
         with self.assertRaises(HTTPException) as context:
             self.chat.extract_routed_dp_rank_from_header(
@@ -818,6 +819,7 @@ class ServingChatTestCase(unittest.TestCase):
             )
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("must be an integer", context.exception.detail)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

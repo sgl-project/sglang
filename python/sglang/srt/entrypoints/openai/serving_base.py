@@ -283,7 +283,10 @@ class OpenAIServingBase(ABC):
         if header_value is not None:
             try:
                 header_dp_rank = int(header_value)
-                if body_routed_dp_rank is not None and header_dp_rank != body_routed_dp_rank:
+                if (
+                    body_routed_dp_rank is not None
+                    and header_dp_rank != body_routed_dp_rank
+                ):
                     logger.debug(
                         f"X-Data-Parallel-Rank header ({header_dp_rank}) overrides "
                         f"body routed_dp_rank ({body_routed_dp_rank})"
@@ -292,7 +295,7 @@ class OpenAIServingBase(ABC):
             except ValueError:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid X-Data-Parallel-Rank header: must be an integer, got '{header_value}'"
+                    detail=f"Invalid X-Data-Parallel-Rank header: must be an integer, got '{header_value}'",
                 )
 
         return body_routed_dp_rank
