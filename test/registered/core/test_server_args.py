@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    CustomTestCase,
+)
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
@@ -19,14 +22,12 @@ class TestPrepareServerArgs(CustomTestCase):
         server_args = prepare_server_args(
             [
                 "--model-path",
-                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                 "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
             ]
         )
-        self.assertEqual(
-            server_args.model_path, "meta-llama/Meta-Llama-3.1-8B-Instruct"
-        )
+        self.assertEqual(server_args.model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
