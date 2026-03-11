@@ -342,7 +342,12 @@ def get_available_gpu_count():
 
 
 def tune_on_gpu(args_dict):
-    """Run tuning on a specific GPU."""
+    """Run tuning on a specific GPU and return results (not write to disk).
+
+    Each GPU tunes its assigned batch_sizes for every weight shape and returns
+    a dict of {(N, K): {M: config}} so the main process can merge all partial
+    results before writing a single complete config file per shape.
+    """
     gpu_id = args_dict["gpu_id"]
     batch_sizes = args_dict["batch_sizes"]
     weight_shapes = args_dict["weight_shapes"]
@@ -354,7 +359,6 @@ def tune_on_gpu(args_dict):
     block_n = args.block_n
     block_k = args.block_k
     out_dtype = DTYPE_MAP[args.out_dtype]
-    save_path = args.save_path
     input_type = args.input_type
 
     search_space = get_configs_compute_bound()
@@ -363,7 +367,7 @@ def tune_on_gpu(args_dict):
     ]
 
     start = time.perf_counter()
-    results = {}
+    all_results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
@@ -380,10 +384,11 @@ def tune_on_gpu(args_dict):
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
         best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
-        save_configs(N, K, block_n, block_k, best_configs, save_path, input_type)
+        all_results[(N, K)] = best_configs
 
     end = time.perf_counter()
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
+    return all_results
 
 
 def distribute_batch_sizes(batch_sizes, num_gpus):
@@ -454,7 +459,23 @@ def main(args):
 
     ctx = mp.get_context("spawn")
     with ctx.Pool(num_gpus) as pool:
-        pool.map(tune_on_gpu, process_args)
+        gpu_results = pool.map(tune_on_gpu, process_args)
+
+    # Merge partial results from all GPUs into one config per (N, K) shape.
+    # Each GPU tuned a different subset of batch_sizes, so we combine them.
+    merged: Dict[tuple, Dict[int, Any]] = {}
+    for partial in gpu_results:
+        for shape_key, configs in partial.items():
+            if shape_key not in merged:
+                merged[shape_key] = {}
+            merged[shape_key].update(configs)
+
+    block_n = args.block_n
+    block_k = args.block_k
+    input_type = args.input_type
+    save_path = args.save_path
+    for (N, K), configs in merged.items():
+        save_configs(N, K, block_n, block_k, configs, save_path, input_type)
 
     print("Multi-GPU tuning completed")
 
