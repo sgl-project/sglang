@@ -210,6 +210,19 @@ class Sampler(nn.Module):
                 assert (
                     sampling_info.sampling_seed is None
                 ), "Sampling seed is not supported for flashinfer backend"
+                # Ensure no NaN/Inf reaches flashinfer kernel (flashinfer#1575).
+                # FP4 quantized models can produce numerical instability leading to
+                # undefined behavior / illegal memory access in TopKTopPSamplingFromProbs.
+                if torch.any(torch.isnan(probs) | torch.isinf(probs)):
+                    probs = torch.nan_to_num(
+                        probs, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    probs_sum = probs.sum(dim=-1, keepdim=True)
+                    probs = torch.where(
+                        probs_sum > 0,
+                        probs / probs_sum,
+                        torch.ones_like(probs) / probs.shape[-1],
+                    )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
