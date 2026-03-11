@@ -7,10 +7,13 @@ import torch.nn.functional as F
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import (
+    DEFAULT_DEVICE,
+    DEFAULT_DTYPE,
+    get_benchmark_range,
+    run_benchmark,
+)
 from sglang.jit_kernel.hadamard import hadamard_transform
-
-IS_CI = is_in_ci()
 
 # AOT kernel: might not be available in all environments.
 # This is used for performance baseline comparison.
@@ -29,15 +32,15 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
-
-if IS_CI:
-    batch_sizes = [16]
-    dim_range = [1024]
-else:
-    batch_sizes = [1, 16, 64, 256]
-    dim_range = [64, 256, 1024, 4096, 8192, 16384, 32768]
+# CI environment uses simplified parameters
+batch_sizes = get_benchmark_range(
+    full_range=[1, 16, 64, 256],
+    ci_range=[16],
+)
+dim_range = get_benchmark_range(
+    full_range=[64, 256, 1024, 4096, 8192, 16384, 32768],
+    ci_range=[1024],
+)
 
 
 # Naive reference implementation using precomputed scipy hadamard matrix.
@@ -81,7 +84,7 @@ configs = list(itertools.product(batch_sizes, dim_range))
 )
 def benchmark(batch_size: int, dim: int, provider: str) -> Tuple[float, float, float]:
     scale = 1.0 / math.sqrt(dim)
-    x = torch.randn(batch_size, dim, device=DEVICE, dtype=DTYPE)
+    x = torch.randn(batch_size, dim, device=DEFAULT_DEVICE, dtype=DEFAULT_DTYPE)
 
     FN_MAP = {
         "jit_kernel": lambda: hadamard_transform(x.clone(), scale=scale),
@@ -96,16 +99,14 @@ def benchmark(batch_size: int, dim: int, provider: str) -> Tuple[float, float, f
         log_dim = math.ceil(math.log2(dim)) if dim > 0 else 0
         dim_padded = 2**log_dim if dim > 0 else 1
         H = torch.tensor(
-            hadamard(dim_padded, dtype=float), dtype=DTYPE, device=DEVICE
+            hadamard(dim_padded, dtype=float), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
         )
         FN_MAP["naive"] = lambda: torch_hadamard_transform(
             x.clone(), scale, H, dim, dim_padded
         )
 
     fn = FN_MAP[provider]
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
