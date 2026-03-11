@@ -83,11 +83,10 @@ RETRY_BACKOFF_SECS = [15, 30]
 def _num_prompts_for_concurrency(concurrency: int) -> int:
     """Return num-prompts for a given concurrency level.
 
-    Uses max(concurrency, 32) to ensure at least 32 data points for
-    stable latency percentiles while matching the canonical pattern of
-    num-prompt == max-concurrency at higher values.
+    Floor of 32 ensures stable latency percentiles at low concurrency.
+    Cap of 256 keeps high-concurrency runs (512+) from dominating runtime.
     """
-    return max(concurrency, 32)
+    return min(max(concurrency, 32), 256)
 
 
 def _build_server_args(
