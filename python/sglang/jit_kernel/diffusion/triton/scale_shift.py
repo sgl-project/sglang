@@ -5,16 +5,6 @@ import triton.language as tl  # type: ignore
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=2),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8),
-    ],
-    key=["inner_dim", "HAS_WEIGHT", "HAS_BIAS"],
-)
 @triton.jit
 def _fused_layernorm_scale_shift_gate_select01_kernel(
     output_ptr,
@@ -122,16 +112,6 @@ def _fused_layernorm_scale_shift_gate_select01_kernel(
     tl.store(gate_row_ptr + cols, gate, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=2),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8),
-    ],
-    key=["inner_dim", "HAS_WEIGHT", "HAS_BIAS"],
-)
 @triton.jit
 def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     output_ptr,
