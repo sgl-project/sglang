@@ -434,8 +434,10 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
 
     from sglang.srt.utils.network import NetworkAddress
 
+    # Determine socket family based on address type
     na = NetworkAddress(host or "0.0.0.0", port)
     sock = socket.socket(family=na.family, type=socket.SOCK_STREAM)
+    # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:

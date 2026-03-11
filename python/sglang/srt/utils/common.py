@@ -1487,6 +1487,7 @@ def get_zmq_socket_on_host(
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
+    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
     if host:
         if is_valid_ipv6_address(host):
