@@ -1,0 +1,741 @@
+---
+title: "Tool Parser"
+metatags:
+    description: "SGLang function calling: tool parsers for DeepSeek, Llama, Qwen, Mistral, GLM, Kimi K2. OpenAI-compatible tool use API."
+---
+This guide demonstrates how to use SGLang’s [Function calling](https://platform.openai.com/docs/guides/function-calling) functionality.
+
+
+## Currently supported parsers:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parser</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Supported Models</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`deepseekv3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-v3 (e.g., `deepseek-ai/DeepSeek-V3-0324`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommend adding `--chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja` to launch command.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`deepseekv31`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V3.1 and DeepSeek-V3.2-Exp (e.g. `deepseek-ai/DeepSeek-V3.1`, `deepseek-ai/DeepSeek-V3.2-Exp`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommend adding `--chat-template ./examples/chat_template/tool_chat_template_deepseekv31.jinja` (Or ..deepseekv32.jinja for DeepSeek-V3.2) to launch command.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`deepseekv32`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V3.2 (`deepseek-ai/DeepSeek-V3.2`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`glm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GLM series (e.g. `zai-org/GLM-4.6`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gpt-oss`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPT-OSS (e.g., `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `lmsys/gpt-oss-120b-bf16`, `lmsys/gpt-oss-20b-bf16`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The gpt-oss tool parser filters out analysis channel events and only preserves normal text. This can cause the content to be empty when explanations are in the analysis channel. To work around this, complete the tool round by returning tool results as `role="tool"` messages, which enables the model to generate the final content.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`kimi_k2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`moonshotai/Kimi-K2-Instruct`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`llama3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Llama 3.1 / 3.2 / 3.3 (e.g. `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`, `meta-llama/Llama-3.3-70B-Instruct`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`llama4`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Llama 4 (e.g. `meta-llama/Llama-4-Scout-17B-16E-Instruct`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`mistral`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mistral (e.g. `mistralai/Mistral-7B-Instruct-v0.3`, `mistralai/Mistral-Nemo-Instruct-2407`, `mistralai/Mistral-7B-v0.3`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`pythonic`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Llama-3.2 / Llama-3.3 / Llama-4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Model outputs function calls as Python code. Requires `--tool-call-parser pythonic` and is recommended to use with a specific chat template.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`qwen`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen series (e.g. `Qwen/Qwen3-Next-80B-A3B-Instruct`, `Qwen/Qwen3-VL-30B-A3B-Thinking`) except Qwen3-Coder</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`qwen3_coder`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3-Coder (e.g. `Qwen/Qwen3-Coder-30B-A3B-Instruct`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`step3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Step-3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+  </tbody>
+</table>
+
+
+
+## OpenAI Compatible API
+
+
+### Launching the Server
+
+
+
+```python Example
+import json
+from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import wait_for_server, print_highlight, terminate_process
+from openai import OpenAI
+
+server_process, port = launch_server_cmd(
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen25 --host 0.0.0.0 --log-level warning"  # qwen25
+)
+wait_for_server(f"http://localhost:{port}")
+```
+
+Note that `--tool-call-parser` defines the parser used to interpret responses.
+
+
+### Define Tools for Function Call
+Below is a Python snippet that shows how to define a tool as a dictionary. The dictionary includes a tool name, a description, and property defined Parameters.
+
+
+
+```python Example
+# Define tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "The city to find the weather for, e.g. 'San Francisco'",
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "the two-letter abbreviation for the state that the city is"
+                        " in, e.g. 'CA' which would mean 'California'",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "The unit to fetch the temperature in",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["city", "state", "unit"],
+            },
+        },
+    }
+]
+```
+
+### Define Messages
+
+
+
+```python Example
+def get_messages():
+    return [
+        {
+            "role": "user",
+            "content": "What's the weather like in Boston today? Output a reasoning before act, then use the tools to help you.",
+        }
+    ]
+
+
+messages = get_messages()
+```
+
+### Initialize the Client
+
+
+
+```python Example
+# Initialize OpenAI-like client
+client = OpenAI(api_key="None", base_url=f"http://0.0.0.0:{port}/v1")
+model_name = client.models.list().data[0].id
+```
+
+###  Non-Streaming Request
+
+
+
+```python Example
+# Non-streaming mode test
+response_non_stream = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=0,
+    top_p=0.95,
+    max_tokens=1024,
+    stream=False,  # Non-streaming
+    tools=tools,
+)
+print_highlight("Non-stream response:")
+print_highlight(response_non_stream)
+print_highlight("==== content ====")
+print_highlight(response_non_stream.choices[0].message.content)
+print_highlight("==== tool_calls ====")
+print_highlight(response_non_stream.choices[0].message.tool_calls)
+```
+
+#### Handle Tools
+When the engine determines it should call a particular tool, it will return arguments or partial arguments through the response. You can parse these arguments and later invoke the tool accordingly.
+
+
+
+```python Example
+name_non_stream = response_non_stream.choices[0].message.tool_calls[0].function.name
+arguments_non_stream = (
+    response_non_stream.choices[0].message.tool_calls[0].function.arguments
+)
+
+print_highlight(f"Final streamed function call name: {name_non_stream}")
+print_highlight(f"Final streamed function call arguments: {arguments_non_stream}")
+```
+
+### Streaming Request
+
+
+
+```python Example
+# Streaming mode test
+print_highlight("Streaming response:")
+response_stream = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=0,
+    top_p=0.95,
+    max_tokens=1024,
+    stream=True,  # Enable streaming
+    tools=tools,
+)
+
+texts = ""
+tool_calls = []
+name = ""
+arguments = ""
+for chunk in response_stream:
+    if chunk.choices[0].delta.content:
+        texts += chunk.choices[0].delta.content
+    if chunk.choices[0].delta.tool_calls:
+        tool_calls.append(chunk.choices[0].delta.tool_calls[0])
+print_highlight("==== Text ====")
+print_highlight(texts)
+
+print_highlight("==== Tool Call ====")
+for tool_call in tool_calls:
+    print_highlight(tool_call)
+```
+
+#### Handle Tools
+When the engine determines it should call a particular tool, it will return arguments or partial arguments through the response. You can parse these arguments and later invoke the tool accordingly.
+
+
+
+```python Example
+# Parse and combine function call arguments
+arguments = []
+for tool_call in tool_calls:
+    if tool_call.function.name:
+        print_highlight(f"Streamed function call name: {tool_call.function.name}")
+
+    if tool_call.function.arguments:
+        arguments.append(tool_call.function.arguments)
+
+# Combine all fragments into a single JSON string
+full_arguments = "".join(arguments)
+print_highlight(f"streamed function call arguments: {full_arguments}")
+```
+
+### Define a Tool Function
+
+
+
+```python Example
+# This is a demonstration, define real function according to your usage.
+def get_current_weather(city: str, state: str, unit: "str"):
+    return (
+        f"The weather in {city}, {state} is 85 degrees {unit}. It is "
+        "partly cloudly, with highs in the 90's."
+    )
+
+
+available_tools = {"get_current_weather": get_current_weather}
+```
+
+
+### Execute the Tool
+
+
+
+```python Example
+messages.append(response_non_stream.choices[0].message)
+
+# Call the corresponding tool function
+tool_call = messages[-1].tool_calls[0]
+tool_name = tool_call.function.name
+tool_to_call = available_tools[tool_name]
+result = tool_to_call(**(json.loads(tool_call.function.arguments)))
+print_highlight(f"Function call result: {result}")
+# messages.append({"role": "tool", "content": result, "name": tool_name})
+messages.append(
+    {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": str(result),
+        "name": tool_name,
+    }
+)
+
+print_highlight(f"Updated message history: {messages}")
+```
+
+### Send Results Back to Model
+
+
+
+```python Example
+final_response = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=0,
+    top_p=0.95,
+    stream=False,
+    tools=tools,
+)
+print_highlight("Non-stream response:")
+print_highlight(final_response)
+
+print_highlight("==== Text ====")
+print_highlight(final_response.choices[0].message.content)
+```
+
+## Native API and SGLang Runtime (SRT)
+
+
+
+```python Example
+from transformers import AutoTokenizer
+import requests
+
+# generate an answer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+
+messages = get_messages()
+
+input = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True, tools=tools, return_dict=False
+)
+
+gen_url = f"http://localhost:{port}/generate"
+gen_data = {
+    "text": input,
+    "sampling_params": {
+        "skip_special_tokens": False,
+        "max_new_tokens": 1024,
+        "temperature": 0,
+        "top_p": 0.95,
+    },
+}
+gen_response = requests.post(gen_url, json=gen_data).json()["text"]
+print_highlight("==== Response ====")
+print_highlight(gen_response)
+
+# parse the response
+parse_url = f"http://localhost:{port}/parse_function_call"
+
+function_call_input = {
+    "text": gen_response,
+    "tool_call_parser": "qwen25",
+    "tools": tools,
+}
+
+function_call_response = requests.post(parse_url, json=function_call_input)
+function_call_response_json = function_call_response.json()
+
+print_highlight("==== Text ====")
+print(function_call_response_json["normal_text"])
+print_highlight("==== Calls ====")
+print("function name: ", function_call_response_json["calls"][0]["name"])
+print("function arguments: ", function_call_response_json["calls"][0]["parameters"])
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+## Offline Engine API
+
+
+
+```python Example
+import sglang as sgl
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.io_struct import Tool, Function
+
+llm = sgl.Engine(model_path="Qwen/Qwen2.5-7B-Instruct")
+tokenizer = llm.tokenizer_manager.tokenizer
+input_ids = tokenizer.apply_chat_template(
+    messages, tokenize=True, add_generation_prompt=True, tools=tools, return_dict=False
+)
+
+# Note that for gpt-oss tool parser, adding "no_stop_trim": True
+# to make sure the tool call token <call> is not trimmed.
+
+sampling_params = {
+    "max_new_tokens": 1024,
+    "temperature": 0,
+    "top_p": 0.95,
+    "skip_special_tokens": False,
+}
+
+# 1) Offline generation
+result = llm.generate(input_ids=input_ids, sampling_params=sampling_params)
+generated_text = result["text"]  # Assume there is only one prompt
+
+print_highlight("=== Offline Engine Output Text ===")
+print_highlight(generated_text)
+
+
+# 2) Parse using FunctionCallParser
+def convert_dict_to_tool(tool_dict: dict) -> Tool:
+    function_dict = tool_dict.get("function", {})
+    return Tool(
+        type=tool_dict.get("type", "function"),
+        function=Function(
+            name=function_dict.get("name"),
+            description=function_dict.get("description"),
+            parameters=function_dict.get("parameters"),
+        ),
+    )
+
+
+tools = [convert_dict_to_tool(raw_tool) for raw_tool in tools]
+
+parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
+normal_text, calls = parser.parse_non_stream(generated_text)
+
+print_highlight("=== Parsing Result ===")
+print("Normal text portion:", normal_text)
+print_highlight("Function call portion:")
+for call in calls:
+    # call: ToolCallItem
+    print_highlight(f"  - tool name: {call.name}")
+    print_highlight(f"    parameters: {call.parameters}")
+
+# 3) If needed, perform additional logic on the parsed functions, such as automatically calling the corresponding function to obtain a return value, etc.
+```
+
+
+```python Example
+llm.shutdown()
+```
+
+## Tool Choice Mode
+
+SGLang supports OpenAI's `tool_choice` parameter to control when and which tools the model should call. This feature is implemented using EBNF (Extended Backus-Naur Form) grammar to ensure reliable tool calling behavior.
+
+### Supported Tool Choice Options
+
+- **`tool_choice="required"`**: Forces the model to call at least one tool
+- **`tool_choice={"type": "function", "function": {"name": "specific_function"}}`**: Forces the model to call a specific function
+
+### Backend Compatibility
+
+Tool choice is fully supported with the **Xgrammar backend**, which is the default grammar backend (`--grammar-backend xgrammar`). However, it may not be fully supported with other backends such as `outlines`.
+
+### Example: Required Tool Choice
+
+
+
+```python Example
+from openai import OpenAI
+from sglang.utils import wait_for_server, print_highlight, terminate_process
+from sglang.test.doc_patch import launch_server_cmd
+
+# Start a new server session for tool choice examples
+server_process_tool_choice, port_tool_choice = launch_server_cmd(
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen25 --host 0.0.0.0  --log-level warning"
+)
+wait_for_server(f"http://localhost:{port_tool_choice}")
+
+# Initialize client for tool choice examples
+client_tool_choice = OpenAI(
+    api_key="None", base_url=f"http://0.0.0.0:{port_tool_choice}/v1"
+)
+model_name_tool_choice = client_tool_choice.models.list().data[0].id
+
+# Example with tool_choice="required" - forces the model to call a tool
+messages_required = [
+    {"role": "user", "content": "Hello, what is the capital of France?"}
+]
+
+# Define tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "The city to find the weather for, e.g. 'San Francisco'",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "The unit to fetch the temperature in",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["city", "unit"],
+            },
+        },
+    }
+]
+
+response_required = client_tool_choice.chat.completions.create(
+    model=model_name_tool_choice,
+    messages=messages_required,
+    temperature=0,
+    max_tokens=1024,
+    tools=tools,
+    tool_choice="required",  # Force the model to call a tool
+)
+
+print_highlight("Response with tool_choice='required':")
+print("Content:", response_required.choices[0].message.content)
+print("Tool calls:", response_required.choices[0].message.tool_calls)
+```
+
+### Example: Specific Function Choice
+
+
+
+
+```python Example
+# Example with specific function choice - forces the model to call a specific function
+messages_specific = [
+    {"role": "user", "content": "What are the most attactive places in France?"}
+]
+
+response_specific = client_tool_choice.chat.completions.create(
+    model=model_name_tool_choice,
+    messages=messages_specific,
+    temperature=0,
+    max_tokens=1024,
+    tools=tools,
+    tool_choice={
+        "type": "function",
+        "function": {"name": "get_current_weather"},
+    },  # Force the model to call the specific get_current_weather function
+)
+
+print_highlight("Response with specific function choice:")
+print("Content:", response_specific.choices[0].message.content)
+print("Tool calls:", response_specific.choices[0].message.tool_calls)
+
+if response_specific.choices[0].message.tool_calls:
+    tool_call = response_specific.choices[0].message.tool_calls[0]
+    print_highlight(f"Called function: {tool_call.function.name}")
+    print_highlight(f"Arguments: {tool_call.function.arguments}")
+```
+
+
+```python Example
+terminate_process(server_process_tool_choice)
+```
+
+## Pythonic Tool Call Format (Llama-3.2 / Llama-3.3 / Llama-4)
+
+Some Llama models (such as Llama-3.2-1B, Llama-3.2-3B, Llama-3.3-70B, and Llama-4) support a "pythonic" tool call format, where the model outputs function calls as Python code, e.g.:
+
+```python Example
+[get_current_weather(city="San Francisco", state="CA", unit="celsius")]
+```
+
+- The output is a Python list of function calls, with arguments as Python literals (not JSON).
+- Multiple tool calls can be returned in the same list:
+```python Example
+[get_current_weather(city="San Francisco", state="CA", unit="celsius"),
+ get_current_weather(city="New York", state="NY", unit="fahrenheit")]
+```
+
+For more information, refer to Meta’s documentation on  [Zero shot function calling](https://github.com/meta-llama/llama-models/blob/main/models/llama4/prompt_format.md#zero-shot-function-calling---system-message).
+
+Note that this feature is still under development on Blackwell.
+
+### How to enable
+- Launch the server with `--tool-call-parser pythonic`
+- You may also specify --chat-template with the improved template for the model (e.g., `--chat-template=examples/chat_template/tool_chat_template_llama4_pythonic.jinja`).
+This is recommended because the model expects a special prompt format to reliably produce valid pythonic tool call outputs. The template ensures that the prompt structure (e.g., special tokens, message boundaries like `<|eom|>`, and function call delimiters) matches what the model was trained or fine-tuned on. If you do not use the correct chat template, tool calling may fail or produce inconsistent results.
+
+#### Forcing Pythonic Tool Call Output Without a Chat Template
+If you don't want to specify a chat template, you must give the model extremely explicit instructions in your messages to enforce pythonic output. For example, for `Llama-3.2-1B-Instruct`, you need:
+
+
+
+```python Example
+import openai
+
+server_process, port = launch_server_cmd(
+    " python3 -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --tool-call-parser pythonic --tp 1  --log-level warning"  # llama-3.2-1b-instruct
+)
+wait_for_server(f"http://localhost:{port}")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a given location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The name of the city or location.",
+                    }
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tourist_attractions",
+            "description": "Get a list of top tourist attractions for a given city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "The name of the city to find attractions for.",
+                    }
+                },
+                "required": ["city"],
+            },
+        },
+    },
+]
+
+
+def get_messages():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a travel assistant. "
+                "When asked to call functions, ALWAYS respond ONLY with a python list of function calls, "
+                "using this format: [func_name1(param1=value1, param2=value2), func_name2(param=value)]. "
+                "Do NOT use JSON, do NOT use variables, do NOT use any other format. "
+                "Here is an example:\n"
+                '[get_weather(location="Paris"), get_tourist_attractions(city="Paris")]'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "I'm planning a trip to Tokyo next week. What's the weather like and what are some top tourist attractions? "
+                "Propose parallel tool calls at once, using the python list of function calls format as shown above."
+            ),
+        },
+    ]
+
+
+messages = get_messages()
+
+client = openai.Client(base_url=f"http://localhost:{port}/v1", api_key="xxxxxx")
+model_name = client.models.list().data[0].id
+
+
+response_non_stream = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=0,
+    top_p=0.9,
+    stream=False,  # Non-streaming
+    tools=tools,
+)
+print_highlight("Non-stream response:")
+print_highlight(response_non_stream)
+
+response_stream = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=0,
+    top_p=0.9,
+    stream=True,
+    tools=tools,
+)
+texts = ""
+tool_calls = []
+name = ""
+arguments = ""
+
+for chunk in response_stream:
+    if chunk.choices[0].delta.content:
+        texts += chunk.choices[0].delta.content
+    if chunk.choices[0].delta.tool_calls:
+        tool_calls.append(chunk.choices[0].delta.tool_calls[0])
+
+print_highlight("Streaming Response:")
+print_highlight("==== Text ====")
+print_highlight(texts)
+
+print_highlight("==== Tool Call ====")
+for tool_call in tool_calls:
+    print_highlight(tool_call)
+
+terminate_process(server_process)
+```
+
+> **Note:**  
+> The model may still default to JSON if it was heavily finetuned on that format. Prompt engineering (including examples) is the only way to increase the chance of pythonic output if you are not using a chat template.
+
+
+## How to support a new model?
+1. Update the TOOLS_TAG_LIST in sglang/srt/function_call_parser.py with the model’s tool tags. Currently supported tags include:
+```text Output
+	TOOLS_TAG_LIST = [
+	    “<|plugin|>“,
+	    “<function=“,
+	    “<tool_call>“,
+	    “<|python_tag|>“,
+	    “[TOOL_CALLS]”
+	]
+```
+2. Create a new detector class in sglang/srt/function_call_parser.py that inherits from BaseFormatDetector. The detector should handle the model’s specific function call format. For example:
+```text Output
+    class NewModelDetector(BaseFormatDetector):
+```
+3. Add the new detector to the MultiFormatParser class that manages all the format detectors.
+

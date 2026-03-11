@@ -1,0 +1,193 @@
+---
+title: Chroma-1.0
+metatags:
+    description: "Deploy Chroma-1.0 end-to-end speech conversation model with SGLang - real-time speech generation, voice cloning, and speech reasoning."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Chroma-1.0](https://github.com/FlashLabs-AI-Corp/FlashLabs-Chroma) is an open-source end-to-end speech conversation model developed by FlashLabs, focusing on the following core capabilities:
+
+- **Real-time Speech Generation**: Supports low-latency speech synthesis, suitable for real-time conversational scenarios.
+- **Customized Voice Cloning**: Capable of cloning and replicating specific speaker voice characteristics.
+- **End-to-End Architecture**: Provides a complete processing workflow from speech to speech.
+- **Speech Reasoning**: Equipped with reasoning capabilities to understand and process speech content.
+
+## 2. Architecture Overview
+
+**Chroma-1.0** utilizes a hybrid serving architecture rather than a direct SGLang deployment. This design choice is driven by:
+
+1. **Complex Model Architecture**: The end-to-end speech processing pipeline involves specialized components that go beyond standard text generation loops.
+2. **KV Cache & State Management**: The model requires custom handling of KV caches that differs from standard implementations.
+3. **Batching Limitations**: The current implementation supports a batch size of 1, meaning SGLang's advanced continuous batching capabilities are not yet fully applicable.
+
+Therefore, you will start the **FlashLabs Server**, which manages the overall workflow and selectively leverages SGLang for specific inference components where supported.
+
+- **Outer Layer**: FlashLabs Server (Handles Audio I/O, State, and Model Logic)
+- **Inner Engine**: SGLang Instance (Utilized for specific acceleration where applicable)
+
+## 3. Installation & Setup
+
+We recommend following these steps to set up the environment and prepare the model.
+
+### Step 1: Get the Docker Image
+
+Pull the official pre-built image from Docker Hub to ensure all dependencies are correctly configured.
+
+```bash Command
+docker pull flashlabs/chroma:latest
+```
+
+### Step 2: Download Model Weights
+
+Download the **Chroma-4B** weights from Hugging Face. You can choose one of the following methods:
+
+**Method 1: Using Python (Recommended)**
+
+```bash Command
+huggingface-cli download FlashLabs/Chroma-4B --local-dir Chroma-4B
+```
+
+**Method 2: Using Git Clone**
+
+Make sure you have Git LFS installed before cloning.
+
+```bash Command
+# Install Git LFS first
+git lfs install
+
+# Clone the repository
+git clone https://huggingface.co/FlashLabs/Chroma-4B Chroma-4B
+```
+
+### Step 3: Download Chroma Codes (SGLang version)
+
+```bash Command
+git clone https://github.com/FlashLabs-AI-Corp/Chroma-SGLang.git
+
+cd Chroma-SGLang
+```
+
+### Step 4: Run the Server
+
+```bash Command
+docker run -d \
+  --gpus all \
+  -p 8000:8000 \
+  -w /app/Chroma-SGLang \
+  -v "your_Chroma-SGLang_path":/app/Chroma-SGLang \
+  -v "your_chroma_path":/model \
+  -e CHROMA_MODEL_PATH=/model \
+  -e DP_SIZE="1" \
+  flashlabs/chroma:latest \
+  /opt/conda/bin/python -m uvicorn api_server:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --workers 1
+```
+
+or run simply the following one line command
+
+```bash Command
+docker-compose up -d
+```
+
+## 5. Client Usage Example
+
+Once the server is running, you can interact with it using HTTP requests.
+
+### Python Client
+
+```python Example
+import requests
+import base64
+
+url = "http://localhost:8000/v1/chat/completions"
+headers = {"Content-Type": "application/json"}
+
+payload = {
+    "model": "chroma",
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are Chroma, a voice agent developed by FlashLabs."
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": "assets/question_audio.wav"}
+            ]
+        }
+    ],
+    "max_tokens": 1000,
+    "return_audio": True
+}
+
+response = requests.post(url, json=payload, headers=headers)
+result = response.json()
+
+if result.get("audio"):
+    audio_data = base64.b64decode(result["audio"])
+    with open("output.wav", "wb") as f:
+        f.write(audio_data)
+    print("Audio saved to output.wav")
+```
+
+### OpenAI SDK Compatible Example
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="dummy",
+    base_url="http://localhost:8000/v1"
+)
+
+response = client.chat.completions.create(
+    model="chroma",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": "assets/question_audio.wav"}
+            ]
+        }
+    ],
+    extra_body={
+        "prompt_text": "I have not... I'm so exhausted, I haven't slept in a very long time. It could be because... Well, I used our... Uh, I'm, I just use... This is what I use every day. I use our cleanser every day, I use serum in the morning and then the moistu- daily moisturizer. That's what I use every morning.",
+        "prompt_audio": "assets/ref_audio.wav",
+        "return_audio": True
+    }
+)
+
+print(response)
+```
+
+### CLI (cURL)
+
+```bash Command
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chroma",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are Chroma, a voice agent developed by FlashLabs."
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "audio",
+            "audio": "assets/question_audio.wav"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 1000,
+    "return_audio": true
+  }' | jq -r '.audio' | base64 -d > output.wav
+```

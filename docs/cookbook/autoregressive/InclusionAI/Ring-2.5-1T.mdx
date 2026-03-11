@@ -1,0 +1,260 @@
+---
+title: Ring-2.5-1T
+metatags:
+    description: "Deploy Ring-2.5-1T with SGLang - world's first open-source 1T parameter reasoning model with hybrid linear attention, deep reasoning, and agentic tool calling capabilities."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Ring-2.5-1T](https://huggingface.co/inclusionAI/Ring-2.5-1T) is the world's first open-source trillion-parameter reasoning model based on hybrid linear attention architecture, developed by InclusionAI. Building on Ring-1T, Ring-2.5-1T demonstrates substantial improvements in generation efficiency, reasoning depth, and long-horizon task execution capabilities.
+
+**Key Features:**
+
+- **Trillion-Scale Model**: ~1T total parameters with 63B activation parameters using a hybrid linear attention architecture (1:7 MLA + Lightning Linear Attention)
+- **Generation Efficiency**: Reduces memory access overhead by over 10x and increases generation throughput by more than 3x for sequences exceeding 32K tokens
+- **Deep Reasoning**: Achieves gold medal level for both IMO 2025 and CMO 2025, with dense rewards for rigorous reasoning process feedback
+- **Long-horizon Task Execution**: Enhanced autonomous execution capability through large-scale fully-async agentic RL training
+- **Tool Calling**: Supports function calling with XML-style tool call format
+- **Context Length**: 128K -> 256K (YaRN)
+
+**Available Models:**
+
+- **FP8 (8-bit quantized)**: [inclusionAI/Ring-2.5-1T](https://huggingface.co/inclusionAI/Ring-2.5-1T)
+
+**License:** MIT
+
+## 2. SGLang Installation
+
+Ring-2.5-1T requires a specific SGLang Docker image:
+
+```bash
+# For H200/B200
+docker pull lmsysorg/sglang:nightly-dev-20260213-a0ebaa64
+
+# For GB200/GB300
+docker pull lmsysorg/sglang:nightly-dev-cu13-20260213-a0ebaa64
+```
+
+For other installation methods, please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
+
+import { Ring251TDeployment } from '/src/snippets/autoregressive/ring-25-1t-deployment.jsx'
+
+<Ring251TDeployment />
+
+### 3.2 Configuration Tips
+
+- The `--trust-remote-code` flag is required for this model due to custom modeling code.
+- The model uses FP8 quantization (compressed-tensors format).
+
+## 4. Model Invocation
+
+Deploy Ring-2.5-1T with the following command (on H200, all features enabled):
+
+```shell
+python -m sglang.launch_server \
+  --model-path inclusionAI/Ring-2.5-1T \
+  --tp 8 \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+To enable reasoning output separation, add `--reasoning-parser deepseek-r1` when launching the server. The thinking process is returned via `reasoning_content` in the streaming response.
+
+```shell
+python -m sglang.launch_server \
+  --model-path inclusionAI/Ring-2.5-1T \
+  --tp 8 \
+  --trust-remote-code \
+  --reasoning-parser deepseek-r1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="inclusionAI/Ring-2.5-1T",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+<details>
+<summary>Output Example</summary>
+
+````
+We are asked: "Solve this problem step by step: What is 15% of 240?" This is a straightforward percentage calculation. We need to show step-by-step solution.
+
+We can compute 15% of 240 as (15/100)*240 = 0.15 * 240 = 36.
+
+But we need to present step by step. Also ensure it's clear.
+
+We could also break down: 10% of 240 = 24, then 5% = 12, so 15% = 36.
+
+But any method is fine.
+
+We'll produce a solution with explanation: "To find 15% of 240, multiply 240 by 0.15 (or 15/100)."
+
+We'll show:
+
+15% = 15/100 = 0.15
+
+Then 0.15 × 240 = 36.
+
+Alternatively: (15/100) × 240 = (15 × 240) / 100 = 3600/100 = 36.
+
+Finally, answer: 36.
+
+We can also illustrate stepwise: "First, convert the percentage to a decimal: 15% = 0.15. Then multiply by the number: 0.15 × 240 = 36."
+
+We'll present as a final answer: \boxed{36}.
+
+However, we need to provide step-by-step solution as per instructions. We'll write a full explanation.
+
+We can also use the fraction method: 15% of 240 = (15/100)*240 = (15*240)/100 = 3600/100 = 36.
+
+Alr.
+
+I think that's it.
+
+
+**Step 1:** Write 15% as a fraction or decimal.
+\[ 15\% = \frac{15}{100} = 0.15\]
+
+**Step 2:** Multiply the number (240) by this fraction/decimal.
+\[ 240 \times 0.15 = 36\]
+
+Alternatively, using the fraction:
+\[ \frac{15}{100} \times 240 = \frac{15 \times 240}{100} = \frac{3600}{100} = 36\]
+
+**Conclusion:** 15% of 240 is 36.
+
+\[ \boxed{36} \]
+````
+
+</details>
+
+#### 4.2.2 Tool Calling
+
+To enable tool calling, add `--tool-call-parser qwen` when launching the server.
+
+```shell
+python -m sglang.launch_server \
+  --model-path inclusionAI/Ring-2.5-1T \
+  --tp 8 \
+  --trust-remote-code \
+  --tool-call-parser qwen \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+response = client.chat.completions.create(
+    model="inclusionAI/Ring-2.5-1T",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools
+)
+
+print(response.choices[0].message.tool_calls)
+```
+
+**Output Example:**
+
+```
+[ChatCompletionMessageFunctionToolCall(id='call_770360e31d194ed79d32cd8c', function=Function(arguments='{"location": "Beijing"}', name='get_weather'), type='function', index=0)]
+```
+
+## 5. Benchmark
+
+### GSM8K
+
+- Deployment Command
+```bash
+python3 -m sglang.launch_server \
+  --model-path inclusionAI/Ring-2.5-1T \
+  --tp-size 8 \
+  --trust-remote-code
+```
+
+- Benchmark Command
+```bash
+python3 benchmark/gsm8k/bench_sglang.py --temperature 1.2 --top-p 0.8 --max-new-tokens 32768 --num-questions 200 --tokenizer-path inclusionAI/Ring-2.5-1T --enable-thinking
+```
+
+- Test Result
+```
+Accuracy: 0.955
+Invalid: 0.010
+Latency: 615.833 s
+Output throughput: 412.360 token/s
+```

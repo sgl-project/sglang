@@ -1,0 +1,144 @@
+---
+title: Install SGLang Diffusion
+description: Install SGLang Diffusion on NVIDIA, AMD, MUSA, and Ascend platforms.
+---
+
+You can install SGLang Diffusion using one of the methods below.
+
+## Standard installation (NVIDIA GPUs)
+
+**Platform:** NVIDIA GPUs (CUDA)
+
+<Tabs>
+  <Tab title="pip or uv">
+    Use `uv` for faster installation.
+
+    <Steps>
+      <Step title="Upgrade pip">
+        ```bash
+        pip install --upgrade pip
+        ```
+      </Step>
+      <Step title="Install uv">
+        ```bash
+        pip install uv
+        ```
+      </Step>
+      <Step title="Install SGLang Diffusion">
+        ```bash
+        uv pip install "sglang[diffusion]" --prerelease=allow
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="From source">
+    <Steps>
+      <Step title="Clone the repo">
+        ```bash
+        git clone https://github.com/sgl-project/sglang.git
+        cd sglang
+        ```
+      </Step>
+      <Step title="Install the Python packages">
+        ```bash
+        pip install --upgrade pip
+        pip install -e "python[diffusion]"
+        ```
+
+        ```bash
+        uv pip install -e "python[diffusion]" --prerelease=allow
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Docker">
+    The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from the [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile). Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+
+    ```bash
+    docker run --gpus all \
+        --shm-size 32g \
+        -p 30000:30000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --env "HF_TOKEN=<secret>" \
+        --ipc=host \
+        lmsysorg/sglang:dev \
+        zsh -c '\
+            echo "Installing diffusion dependencies..." && \
+            pip install -e "python[diffusion]" && \
+            echo "Starting SGLang-Diffusion..." && \
+            sglang generate \
+                --model-path black-forest-labs/FLUX.1-dev \
+                --prompt "A logo With Bold Large text: SGL Diffusion" \
+                --save-output \
+        '
+    ```
+  </Tab>
+</Tabs>
+
+## Platform-specific installs
+
+Use the tab that matches your accelerator.
+
+<Tabs>
+  <Tab title="ROCm (AMD GPUs)">
+    **Platform:** AMD Instinct GPUs (ROCm)
+
+    For AMD Instinct GPUs (for example, MI300X), use the ROCm-enabled Docker image:
+
+    ```bash
+    docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
+      -v ~/.cache/huggingface:/root/.cache/huggingface \
+      --env HF_TOKEN=<secret> \
+      lmsysorg/sglang:v0.5.5.post2-rocm700-mi30x \
+      sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
+    ```
+
+    For detailed ROCm system configuration and installation from source, see [AMD GPUs](https://github.com/sgl-project/sglang/blob/main/docs/hardware-platforms/amd-gpus.mdx).
+  </Tab>
+
+  <Tab title="MUSA (Moore Threads GPUs)">
+    **Platform:** Moore Threads GPUs (MUSA)
+
+    For Moore Threads GPUs (MTGPU) with the MUSA software stack:
+
+    <Steps>
+      <Step title="Clone the repo">
+        ```bash
+        git clone https://github.com/sgl-project/sglang.git
+        cd sglang
+        ```
+      </Step>
+      <Step title="Install requirements">
+        ```bash
+        pip install --upgrade pip
+        ```
+      </Step>
+      <Step title="Switch to the MUSA build config">
+        ```bash
+        rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+        ```
+      </Step>
+      <Step title="Install SGLang Diffusion for MUSA">
+        ```bash
+        pip install -e "python[all_musa]"
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Ascend NPU">
+    **Platform:** Ascend NPU
+
+    For Ascend NPU, follow the [NPU installation guide](https://github.com/sgl-project/sglang/blob/main/docs/hardware-platforms/ascend-npus/SGLang%20installation%20with%20NPUs%20support.mdx).
+
+    Quick test:
+
+    ```bash
+    sglang generate --model-path black-forest-labs/FLUX.1-dev \
+        --prompt "A logo With Bold Large text: SGL Diffusion" \
+        --save-output
+    ```
+  </Tab>
+</Tabs>

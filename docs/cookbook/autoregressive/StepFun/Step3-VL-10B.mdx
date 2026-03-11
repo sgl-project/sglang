@@ -1,0 +1,697 @@
+---
+title: Step3-VL-10B
+metatags:
+    description: "Deploy Step3-VL-10B multimodal model with SGLang - compact 10B dense model with frontier-level vision understanding, complex reasoning, and tool calling capabilities."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Step3-VL-10B](https://huggingface.co/stepfun-ai/Step3-VL-10B) is a lightweight open-source multimodal model developed by StepFun, designed to redefine the trade-off between compact efficiency and frontier-level multimodal intelligence. Despite its compact 10B parameter footprint, Step3-VL-10B excels in visual perception, complex reasoning, and human-centric alignment.
+
+Key highlights of Step3-VL-10B include:
+
+- **STEM Reasoning**: Achieves 94.43% on AIME 2025 and 75.95% on MathVision (with PaCoRe), demonstrating exceptional complex reasoning capabilities that outperform models 10×–20× larger.
+- **Visual Perception**: Records 92.05% on MMBench and 80.11% on MMMU, establishing strong general visual understanding and multimodal reasoning.
+- **GUI & OCR**: Delivers state-of-the-art performance on ScreenSpot-V2 (92.61%), ScreenSpot-Pro (51.55%), and OCRBench (86.75%), optimized for agentic and document understanding tasks.
+- **Spatial Understanding**: Demonstrates emergent spatial awareness with 66.79% on BLINK and 57.21% on All-Angles-Bench, establishing strong potential for embodied intelligence applications.
+
+For more details, please refer to the [Step3-VL-10B model card on Hugging Face](https://huggingface.co/stepfun-ai/Step3-VL-10B).
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+Step3-VL-10B is a compact 10B dense model that can run on a single GPU. Recommended starting configurations vary depending on hardware.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and quantization method.
+
+import { Step3VL10BDeployment } from '/src/snippets/autoregressive/step-3vl-10b-deployment.jsx'
+
+<Step3VL10BDeployment />
+
+### 3.2 Configuration Tips
+
+- **Single GPU Deployment**: Step3-VL-10B fits comfortably on a single GPU with BF16 precision, no tensor parallelism required.
+- **Memory Management**: Set lower `--context-length` to conserve memory if needed. A value of `32768` is sufficient for most scenarios.
+- **FP8 Quantization**: Use FP8 quantization to further reduce memory usage while maintaining quality.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang OpenAI Vision API Guide](https://docs.sglang.ai/basic_usage/openai_api_vision.html)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Multi-Modal Inputs
+
+Step3-VL-10B supports image inputs. Here's a basic example with image input:
+
+```python
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Read all the text in the image."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="stepfun-ai/Step3-VL-10B",
+    messages=messages,
+    max_tokens=2048,
+    extra_body={"top_k": -1}
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example output:**
+
+```
+Response costs: 5.89s
+Generated text: Auntie Anne's
+
+CINNAMON SUGAR
+1 × 17,000               17,000
+
+SUB TOTAL                    17,000
+
+GRAND TOTAL                 17,000
+
+CASH IDR                    20,000
+
+CHANGE DUE                 3,000
+```
+
+**Multi-Image Input Example:**
+
+Step3-VL-10B can process multiple images in a single request for comparison or analysis:
+
+```python
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://www.civitatis.com/f/china/hong-kong/guia/taxi.jpg"
+                }
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://cdn.cheapoguides.com/wp-content/uploads/sites/7/2025/05/GettyImages-509614603-1280x600.jpg"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Compare these two images and describe the differences in 100 words or less."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="stepfun-ai/Step3-VL-10B",
+    messages=messages,
+    max_tokens=2048,
+    extra_body={"top_k": -1}
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example Output:**
+
+```
+Response costs: 3.24s
+Generated text: First image: Single red Hong Kong taxi close - up, clear license plate (RX 5004), “4 SEATS” sticker, urban street with shops behind. Second image: Aerial view of many taxis (red, green) on a highway with a viaduct, some hoods open, dense arrangement. Differences: Scale (single vs many), perspective (close - up vs aerial), context (street shops vs highway), and taxi conditions (normal vs some open hoods).
+```
+
+#### 4.2.2 Reasoning Parser
+
+Step3-VL-10B supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
+
+```shell
+python -m sglang.launch_server \
+  --model stepfun-ai/Step3-VL-10B \
+  --reasoning-parser deepseek-r1 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code
+```
+
+**Streaming with Thinking Process:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="stepfun-ai/Step3-VL-10B",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True,
+    extra_body={"top_k": -1}
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Example Output:**
+```
+=============== Thinking =================
+Okay, let's see. The problem is asking for 15% of 240. Hmm, I need to remember how to calculate percentages. So, percentage means "per hundred," right? So, 15% is the same as 15 per 100, or 15/100. To find a percentage of a number, I think you convert the percentage to a decimal and then multiply it by the number. Let me check that.
+
+First, 15% as a decimal. To convert a percentage to a decimal, you divide by 100. So 15 divided by 100 is 0.15. Yeah, that's right. So 15% is 0.15 in decimal form. Then, to find 15% of 24
+0, I need to multiply 0.15 by 240. Let me do that calculation.
+
+Let me write it out: 0.15 * 240. Let's compute that. Maybe break it down. 0.1 is 10%, and 0.05 is 5%, so 10% of 240 is 24, and 5% of 240 is 12. Then 10% + 5% is 15%, so 24 + 12 is 36. Oh,
+ that's a good way to check. So 15% is 10% plus 5%, which adds up to 36. Let me verify with the decimal method. 0.15 * 240. Let's multiply 240 by 0.1 first: 24. Then 240 by 0.05: 12. Adding them gives 36. Yep, that matches. Alternatively, 240 * 15 = 3600, and then divide by 100 (since it's per hundred), so 3600 / 100 = 36. That's another way. So 15% of 240 is 36. Let me make sure I didn't make a mistake. Let's check with another method. 10% of 240 is 24, 20% would be 48, so 15% is halfway between 10% and 20%, which is (24 + 48)/2 = 36. Yep, that works too
+. So all methods point to 36. I think that's the answer.
+
+=============== Content =================
+
+To solve the problem "What is 15% of 240?" step by step:
+
+---
+
+### **Step 1: Understand the concept of percentage**
+A percentage represents a portion of a whole. Specifically, "percent" means "per hundred." So, 15% means **15 out of 100**, or **15/100**.
+
+---
+
+### **Step 2: Convert the percentage to a decimal**
+To use percentages in calculations, convert them to decimals by dividing by 100:
+$$
+15\% = \frac{15}{100} = 0.15
+$$
+
+---
+
+### **Step 3: Multiply the decimal by the given number**
+Now, multiply 0.15 (the decimal form of 15%) by 240:
+$$
+0.15 \times 240 = 36
+$$
+
+---
+
+### **Alternative Verification Methods**
+
+#### **Method A: Break into parts**
+- 10% of 240 = $ 0.10 \times 240 = 24 $
+- 5% of 240 = $ 0.05 \times 240 = 12 $
+- Add them: $ 24 + 12 = 36 $
+
+#### **Method B: Use direct multiplication**
+- $ 15\% \text{ of } 240 = \frac{15}{100} \times 240 = \frac{3600}{100} = 36 $
+
+#### **Method C: Estimate using known percentages**
+- 20% of 240 = $ 0.20 \times 240 = 48 $
+- 10% of 240 = $ 0.10 \times 240 = 24 $
+- 15% is halfway between 10% and 20%: $ \frac{24 + 48}{2} = 36 $
+
+---
+
+### **Final Answer**
+$$
+\boxed{36}
+$$
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+#### 4.2.3 Tool Calling
+
+Step3-VL-10B supports tool calling capabilities. Enable the tool call parser:
+
+```shell
+python -m sglang.launch_server \
+  --model stepfun-ai/Step3-VL-10B \
+  --reasoning-parser deepseek-r1 \
+  --tool-call-parser hermes \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code
+```
+
+**Python Example (with Thinking Process):**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="stepfun-ai/Step3-VL-10B",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True,
+    extra_body={"top_k": -1}
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Accumulate tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================\n", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+**Example Output:**
+```
+=============== Thinking =================
+The user is asking about the weather in Beijing. I have a function called "get_weather" that can provide weather information for a location. Let me check the parameters:
+
+- location: required (string) - "Beijing"
+- unit: optional (string, enum: ["celsius", "fahrenheit"]) - not specified by the user, so I won't include it
+
+I should call the function with location="Beijing".
+
+
+<tool_calls>
+
+=============== Content =================
+
+
+</tool_calls>Tool Call: get_weather
+   Arguments: {"location": "Beijing"}
+```
+
+**Handling Tool Call Results:**
+
+```python
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="stepfun-ai/Step3-VL-10B",
+    messages=messages,
+    temperature=0.7,
+    extra_body={"top_k": -1}
+)
+
+print(final_response.choices[0].message.content)
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (1x)
+- Model: stepfun-ai/Step3-VL-10B
+- Tensor Parallelism: 1
+- sglang version: 0.5.8+
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images.
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell
+python -m sglang.launch_server \
+  --model stepfun-ai/Step3-VL-10B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code
+```
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model stepfun-ai/Step3-VL-10B \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- Result:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  30.85
+Total input tokens:                      14120
+Total input text tokens:                 720
+Total input vision tokens:               13400
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4217
+Request throughput (req/s):              0.32
+Input token throughput (tok/s):          457.71
+Output token throughput (tok/s):         136.79
+Peak output token throughput (tok/s):    240.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          594.50
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3083.40
+Median E2E Latency (ms):                 2747.00
+P90 E2E Latency (ms):                    4574.50
+P99 E2E Latency (ms):                    5462.49
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1327.69
+Median TTFT (ms):                        1341.01
+P99 TTFT (ms):                           1486.11
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          4.16
+Median TPOT (ms):                        4.17
+P99 TPOT (ms):                           4.18
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           4.17
+Median ITL (ms):                         4.18
+P95 ITL (ms):                            4.30
+P99 ITL (ms):                            4.38
+Max ITL (ms):                            8.24
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model stepfun-ai/Step3-VL-10B \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- Result:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  976.52
+Total input tokens:                      1416949
+Total input text tokens:                 76949
+Total input vision tokens:               1340000
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    510526
+Request throughput (req/s):              1.02
+Input token throughput (tok/s):          1451.02
+Output token throughput (tok/s):         523.14
+Peak output token throughput (tok/s):    20429.00
+Peak concurrent requests:                103
+Total token throughput (tok/s):          1974.16
+Concurrency:                             99.81
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   97463.22
+Median E2E Latency (ms):                 91872.75
+P90 E2E Latency (ms):                    118553.42
+P99 E2E Latency (ms):                    198445.56
+---------------Time to First Token----------------
+Mean TTFT (ms):                          94379.07
+Median TTFT (ms):                        87163.09
+P99 TTFT (ms):                           194871.41
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          5.89
+Median TPOT (ms):                        5.72
+P99 TPOT (ms):                           23.58
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.05
+Median ITL (ms):                         0.13
+P95 ITL (ms):                            0.56
+P99 ITL (ms):                            3.99
+Max ITL (ms):                            97551.06
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 MMMU Benchmark
+
+You can evaluate the model's accuracy using the MMMU dataset:
+
+- Model Deployment Command:
+
+```shell
+python -m sglang.launch_server \
+  --model stepfun-ai/Step3-VL-10B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code
+```
+
+- Benchmark Command:
+
+```shell
+python3 benchmark/mmmu/bench_sglang.py \
+    --port 30000 \
+    --concurrency 64
+```
+
+- Result:
+
+```
+Benchmark time: 934.6179109360091
+answers saved to: ./answer_sglang.json
+Evaluating...
+answers saved to: ./answer_sglang.json
+{'Accounting': {'acc': 0.667, 'num': 30},
+ 'Agriculture': {'acc': 0.367, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.4, 'num': 30},
+ 'Art': {'acc': 0.467, 'num': 30},
+ 'Art_Theory': {'acc': 0.5, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.367, 'num': 30},
+ 'Biology': {'acc': 0.3, 'num': 30},
+ 'Chemistry': {'acc': 0.467, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.567, 'num': 30},
+ 'Computer_Science': {'acc': 0.467, 'num': 30},
+ 'Design': {'acc': 0.567, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.3, 'num': 30},
+ 'Economics': {'acc': 0.6, 'num': 30},
+ 'Electronics': {'acc': 0.567, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.633, 'num': 30},
+ 'Finance': {'acc': 0.733, 'num': 30},
+ 'Geography': {'acc': 0.333, 'num': 30},
+ 'History': {'acc': 0.533, 'num': 30},
+ 'Literature': {'acc': 0.533, 'num': 30},
+ 'Manage': {'acc': 0.6, 'num': 30},
+ 'Marketing': {'acc': 0.767, 'num': 30},
+ 'Materials': {'acc': 0.6, 'num': 30},
+ 'Math': {'acc': 0.7, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.333, 'num': 30},
+ 'Music': {'acc': 0.4, 'num': 30},
+ 'Overall': {'acc': 0.523, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.483, 'num': 120},
+ 'Overall-Business': {'acc': 0.673, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.513, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.492, 'num': 120},
+ 'Overall-Science': {'acc': 0.5, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.481, 'num': 210},
+ 'Pharmacy': {'acc': 0.6, 'num': 30},
+ 'Physics': {'acc': 0.7, 'num': 30},
+ 'Psychology': {'acc': 0.467, 'num': 30},
+ 'Public_Health': {'acc': 0.733, 'num': 30},
+ 'Sociology': {'acc': 0.433, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.523
+```

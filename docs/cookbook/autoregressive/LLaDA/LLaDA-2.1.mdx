@@ -1,0 +1,717 @@
+---
+title: LLaDA 2.1
+metatags:
+    description: "Deploy LLaDA 2.1 with SGLang - large-scale discrete diffusion language model with parallel token generation, iterative denoising, MoE architecture, and reinforcement learning for reasoning."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[LLaDA 2.1](https://github.com/inclusionAI/LLaDA2.X) is a series of large-scale discrete diffusion language models (dLLMs) developed by the InclusionAI team at Ant Group. Unlike traditional autoregressive models that generate text left-to-right one token at a time, LLaDA 2.1 uses a diffusion-based approach — drafting tokens in parallel and refining them through iterative denoising, enabling self-correction during generation.
+
+**Key Features:**
+
+- **Token Editing (T2T + M2T)**: Combines Mask-to-Token (M2T) and Token-to-Token (T2T) editing, allowing the model to not only unmask tokens but also revise already-generated tokens mid-flight
+- **Dual Decoding Modes**: Speed Mode (S) for maximum throughput with T2T refinement, and Quality Mode (Q) for conservative thresholds and higher benchmark scores
+- **MoE Architecture**: Both variants use Mixture-of-Experts architecture for efficient scaling
+- **First Large-Scale RL for dLLMs**: Implements the first reinforcement learning framework specifically designed for diffusion language models, improving reasoning and instruction-following
+- **Lightning-Fast Decoding**: Up to 892 tokens/s on HumanEval+ for the 100B model
+
+**Available Models:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parameters</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Architecture</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Context Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>HuggingFace</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**LLaDA2.1-mini**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE (20 layers, 16 attention heads)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32,768 tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[inclusionAI/LLaDA2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**LLaDA2.1-flash**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32,768 tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[inclusionAI/LLaDA2.1-flash](https://huggingface.co/inclusionAI/LLaDA2.1-flash)</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:**
+
+Apache 2.0. Please refer to the [official LLaDA2.X repository](https://github.com/inclusionAI/LLaDA2.X) for details.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, and decoding mode.
+
+import { LLaDA21Deployment } from '/src/snippets/autoregressive/llada-21-deployment.jsx'
+
+<LLaDA21Deployment />
+
+### 3.2 Configuration Tips
+
+**dLLM-Specific Parameters:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dllm-algorithm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diffusion decoding algorithm</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`JointThreshold`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-remote-code`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Required for LLaDA model loading</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Always enabled</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mem-fraction-static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Static memory fraction for KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.8`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-running-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum concurrent requests</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1` (for best quality)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention computation backend</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`flashinfer`</td>
+    </tr>
+  </tbody>
+</table>
+
+**Decoding Mode Comparison:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Threshold</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Speed</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Quality</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Best For</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Quality Mode (Q)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Conservative</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Moderate</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Higher benchmark scores</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Accuracy-critical tasks</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Speed Mode (S)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Aggressive</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Very fast, relies on T2T editing</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Slightly lower</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Throughput-critical tasks</td>
+    </tr>
+  </tbody>
+</table>
+
+**Hardware Requirements:**
+
+- **LLaDA2.1-mini (16B)**: ~47 GB VRAM, runs on a single GPU (TP=1)
+- **LLaDA2.1-flash (100B)**: Requires multi-GPU setup (TP=4 on H100/H200, TP=2 on B200)
+
+## 4. Model Invocation
+
+### 4.1 Deployment
+
+Start the server using the command generated above, for example:
+
+```shell
+python -m sglang.launch_server \
+  --model-path inclusionAI/LLaDA2.1-mini \
+  --dllm-algorithm JointThreshold \
+  --tp 1 \
+  --trust-remote-code \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 1 \
+  --attention-backend flashinfer \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### 4.2 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+
+**Simple Completion Example:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="inclusionAI/LLaDA2.1-mini",
+    messages=[
+        {"role": "user", "content": "Explain what a diffusion language model is in simple terms."}
+    ],
+    max_tokens=1024
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```
+Sure! Let's break it down in simple terms.
+
+A **diffusion language model** is a type of artificial intelligence that learns to generate text—like sentences, stories, or emails—by studying a lot of written text.
+
+Here’s how it works, using a simple real-life analogy:
+
+Imagine you have a big book full of stories. A diffusion language model is trying to learn how to write a new story. Instead of being told the rules, it starts by looking at all the words in the book and trying to understand how words usually go together.
+
+Now, think of the process like this:
+
+1. **Start with random noise**: The model begins with a completely random set of words (like a scribble on paper).
+2. ** ** "clean up" the noise**: It gradually "denoises" the noise by turning it into meaningful text, word by word, based on what it learned learned from the book.
+3. **Learn from patterns**: As it does this, it learns patterns—like how words often follow each other, or how sentences start.
+4. **Generate new text**: Once it’s learned the patterns, it can create new, coherent sentences or stories by starting from a and and building it up word by word.
+
+So, the "diffusion" part comes from the idea of going from random noise to clear, meaningful text—like turning a scribble into a full story.
+
+In short:
+A diffusion language model is an AI that learns to write text by reading lots of books and gradually turning random noise into coherent, meaningful sentences based on what it learned.
+```
+
+### 4.3 Advanced Usage
+
+#### 4.3.1 Streaming
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="inclusionAI/LLaDA2.1-mini",
+    messages=[
+        {"role": "user", "content": "Write a Python function to compute the Fibonacci sequence."}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+````
+Here are several ways to implement the Fibonacci sequence in Python:
+
+## 1. Recursive Approach (Simple but Inefficient)
+
+```python
+def fibonacci_recursive(n):
+    """
+    Compute the nth Fibonacci number using recursion.
+
+    Args:
+        n (int): The position in the Fibonacci sequence (0-indexed)
+
+    Returns:
+        int: The nth Fibonacci number
+
+    Raises:
+        ValueError: If n is negative
+    """
+    if n < 0:
+        raise ValueError("n must be non-negative")
+
+    if n <= 1:
+        return n
+
+    return fibonacci_recursive(n - 1) + fibonacci_recursive(n - 2)
+
+# Example usage
+print(fibonacci_recursive(10))  # Output: 55
+```
+
+## 2. Iterative Approach (Efficient)
+...
+````
+
+#### 4.3.2 Code Generation
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="inclusionAI/LLaDA2.1-mini",
+    messages=[
+        {"role": "user", "content": "Write a Python function that checks if a string is a palindrome. Include docstring and test cases."}
+    ],
+    max_tokens=2048
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+````
+```python
+def is_palindrome(s):
+    """
+    Check if a string is a palindrome.
+
+    A palindrome is a word, phrase, or sequence that reads the same backward as forward.
+    This function ignores case, spaces, punctuation, and non characters characters.
+
+    Args:
+        s (str): The string to check
+
+    Returns:
+        bool: True if the string is a palindrome, False otherwise
+
+    Examples:
+        >>> is_palindrome("racecar")
+        True
+        >>> is_palindrome("A man a plan a canal Panama")
+        True
+        >>> is_palindrome("race a car")
+        False
+        >>> is_palindrome("")
+        True
+        >>> is_palindrome("a")
+        True
+    """
+    # Remove non-alphanumeric characters and convert to lowercase
+    cleaned = ''.join(char.lower() for char in s if char.isalnum())
+
+    # Check if the cleaned string reads the same forwards and backwards
+    return cleaned == cleaned[::-1]
+
+
+# Test cases
+def test_is_palindrome():
+    """Test the is_palindrome function with various inputs."""
+
+    # Test basic palindromes
+    assert is_palindrome("racecar") == True
+    assert is_palindrome("level") == True
+    assert is_palindrome("madam") == True
+    assert is_palindrome("radar") == True
+
+    # Test palindromes with spaces and punctuation
+    assert is_palindrome("A man a plan a canal Panama") == True
+    assert is_palindrome("race a car") == False
+    assert is_palindrome("Was it a car or a cat I saw?") == True
+    assert is_palindrome("Madam, I'm Adam") == True
+
+    # Test edge cases
+    assert is_palindrome("") == True
+    assert is_palindrome("a") == True
+    assert is_palindrome("A") == True
+    assert is_palindrome("Aa") == True
+
+    # Test non-palindromes
+    assert is_palindrome("hello") == False
+    assert is_palindrome("world") == False
+    assert is_palindrome("python") == False
+
+    # Test single characters
+    assert is_palindrome("1") == True
+    assert is_palindrome("1") == True
+
+    print("All tests passed!")
+
+
+# Run the tests
+if __name__ == "__main__":
+    # Example usage
+    print("Testing isalindrome function:")
+    print(f"'racecar' {is_palindrome('racecar')}")
+    print(f"'A man a plan a canal Panama': {is_palindrome('A man a plan a canal Panama')}")
+    print(f"'race a car': {is_palindrome('race a car')}")
+    print(f"'hello': {is_palindrome('hello')}")
+
+    # Run tests
+    test_is_palindrome()
+```
+
+This implementation includes:
+
+1. **Comprehensive function** `is_palindrome()` that:
+   - Ignores case by converting to lowercase
+   - Removes all non-alphanumeric characters (spaces, punctuation, etc.)
+   - Uses string slicing (`[::-1]`) to reverse the string
+
+2. **Detailed docstring** explaining:
+   - What the function does
+   - How it works
+   - Return value
+   - Examples of usage
+
+3. **Extensive test cases** covering:
+   - Basic palindromes
+   - Palindromes with spaces and punctuation
+   - Edge cases (empty string, single character)
+   - Non-palindromes
+   - Mixed case scenarios
+
+4. **Test function** that uses assertions to verify the function works correctly
+
+The function efficiently handles real-world palindrome checking by ignoring case, spaces, and punctuation, making it suitable for phrases like "A man a plan a canal Panama".
+````
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 (4x)
+- SGLang Version: 0.5.8+
+
+#### 5.1.1 LLaDA2.1-mini
+
+**Model Deployment:**
+
+```bash
+python -m sglang.launch_server \
+  --model-path inclusionAI/LLaDA2.1-mini \
+  --dllm-algorithm JointThreshold \
+  --tp 1 \
+  --trust-remote-code \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 1 \
+  --attention-backend flashinfer
+```
+
+- Latency Benchmark
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model inclusionAI/LLaDA2.1-mini \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- **Latency Result**:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  9.90
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    3433
+Request throughput (req/s):              1.01
+Input token throughput (tok/s):          616.26
+Output token throughput (tok/s):         426.26
+Peak output token throughput (tok/s):    1010.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          1042.53
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   988.87
+Median E2E Latency (ms):                 655.27
+P90 E2E Latency (ms):                    1952.50
+P99 E2E Latency (ms):                    2932.19
+---------------Time to First Token----------------
+Mean TTFT (ms):                          152.74
+Median TTFT (ms):                        150.37
+P99 TTFT (ms):                           229.78
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          2.16
+Median TPOT (ms):                        2.08
+P99 TPOT (ms):                           3.72
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           2.10
+Median ITL (ms):                         1.99
+P95 ITL (ms):                            4.03
+P99 ITL (ms):                            6.34
+Max ITL (ms):                            26.59
+==================================================
+```
+
+- Throughput Benchmark
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model inclusionAI/LLaDA2.1-mini \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+- **Throughput Result**:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  467.74
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    189717
+Request throughput (req/s):              1.07
+Input token throughput (tok/s):          534.12
+Output token throughput (tok/s):         540.17
+Peak output token throughput (tok/s):    1753.00
+Peak concurrent requests:                105
+Total token throughput (tok/s):          1074.30
+Concurrency:                             90.77
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   84912.27
+Median E2E Latency (ms):                 86564.26
+P90 E2E Latency (ms):                    110567.26
+P99 E2E Latency (ms):                    114303.38
+---------------Time to First Token----------------
+Mean TTFT (ms):                          83920.39
+Median TTFT (ms):                        85669.54
+P99 TTFT (ms):                           112969.91
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          2.67
+Median TPOT (ms):                        1.65
+P99 TPOT (ms):                           4.43
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.69
+Median ITL (ms):                         1.46
+P95 ITL (ms):                            3.96
+P99 ITL (ms):                            4.84
+Max ITL (ms):                            92.08
+==================================================
+```
+
+
+#### 5.1.2 LLaDA2.1-flash
+
+**Model Deployment:**
+
+```bash
+python -m sglang.launch_server \
+  --model-path inclusionAI/LLaDA2.1-flash \
+  --dllm-algorithm JointThreshold \
+  --tp 4 \
+  --trust-remote-code \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 1 \
+  --attention-backend flashinfer
+```
+
+- Latency Benchmark
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model inclusionAI/LLaDA2.1-flash \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- **Latency Result**:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  14.46
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    3276
+Request throughput (req/s):              0.69
+Input token throughput (tok/s):          421.79
+Output token throughput (tok/s):         291.75
+Peak output token throughput (tok/s):    676.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          713.53
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1445.16
+Median E2E Latency (ms):                 968.06
+P90 E2E Latency (ms):                    3101.86
+P99 E2E Latency (ms):                    4208.49
+---------------Time to First Token----------------
+Mean TTFT (ms):                          231.63
+Median TTFT (ms):                        242.67
+P99 TTFT (ms):                           341.33
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          3.04
+Median TPOT (ms):                        2.79
+P99 TPOT (ms):                           5.33
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           3.05
+Median ITL (ms):                         2.41
+P95 ITL (ms):                            7.25
+P99 ITL (ms):                            8.27
+Max ITL (ms):                            29.27
+==================================================
+```
+
+- Throughput Benchmark
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model inclusionAI/LLaDA2.1-flash \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+- **Throughput Result**:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  671.85
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    177961
+Request throughput (req/s):              0.74
+Input token throughput (tok/s):          371.85
+Output token throughput (tok/s):         376.07
+Peak output token throughput (tok/s):    1521.00
+Peak concurrent requests:                103
+Total token throughput (tok/s):          747.92
+Concurrency:                             91.28
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   122658.36
+Median E2E Latency (ms):                 125265.55
+P90 E2E Latency (ms):                    159554.07
+P99 E2E Latency (ms):                    165174.88
+---------------Time to First Token----------------
+Mean TTFT (ms):                          121009.17
+Median TTFT (ms):                        124437.80
+P99 TTFT (ms):                           163579.29
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          4.73
+Median TPOT (ms):                        2.16
+P99 TPOT (ms):                           7.13
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           2.38
+Median ITL (ms):                         1.40
+P95 ITL (ms):                            6.89
+P99 ITL (ms):                            8.60
+Max ITL (ms):                            176.78
+==================================================
+```
+
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+```bash
+python -m sglang.test.few_shot_gsm8k \
+  --num-questions 200 \
+  --port 8000
+```
+
+**Results:**
+
+```
+Accuracy: 0.895
+Invalid: 0.000
+Latency: 100.552 s
+Output throughput: 262.094 token/s
+```

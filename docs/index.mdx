@@ -1,0 +1,415 @@
+---
+title: Welcome to SGLang
+mode: center
+---
+
+<a
+  class="github-button"
+  href="https://github.com/sgl-project/sglang"
+  data-size="large"
+  data-show-count="true"
+  aria-label="Star sgl-project/sglang on GitHub"
+>
+  Star
+</a>
+<a
+  class="github-button"
+  href="https://github.com/sgl-project/sglang/fork"
+  data-icon="octicon-repo-forked"
+  data-size="large"
+  data-show-count="true"
+  aria-label="Fork sgl-project/sglang on GitHub"
+>
+  Fork
+</a>
+<script async defer src="https://buttons.github.io/buttons.js"></script>
+<br></br>
+
+A high-performance serving framework for large language models
+and multimodal models.
+
+<Columns cols={2}>
+  <Card title="Performance & Runtime" icon="arrow-trend-up">
+    Designed for low-latency, high-throughput inference with RadixAttention, prefix caching, and multi-GPU parallelism.
+  </Card>
+
+<Card title="Models & Ecosystem" icon="hexagon-nodes">
+  Broad support for Llama, Qwen, DeepSeek, and more. Compatible with Hugging
+  Face and OpenAI APIs.
+</Card>
+
+<Card title="Extensive Hardware Support" icon="microchip">
+  Native support for NVIDIA, AMD, Intel Xeon, Google TPU, and Ascend NPU
+  accelerators.
+</Card>
+
+  <Card title="Community & Training" icon="users">
+    Open-source with widespread adoption, powering 400k+ GPUs and integrated with major RL frameworks.
+  </Card>
+</Columns>
+
+---
+
+## Get Started
+
+SGLang is an inference framework meant for production level serving.<br></br>
+It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
+
+<Columns cols={2}>
+<Card title="Install SGLang" icon="angles-down" href="./docs/get-started/installation">
+  Native support for NVIDIA, AMD, Intel Xeon, Google TPU, and Ascend NPU
+  accelerators.
+</Card>
+
+<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
+  Open-source with widespread adoption, powering 400k+ GPUs and integrated with major RL frameworks.
+</Card>
+</Columns>
+
+---
+
+## News and latest blogs
+
+{/* BEGIN_LMSYS_SGLANG_BLOG_CARDS */}
+<div className="not-prose">
+  <div
+    style={{
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
+      gap: "1rem",
+      alignItems: "stretch",
+    }}
+  >
+    <a
+      href="https://lmsys.org/blog/2026-02-20-gb300-inferencex/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/gb300_inferencex/img-1.png"
+          alt="Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"February 20, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-02-19-gb300-longctx/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/gb300_longctx/cover.png"
+          alt="Deploying DeepSeek on GB300 NVL72: Big Wins in Long-Context Inference"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Deploying DeepSeek on GB300 NVL72: Big Wins in Long-Context Inference"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"February 19, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-02-16-sglang-diffusion-advanced-optimizations/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/sgl-diffusion/sgl-diffusion-banner-16-9.png"
+          alt="SGLang-Diffusion: Advanced Optimizations for Production-Ready Video Generation"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"SGLang-Diffusion: Advanced Optimizations for Production-Ready Video Generation"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"February 16, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-02-11-Qwen-latency/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/qwen_amd_latency/preview.png"
+          alt="Unleashing Computational Power: Ultimate Latency Optimization of Qwen3 and Qwen3-VL on AMD MI300X Series"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Unleashing Computational Power: Ultimate Latency Optimization of Qwen3 and Qwen3-VL on AMD MI300X Series"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"February 11, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-01-26-int4-qat/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://raw.githubusercontent.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/refs/heads/main/rlhf/slime/int4/figs/fake-quantize-STE.png"
+          alt="Squeezing 1TB Model Rollout into a Single H200: INT4 QAT RL End-to-End Practice"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Squeezing 1TB Model Rollout into a Single H200: INT4 QAT RL End-to-End Practice"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"January 26, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-01-21-novita-glm4/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/novita-glm4/novita-glm4-preview.png"
+          alt="Optimizing GLM4-MoE for Production: 65% Faster TTFT with SGLang"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Optimizing GLM4-MoE for Production: 65% Faster TTFT with SGLang"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"January 21, 2026"}
+        </p>
+      </div>
+    </a>
+  </div>
+</div>
+{/* END_LMSYS_SGLANG_BLOG_CARDS */}

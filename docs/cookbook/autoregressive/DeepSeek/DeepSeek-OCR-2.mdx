@@ -1,0 +1,250 @@
+---
+title: DeepSeek-OCR-2
+metatags:
+    description: "Deploy DeepSeek-OCR-2 with SGLang - high-accuracy text extraction from images and documents for OCR tasks."
+---
+
+## 1. Model Introduction
+
+[DeepSeek-OCR-2](https://github.com/deepseek-ai/DeepSeek-OCR-2) is DeepSeek's next-generation OCR (Optical Character Recognition) model, building on DeepSeek-OCR with improved accuracy and broader document understanding capabilities. The model is optimized for high-accuracy text extraction from images across a wide variety of document types and formats.
+
+**Key Features:**
+
+- **Semantic-Aware Visual Encoding (DeepEncoder V2)**: DeepSeek-OCR-2 introduces DeepEncoder V2, which models document reading order in a more human-like, semantic-driven manner rather than relying on fixed raster scanning. This significantly improves logical reading flow in complex layouts (e.g., multi-column documents).
+- **Stronger Layout and Structural Understanding**: DeepSeek-OCR-2 demonstrates improved performance on structured documents such as tables, forms, and dense multi-column pages. It reduces reading-order errors and improves overall document parsing robustness compared to the original version.
+- **Improved Accuracy While Maintaining Token Efficiency**: The original DeepSeek-OCR emphasized aggressive visual token compression. OCR-2 maintains high token efficiency while delivering higher benchmark performance, particularly on document-level understanding tasks.
+- **Better Generalization Across Complex Document Tasks**: DeepSeek-OCR-2 performs more consistently across multilingual documents, structured data extraction, and visually complex content, making it more suitable for real-world document intelligence scenarios beyond plain text OCR.
+
+**Available Models:**
+
+- **Base Model**: [deepseek-ai/DeepSeek-OCR-2](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2) - Recommended for OCR tasks
+
+**License:**
+To use DeepSeek-OCR-2, you must agree to DeepSeek's Community License. See [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2/blob/main/LICENSE.txt) for details.
+
+For more details, please refer to the [official DeepSeek-OCR-2 repository](https://github.com/deepseek-ai/DeepSeek-OCR-2).
+
+## 2. SGLang Installation
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and deployment strategy.
+
+import { DeepSeekOCRV2Deployment } from '/src/snippets/autoregressive/deepseek-ocr-v2-deployment.jsx'
+
+<DeepSeekOCRV2Deployment />
+
+**Note**: DeepSeek-OCR-2 has ~3.58B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](https://docs.sglang.io/advanced_features/dp_dpa_smg_guide.html) for more details.
+
+### 3.2 Configuration Tips
+
+For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](https://docs.sglang.io/basic_usage/deepseek_v3.html).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+**OpenAI-compatible request example**
+
+```python
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "deepseek-ai/DeepSeek-OCR-2",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<image>\n<|grounding|>Convert the document to markdown."},
+                {"type": "image_url", "image_url": {"url": "https://example.com/your_image.jpg"}},
+            ],
+        }
+    ],
+    "max_tokens": 512,
+}
+
+response = requests.post(url, json=data)
+print(response.text)
+```
+
+**Reference**
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+
+### 4.2 Recommended Prompts
+
+The following prompts are recommended by the [official model card](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2#main-prompts).
+
+**Structured document conversion** — extracts text while preserving layout:
+
+```
+<image>
+<|grounding|>Convert the document to markdown.
+```
+
+**Free-form OCR** — extracts without layouts:
+
+```
+<image>
+Free OCR.
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA H200 GPU (1x)
+- Model: DeepSeek-OCR-2
+- Tensor Parallelism: 1
+- sglang version: 0.0.0.dev1+g93fca0bbc
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses. For more details on how to perform evaluation, see [Evaluating New Models with SGLang](https://docs.sglang.io/developer_guide/evaluating_new_models.html).
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-OCR-2 \
+  --enable-multimodal \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-OCR-2 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  3.54
+Total input tokens:                      1972
+Total input text tokens:                 1972
+Total generated tokens:                  2784
+Total generated tokens (retokenized):    2710
+Request throughput (req/s):              2.83
+Input token throughput (tok/s):          557.53
+Output token throughput (tok/s):         787.10
+Peak output token throughput (tok/s):    818.00
+Peak concurrent requests:                5
+Total token throughput (tok/s):          1344.63
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   352.69
+Median E2E Latency (ms):                 392.34
+P90 E2E Latency (ms):                    540.64
+P99 E2E Latency (ms):                    639.01
+---------------Time to First Token----------------
+Mean TTFT (ms):                          18.08
+Median TTFT (ms):                        16.57
+P99 TTFT (ms):                           25.67
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.18
+Median TPOT (ms):                        1.21
+P99 TPOT (ms):                           1.22
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.21
+Median ITL (ms):                         1.21
+P95 ITL (ms):                            1.28
+P99 ITL (ms):                            1.44
+Max ITL (ms):                            4.32
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-OCR-2 \
+  --enable-multimodal \
+  --tp 1 \
+  --ep 1 \
+  --dp 1 \
+  --enable-dp-attention \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-OCR-2 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  14.79
+Total input tokens:                      301698
+Total input text tokens:                 301698
+Total generated tokens:                  188375
+Total generated tokens (retokenized):    185236
+Request throughput (req/s):              67.63
+Input token throughput (tok/s):          20402.54
+Output token throughput (tok/s):         12738.99
+Peak output token throughput (tok/s):    17508.00
+Peak concurrent requests:                187
+Total token throughput (tok/s):          33141.53
+Concurrency:                             86.87
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1284.50
+Median E2E Latency (ms):                 866.07
+P90 E2E Latency (ms):                    3027.32
+P99 E2E Latency (ms):                    5490.63
+---------------Time to First Token----------------
+Mean TTFT (ms):                          86.08
+Median TTFT (ms):                        50.09
+P99 TTFT (ms):                           613.92
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.79
+Median TPOT (ms):                        6.54
+P99 TPOT (ms):                           50.10
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.42
+Median ITL (ms):                         4.64
+P95 ITL (ms):                            23.65
+P99 ITL (ms):                            39.62
+Max ITL (ms):                            452.65
+==================================================
+```

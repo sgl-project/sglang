@@ -1,0 +1,634 @@
+---
+title: GLM-5
+metatags:
+    description: "Deploy GLM-5 with SGLang on AMD GPUs - state-of-the-art reasoning, enhanced coding, and robust tool calling capabilities."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[GLM-5](https://huggingface.co/zai-org/GLM-5) is the most powerful language model in the GLM series developed by Zhipu AI, targeting complex systems engineering and long-horizon agentic tasks. Scaling from GLM-4.5's 355B parameters (32B active) to 744B parameters (40B active), GLM-5 integrates DeepSeek Sparse Attention (DSA) to largely reduce deployment cost while preserving long-context capacity.
+
+With advances in both pre-training (28.5T tokens) and post-training via [slime](https://github.com/THUDM/slime) (a novel asynchronous RL infrastructure), GLM-5 delivers significant improvements over GLM-4.7 and achieves best-in-class performance among open-source models on reasoning, coding, and agentic tasks.
+
+**Key Features:**
+
+- **Systems Engineering & Agentic Tasks**: Purpose-built for complex systems engineering and long-horizon agentic tasks
+- **State-of-the-Art Performance**: Best-in-class among open-source models on reasoning (HLE, AIME, GPQA), coding (SWE-bench, Terminal-Bench), and agentic tasks (BrowseComp, Vending Bench 2)
+- **DeepSeek Sparse Attention (DSA)**: Reduces deployment cost while preserving long-context capacity
+- **Multiple Quantizations**: BF16 and FP8 variants for different performance/memory trade-offs
+- **Speculative Decoding**: EAGLE-based speculative decoding support for lower latency
+
+**Available Models:**
+
+- **BF16 (Full precision)**: [zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5)
+- **FP8 (8-bit quantized)**: [zai-org/GLM-5-FP8](https://huggingface.co/zai-org/GLM-5-FP8)
+
+**License:** MIT
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+GLM-5 requires a specific SGLang Docker image or install from source:
+
+```bash
+# For Hopper GPUs (H100/H200)
+docker pull lmsysorg/sglang:glm5-hopper
+
+# For Blackwell GPUs (B200)
+docker pull lmsysorg/sglang:glm5-blackwell
+```
+
+For other installation methods, please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+
+:::note Blackwell (B200) Source Build
+If you build SGLang from source on Blackwell GPUs, you need to manually compile `sgl-kernel` due to existing kernel issues (Hopper GPUs are unaffected). See [sglang#18595](https://github.com/sgl-project/sglang/issues/18595) for details.
+:::
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities.
+
+import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.jsx'
+
+<GLM5Deployment />
+
+### 3.2 Configuration Tips
+
+
+- Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **DP Attention**: Enables data parallel attention for higher throughput under high concurrency. Note that DP attention trades off low-concurrency latency for high-concurrency throughput — disable it if your workload is latency-sensitive with few concurrent requests.
+- The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
+- BF16 model always requires **2x GPUs** compared to FP8:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=32</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+    </tr>
+  </tbody>
+</table>
+
+## 4. Model Invocation
+
+Deploy GLM-5 with the following command (FP8 on H200, all features enabled):
+
+```shell
+python -m sglang.launch_server \
+  --model zai-org/GLM-5-FP8 \
+  --tp 8 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.85 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+GLM-5 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
+
+To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
+
+- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
+- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
+
+**Example 1: Thinking Mode (Default)**
+
+Thinking mode is enabled by default. The model will reason step-by-step before answering, and the thinking process is returned via `reasoning_content`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Thinking mode is enabled by default, no extra parameters needed
+response = client.chat.completions.create(
+    model="zai-org/GLM-5-FP8",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```
+=============== Thinking =================
+The user wants me to solve a math problem: "What is 15% of 240?".
+
+Step 1: Understand the problem. I need to calculate a percentage of a number.
+Formula: Percentage × Number = Result.
+
+Step 2: Convert the percentage to a decimal or fraction.
+15% = 15/100 or 0.15.
+
+Step 3: Perform the multiplication.
+Method A: Decimal multiplication.
+0.15 × 240.
+Break it down:
+10% of 240 = 24.
+5% is half of 10%, so 12.
+15% = 10% + 5% = 24 + 12 = 36.
+
+Method B: Fraction multiplication.
+15/100 × 240.
+Simplify 240/100 = 2.4.
+15 × 2.4.
+10 × 2.4 = 24.
+5 × 2.4 = 12.
+24 + 12 = 36.
+
+Method C: Direct multiplication.
+240 × 0.15.
+240 × 0.10 = 24.
+240 × 0.05 = 12.
+24 + 12 = 36.
+
+Step 4: Final Verification.
+Is 36 reasonable?
+10% is 24. 20% is 48.
+15% is halfway between 10% and 20%.
+Halfway between 24 and 48 is 36.
+The result is correct.
+
+Step 5: Structure the final response. I will present the calculation clearly, perhaps showing the fractional or decimal method, or the mental math shortcut (10% + 5%).
+=============== Content =================
+Here is the step-by-step solution:
+
+**Step 1: Convert the percentage to a decimal.**
+To convert 15% to a decimal, divide by 100.
+$$15\% = \frac{15}{100} = 0.15$$
+
+**Step 2: Multiply the decimal by the number.**
+Now, multiply 0.15 by 240.
+$$0.15 \times 240$$
+
+**Step 3: Perform the calculation.**
+You can break this down to make it easier:
+$$0.15 = 0.10 + 0.05$$
+
+*   First, find 10% of 240:
+    $$0.10 \times 240 = 24$$
+*   Next, find 5% (which is half of 10%):
+    $$\frac{24}{2} = 12$$
+*   Add the two results together:
+    $$24 + 12 = 36$$
+
+**Answer:**
+15% of 240 is **36**.
+```
+
+**Example 2: Instruct Mode (Thinking Off)**
+
+To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Disable thinking mode via chat_template_kwargs
+response = client.chat.completions.create(
+    model="zai-org/GLM-5-FP8",
+    messages=[
+        {"role": "user", "content": "What is 15% of 240?"}
+    ],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    max_tokens=2048,
+    stream=True
+)
+
+# In Instruct mode, the model responds directly without reasoning_content
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```
+To find **15% of 240**, follow these steps:
+
+### Step 1: Convert the Percentage to a Decimal
+First, convert the percentage to a decimal by dividing by 100.
+
+\[
+15\% = \frac{15}{100} = 0.15
+\]
+
+### Step 2: Multiply by the Number
+Next, multiply the decimal by the number you want to find the percentage of.
+
+\[
+0.15 \times 240
+\]
+
+### Step 3: Perform the Multiplication
+Calculate the multiplication:
+
+\[
+0.15 \times 240 = 36
+\]
+
+### Final Answer
+\[
+\boxed{36}
+\]
+```
+
+#### 4.2.2 Tool Calling
+
+GLM-5 supports tool calling capabilities. Enable the tool call parser during deployment. Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+
+**Python Example (with Thinking Process):**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="zai-org/GLM-5-FP8",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```
+=============== Thinking =================
+The user is asking for the weather in Beijing. I have access to a get_weather function that can provide current weather information. Let me check what parameters are required:
+
+- location: required, should be "Beijing"
+- unit: optional (not in required array), can be "celsius" or "fahrenheit"
+
+Since the user didn't specify a unit preference and it's optional, I should not ask about it or make up a value. I'll just call the function with the required location parameter.I'll get the current weather in Beijing for you.
+=============== Content =================
+Tool Call: get_weather
+   Arguments:
+Tool Call: None
+   Arguments: {
+Tool Call: None
+   Arguments: "location": "Be
+Tool Call: None
+   Arguments: ijing"
+Tool Call: None
+   Arguments: }
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: H200 (8x)
+- Model: GLM-5-FP8
+- Tensor Parallelism: 8
+- SGLang Version: commit 947927bdb
+
+#### 5.1.1 Latency Benchmark
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-5-FP8 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  35.78
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4213
+Request throughput (req/s):              0.28
+Input token throughput (tok/s):          170.54
+Output token throughput (tok/s):         117.96
+Peak output token throughput (tok/s):    148.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          288.50
+Concurrency:                             1.00
+Accept length:                           3.48
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3576.31
+Median E2E Latency (ms):                 2935.97
+P90 E2E Latency (ms):                    5908.97
+P99 E2E Latency (ms):                    8588.08
+---------------Time to First Token----------------
+Mean TTFT (ms):                          290.88
+Median TTFT (ms):                        282.34
+P99 TTFT (ms):                           332.27
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.54
+Median TPOT (ms):                        6.97
+P99 TPOT (ms):                           9.04
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           7.80
+Median ITL (ms):                         6.81
+P95 ITL (ms):                            13.51
+P99 ITL (ms):                            26.99
+Max ITL (ms):                            29.50
+==================================================
+```
+
+#### 5.1.2 Throughput Benchmark
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-5-FP8 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  411.74
+Total input tokens:                      502493
+Total input text tokens:                 502493
+Total generated tokens:                  500251
+Total generated tokens (retokenized):    499614
+Request throughput (req/s):              2.43
+Input token throughput (tok/s):          1220.41
+Output token throughput (tok/s):         1214.97
+Peak output token throughput (tok/s):    2648.00
+Peak concurrent requests:                105
+Total token throughput (tok/s):          2435.38
+Concurrency:                             96.30
+Accept length:                           3.50
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   39648.76
+Median E2E Latency (ms):                 39058.12
+P90 E2E Latency (ms):                    57009.82
+P99 E2E Latency (ms):                    68880.33
+---------------Time to First Token----------------
+Mean TTFT (ms):                          20613.80
+Median TTFT (ms):                        21429.21
+P99 TTFT (ms):                           29543.17
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          38.73
+Median TPOT (ms):                        36.52
+P99 TPOT (ms):                           67.09
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           38.13
+Median ITL (ms):                         16.57
+P95 ITL (ms):                            86.01
+P99 ITL (ms):                            164.88
+Max ITL (ms):                            1307.02
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- Benchmark Command
+```bash
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+- Test Result
+```
+Accuracy: 0.955
+Invalid: 0.000
+Latency: 32.470 s
+Output throughput: 642.044 token/s
+```
+
+#### 5.2.2 MMLU Benchmark
+
+- Benchmark Command
+```bash
+python3 benchmark/mmlu/bench_sglang.py --port 30000
+```
+
+- Test Result
+```
+subject: abstract_algebra, #q:100, acc: 0.860
+subject: anatomy, #q:135, acc: 0.874
+subject: astronomy, #q:152, acc: 0.941
+subject: business_ethics, #q:100, acc: 0.880
+subject: clinical_knowledge, #q:265, acc: 0.932
+subject: college_biology, #q:144, acc: 0.972
+subject: college_chemistry, #q:100, acc: 0.640
+subject: college_computer_science, #q:100, acc: 0.900
+subject: college_mathematics, #q:100, acc: 0.810
+subject: college_medicine, #q:173, acc: 0.873
+subject: college_physics, #q:102, acc: 0.912
+subject: computer_security, #q:100, acc: 0.880
+subject: conceptual_physics, #q:235, acc: 0.928
+subject: econometrics, #q:114, acc: 0.807
+subject: electrical_engineering, #q:145, acc: 0.897
+subject: elementary_mathematics, #q:378, acc: 0.937
+subject: formal_logic, #q:126, acc: 0.778
+subject: global_facts, #q:100, acc: 0.710
+subject: high_school_biology, #q:310, acc: 0.961
+subject: high_school_chemistry, #q:203, acc: 0.847
+subject: high_school_computer_science, #q:100, acc: 0.960
+subject: high_school_european_history, #q:165, acc: 0.891
+subject: high_school_geography, #q:198, acc: 0.960
+subject: high_school_government_and_politics, #q:193, acc: 0.984
+subject: high_school_macroeconomics, #q:390, acc: 0.923
+subject: high_school_mathematics, #q:270, acc: 0.696
+subject: high_school_microeconomics, #q:238, acc: 0.962
+subject: high_school_physics, #q:151, acc: 0.821
+subject: high_school_psychology, #q:545, acc: 0.956
+subject: high_school_statistics, #q:216, acc: 0.889
+subject: high_school_us_history, #q:204, acc: 0.941
+subject: high_school_world_history, #q:237, acc: 0.945
+subject: human_aging, #q:223, acc: 0.857
+subject: human_sexuality, #q:131, acc: 0.908
+subject: international_law, #q:121, acc: 0.934
+subject: jurisprudence, #q:108, acc: 0.907
+subject: logical_fallacies, #q:163, acc: 0.933
+subject: machine_learning, #q:112, acc: 0.830
+subject: management, #q:103, acc: 0.942
+subject: marketing, #q:234, acc: 0.940
+subject: medical_genetics, #q:100, acc: 0.990
+subject: miscellaneous, #q:783, acc: 0.959
+subject: moral_disputes, #q:346, acc: 0.873
+subject: moral_scenarios, #q:895, acc: 0.837
+subject: nutrition, #q:306, acc: 0.922
+subject: philosophy, #q:311, acc: 0.897
+subject: prehistory, #q:324, acc: 0.929
+subject: professional_accounting, #q:282, acc: 0.844
+subject: professional_law, #q:1534, acc: 0.714
+subject: professional_medicine, #q:272, acc: 0.941
+subject: professional_psychology, #q:612, acc: 0.913
+subject: public_relations, #q:110, acc: 0.791
+subject: security_studies, #q:245, acc: 0.878
+subject: sociology, #q:201, acc: 0.940
+subject: us_foreign_policy, #q:100, acc: 0.920
+subject: virology, #q:166, acc: 0.596
+subject: world_religions, #q:171, acc: 0.936
+Total latency: 165.275
+Average accuracy: 0.877
+```

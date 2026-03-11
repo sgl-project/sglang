@@ -1,0 +1,987 @@
+---
+title: Kimi-K2.5
+metatags:
+    description: "Deploy Kimi-K2.5 MoE model with SGLang - 1T total parameters, 32B active, step-by-step reasoning and tool calling capabilities."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) is an open-source, native multimodal agentic model by Moonshot AI, built through continual pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It seamlessly integrates vision and language understanding with advanced agentic capabilities, instant and thinking modes.
+
+**Key Features:**
+
+- **Native Multimodality**: Pre-trained on vision–language tokens, K2.5 excels in visual knowledge, cross-modal reasoning, and agentic tool use grounded in visual inputs.
+- **Coding with Vision**: K2.5 generates code from visual specifications (UI designs, video workflows) and autonomously orchestrates tools for visual data processing.
+- **Agent Swarm**: K2.5 transitions from single-agent scaling to a self-directed, coordinated swarm-like execution scheme. It decomposes complex tasks into parallel sub-tasks executed by dynamically instantiated, domain-specific agents.
+
+For details, see [official documentation](https://huggingface.co/moonshotai/Kimi-K2.5) and [deployment guidance](https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/docs/deploy_guidance.md).
+
+## 2. SGLang Installation
+
+Refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and capabilities.
+
+import { KimiK25Deployment } from '/src/snippets/autoregressive/kimi-k25-deployment.jsx'
+
+<KimiK25Deployment />
+
+### 3.2 Configuration Tips
+
+- **Reasoning Parser**: Add `--reasoning-parser kimi_k2` for thinking mode to separate thinking and content.
+- **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+See [Basic API Usage](https://docs.sglang.ai/basic_usage/send_request.html).
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Multimodal (Vision + Text) Input
+
+Kimi-K2.5 supports native multimodal input with images:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="moonshotai/Kimi-K2.5",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "What is in this image? Describe it in detail."
+                }
+            ]
+        }
+    ],
+    temperature=0.7,
+    max_tokens=2048
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+This image shows a **receipt from Auntie Anne's**, the pretzel restaurant chain. Here's a detailed breakdown:
+
+## Header
+- **Logo**: The Auntie Anne's logo featuring a pretzel with a halo
+- **Store name**: "Auntie Anne's" in stylized text
+- Store location/address information (blurred out)
+
+## Purchase Details
+- **Item**: CINNAMON SUGAR (likely a cinnamon sugar pretzel)
+- **Quantity**: 1
+- **Unit price**: 17,000
+- **Line total**: 17,000
+
+## Financial Summary
+- **SUB TOTAL**: 17,000
+- **GRAND TOTAL**: 17,000
+- **CASH IDR**: 20,000 (payment in Indonesian Rupiah)
+- **CHANGE DUE**: 3,000
+
+## Key Observations
+- The currency is **Indonesian Rupiah (IDR)**
+- Customer paid 20,000 IDR in cash
+- Change received: 3,000 IDR
+- Bottom section contains blurred transaction details (likely date, time, receipt number, cashier ID)
+
+The receipt is printed on white thermal paper and appears to be placed on a dark surface. The transaction shows a straightforward single-item purchase.
+```
+
+#### 4.2.2 Reasoning Output
+
+Kimi-K2.5 supports both thinking mode and instant mode. You can get the reasoning content by calling the `reasoning_content` field in the response.
+
+**Usage:**
+
+```python
+import openai
+import base64
+import requests
+def simple_chat(client: openai.OpenAI, model_name: str):
+    messages = [
+        {'role': 'system', 'content': 'You are Kimi, an AI assistant created by Moonshot AI.'},
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': 'which one is bigger, 9.11 or 9.9? think carefully.'}
+            ],
+        },
+    ]
+    response = client.chat.completions.create(
+        model=model_name, messages=messages, stream=False, max_tokens=4096
+    )
+    print('====== Below is reasoning_content in Thinking Mode ======')
+    print(f'reasoning content: {response.choices[0].message.reasoning_content}')
+    print('====== Below is response in Thinking Mode ======')
+    print(f'response: {response.choices[0].message.content}')
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        stream=False,
+        max_tokens=4096,
+        extra_body= {'chat_template_kwargs': {"thinking": False}} # To use instant mode
+    )
+    print('====== Below is response in Instant Mode ======')
+    print(f'response: {response.choices[0].message.content}')
+
+if __name__ == "__main__":
+    client = openai.OpenAI(api_key="sk-123456", base_url="http://localhost:30000/v1")
+    simple_chat(client, "moonshotai/Kimi-K2.5")
+```
+
+**Output Example:**
+
+```text
+====== Below is reasoning_content in Thinking Mode ======
+reasoning content: The user is asking which number is bigger, 9.11 or 9.9. This is a classic "trick" question that plays on how people sometimes compare decimals incorrectly by treating them like strings or whole numbers.
+
+Let me think through this carefully:
+
+9.11 vs 9.9
+
+When comparing decimals, I need to look at the place values:
+- 9.11 = 9 + 1/10 + 1/100 = 9 + 0.1 + 0.01 = 9.11
+- 9.9 = 9 + 9/10 = 9 + 0.9 = 9.90
+
+Now comparing 9.11 and 9.90:
+- The integer parts are both 9, so we look at the tenths place.
+- 9.11 has 1 in the tenths place
+- 9.90 has 9 in the tenths place
+- Since 9 > 1, we have 9.9 > 9.11
+
+Alternatively, thinking about it as money:
+- $9.11 is nine dollars and eleven cents
+- $9.90 is nine dollars and ninety cents
+- 90 cents is more than 11 cents, so $9.90 > $9.11
+
+Another way:
+- 9.9 = 9.90
+- 9.90 > 9.11
+
+Common mistake: People might think 11 > 9, so 9.11 > 9.9, but that's wrong because 9.9 is actually 9.90, not 9.09 or something. The decimal places need to be aligned.
+
+So the answer is 9.9 is bigger than 9.11.
+
+Wait, I should make sure I'm not falling into any traps here. The user said "think carefully" which suggests they know about the common confusion between 9.11 and 9.9 (similar to the famous 0.999... = 1 debates, or the "9.11 vs 9.9" meme that went around regarding version numbers or dates).
+
+Let me double-check:
+- 9.11 = 9.110
+- 9.9 = 9.900
+- 9.900 > 9.110
+
+Yes, 9.9 is definitely bigger.
+
+I should explain this clearly by showing the decimal expansion or using the money analogy, as that's intuitive.
+====== Below is response in Thinking Mode ======
+response: **9.9 is bigger** than 9.11.
+
+Here's why people often get this wrong: They compare the numbers after the decimal point as if they were whole numbers ("11" vs "9") and think 11 > 9, so 9.11 must be larger. But that's incorrect because **9.9 is actually 9.90**, not 9.09.
+
+Think of it like money:
+- **9.11** = $\$9.11$ (9 dollars and 11 cents)
+- **9.9** = $\$9.90$ (9 dollars and 90 cents)
+
+Comparing the decimal places:
+- 9.**1**1 vs 9.**9**0
+- The tenths place: **1** vs **9**
+- Since 9 > 1, we have 9.90 > 9.11
+
+Or mathematically:
+$$9.9 - 9.11 = 0.79$$
+
+So **9.9 is larger by 0.79**.
+====== Below is response in Instant Mode ======
+response:  I need to compare 9.11 and 9.9.
+
+Let me think carefully. This is a common trick question because of how we read version numbers vs. decimal numbers.
+
+**As decimal numbers:**
+- 9.11 = 9 + 11/100 = 9.11
+- 9.9 = 9 + 9/10 = 9.90
+
+Since 9.90 > 9.11, **9.9 is bigger** (as decimals).
+
+**However**, if this were software version numbers (like "version 9.11" vs "version 9.9"), then 9.11 would be newer/bigger (11 > 9 in the versioning scheme).
+
+Given the notation with decimal points, the most natural interpretation is **decimal numbers**, so **9.9 is bigger**.
+```
+
+#### 4.2.3 Tool Calling
+
+Kimi-K2.5 supports tool calling capabilities for agentic tasks. Enable the tool call parser during deployment:
+
+**Deployment Command:**
+
+```shell
+python -m sglang.launch_server \
+  --model moonshotai/Kimi-K2.5 \
+  --tool-call-parser kimi_k2 \
+  --tp 8 \
+  --trust-remote-code
+```
+
+**Python Example:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming
+response = client.chat.completions.create(
+    model="moonshotai/Kimi-K2.5",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Accumulate tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+**Output Example:**
+
+```text
+🔧 Tool Call: get_weather
+   Arguments: {"location":"Beijing"}
+```
+
+**Handling Tool Call Results:**
+
+```python
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="moonshotai/Kimi-K2.5",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.4 Multimodal + Tool Calling (Agentic Vision)
+
+Combine vision understanding with tool calling for advanced agentic tasks:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_product",
+            "description": "Search for a product by name or description",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The product name or description to search for"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+response = client.chat.completions.create(
+    model="moonshotai/Kimi-K2.5",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Can you identify this product and search for similar items?"
+                }
+            ]
+        }
+    ],
+    tools=tools,
+    temperature=0.7,
+    max_tokens=2048
+)
+
+print(response.choices[0].message)
+```
+
+**Output Example:**
+
+```text
+ChatCompletionMessage(content="I can see from the receipt that the product is **CINNAMON SUGAR** from Auntie Anne's, which is their classic **Cinnamon Sugar Pretzel**. Let me search for similar items for you. ", refusal=None, role='assistant', annotations=None, audio=None, function_call=None, tool_calls=[ChatCompletionMessageFunctionToolCall(id='functions.search_product:0', function=Function(arguments='{"query": "cinnamon sugar pretzel"}', name='search_product'), type='function', index=0)], reasoning_content='The user is asking me to identify a product from a receipt and search for similar items. Looking at the receipt, I can see the product is "CINNAMON SUGAR" from Auntie Anne\'s. The price is 17,000 (which appears to be Indonesian Rupiah based on the "CASH IDR" text).\n \n Auntie Anne\'s is a chain that sells pretzels, so this is likely a Cinnamon Sugar Pretzel. I should search for this product to find similar items.\n \n Let me use the search_product function to search for "cinnamon sugar pretzel" or similar terms. ')
+```
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA H200 GPU (8x)
+- Model: Kimi-K2.5
+- Tensor Parallelism: 8
+- SGLang Version: 0.5.6.post2
+
+#### 5.1.1 Benchmark Commands
+
+**Scenario 1: Chat (1K/1K) - Most Important**
+
+- **Model Deployment**
+
+```bash
+python -m sglang.launch_server \
+  --model moonshotai/Kimi-K2.5 \
+  --tp 8 \
+  --trust-remote-code
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  39.77
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4221
+Request throughput (req/s):              0.25
+Input token throughput (tok/s):          153.40
+Output token throughput (tok/s):         106.10
+Peak output token throughput (tok/s):    156.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          259.50
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3972.87
+Median E2E Latency (ms):                 4044.55
+P90 E2E Latency (ms):                    7046.30
+P99 E2E Latency (ms):                    7441.13
+---------------Time to First Token----------------
+Mean TTFT (ms):                          176.89
+Median TTFT (ms):                        154.24
+P99 TTFT (ms):                           285.75
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.22
+Median TPOT (ms):                        9.32
+P99 TPOT (ms):                           12.72
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.02
+Median ITL (ms):                         8.80
+P95 ITL (ms):                            13.23
+P99 ITL (ms):                            14.17
+Max ITL (ms):                            29.38
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  158.05
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    40775
+Request throughput (req/s):              0.51
+Input token throughput (tok/s):          250.99
+Output token throughput (tok/s):         258.18
+Peak output token throughput (tok/s):    1103.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          509.17
+Concurrency:                             14.09
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   27837.05
+Median E2E Latency (ms):                 23508.00
+P90 E2E Latency (ms):                    57126.31
+P99 E2E Latency (ms):                    66044.35
+---------------Time to First Token----------------
+Mean TTFT (ms):                          374.30
+Median TTFT (ms):                        375.51
+P99 TTFT (ms):                           695.58
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          53.25
+Median TPOT (ms):                        57.93
+P99 TPOT (ms):                           85.45
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           53.95
+Median ITL (ms):                         53.97
+P95 ITL (ms):                            84.74
+P99 ITL (ms):                            244.84
+Max ITL (ms):                            655.61
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  996.64
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    252588
+Request throughput (req/s):              0.50
+Input token throughput (tok/s):          250.67
+Output token throughput (tok/s):         253.51
+Peak output token throughput (tok/s):    1199.00
+Peak concurrent requests:                104
+Total token throughput (tok/s):          504.18
+Concurrency:                             92.70
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   184773.75
+Median E2E Latency (ms):                 174183.65
+P90 E2E Latency (ms):                    343625.28
+P99 E2E Latency (ms):                    404284.53
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1289.59
+Median TTFT (ms):                        1313.35
+P99 TTFT (ms):                           2346.78
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          364.70
+Median TPOT (ms):                        403.32
+P99 TPOT (ms):                           452.34
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           363.82
+Median ITL (ms):                         316.21
+P95 ITL (ms):                            745.91
+P99 ITL (ms):                            1345.88
+Max ITL (ms):                            3118.59
+==================================================
+```
+
+**Scenario 2: Reasoning (1K/8K)**
+
+- Low Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  680.26
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  44462
+Total generated tokens (retokenized):    44455
+Request throughput (req/s):              0.01
+Input token throughput (tok/s):          8.97
+Output token throughput (tok/s):         65.36
+Peak output token throughput (tok/s):    151.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          74.33
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   68019.29
+Median E2E Latency (ms):                 70568.85
+P90 E2E Latency (ms):                    113237.40
+P99 E2E Latency (ms):                    121682.34
+---------------Time to First Token----------------
+Mean TTFT (ms):                          206.17
+Median TTFT (ms):                        177.28
+P99 TTFT (ms):                           445.37
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.36
+Median TPOT (ms):                        15.89
+P99 TPOT (ms):                           16.43
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           15.26
+Median ITL (ms):                         15.85
+P95 ITL (ms):                            17.50
+P99 ITL (ms):                            23.21
+Max ITL (ms):                            45.22
+==================================================
+```
+
+- Medium Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  2475.98
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  318306
+Total generated tokens (retokenized):    318166
+Request throughput (req/s):              0.03
+Input token throughput (tok/s):          16.02
+Output token throughput (tok/s):         128.56
+Peak output token throughput (tok/s):    847.00
+Peak concurrent requests:                18
+Total token throughput (tok/s):          144.58
+Concurrency:                             14.62
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   452592.46
+Median E2E Latency (ms):                 486002.05
+P90 E2E Latency (ms):                    833197.57
+P99 E2E Latency (ms):                    957399.48
+---------------Time to First Token----------------
+Mean TTFT (ms):                          359.38
+Median TTFT (ms):                        350.78
+P99 TTFT (ms):                           500.36
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          111.18
+Median TPOT (ms):                        122.76
+P99 TPOT (ms):                           145.90
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           113.69
+Median ITL (ms):                         122.81
+P95 ITL (ms):                            147.87
+P99 ITL (ms):                            151.03
+Max ITL (ms):                            272.05
+==================================================
+```
+
+- High Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+```
+Waiting for completion...
+```
+
+**Scenario 3: Summarization (8K/1K)**
+
+- Low Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  120.73
+Total input tokens:                      41941
+Total input text tokens:                 41941
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.08
+Input token throughput (tok/s):          347.41
+Output token throughput (tok/s):         34.96
+Peak output token throughput (tok/s):    73.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          382.36
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   12068.56
+Median E2E Latency (ms):                 10211.36
+P90 E2E Latency (ms):                    23203.32
+P99 E2E Latency (ms):                    30677.66
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1625.64
+Median TTFT (ms):                        1526.63
+P99 TTFT (ms):                           3743.51
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          24.95
+Median TPOT (ms):                        23.95
+P99 TPOT (ms):                           35.40
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           24.80
+Median ITL (ms):                         21.73
+P95 ITL (ms):                            59.56
+P99 ITL (ms):                            61.10
+Max ITL (ms):                            62.70
+==================================================
+```
+
+- Medium Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  389.96
+Total input tokens:                      300020
+Total input text tokens:                 300020
+Total generated tokens:                  41669
+Total generated tokens (retokenized):    41670
+Request throughput (req/s):              0.21
+Input token throughput (tok/s):          769.36
+Output token throughput (tok/s):         106.86
+Peak output token throughput (tok/s):    304.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          876.22
+Concurrency:                             14.95
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   72870.97
+Median E2E Latency (ms):                 70495.88
+P90 E2E Latency (ms):                    121820.46
+P99 E2E Latency (ms):                    148933.09
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2460.45
+Median TTFT (ms):                        1976.29
+P99 TTFT (ms):                           7305.53
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          140.57
+Median TPOT (ms):                        142.31
+P99 TPOT (ms):                           273.40
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           135.44
+Median ITL (ms):                         95.96
+P95 ITL (ms):                            152.93
+P99 ITL (ms):                            1488.37
+Max ITL (ms):                            6540.24
+==================================================
+```
+
+- High Concurrency
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-K2.5 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  1279.50
+Total input tokens:                      1273893
+Total input text tokens:                 1273893
+Total generated tokens:                  170000
+Total generated tokens (retokenized):    169981
+Request throughput (req/s):              0.25
+Input token throughput (tok/s):          995.62
+Output token throughput (tok/s):         132.86
+Peak output token throughput (tok/s):    703.00
+Peak concurrent requests:                67
+Total token throughput (tok/s):          1128.49
+Concurrency:                             60.12
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   240385.63
+Median E2E Latency (ms):                 236266.30
+P90 E2E Latency (ms):                    429882.12
+P99 E2E Latency (ms):                    515158.36
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2710.44
+Median TTFT (ms):                        2345.63
+P99 TTFT (ms):                           7144.20
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          443.84
+Median TPOT (ms):                        493.29
+P99 TPOT (ms):                           606.19
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           448.23
+Median ITL (ms):                         296.17
+P95 ITL (ms):                            1869.15
+P99 ITL (ms):                            2708.95
+Max ITL (ms):                            7778.47
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 MMMU Benchmark
+
+You can evaluate the model's accuracy using the MMMU dataset with `lmms_eval`:
+
+- Benchmark Command:
+
+```shell
+python3 benchmark/mmmu/bench_sglang.py \
+    --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of_box\|>" \
+    --port 30000 \
+    --concurrency 64
+```
+
+- Result:
+
+```text
+Benchmark time: 2903.3503892859444
+answers saved to: ./answer_sglang.json
+Evaluating...
+answers saved to: ./answer_sglang.json
+{'Accounting': {'acc': 0.8, 'num': 30},
+ 'Agriculture': {'acc': 0.667, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.733, 'num': 30},
+ 'Art': {'acc': 0.7, 'num': 30},
+ 'Art_Theory': {'acc': 0.833, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.667, 'num': 30},
+ 'Biology': {'acc': 0.69, 'num': 29},
+ 'Chemistry': {'acc': 0.5, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.467, 'num': 30},
+ 'Computer_Science': {'acc': 0.6, 'num': 30},
+ 'Design': {'acc': 0.8, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.4, 'num': 30},
+ 'Economics': {'acc': 0.733, 'num': 30},
+ 'Electronics': {'acc': 0.633, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.867, 'num': 30},
+ 'Finance': {'acc': 0.897, 'num': 29},
+ 'Geography': {'acc': 0.6, 'num': 30},
+ 'History': {'acc': 0.333, 'num': 30},
+ 'Literature': {'acc': 0.5, 'num': 30},
+ 'Manage': {'acc': 0.7, 'num': 30},
+ 'Marketing': {'acc': 0.933, 'num': 30},
+ 'Materials': {'acc': 0.733, 'num': 30},
+ 'Math': {'acc': 0.867, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.733, 'num': 30},
+ 'Music': {'acc': 0.567, 'num': 30},
+ 'Overall': {'acc': 0.678, 'num': 898},
+ 'Overall-Art and Design': {'acc': 0.725, 'num': 120},
+ 'Overall-Business': {'acc': 0.812, 'num': 149},
+ 'Overall-Health and Medicine': {'acc': 0.593, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.475, 'num': 120},
+ 'Overall-Science': {'acc': 0.711, 'num': 149},
+ 'Overall-Tech and Engineering': {'acc': 0.71, 'num': 210},
+ 'Pharmacy': {'acc': 0.633, 'num': 30},
+ 'Physics': {'acc': 0.9, 'num': 30},
+ 'Psychology': {'acc': 0.467, 'num': 30},
+ 'Public_Health': {'acc': 0.8, 'num': 30},
+ 'Sociology': {'acc': 0.6, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.678
+```

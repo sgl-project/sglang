@@ -63,3 +63,10 @@
 /sgl-model-gateway/examples/wasm @slin1237
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1
+
+# Documentation (Mintlify)
+docs/docs.json                    @merrymercy
+docs/cookbook/                     @merrymercy
+docs/src/snippets/                @merrymercy
+docs/docs/                        @merrymercy
+docs/index.mdx                    @merrymercy

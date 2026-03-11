@@ -1,3 +1,6 @@
+<!-- For documentation-only PRs (docs/ changes), you can skip the
+     Accuracy Tests and Benchmarking sections. Just describe your changes. -->
+
 <!-- Thank you for your contribution! Please follow these guidelines to enhance your pull request. If anything is unclear, submit your PR and reach out to maintainers for assistance. Join our Slack community at https://slack.sglang.io to discuss further. -->
 
 ## Motivation

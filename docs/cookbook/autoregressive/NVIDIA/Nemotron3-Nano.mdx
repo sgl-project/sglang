@@ -1,0 +1,429 @@
+---
+title: Nemotron3-Nano
+metatags:
+    description: "Deploy NVIDIA Nemotron3-Nano 30B hybrid LLM with SGLang - MoE, Mamba2, and attention layers with BF16/FP8 precision options."
+---
+
+## 1. Model Introduction
+
+`NVIDIA Nemotron3-Nano` is a 30B-parameter hybrid LLM that mixes Mixture-of-Experts (MoE) feed-forward layers, Mamba2 sequence-modeling layers, and standard self-attention layers in a single stack rather than classic “attention + MLP” transformer blocks.
+
+The BF16 variant (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) is designed as a high-fidelity reference model, while the FP8 variant (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8`) targets optimized inference performance on modern NVIDIA GPUs.
+
+At a high level:
+
+- **Hybrid layer stack (Mamba2 + MoE + attention):** The network is composed of interleaved layers that are *either* Mamba2, *or* MoE feed-forward, *or* attention-only.
+- **Non-uniform layer ordering:** The order and mix of these specialized layers is not a simple, rigid pattern, enabling the model to trade off sequence modeling, routing capacity, and expressivity across depth.
+- **Deployment-friendly precision:** Use BF16 for accuracy-sensitive and evaluation workloads; use FP8 for latency- and throughput-critical serving on recent NVIDIA GPUs.
+
+---
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+For a quick start, please install the nightly wheel for SGLang:
+```bash Command
+pip install sglang==0.5.6.post2.dev7852+g8102e36b5 --extra-index-url https://sgl-project.github.io/whl/nightly/
+```
+---
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance tuning.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: select hardware, model variant, and common knobs to generate a launch command.
+
+import { Nemotron3NanoDeployment } from "/src/snippets/autoregressive/nemotron3-nano-deployment.jsx";
+
+<Nemotron3NanoDeployment />
+
+### 3.2 Configuration Tips
+
+
+- **Attention backend**:
+
+    **H200/B200**: use flashinfer attention backend by default.
+
+- **TP support**:
+
+    To set tp size, use `--tp <1|2|4|8>`.
+
+- **FP8 KV cache**:
+
+    To enable fp8 kv cache, please append `--kv-cache-dtype fp8_e4m3`.
+
+---
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage (OpenAI-Compatible API)
+
+SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python client:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Summarize what MoE models are in 5 bullets."},
+    ],
+    temperature=0.7,
+    max_tokens=256,
+)
+
+print(resp.choices[0].message.content)
+
+```
+
+Streaming chat completion
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+stream = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        {"role": "user", "content": "What are the first 5 prime numbers?"}
+    ],
+    temperature=0.7,
+    max_tokens=1024,
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta and delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+### 4.2 Reasoning
+To enable reasoning, `--reasoning-parser nano_v3` should be appended to the launching command. The model supports two modes - Reasoning ON (default) vs OFF. This can be toggled by setting enable_thinking to False, as shown below.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+# Reasoning on (default)
+print("Reasoning on")
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs."}
+    ],
+    temperature=0.7,
+    max_tokens=512,
+)
+print(resp.choices[0].message.reasoning_content)
+
+# Reasoning off
+print("Reasoning off")
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs."}
+    ],
+    temperature=0.6,
+    max_tokens=256,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+)
+print(resp.choices[0].message.reasoning_content)
+
+```
+
+### 4.3 Tool calling
+To enable reasoning, `--tool-call-parser qwen3_coder` should be appended to the launching command. Call functions using the OpenAI Tools schema and inspect returned tool_calls.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+# Tool calling via OpenAI tools schema
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_tip",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bill_total": {
+                        "type": "integer",
+                        "description": "The total amount of the bill"
+                    },
+                    "tip_percentage": {
+                        "type": "integer",
+                        "description": "The percentage of tip to be applied"
+                    }
+                },
+                "required": ["bill_total", "tip_percentage"]
+            }
+        }
+    }
+]
+
+completion = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    messages=[
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "My bill is $50. What will be the amount for 15% tip?"}
+    ],
+    tools=TOOLS,
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=512,
+    stream=False
+)
+
+print(completion.choices[0].message.reasoning_content)
+print(completion.choices[0].message.tool_calls)
+```
+
+---
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU
+
+**FP8 variant**
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
+  --trust-remote-code \
+  --max-running-requests 1024 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 4096 \
+  --max-concurrency 256
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 256
+Successful requests:                     4096
+Benchmark duration (s):                  183.18
+Total input tokens:                      2081726
+Total input text tokens:                 2081726
+Total input vision tokens:               0
+Total generated tokens:                  2116125
+Total generated tokens (retokenized):    1076256
+Request throughput (req/s):              22.36
+Input token throughput (tok/s):          11364.25
+Output token throughput (tok/s):         11552.04
+Peak output token throughput (tok/s):    24692.00
+Peak concurrent requests:                294
+Total token throughput (tok/s):          22916.30
+Concurrency:                             251.19
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   11233.74
+Median E2E Latency (ms):                 11142.97
+---------------Time to First Token----------------
+Mean TTFT (ms):                          172.99
+Median TTFT (ms):                        116.57
+P99 TTFT (ms):                           1193.68
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          21.74
+Median TPOT (ms):                        21.14
+P99 TPOT (ms):                           41.12
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           21.45
+Median ITL (ms):                         9.06
+P95 ITL (ms):                            62.59
+P99 ITL (ms):                            110.83
+Max ITL (ms):                            5368.19
+==================================================
+```
+
+**BF16 variant**
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+  --trust-remote-code \
+  --max-running-requests 1024 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 4096 \
+  --max-concurrency 256
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 256
+Successful requests:                     4096
+Benchmark duration (s):                  360.22
+Total input tokens:                      2081726
+Total input text tokens:                 2081726
+Total input vision tokens:               0
+Total generated tokens:                  2087288
+Total generated tokens (retokenized):    1940652
+Request throughput (req/s):              11.37
+Input token throughput (tok/s):          5779.10
+Output token throughput (tok/s):         5794.55
+Peak output token throughput (tok/s):    9169.00
+Peak concurrent requests:                276
+Total token throughput (tok/s):          11573.65
+Concurrency:                             249.76
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   21965.10
+Median E2E Latency (ms):                 21706.35
+---------------Time to First Token----------------
+Mean TTFT (ms):                          211.54
+Median TTFT (ms):                        93.06
+P99 TTFT (ms):                           2637.66
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          43.27
+Median TPOT (ms):                        43.04
+P99 TPOT (ms):                           61.15
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           42.77
+Median ITL (ms):                         28.46
+P95 ITL (ms):                            71.85
+P99 ITL (ms):                            113.20
+Max ITL (ms):                            5237.28
+==================================================
+
+```
+### 5.2 Accuracy Benchmark
+
+
+#### 5.2.1 GSM8K Benchmark
+
+**Environment**
+- Hardware: NVIDIA B200 GPU
+- Model: BF16 checkpoint
+
+**Launch Model**
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+  --trust-remote-code \
+  --reasoning-parser nano_v3
+```
+
+**Run Benchmark with lm-eval**
+```bash Command
+pip install lm-eval[api]==0.4.9.2
+
+lm_eval --model local-completions --tasks gsm8k --model_args "model=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16,base_url=http://127.0.0.1:30000/v1/completions,num_concurrent=4,max_retries=3,tokenized_requests=False,max_lengths=16384" --gen_kwargs '{"chat_template_kwargs":{"thinking":true}}' --batch_size 256
+```
+
+**Test Results:**
+```text Output
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "12%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+    <col style={{width: "11%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Tasks</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Filter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>n-shot</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Metric</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}></th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Value</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}></th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Stderr</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gsm8k</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>flexible-extract</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>exact_match</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>↑</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.5603</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>±</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.0137</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>strict-match</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>exact_match</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>↑</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.8453</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>±</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.0100</td>
+    </tr>
+  </tbody>
+</table>
+```

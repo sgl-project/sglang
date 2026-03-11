@@ -1,0 +1,100 @@
+---
+title: MiMo-V2-Flash
+metatags:
+    description: "Deploy MiMo-V2-Flash 309B MoE model with SGLang - hybrid attention, multi-token prediction, and 256K context for efficient inference."
+---
+
+## Introduction
+
+XiaomiMiMo/MiMo-V2-Flash, with 309B total parameters and 15B activated parameters, is a new inference-centric model designed to maximize decoding efficiency created by XiaomiMiMo Team explicitly co-designed for real-world serving workloads, enabling flexible tradeoffs between throughput and latency on different hardware.
+
+This model creates a new balance between long-context modeling capability and inference efficiency. Key features include:
+- **Hybrid Attention Architecture**: Interleaves Sliding Window Attention (SWA) and Global Attention (GA) with a 5:1 ratio and an aggressive 128-token window. This reduces KV-cache storage by nearly 6x while maintaining long-context performance via learnable attention sink bias.
+- **Multi-Token Prediction (MTP)**: Equipped with a lightweight MTP module (0.33B params/block) using dense FFNs. This triples output speed during inference and will be good to accelerates rollout in RL training.
+- **Efficient Pre-Training**: Trained on 27T tokens using FP8 mixed precision and native 32k seq length. The context window supports up to 256k length.
+- **Agentic Capabilities**: Post-training utilizes Multi-Teacher On-Policy Distillation (MOPD) and large-scale agentic RL, achieving superior performance on SWE-Bench and complex reasoning tasks.
+
+
+## Installation
+
+MiMo-V2-Flash is currently available in SGLang via Docker image and pip install.
+
+### Docker
+
+```bash Command
+# Pull the docker image
+docker pull lmsysorg/sglang:dev-pr-15207
+
+# Launch the container
+docker run -it --gpus all \
+  --shm-size=32g \
+  --ipc=host \
+  --network=host \
+  lmsysorg/sglang:dev-pr-15207 bash
+```
+
+### Pip Installation
+
+```bash Command
+# On a machine with SGLang dependencies installed or inside a SGLang nightly container
+# Start an SGLang nightly container
+docker run -it --gpus all \
+  --shm-size=32g \
+  --ipc=host \
+  --network=host \
+  lmsysorg/sglang:nightly-dev-20251215-4449c170 bash
+
+# If you already have SGLang installed, uninstall the current SGLang version
+pip uninstall sglang -y
+
+# Install the PyPI Package
+pip install sglang==0.5.6.post2.dev8005+pr.15207.g39d5bd57a \
+  --extra-index-url https://sgl-project.github.io/whl/pr/
+```
+
+## Model Deployment
+
+Use the configuration selector below to automatically generate the appropriate deployment command.
+
+import { MiMoV2FlashDeployment } from "/src/snippets/autoregressive/mimo-v2-flash-deployment.jsx";
+
+<MiMoV2FlashDeployment />
+
+## Testing the deployment
+
+Once the server is running, test it with a chat completion request in another terminal:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "XiaomiMiMo/MiMo-V2-Flash",
+    "messages": [
+      {"role": "user", "content": "Hello! What can you help me with?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 100
+  }'
+```
+
+**Expected response:**
+
+```json Config
+{
+  "id": "...",
+  "object": "chat.completion",
+  "model": "XiaomiMiMo/MiMo-V2-Flash",
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "Hello! I can help you with..."
+    }
+  }]
+}
+```
+
+## Troubleshooting
+
+**DeepGEMM Timeout Error**
+
+Occasionally DeepGEMM timeout errors occur during first launch. Simply rerun the server command in the same container - the compiled kernels are cached and subsequent launches will be fast.

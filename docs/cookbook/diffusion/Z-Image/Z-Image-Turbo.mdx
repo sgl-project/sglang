@@ -1,0 +1,285 @@
+---
+title: Z-Image-Turbo
+metatags:
+    description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
+---
+
+## 1. Model Introduction
+
+[Z-Image](https://github.com/Tongyi-MAI/Z-Image) is a powerful and highly efficient image generation model family with 6B parameters, developed by Tongyi-MAI. It adopts a Scalable Single-Stream DiT (S3-DiT) architecture, where text, visual semantic tokens, and image VAE tokens are concatenated at the sequence level to serve as a unified input stream, maximizing parameter efficiency compared to dual-stream approaches.
+
+[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a distilled version of Z-Image that matches or exceeds leading competitors with only 8 NFEs (Number of Function Evaluations). It is powered by two core techniques: **Decoupled-DMD** (few-step distillation) and **DMDR** (fusing DMD with Reinforcement Learning).
+
+**Key Features:**
+
+- **Sub-second Inference Latency**: Achieves sub-second inference on enterprise-grade H800 GPUs and fits comfortably within 16GB VRAM consumer devices
+- **Photorealistic Image Generation**: Excels in high-quality photorealistic image generation with rich aesthetics
+- **Bilingual Text Rendering**: Supports accurate bilingual text rendering in both English and Chinese
+- **Robust Instruction Adherence**: Strong prompt following and instruction adherence capabilities
+- **#1 Open-Source Model**: Ranked 8th overall and #1 among open-source models on the [Artificial Analysis Text-to-Image Leaderboard](https://artificialanalysis.ai/image/leaderboard/text-to-image)
+
+For more details, please refer to the [Z-Image-Turbo HuggingFace page](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo), the [GitHub repository](https://github.com/Tongyi-MAI/Z-Image), and the [technical report (arXiv)](https://arxiv.org/abs/2511.22699).
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+Z-Image-Turbo is optimized for high-quality image generation with only 8 inference steps. The recommended launch configurations vary by hardware.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
+
+import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx'
+
+<ZImageTurboDeployment />
+
+### 3.2 Configuration Tips
+
+Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
+- `--num-gpus`: Number of GPUs to use
+- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
+- `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
+- `--ring-degree`: The degree of ring attention-style SP in USP
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md).
+
+### 4.1 Generate an Image
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:3000/v1")
+
+response = client.images.generate(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    prompt="Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, red floral forehead pattern. Elaborate high bun, golden phoenix headdress, red flowers, beads. Holds round folding fan with lady, trees, bird. Soft-lit outdoor night background, silhouetted tiered pagoda, blurred colorful distant lights.",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+)
+
+# Save the generated image
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Cache-DiT Acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache_dit.md).
+
+**Basic Usage**
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
+```
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+  Combined Configuration Example:
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
+```
+
+#### 4.2.2 CPU Offload
+
+- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory.
+- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
+- `--vae-cpu-offload`: Use CPU offload for VAE.
+- `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+## 5. Benchmark
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate a image
+
+Test Environment:
+
+- Hardware: NVIDIA B300 SXM6 AC (1x)
+- Model: Tongyi-MAI/Z-Image-Turbo
+- sglang version: 0.0.0.dev1+gf4417475b
+- git revision: f441747
+
+**Server Command**:
+
+```
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --port 30000
+```
+
+**Benchmark Command**:
+
+```
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+```
+
+**Result**:
+
+```
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   Tongyi-MAI/Z-Image-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  13.59
+Request rate:                            inf
+Max request concurrency:                 1
+Successful requests:                     1/1
+--------------------------------------------------
+Request throughput (req/s):              0.07
+Latency Mean (s):                        13.5904
+Latency Median (s):                      13.5904
+Latency P99 (s):                         13.5904
+--------------------------------------------------
+Peak Memory Max (MB):                    16984.45
+Peak Memory Mean (MB):                   16984.45
+Peak Memory Median (MB):                 16984.45
+============================================================
+```
+
+#### 5.1.2 Generate images with high concurrency
+
+**Server Command** :
+
+```
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --port 30000
+```
+
+**Benchmark Command** :
+
+```
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+```
+
+**Result** :
+
+```
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   Tongyi-MAI/Z-Image-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  30.15
+Request rate:                            inf
+Max request concurrency:                 20
+Successful requests:                     20/20
+--------------------------------------------------
+Request throughput (req/s):              0.66
+Latency Mean (s):                        21.2048
+Latency Median (s):                      21.1990
+Latency P99 (s):                         29.9739
+--------------------------------------------------
+Peak Memory Max (MB):                    16984.51
+Peak Memory Mean (MB):                   16984.47
+Peak Memory Median (MB):                 16984.46
+============================================================
+```

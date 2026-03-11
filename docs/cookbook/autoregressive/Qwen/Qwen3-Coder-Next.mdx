@@ -1,0 +1,899 @@
+---
+title: Qwen3-Coder-Next
+metatags:
+    description: "Deploy Qwen3-Coder-Next code-focused models with SGLang on AMD MI300X - available in 3B to 80B sizes with enhanced code understanding."
+---
+
+## 1. Model Introduction
+
+[Qwen3-Coder-Next](https://huggingface.co/Qwen/Qwen3-Coder-Next) is a cost-efficient code-focused language model from the Qwen team (Alibaba). With 80B total parameters but only 3B activated parameters, it achieves performance comparable to models with 10–20x more active parameters through its innovative hybrid architecture.
+
+**Key Features:**
+
+- **Hybrid Architecture**: Uses a 48-layer hybrid layout combining Gated DeltaNet and Gated Attention with Mixture-of-Experts (512 total experts, 10 activated, 1 shared), enabling exceptional efficiency.
+- **Tool Calling Support**: Advanced agentic capabilities with native support for function calling and tool use via the `qwen3_coder` parser.
+- **Extended Context Length**: Supports up to 256K tokens for processing large codebases and long documents.
+- **Cost-Efficient Inference**: Only 3B parameters activated per token, making it ideal for local development and cost-effective deployment at scale.
+- **IDE Integration**: Compatible with Claude Code, Qwen Code, Cline, and other IDE platforms.
+
+For more details, please refer to the [Qwen3-Coder-Next model card](https://huggingface.co/Qwen/Qwen3-Coder-Next).
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+**Note:** Qwen3-Coder-Next requires SGLang v0.5.8 or later.
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and deployment options.
+
+import { Qwen3CoderNextDeployment } from '/src/snippets/autoregressive/qwen3-coder-next-deployment.jsx'
+
+<Qwen3CoderNextDeployment />
+
+### 3.2 Configuration Tips
+
+- **Context Length**: The model supports up to 256K tokens natively. If you encounter OOM issues, try `--context-length 32768`.
+- **Tool Use**: To enable tool calling capabilities, use the `--tool-call-parser qwen3_coder` flag.
+- **Sampling Parameters**: SGLang automatically applies the recommended sampling parameters from the model's `generation_config.json`. No manual configuration is needed.
+
+## 4. Model Invocation
+
+**Deployment Command:**
+
+```shell
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Coder-Next \
+  --tp 2 \
+  --tool-call-parser qwen3_coder \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Code Generation Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Coder-Next",
+    messages=[
+        {"role": "user", "content": "Write a Python function that implements binary search on a sorted list. Include type hints."}
+    ],
+    max_tokens=2048
+)
+
+print(response.choices[0].message.content)
+```
+
+**Example Output:**
+
+````
+Here's a Python function implementing binary search on a sorted list, with comprehensive type hints:
+
+```python
+from typing import Sequence, TypeVar, Optional
+
+T = TypeVar('T')
+
+def binary_search(sorted_list: Sequence[T], target: T) -> Optional[int]:
+    """
+    Perform binary search on a sorted list to find the index of a target element.
+
+    Args:
+        sorted_list: A sequence (e.g., list, tuple) sorted in ascending order.
+        target: The element to search for in the list.
+
+    Returns:
+        The index of the target element if found, or None if not found.
+
+    Time Complexity: O(log n)
+    Space Complexity: O(1)
+
+    Note:
+        The function assumes the list is sorted in ascending order.
+        If the list contains duplicate elements, it returns the index of one of them.
+    """
+    left = 0
+    right = len(sorted_list) - 1
+
+    while left <= right:
+        mid = (left + right) // 2
+        mid_val = sorted_list[mid]
+
+        if mid_val == target:
+            return mid
+        elif mid_val < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    return None
+```
+
+### Example usage:
+
+```python
+# Example 1: Finding an existing element
+numbers = [1, 3, 5, 7, 9, 11]
+print(binary_search(numbers, 7))  # Output: 3
+
+# Example 2: Element not in the list
+print(binary_search(numbers, 4))  # Output: None
+
+# Example 3: Empty list
+print(binary_search([], 5))  # Output: None
+
+# Example 4: Single element
+print(binary_search([1], 1))  # Output: 0
+print(binary_search([1], 2))  # Output: None
+```
+
+### Key features:
+- Uses `TypeVar` to support generic types (as long as comparison operations are defined)
+- Returns `Optional[int]` to indicate either the index or no match found
+- Uses `Sequence[T]` to accept any sequence type (list, tuple, etc.)
+- Includes comprehensive docstring with time/space complexity
+- Implements standard iterative binary search for O(1) space complexity
+````
+
+#### 4.2.2 Streaming Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Coder-Next",
+    messages=[
+        {"role": "user", "content": "Explain the difference between a stack and a queue in 3 sentences."}
+    ],
+    max_tokens=512,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
+```
+
+**Example Output:**
+
+```
+A **stack** follows the **Last In, First Out (LIFO)** principle, meaning the last element added is the first one removed—operations like `push` (add) and `pop` (remove) occur at the same end, called the *top*. In contrast, a **queue** follows the **First In, First Out (FIFO)** principle, where elements are added at the *back* (enqueue) and removed from the *front* (dequeue), preserving the order of insertion. This structural difference makes stacks ideal for tasks like function call management and expression evaluation, while queues suit scheduling, buffering, and breadth-first traversal.
+```
+
+#### 4.2.3 Tool Calling Example
+
+Qwen3-Coder-Next supports tool calling capabilities. Make sure `--tool-call-parser qwen3_coder` is included in the deployment command above.
+
+**Python Example:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "Execute Python code and return the result",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "The Python code to execute"
+                    }
+                },
+                "required": ["code"]
+            }
+        }
+    }
+]
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Coder-Next",
+    messages=[
+        {"role": "user", "content": "Calculate the factorial of 10 using Python"}
+    ],
+    tools=tools
+)
+
+# Check if the model wants to call a tool
+if response.choices[0].message.tool_calls:
+    tool_call = response.choices[0].message.tool_calls[0]
+    print(f"Tool: {tool_call.function.name}")
+    print(f"Arguments: {tool_call.function.arguments}")
+else:
+    print(response.choices[0].message.content)
+```
+
+**Example Output:**
+
+```
+Tool: execute_code
+Arguments: {"code": "import math\nmath.factorial(10)"}
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (2x)
+- Model: Qwen/Qwen3-Coder-Next
+- Tensor Parallelism: 2
+- sglang version: 0.5.8+
+
+#### 5.1.1 Standard Scenario Benchmark
+
+- Model Deployment Command:
+
+```shell
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Coder-Next \
+  --tp 2 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+##### 5.1.1.1 Low Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  27.86
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4218
+Request throughput (req/s):              0.36
+Input token throughput (tok/s):          219.00
+Output token throughput (tok/s):         151.48
+Peak output token throughput (tok/s):    166.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          370.48
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2784.14
+Median E2E Latency (ms):                 2258.08
+P90 E2E Latency (ms):                    5044.43
+P99 E2E Latency (ms):                    6130.52
+---------------Time to First Token----------------
+Mean TTFT (ms):                          161.68
+Median TTFT (ms):                        168.09
+P99 TTFT (ms):                           183.26
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          6.19
+Median TPOT (ms):                        6.23
+P99 TPOT (ms):                           6.32
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.23
+Median ITL (ms):                         6.23
+P95 ITL (ms):                            6.51
+P99 ITL (ms):                            6.64
+Max ITL (ms):                            13.45
+==================================================
+```
+
+##### 5.1.1.2 Medium Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16
+```
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  39.06
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    40789
+Request throughput (req/s):              2.05
+Input token throughput (tok/s):          1015.62
+Output token throughput (tok/s):         1044.73
+Peak output token throughput (tok/s):    1664.00
+Peak concurrent requests:                21
+Total token throughput (tok/s):          2060.34
+Concurrency:                             14.16
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6910.97
+Median E2E Latency (ms):                 7248.27
+P90 E2E Latency (ms):                    11612.63
+P99 E2E Latency (ms):                    13933.91
+---------------Time to First Token----------------
+Mean TTFT (ms):                          183.48
+Median TTFT (ms):                        156.50
+P99 TTFT (ms):                           311.46
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          13.61
+Median TPOT (ms):                        13.59
+P99 TPOT (ms):                           21.11
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           13.22
+Median ITL (ms):                         9.76
+P95 ITL (ms):                            10.43
+P99 ITL (ms):                            158.04
+Max ITL (ms):                            394.39
+==================================================
+```
+
+##### 5.1.1.3 High Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100
+```
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  102.81
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    252536
+Request throughput (req/s):              4.86
+Input token throughput (tok/s):          2429.99
+Output token throughput (tok/s):         2457.53
+Peak output token throughput (tok/s):    5299.00
+Peak concurrent requests:                109
+Total token throughput (tok/s):          4887.52
+Concurrency:                             94.28
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   19385.20
+Median E2E Latency (ms):                 17584.09
+P90 E2E Latency (ms):                    36762.15
+P99 E2E Latency (ms):                    42518.35
+---------------Time to First Token----------------
+Mean TTFT (ms):                          270.62
+Median TTFT (ms):                        159.65
+P99 TTFT (ms):                           938.90
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          38.57
+Median TPOT (ms):                        41.78
+P99 TPOT (ms):                           53.28
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           37.90
+Median ITL (ms):                         18.26
+P95 ITL (ms):                            167.82
+P99 ITL (ms):                            311.45
+Max ITL (ms):                            993.20
+==================================================
+```
+
+#### 5.1.2 Reasoning Scenario Benchmark
+
+- Model Deployment Command:
+
+```shell
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Coder-Next \
+  --tp 2 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+##### 5.1.2.1 Low Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- Result:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  285.02
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  44462
+Total generated tokens (retokenized):    44432
+Request throughput (req/s):              0.04
+Input token throughput (tok/s):          21.41
+Output token throughput (tok/s):         156.00
+Peak output token throughput (tok/s):    173.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          177.40
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   28499.54
+Median E2E Latency (ms):                 30424.65
+P90 E2E Latency (ms):                    49132.26
+P99 E2E Latency (ms):                    51075.28
+---------------Time to First Token----------------
+Mean TTFT (ms):                          95.51
+Median TTFT (ms):                        93.86
+P99 TTFT (ms):                           112.56
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          6.24
+Median TPOT (ms):                        6.30
+P99 TPOT (ms):                           6.60
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.39
+Median ITL (ms):                         6.34
+P95 ITL (ms):                            7.16
+P99 ITL (ms):                            7.42
+Max ITL (ms):                            12.48
+==================================================
+```
+
+##### 5.1.2.2 Medium Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 80 \
+  --max-concurrency 16
+```
+
+- Result:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  237.77
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  318306
+Total generated tokens (retokenized):    315646
+Request throughput (req/s):              0.34
+Input token throughput (tok/s):          166.83
+Output token throughput (tok/s):         1338.72
+Peak output token throughput (tok/s):    1727.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          1505.55
+Concurrency:                             13.88
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   41266.21
+Median E2E Latency (ms):                 41010.10
+P90 E2E Latency (ms):                    77574.22
+P99 E2E Latency (ms):                    82688.04
+---------------Time to First Token----------------
+Mean TTFT (ms):                          140.73
+Median TTFT (ms):                        84.52
+P99 TTFT (ms):                           365.86
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          10.32
+Median TPOT (ms):                        10.38
+P99 TPOT (ms):                           10.87
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           10.34
+Median ITL (ms):                         10.19
+P95 ITL (ms):                            10.75
+P99 ITL (ms):                            11.18
+Max ITL (ms):                            206.79
+==================================================
+```
+
+##### 5.1.2.3 High Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 320 \
+  --max-concurrency 64
+```
+
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  384.82
+Total input tokens:                      158939
+Total input text tokens:                 158939
+Total generated tokens:                  1301025
+Total generated tokens (retokenized):    1299908
+Request throughput (req/s):              0.83
+Input token throughput (tok/s):          413.02
+Output token throughput (tok/s):         3380.83
+Peak output token throughput (tok/s):    4317.00
+Peak concurrent requests:                69
+Total token throughput (tok/s):          3793.85
+Concurrency:                             56.42
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   67847.54
+Median E2E Latency (ms):                 70724.38
+P90 E2E Latency (ms):                    120888.83
+P99 E2E Latency (ms):                    133234.48
+---------------Time to First Token----------------
+Mean TTFT (ms):                          212.24
+Median TTFT (ms):                        115.96
+P99 TTFT (ms):                           652.93
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          16.76
+Median TPOT (ms):                        16.99
+P99 TPOT (ms):                           18.18
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           16.64
+Median ITL (ms):                         15.83
+P95 ITL (ms):                            31.64
+P99 ITL (ms):                            90.85
+Max ITL (ms):                            576.60
+==================================================
+```
+
+#### 5.1.3 Summarization Scenario Benchmark
+
+##### 5.1.3.1 Low Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  29.42
+Total input tokens:                      41941
+Total input text tokens:                 41941
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.34
+Input token throughput (tok/s):          1425.35
+Output token throughput (tok/s):         143.42
+Peak output token throughput (tok/s):    169.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          1568.77
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2941.19
+Median E2E Latency (ms):                 2411.84
+P90 E2E Latency (ms):                    5661.26
+P99 E2E Latency (ms):                    6497.45
+---------------Time to First Token----------------
+Mean TTFT (ms):                          139.46
+Median TTFT (ms):                        160.33
+P99 TTFT (ms):                           184.30
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          6.56
+Median TPOT (ms):                        6.65
+P99 TPOT (ms):                           7.29
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.65
+Median ITL (ms):                         6.68
+P95 ITL (ms):                            7.39
+P99 ITL (ms):                            7.51
+Max ITL (ms):                            16.34
+==================================================
+```
+
+##### 5.1.3.2 Medium Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16
+```
+
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  41.62
+Total input tokens:                      300020
+Total input text tokens:                 300020
+Total generated tokens:                  41669
+Total generated tokens (retokenized):    41664
+Request throughput (req/s):              1.92
+Input token throughput (tok/s):          7208.67
+Output token throughput (tok/s):         1001.19
+Peak output token throughput (tok/s):    1536.00
+Peak concurrent requests:                21
+Total token throughput (tok/s):          8209.86
+Concurrency:                             14.27
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   7421.29
+Median E2E Latency (ms):                 7985.77
+P90 E2E Latency (ms):                    12122.09
+P99 E2E Latency (ms):                    14595.05
+---------------Time to First Token----------------
+Mean TTFT (ms):                          248.49
+Median TTFT (ms):                        179.25
+P99 TTFT (ms):                           915.90
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.13
+Median TPOT (ms):                        14.28
+P99 TPOT (ms):                           24.02
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           13.80
+Median ITL (ms):                         10.46
+P95 ITL (ms):                            11.00
+P99 ITL (ms):                            173.14
+Max ITL (ms):                            823.32
+==================================================
+```
+
+##### 5.1.3.3 High Concurrency
+
+- Benchmark Command:
+
+```shell
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3-Coder-Next \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64
+```
+
+- Result:
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  85.74
+Total input tokens:                      1273893
+Total input text tokens:                 1273893
+Total generated tokens:                  170000
+Total generated tokens (retokenized):    169983
+Request throughput (req/s):              3.73
+Input token throughput (tok/s):          14858.12
+Output token throughput (tok/s):         1982.80
+Peak output token throughput (tok/s):    3734.00
+Peak concurrent requests:                70
+Total token throughput (tok/s):          16840.92
+Concurrency:                             59.75
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   16008.12
+Median E2E Latency (ms):                 15460.65
+P90 E2E Latency (ms):                    27705.81
+P99 E2E Latency (ms):                    32874.74
+---------------Time to First Token----------------
+Mean TTFT (ms):                          476.99
+Median TTFT (ms):                        177.50
+P99 TTFT (ms):                           3014.39
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          29.81
+Median TPOT (ms):                        31.19
+P99 TPOT (ms):                           45.53
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           29.29
+Median ITL (ms):                         15.75
+P95 ITL (ms):                            173.94
+P99 ITL (ms):                            202.00
+Max ITL (ms):                            2783.23
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- **Benchmark Command:**
+
+```shell
+python benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+- **Test Results:**
+
+```
+Accuracy: 0.965
+Invalid: 0.000
+Latency: 26.407 s
+Output throughput: 929.132 token/s
+```
+
+#### 5.2.2 MMLU Benchmark
+
+- **Benchmark Command:**
+
+```shell
+cd benchmark/mmlu
+bash download_data.sh
+python3 bench_sglang.py --port 30000
+```
+
+- **Test Results:**
+
+```
+subject: abstract_algebra, #q:100, acc: 0.780
+subject: anatomy, #q:135, acc: 0.807
+subject: astronomy, #q:152, acc: 0.921
+subject: business_ethics, #q:100, acc: 0.820
+subject: clinical_knowledge, #q:265, acc: 0.860
+subject: college_biology, #q:144, acc: 0.944
+subject: college_chemistry, #q:100, acc: 0.590
+subject: college_computer_science, #q:100, acc: 0.820
+subject: college_mathematics, #q:100, acc: 0.800
+subject: college_medicine, #q:173, acc: 0.803
+subject: college_physics, #q:102, acc: 0.775
+subject: computer_security, #q:100, acc: 0.880
+subject: conceptual_physics, #q:235, acc: 0.936
+subject: econometrics, #q:114, acc: 0.807
+subject: electrical_engineering, #q:145, acc: 0.834
+subject: elementary_mathematics, #q:378, acc: 0.854
+subject: formal_logic, #q:126, acc: 0.802
+subject: global_facts, #q:100, acc: 0.610
+subject: high_school_biology, #q:310, acc: 0.971
+subject: high_school_chemistry, #q:203, acc: 0.803
+subject: high_school_computer_science, #q:100, acc: 0.920
+subject: high_school_european_history, #q:165, acc: 0.891
+subject: high_school_geography, #q:198, acc: 0.929
+subject: high_school_government_and_politics, #q:193, acc: 0.969
+subject: high_school_macroeconomics, #q:390, acc: 0.903
+subject: high_school_mathematics, #q:270, acc: 0.689
+subject: high_school_microeconomics, #q:238, acc: 0.962
+subject: high_school_physics, #q:151, acc: 0.854
+subject: high_school_psychology, #q:545, acc: 0.947
+subject: high_school_statistics, #q:216, acc: 0.815
+subject: high_school_us_history, #q:204, acc: 0.907
+subject: high_school_world_history, #q:237, acc: 0.937
+subject: human_aging, #q:223, acc: 0.821
+subject: human_sexuality, #q:131, acc: 0.840
+subject: international_law, #q:121, acc: 0.934
+subject: jurisprudence, #q:108, acc: 0.870
+subject: logical_fallacies, #q:163, acc: 0.847
+subject: machine_learning, #q:112, acc: 0.812
+subject: management, #q:103, acc: 0.922
+subject: marketing, #q:234, acc: 0.923
+subject: medical_genetics, #q:100, acc: 0.970
+subject: miscellaneous, #q:783, acc: 0.941
+subject: moral_disputes, #q:346, acc: 0.850
+subject: moral_scenarios, #q:895, acc: 0.726
+subject: nutrition, #q:306, acc: 0.915
+subject: philosophy, #q:311, acc: 0.859
+subject: prehistory, #q:324, acc: 0.889
+subject: professional_accounting, #q:282, acc: 0.723
+subject: professional_law, #q:1534, acc: 0.648
+subject: professional_medicine, #q:272, acc: 0.923
+subject: professional_psychology, #q:612, acc: 0.845
+subject: public_relations, #q:110, acc: 0.782
+subject: security_studies, #q:245, acc: 0.796
+subject: sociology, #q:201, acc: 0.925
+subject: us_foreign_policy, #q:100, acc: 0.950
+subject: virology, #q:166, acc: 0.572
+subject: world_religions, #q:171, acc: 0.883
+Total latency: 208.985
+Average accuracy: 0.834
+```

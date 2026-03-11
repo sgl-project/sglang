@@ -6,9 +6,9 @@ on:
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "python/sglang/**"
-      - "docs/**"
+      - "docs-legacy/**"
       - "!python/sglang/**/*.md"
-      - "!docs/**/*.md"
+      - "!docs-legacy/**/*.md"
   workflow_dispatch:
 
 
@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
-          pip install -r docs/requirements.txt
+          pip install -r docs-legacy/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python
 
@@ -48,7 +48,7 @@ jobs:
       - name: Execute notebooks
         timeout-minutes: 40
         run: |
-          cd docs
+          cd docs-legacy
           make clean
           make compile
 

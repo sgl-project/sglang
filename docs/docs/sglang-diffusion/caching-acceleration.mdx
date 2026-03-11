@@ -1,0 +1,88 @@
+---
+title: "Caching Acceleration"
+description: "Compare caching acceleration strategies for diffusion models."
+---
+
+SGLang provides multiple caching acceleration strategies for Diffusion Transformer (DiT) models. These strategies can significantly reduce inference time by skipping redundant computation.
+
+## Overview
+
+SGLang supports two complementary caching approaches:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "42%"}} />
+    <col style={{width: "22%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Strategy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Scope</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mechanism</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Best For</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block-level</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Skip individual transformer blocks dynamically</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Advanced, higher speedup</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TeaCache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timestep-level</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Skip entire denoising steps based on L1 similarity</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Simple, built-in</td>
+    </tr>
+  </tbody>
+</table>
+
+
+## Cache-DiT
+
+[Cache-DiT](https://github.com/vipshop/cache-dit) provides block-level caching with
+advanced strategies like DBCache and TaylorSeer. It can achieve up to **1.69x speedup**.
+
+See [Cache-DiT](/docs/sglang-diffusion/cache-dit) for detailed configuration.
+
+### Quick Start
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A beautiful sunset over the mountains"
+```
+
+### Key Features
+
+- **DBCache**: Dynamic block-level caching based on residual differences
+- **TaylorSeer**: Taylor expansion-based calibration for optimized caching
+- **SCM**: Step-level computation masking for additional speedup
+
+## TeaCache
+
+TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+
+See [TeaCache](/docs/sglang-diffusion/tea-cache) for detailed documentation.
+
+### Quick Overview
+
+- Tracks L1 distance between modulated inputs across timesteps
+- When accumulated distance is below threshold, reuses cached residual
+- Supports CFG with separate positive/negative caches
+
+### Supported Models
+
+- Wan (wan2.1, wan2.2)
+- Hunyuan (HunyuanVideo)
+- Z-Image
+
+For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled.
+
+## References
+
+- [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
+- [TeaCache Paper](https://arxiv.org/abs/2411.14324)

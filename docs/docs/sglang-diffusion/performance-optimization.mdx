@@ -1,0 +1,105 @@
+---
+title: "Performance Optimization"
+description: "Optimize SGLang diffusion performance with caching, kernels, and profiling."
+---
+
+SGLang-Diffusion provides multiple performance optimization strategies to accelerate inference. This section covers all available performance tuning options.
+
+## Overview
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "60%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Block-level caching with DBCache, TaylorSeer, and SCM</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TeaCache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Timestep-level caching using L1 similarity</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention Backends</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimized attention implementations (FlashAttention, SageAttention, etc.)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Profiling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diagnostics</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PyTorch Profiler and Nsight Systems guidance</td>
+    </tr>
+  </tbody>
+</table>
+
+## Caching Strategies
+
+SGLang supports two complementary caching approaches:
+
+### Cache-DiT
+
+[Cache-DiT](https://github.com/vipshop/cache-dit) provides block-level caching with advanced strategies. It can achieve up to **1.69x speedup**.
+
+**Quick Start:**
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A beautiful sunset over the mountains"
+```
+
+**Key Features:**
+- **DBCache**: Dynamic block-level caching based on residual differences
+- **TaylorSeer**: Taylor expansion-based calibration for optimized caching
+- **SCM**: Step-level computation masking for additional speedup
+
+See [Cache-DiT documentation](/docs/sglang-diffusion/cache-dit) for detailed configuration.
+
+### TeaCache
+
+TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+
+**Quick Overview:**
+- Tracks L1 distance between modulated inputs across timesteps
+- When accumulated distance is below threshold, reuses cached residual
+- Supports CFG with separate positive/negative caches
+
+**Supported Models:** Wan (wan2.1, wan2.2), Hunyuan (HunyuanVideo), Z-Image
+
+See [TeaCache documentation](/docs/sglang-diffusion/tea-cache) for detailed configuration.
+
+## Attention Backends
+
+Different attention backends offer varying performance characteristics depending on your hardware and model:
+
+- **FlashAttention**: Fastest on NVIDIA GPUs with fp16/bf16
+- **SageAttention**: Alternative optimized implementation
+- **xformers**: Memory-efficient attention
+- **SDPA**: PyTorch native scaled dot-product attention
+
+See [Attention backends](/docs/sglang-diffusion/attention-backends) for platform support and configuration options.
+
+## Profiling
+
+To diagnose performance bottlenecks, SGLang-Diffusion supports profiling tools:
+
+- **PyTorch Profiler**: Built-in Python profiling
+- **Nsight Systems**: GPU kernel-level analysis
+
+See [Profiling guide](/docs/sglang-diffusion/profiling) for detailed instructions.
+
+## References
+
+- [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
+- [TeaCache Paper](https://arxiv.org/abs/2411.14324)
