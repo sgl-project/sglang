@@ -151,7 +151,7 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
@@ -3055,10 +3055,11 @@ class ServerArgs:
                 self.enable_aiter_allreduce_fusion = False
 
             # Check sampling backend
-            self.sampling_backend = "pytorch"
-            logger.warning(
-                "Sampling backend is set to pytorch for deterministic inference."
-            )
+            if self.sampling_backend != "ascend":
+                self.sampling_backend = "pytorch"
+                logger.warning(
+                    "Sampling backend is set to pytorch for deterministic inference."
+                )
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
