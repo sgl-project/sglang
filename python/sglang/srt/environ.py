@@ -161,6 +161,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
@@ -270,6 +271,7 @@ class Envs:
     # Override the distributed init method used by torch.distributed.init_process_group.
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
+    SGLANG_TCP_STORE_PORT = EnvInt(29600)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
@@ -306,6 +308,9 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+
+    # MPS (Apple Silicon)
+    SGLANG_USE_MLX = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -373,6 +378,10 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+
+    # NIXL-EP
+    SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)

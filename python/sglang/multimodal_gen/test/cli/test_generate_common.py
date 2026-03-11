@@ -58,6 +58,24 @@ class CLIBase(unittest.TestCase):
     height: int = 720
     output_path: str = "test_outputs"
 
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path, exist_ok=True)
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
+
+    def tearDown(self):
+        super().tearDown()
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
+
     def get_base_command(self):
         return [
             "sglang",
