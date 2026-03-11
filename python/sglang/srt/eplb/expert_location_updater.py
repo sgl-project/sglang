@@ -38,12 +38,6 @@ class ExpertLocationUpdater:
     def __init__(self):
         self._first_execution = True
 
-    """
-    Update experts' physical location after EPLB.
-
-    Returns a map of layer_id to expert_ids that are missing due to rank failures during fault conditions when elastic EP is enabled.
-    """
-
     def update(
         self,
         routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
@@ -52,6 +46,12 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
     ):
+        """
+        Update experts' physical location after EPLB.
+
+        Returns a map of layer_id to expert_ids that are missing due to rank
+        failures during fault conditions when elastic EP is enabled.
+        """
         if self._first_execution:
             self._first_execution = False
             torch.get_device_module().empty_cache()
@@ -460,12 +460,19 @@ def update_expert_weights_single_layer(
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
             is_active = elastic_ep_state.active_ranks_cpu
             for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
-                if any(op.op == torch.distributed.isend for op in ops):
+                has_isend = any(op.op == torch.distributed.isend for op in ops)
+                has_irecv = any(op.op == torch.distributed.irecv for op in ops)
+                assert not (has_isend and has_irecv), (
+                    "Each p2p_op_infos entry is expected to contain only send "
+                    "or only recv ops."
+                )
+
+                if has_isend:
                     p2p_op_infos[i] = (
                         logical_expert_id,
                         [op for op in ops if is_active[op.peer]],
                     )
-                elif any(op.op == torch.distributed.irecv for op in ops):
+                elif has_irecv:
                     if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
