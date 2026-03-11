@@ -800,11 +800,16 @@ def biased_grouped_topk_gpu(
         )
 
         if num_fused_shared_experts > 0:
-            # Append placeholder columns for shared experts.  The actual IDs and
-            # weights will be overwritten by _remap_topk_ids_for_deepep_fusion
-            # before dispatch, so the fill values here don't matter.
+            # Append shared expert columns: ID = num_experts (first shared slot),
+            # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
+            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
+            if routed_scaling_factor is not None:
+                topk_weights[:, topk_routed:] = (
+                    topk_weights[:, :topk_routed].sum(dim=-1, keepdim=True)
+                    / routed_scaling_factor
+                )
 
         return topk_weights, topk_ids
 
