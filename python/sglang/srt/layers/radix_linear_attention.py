@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Radix linear attention."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple, Union
@@ -70,7 +71,7 @@ class RadixLinearAttention(nn.Module):
     def forward(
         self,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
