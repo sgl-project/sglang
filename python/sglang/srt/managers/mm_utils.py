@@ -28,7 +28,6 @@ from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     flatten_nested_list,
-    is_cuda_alike,
     is_npu,
     print_warning_once,
 )
@@ -1358,7 +1357,7 @@ def tensor_hash(tensor_list) -> int:
                 x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
             ]
             tensor = torch.concat(tensor_list)
-    if is_cuda_alike():
+    if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
 
