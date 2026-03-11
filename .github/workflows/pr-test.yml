@@ -249,7 +249,7 @@ jobs:
           # Use kernel-build runner only when sgl_kernel changes are detected AND we're not in target_stage mode
           # (target_stage skips wheel builds, so we can't use custom kernels)
           # Use API-based detection (filter-api) for target_stage mode, otherwise use dorny/paths-filter (filter)
-          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}"
+          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}"
           target_stage="${{ inputs.target_stage }}"
           if [[ "$sgl_kernel" == "true" && -z "$target_stage" ]]; then
             echo "b200_runner=4-gpu-b200-kernel" >> $GITHUB_OUTPUT

@@ -763,10 +763,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         elif (
             quant_config is None
             or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "mxfp8"
             or quant_config.get_name() == "modelopt_fp8"
             or quant_config.get_name() == "compressed_tensors"
         ):
-            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
+            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
             return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():

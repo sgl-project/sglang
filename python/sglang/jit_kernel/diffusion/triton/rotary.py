@@ -111,3 +111,8 @@ if current_platform.is_npu():
     from .npu_fallback import apply_rotary_embedding_native
 
     apply_rotary_embedding = apply_rotary_embedding_native
+
+if current_platform.is_mps():
+    from .mps_fallback import apply_rotary_embedding_native
+
+    apply_rotary_embedding = apply_rotary_embedding_native
