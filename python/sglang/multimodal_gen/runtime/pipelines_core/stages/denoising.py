@@ -343,9 +343,9 @@ class DenoisingStage(PipelineStage):
             torch.full(
                 (batch_size,),
                 guidance_val,
-                dtype=torch.float32,
+                dtype=target_dtype,
                 device=device,
-            ).to(target_dtype)
+            )
             * 1000.0
         )
 
@@ -755,6 +755,9 @@ class DenoisingStage(PipelineStage):
         ):
             self.save_sta_search_results(batch)
 
+        # Capture references before potential deletion on MPS
+        dits = list(filter(None, [self.transformer, self.transformer_2]))
+
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
         if torch.backends.mps.is_available() and not is_warmup:
@@ -772,7 +775,7 @@ class DenoisingStage(PipelineStage):
             )
 
         # reset offload managers with prefetching first layer for next forward
-        for dit in filter(None, [self.transformer, self.transformer_2]):
+        for dit in dits:
             if isinstance(dit, OffloadableDiTMixin):
                 # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
                 # TODO: should be make this an option?

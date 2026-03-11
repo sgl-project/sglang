@@ -35,7 +35,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device,
@@ -51,6 +50,8 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -58,7 +59,6 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    is_valid_ipv6_address,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -67,6 +67,7 @@ from sglang.srt.utils.common import (
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.network import NetworkAddress
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -179,6 +180,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -189,6 +191,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
     "mooncake",
+    "nixl",
     "mori",
     "ascend_fuseep",
     "flashinfer",
@@ -376,6 +379,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
@@ -465,7 +469,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
-    fp4_gemm_runner_backend: str = "flashinfer_cutlass"
+    fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
@@ -505,7 +509,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -527,7 +531,7 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
-    elastic_ep_backend: Literal[None, "mooncake"] = None
+    elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
@@ -685,6 +689,7 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -887,6 +892,14 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        if self.enable_nan_detection:
+            logger.warning(
+                "--enable-nan-detection is deprecated. "
+                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
+            )
+            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
+            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
+
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.enable_prefill_delayer = True
@@ -909,18 +922,7 @@ class ServerArgs:
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            if not os.path.exists(self.model_path):
-                from modelscope import snapshot_download
-
-                self.model_path = snapshot_download(
-                    self.model_path, cache_dir=self.download_dir, revision=self.revision
-                )
-                self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path,
-                    cache_dir=self.download_dir,
-                    revision=self.revision,
-                    ignore_patterns=["*.bin", "*.safetensors"],
-                )
+            self._handle_modelscope_paths()
 
         # Mamba scheduler strategy
         if self.mamba_scheduler_strategy == "auto":
@@ -935,6 +937,70 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _handle_modelscope_paths(self):
+        """Resolve model / tokenizer / speculative-draft paths from the local
+        ModelScope cache when possible, falling back to ``snapshot_download``
+        for any path that is not already present on disk.
+
+        Note: ``speculative_token_map`` is intentionally NOT handled here
+        because its value uses ``repo_id/filename`` semantics rather than a
+        plain repo ID.  That resolution lives in
+        :func:`sglang.srt.speculative.spec_utils.load_token_map`.
+        """
+
+        ms_root = None
+        ms_snapshot_download = None
+
+        def _resolve_or_download(
+            path: Optional[str],
+            ignore_patterns: Optional[list] = None,
+            revision: Optional[str] = None,
+        ) -> Optional[str]:
+            nonlocal ms_root, ms_snapshot_download
+            if path is None:
+                return None
+            if not path or os.path.exists(path):
+                return path
+
+            if ms_snapshot_download is None:
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as _ms_snapshot_download,
+                )
+                from modelscope.utils.file_utils import get_model_cache_root
+
+                ms_snapshot_download = _ms_snapshot_download
+                ms_root = get_model_cache_root()
+
+            # Check ModelScope default cache
+            cached = os.path.join(ms_root, path)
+            if os.path.exists(cached):
+                return cached
+            # Check user-specified download dir
+            if self.download_dir:
+                alt = os.path.join(self.download_dir, path)
+                if os.path.exists(alt):
+                    return alt
+
+            # Cache miss — download from ModelScope hub
+            return ms_snapshot_download(
+                path,
+                cache_dir=self.download_dir,
+                revision=revision,
+                **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
+            )
+
+        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
+        self.tokenizer_path = _resolve_or_download(
+            self.tokenizer_path,
+            ignore_patterns=["*.bin", "*.safetensors"],
+            revision=self.revision,
+        )
+        if self.speculative_draft_model_path:
+            self.speculative_draft_model_path = _resolve_or_download(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision or "main",
+            )
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -982,8 +1048,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1269,7 +1335,9 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+            self.kv_cache_dtype = (
+                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
+            )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1288,11 +1356,18 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if self.dp_size == 1 and major >= 10:
+                self.nsa_prefill_backend = "trtllm"
+                self.nsa_decode_backend = "trtllm"
+                logger.warning(
+                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
+                )
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -1334,12 +1409,35 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_NSA_FORCE_MLA.set(True)
+                    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
+                else:
+                    if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+                        logger.warning(
+                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
+                        )
+                    else:
+                        # When threshold is not manually set, set it to the index topk of model
+                        from sglang.srt.configs.model_config import get_nsa_index_topk
+
+                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            get_nsa_index_topk(hf_config)
+                        )
+                        logger.warning(
+                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
+                        )
+                    if self.nsa_prefill_backend == "trtllm":
+                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
+                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            128 * 1024
+                        )
+                        logger.warning(
+                            "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
+                        )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -2002,6 +2100,8 @@ class ServerArgs:
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "flashinfer" if is_flashinfer_available() else "triton"
         else:
@@ -2017,6 +2117,8 @@ class ServerArgs:
                     return "aiter"
                 else:
                     return "triton"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "triton"
 
@@ -2359,12 +2461,19 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2381,6 +2490,7 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
+                "mxfp8",
                 "modelopt_fp8",
                 "compressed-tensors",
                 None,
@@ -2388,6 +2498,16 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
@@ -2437,6 +2557,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "nixl":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
@@ -2501,9 +2627,10 @@ class ServerArgs:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
                     self.eplb_algorithm = "elasticity_aware"
-                assert (
-                    self.eplb_algorithm == "elasticity_aware"
-                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+                assert self.eplb_algorithm in [
+                    "elasticity_aware",
+                    "elasticity_aware_hierarchical",
+                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
@@ -2596,7 +2723,8 @@ class ServerArgs:
         if self.speculative_moe_runner_backend is None:
             self.speculative_moe_runner_backend = (
                 "auto"
-                if self.moe_runner_backend == "flashinfer_trtllm"
+                if self.moe_runner_backend
+                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
                 else self.moe_runner_backend
             )
         else:
@@ -3052,6 +3180,12 @@ class ServerArgs:
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
                 self.attention_backend = "triton"
+        elif is_npu():
+            if self.attention_backend != "ascend":
+                logger.warning(
+                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
+                )
+                self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
             if self.attention_backend != "flashinfer":
                 logger.warning(
@@ -3561,7 +3695,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -3726,6 +3860,11 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
+            "--use-ray",
+            action="store_true",
+            help="Use Ray actors for scheduler process management.",
+        )
+        parser.add_argument(
             "--custom-sigquit-handler",
             help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
@@ -3881,7 +4020,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch.",
+            help="The log and metrics reporting interval (in decode iterations) for decode batches.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",
@@ -4225,8 +4364,8 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'flashinfer_cutlass' (default), "
-            "'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "
@@ -4519,8 +4658,8 @@ class ServerArgs:
             "--elastic-ep-backend",
             type=str,
             default=ServerArgs.elastic_ep_backend,
-            choices=["none", "mooncake"],
-            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
         )
         parser.add_argument(
             "--enable-elastic-expert-backup",
@@ -5006,7 +5145,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -5279,6 +5418,12 @@ class ServerArgs:
             default=[],
             help="List of encoder server urls.",
         )
+        parser.add_argument(
+            "--enable-adaptive-dispatch-to-encoder",
+            default=ServerArgs.enable_adaptive_dispatch_to_encoder,
+            action="store_true",
+            help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        )
 
         # Custom weight loader
         parser.add_argument(
@@ -5444,10 +5589,7 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        if is_valid_ipv6_address(host):
-            return f"{scheme}://[{host}]:{self.port}"
-        else:
-            return f"{scheme}://{host}:{self.port}"
+        return NetworkAddress(host, self.port).to_url(scheme)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
@@ -5612,6 +5754,21 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            if self.default_priority_value is None:
+                logger.warning(
+                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
+                    "Requests without explicit priority will have priority=None, "
+                    "resulting in priority='None' string labels in Prometheus metrics."
+                )
+        else:
+            if self.disable_priority_preemption:
+                logger.warning(
+                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
+                )
+            if self.default_priority_value is not None:
+                logger.warning(
+                    "--default-priority-value has no effect without --enable-priority-scheduling"
+                )
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:
@@ -6033,23 +6190,16 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-                port_num, host = configure_ipv6(server_args.dist_init_addr)
-                dist_init_addr = (host, str(port_num))
+                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             else:
-                dist_init_addr = server_args.dist_init_addr.split(":")
+                na = NetworkAddress.parse(server_args.dist_init_addr)
 
-            assert (
-                len(dist_init_addr) == 2
-            ), "please provide --dist-init-addr as host:port of head node"
-
-            dist_init_host, dist_init_port = dist_init_addr
-            dist_init_port = int(dist_init_port)
+            dist_init_host = na.host
+            dist_init_port = na.port
             port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
-            metrics_ipc_name = port_base + 3
+            metrics_port = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -6064,7 +6214,7 @@ class PortArgs:
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    wait_port_available(metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -6076,12 +6226,16 @@ class PortArgs:
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
-                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
+                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                scheduler_input_ipc_name=NetworkAddress(
+                    dist_init_host, scheduler_input_port
+                ).to_tcp(),
+                detokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, detokenizer_port
+                ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
+                metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 

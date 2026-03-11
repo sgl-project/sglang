@@ -248,6 +248,9 @@ async def async_request_openai_completions(
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
 
+        if args.return_logprob and args.top_logprobs_num > 0:
+            payload["logprobs"] = args.top_logprobs_num
+
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
 
@@ -609,9 +612,13 @@ async def async_request_sglang_generate(
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": -1,
+            "logprob_start_len": args.logprob_start_len,
             **request_func_input.extra_request_body,
         }
+        if args.top_logprobs_num > 0:
+            payload["top_logprobs_num"] = args.top_logprobs_num
+        if args.token_ids_logprob is not None:
+            payload["token_ids_logprob"] = args.token_ids_logprob
 
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
@@ -1602,6 +1609,15 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "plot_throughput"):
         args.plot_throughput = False
 
+    if not hasattr(args, "top_logprobs_num"):
+        args.top_logprobs_num = 0
+    if not hasattr(args, "token_ids_logprob"):
+        args.token_ids_logprob = None
+    if not hasattr(args, "logprob_start_len"):
+        args.logprob_start_len = -1
+    if not hasattr(args, "return_logprob"):
+        args.return_logprob = False
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -1985,6 +2001,25 @@ if __name__ == "__main__":
         "--return-logprob",
         action="store_true",
         help="Return logprob.",
+    )
+    parser.add_argument(
+        "--top-logprobs-num",
+        type=int,
+        default=0,
+        help="Number of top logprobs to return per token. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--token-ids-logprob",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Token IDs to probe logprobs for. E.g. --token-ids-logprob 1 2 10 100 1000. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--logprob-start-len",
+        type=int,
+        default=-1,
+        help="Start position for returning input logprobs. -1 means no input logprobs, 0 means all. Only used with --return-logprob.",
     )
     parser.add_argument(
         "--return-routed-experts",

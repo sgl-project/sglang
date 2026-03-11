@@ -193,6 +193,7 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
             or is_deepseek_nsa(self.hf_text_config)
@@ -1360,6 +1361,7 @@ def is_audio_model(model_architectures: List[str]):
 def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "MllamaForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
