@@ -127,7 +127,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_ENABLE_FLASHINFER_FP8_GEMM` (deprecated) | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=flashinfer_trtllm` (SM100/SM103) or `--fp8-gemm-backend=flashinfer_cutlass` (SM120/SM121 and newer) instead. | `false` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` (deprecated) | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=cutlass` instead. | `false` |
 | `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weights downcasting | `false` |
-| `SGLANG_FP8_IGNORED_LAYERS` | Layers to ignore when using FP8 quantization (separated by commas) | `""` |
+| `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1`. | `""` |
 
 
 ## Distributed Computing
