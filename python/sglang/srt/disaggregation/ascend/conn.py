@@ -34,6 +34,11 @@ class AscendKVManager(MooncakeKVManager):
         self.engine.batch_register(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         )
+        # Batch register state/extra pool data buffers
+        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+            self.engine.batch_register(
+                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            )
 
     def send_kvcache(
         self,
