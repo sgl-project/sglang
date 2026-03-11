@@ -468,7 +468,6 @@ def get_context_length(config):
 
     # NOTE: Gemma3's max_position_embeddings is already the final (scaled)
     # context length (128K), so we must not multiply by the RoPE factor again.
-    # This matches the same special-case handling in vLLM.
     model_type = getattr(text_config, "model_type", "") or ""
     is_gemma3 = "gemma3" in model_type
 
