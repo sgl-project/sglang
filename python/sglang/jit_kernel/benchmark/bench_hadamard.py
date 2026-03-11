@@ -1,17 +1,19 @@
 import itertools
 import math
-import os
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.testing
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.hadamard import hadamard_transform
 
+IS_CI = is_in_ci()
+
 # AOT kernel: might not be available in all environments.
-# The hadamard_transform in sgl_kernel may be marked as deprecated/migrated
-# or the build might not include it. This is used for performance baseline comparison.
+# This is used for performance baseline comparison.
 try:
     from sgl_kernel import hadamard_transform as hadamard_transform_aot
 
@@ -20,7 +22,6 @@ except Exception:
     AOT_AVAILABLE = False
 
 # Naive reference implementation using scipy hadamard matrix.
-# This is primarily for validating correctness; scipy may not be installed.
 try:
     from scipy.linalg import hadamard
 
@@ -28,15 +29,9 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
+DTYPE = torch.bfloat16
+DEVICE = "cuda"
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
-
-
-# CI environment uses simplified parameters
 if IS_CI:
     batch_sizes = [16]
     dim_range = [1024]
@@ -44,7 +39,15 @@ else:
     batch_sizes = [1, 16, 64, 256]
     dim_range = [64, 256, 1024, 4096, 8192, 16384, 32768]
 
-configs = list(itertools.product(batch_sizes, dim_range))
+
+# Naive reference implementation using precomputed scipy hadamard matrix.
+def torch_hadamard_transform(x, scale, H, dim, dim_padded):
+    flat = x.reshape(-1, dim)
+    if dim != dim_padded:
+        flat = F.pad(flat, (0, dim_padded - dim))
+    out = F.linear(flat, H) * scale
+    return out[..., :dim].reshape(x.shape)
+
 
 available_providers = ["jit_kernel"]
 available_names = ["JIT Kernel"]
@@ -60,6 +63,8 @@ if SCIPY_AVAILABLE:
     available_names.append("Naive (scipy)")
     available_styles.append(("blue", "-"))
 
+configs = list(itertools.product(batch_sizes, dim_range))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -74,46 +79,32 @@ if SCIPY_AVAILABLE:
         args={},
     )
 )
-def benchmark(batch_size, dim, provider):
-    dtype = torch.bfloat16
-    device = torch.device("cuda")
+def benchmark(batch_size: int, dim: int, provider: str) -> Tuple[float, float, float]:
     scale = 1.0 / math.sqrt(dim)
+    x = torch.randn(batch_size, dim, device=DEVICE, dtype=DTYPE)
 
-    x = torch.randn(batch_size, dim, device=device, dtype=dtype)
-    quantiles = [0.5, 0.2, 0.8]
-
-    if provider == "naive":
-        # Precompute Hadamard matrix on GPU to avoid CPU-GPU transfer during
-        # CUDA graph capture.
+    FN_MAP = {
+        "jit_kernel": lambda: hadamard_transform(x.clone(), scale=scale),
+    }
+    if AOT_AVAILABLE:
+        FN_MAP["aot_kernel"] = lambda: hadamard_transform_aot(
+            x.clone(), scale=scale
+        )
+    if SCIPY_AVAILABLE:
+        # Precompute Hadamard matrix on GPU to avoid CPU-GPU transfer
+        # during CUDA graph capture.
         log_dim = math.ceil(math.log2(dim)) if dim > 0 else 0
         dim_padded = 2**log_dim if dim > 0 else 1
         H = torch.tensor(
-            hadamard(dim_padded, dtype=float), dtype=dtype, device=device
+            hadamard(dim_padded, dtype=float), dtype=DTYPE, device=DEVICE
+        )
+        FN_MAP["naive"] = lambda: torch_hadamard_transform(
+            x.clone(), scale, H, dim, dim_padded
         )
 
-        def naive_fn():
-            xc = x.clone()
-            flat = xc.reshape(-1, dim)
-            if dim != dim_padded:
-                flat = F.pad(flat, (0, dim_padded - dim))
-            out = F.linear(flat, H) * scale
-            return out[..., :dim].reshape(xc.shape)
-
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            naive_fn,
-            quantiles=quantiles,
-        )
-    elif provider == "aot_kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: hadamard_transform_aot(x.clone(), scale=scale),
-            quantiles=quantiles,
-        )
-    elif provider == "jit_kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: hadamard_transform(x.clone(), scale=scale),
-            quantiles=quantiles,
-        )
-
+    fn = FN_MAP[provider]
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
