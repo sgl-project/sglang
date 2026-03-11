@@ -804,13 +804,11 @@ def instanttensor_weights_iterator(
             "Please install instanttensor via `pip install instanttensor`"
         ) from e
 
-    try:
+    process_group = None
+    if torch.distributed.is_initialized():
         world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
-        process_group = None
-    else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
+        if world_group.world_size > 1:
+            process_group = world_group.device_group
 
     device = torch.cuda.current_device()
 

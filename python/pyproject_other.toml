@@ -82,6 +82,7 @@ srt_hip = [
   "torch",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
+  "instanttensor==0.1.6",
 ]
 
 diffusion_hip = [
