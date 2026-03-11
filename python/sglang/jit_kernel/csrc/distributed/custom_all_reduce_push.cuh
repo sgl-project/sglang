@@ -170,6 +170,7 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
   const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes] = params;
 
   PDLWaitPrimary<kUsePDL>();
+
   // Phase 1: Push data from input to all ranks' buffers
   const auto epoch_offset = ctrl.epoch() * epoch_bytes;
   DType* push_buf[kNumGPU];
@@ -179,6 +180,8 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
   }
   push_impl(push_buf, input, num_items);
 
+  PDLTriggerSecondary<kUsePDL>();
+
   // Phase 2: Poll local data
   DType* poll_buf[kNumGPU];
 #pragma unroll
@@ -186,8 +189,6 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
     poll_buf[i] = static_cast<DType*>(pointer::offset(buffer[rank], i * buffer_bytes, epoch_offset));
   }
   poll_impl(poll_buf, output, num_items);
-
-  PDLTriggerSecondary<kUsePDL>();
   ctrl.exit();
 }
 
