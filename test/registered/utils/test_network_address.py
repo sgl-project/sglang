@@ -217,14 +217,12 @@ class TestNetworkAddressImmutability(unittest.TestCase):
 
 
 class TestPortArgsIPv6(unittest.TestCase):
-    """PortArgs.init_new() IPv6 address parsing (moved from test_server_args.py)."""
+    """PortArgs.init_new() IPv6 address parsing via NetworkAddress.parse()."""
 
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_ipv6_address(self, mock_is_valid_ipv6):
+    def test_init_new_with_ipv6_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:25000"
@@ -240,87 +238,65 @@ class TestPortArgsIPv6(unittest.TestCase):
         )
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=False)
-    def test_init_new_with_invalid_ipv6_address(self, mock_is_valid_ipv6):
+    def test_init_new_with_invalid_ipv6_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[invalid-ipv6]:25000"
 
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
-
-        self.assertIn("invalid IPv6 address", str(context.exception))
+        self.assertIn("Invalid IPv6 address inside brackets", str(context.exception))
 
     def test_init_new_with_malformed_ipv6_address_missing_bracket(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1:25000"
 
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
+        self.assertIn("Missing closing bracket", str(context.exception))
 
-        self.assertIn("invalid IPv6 address format", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_missing_port(
-        self, mock_is_valid_ipv6
-    ):
+    def test_init_new_with_malformed_ipv6_address_missing_port(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]"
 
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
+        self.assertIn("Expected ':port' after closing bracket", str(context.exception))
 
-        self.assertIn(
-            "a port must be specified in IPv6 address", str(context.exception)
-        )
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_invalid_port(
-        self, mock_is_valid_ipv6
-    ):
+    def test_init_new_with_malformed_ipv6_address_invalid_port(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:abcde"
 
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
+        self.assertIn("Invalid port number", str(context.exception))
 
-        self.assertIn("invalid port in IPv6 address", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_wrong_separator(
-        self, mock_is_valid_ipv6
-    ):
+    def test_init_new_with_malformed_ipv6_address_wrong_separator(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]#25000"
 
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
-
-        self.assertIn("expected ':' after ']'", str(context.exception))
+        self.assertIn("Expected ':port' after closing bracket", str(context.exception))
 
 
 class TestServerArgsIPv6Url(unittest.TestCase):
