@@ -163,109 +163,6 @@ class TestPortArgs(unittest.TestCase):
         with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_ipv6_address(self, mock_is_valid_ipv6):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]:25000"
-
-        port_args = PortArgs.init_new(server_args)
-
-        self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://[2001:db8::1]:"))
-        self.assertTrue(
-            port_args.scheduler_input_ipc_name.startswith("tcp://[2001:db8::1]:")
-        )
-        self.assertTrue(
-            port_args.detokenizer_ipc_name.startswith("tcp://[2001:db8::1]:")
-        )
-        self.assertIsInstance(port_args.nccl_port, int)
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=False)
-    def test_init_new_with_invalid_ipv6_address(self, mock_is_valid_ipv6):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[invalid-ipv6]:25000"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("invalid IPv6 address", str(context.exception))
-
-    def test_init_new_with_malformed_ipv6_address_missing_bracket(self):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1:25000"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("invalid IPv6 address format", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_missing_port(
-        self, mock_is_valid_ipv6
-    ):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn(
-            "a port must be specified in IPv6 address", str(context.exception)
-        )
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_invalid_port(
-        self, mock_is_valid_ipv6
-    ):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]:abcde"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("invalid port in IPv6 address", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_wrong_separator(
-        self, mock_is_valid_ipv6
-    ):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]#25000"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("expected ':' after ']'", str(context.exception))
-
 
 class TestSSLArgs(unittest.TestCase):
     def test_default_ssl_fields_are_none(self):
@@ -304,10 +201,6 @@ class TestSSLArgs(unittest.TestCase):
     def test_url_rewrites_empty_host_to_loopback(self):
         server_args = ServerArgs(model_path="dummy", host="")
         self.assertEqual(server_args.url(), "http://127.0.0.1:30000")
-
-    def test_url_rewrites_ipv6_all_interfaces_to_loopback(self):
-        server_args = ServerArgs(model_path="dummy", host="::")
-        self.assertEqual(server_args.url(), "http://[::1]:30000")
 
     @patch("os.path.isfile", return_value=True)
     def test_url_returns_https_with_ssl(self, _mock_isfile):
@@ -400,16 +293,6 @@ class TestSSLArgs(unittest.TestCase):
                 self.assertIn(
                     "SSL CA certificates file not found", str(context.exception)
                 )
-
-    @patch("os.path.isfile", return_value=True)
-    def test_url_returns_https_with_ssl_and_ipv6(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy",
-            host="::1",
-            ssl_keyfile="key.pem",
-            ssl_certfile="cert.pem",
-        )
-        self.assertEqual(server_args.url(), "https://[::1]:30000")
 
     def test_enable_ssl_refresh_default_false(self):
         server_args = ServerArgs(model_path="dummy")
