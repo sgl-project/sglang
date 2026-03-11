@@ -1,5 +1,4 @@
 import itertools
-import os
 from typing import Any, Dict, List
 
 import torch
@@ -8,6 +7,7 @@ from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
+    is_in_ci,
 )
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
@@ -21,16 +21,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.bench_utils import bench_kineto
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-NUM_TESTS = 300 if IS_CI else 30
+NUM_TESTS = 30 if IS_CI else 300
 
 GROUP_SIZE_RANGE = [128]
 DST_DTYPE_RANGE = [fp8_type_]
