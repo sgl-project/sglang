@@ -2,19 +2,19 @@
 """
 MoE backend concurrency sweep benchmark.
 
-Compares flashinfer_trtllm, flashinfer_cutlass, and flashinfer_cutedsl across
+Compares MoE runner backends (e.g. flashinfer_trtllm, flashinfer_cutedsl) across
 a range of concurrency levels and EP configurations.  For each (backend, ep)
-pair the script launches a server, runs a quick MMLU sanity check, then sweeps
-concurrency values with bench_serving and records throughput / latency metrics.
+pair the script launches a server, runs a warmup pass, then sweeps concurrency
+values with bench_serving and records throughput / latency metrics.
 
 Example (8xGPU, DeepSeek-R1 NVFP4):
 
     python3 scripts/bench_moe_backend_compare.py \\
         --model nvidia/DeepSeek-R1-0528-NVFP4-v2 \\
-        --backends flashinfer_trtllm flashinfer_cutlass flashinfer_cutedsl \\
+        --backends flashinfer_trtllm flashinfer_cutedsl \\
         --ep-sizes 1 8 \\
         --tp-size 8 \\
-        --concurrency 1 2 4 8 16 32 64 128 512 1024 2048 \\
+        --concurrency 1 8 64 512 4096 \\
         --output-dir bench_moe_sweep_results
 """
 
@@ -29,7 +29,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from sglang.srt.utils import kill_process_tree
@@ -112,27 +111,6 @@ def _build_server_args(
     ]
     args.extend(extra_server_args)
     return args
-
-
-def run_mmlu_sanity(
-    base_url: str,
-    model: str,
-    num_examples: int = 32,
-    num_threads: int = 4,
-) -> float:
-    """Run a small MMLU eval and return the score."""
-    from sglang.test.run_eval import run_eval_once
-    from sglang.test.simple_eval_mmlu import MMLUEval
-
-    if "OPENAI_API_KEY" not in os.environ:
-        os.environ["OPENAI_API_KEY"] = "EMPTY"
-
-    filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-    eval_obj = MMLUEval(filename, num_examples, num_threads)
-    args = SimpleNamespace(base_url=base_url, model=model)
-    base_url_v1 = f"{base_url}/v1"
-    result, _latency, _sampler = run_eval_once(args, base_url_v1, eval_obj)
-    return float(result.score)
 
 
 def run_bench_serving(
@@ -279,18 +257,6 @@ def main() -> None:
         help="Random range ratio for bench_serving.",
     )
     parser.add_argument(
-        "--mmlu-examples",
-        type=int,
-        default=32,
-        help="Number of MMLU examples for sanity check per server launch.",
-    )
-    parser.add_argument(
-        "--mmlu-threads",
-        type=int,
-        default=4,
-        help="Threads for MMLU eval.",
-    )
-    parser.add_argument(
         "--launch-timeout",
         type=int,
         default=max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1200),
@@ -326,13 +292,11 @@ def main() -> None:
     print(f"TP size          : {args.tp_size}")
     print(f"Concurrency      : {concurrency_values}")
     print(f"Input/Output len : {args.random_input_len} / {args.random_output_len}")
-    print(f"MMLU examples    : {args.mmlu_examples}")
     print(f"Server launches  : {total_servers}")
     print(f"Bench runs       : {total_bench_runs}")
     print(f"Output           : {csv_path}")
 
     all_rows: list[dict[str, Any]] = []
-    mmlu_results: dict[tuple[str, int], float] = {}
     done = 0
 
     for ep_size in args.ep_sizes:
@@ -357,43 +321,23 @@ def main() -> None:
             try:
                 server_dead = False
 
-                # -- MMLU sanity check --
-                print(f"\n[MMLU] Running {args.mmlu_examples}-example sanity check ...")
-                try:
-                    score = run_mmlu_sanity(
-                        args.base_url,
-                        args.model,
-                        num_examples=args.mmlu_examples,
-                        num_threads=args.mmlu_threads,
-                    )
-                    mmlu_results[(backend, ep_size)] = score
-                    status = "OK" if score >= 0.5 else "WARNING: low accuracy"
-                    print(f"[MMLU] {label}: score={score:.4f} [{status}]")
-                except Exception as e:
-                    print(f"[MMLU] {label}: FAILED ({e})")
-                    mmlu_results[(backend, ep_size)] = float("nan")
-                    if not _server_alive(args.base_url):
-                        print(f"[MMLU] Server dead after MMLU, skipping sweep")
-                        server_dead = True
-
                 # -- Warmup --
-                if not server_dead:
-                    print(f"\n[WARMUP] concurrency=32, 64 prompts (discarded) ...")
-                    try:
-                        run_bench_serving(
-                            base_url=args.base_url,
-                            num_prompts=64,
-                            max_concurrency=32,
-                            random_input_len=args.random_input_len,
-                            random_output_len=args.random_output_len,
-                            random_range_ratio=args.random_range_ratio,
-                        )
-                        print("[WARMUP] done")
-                    except Exception as e:
-                        print(f"[WARMUP] failed ({e})")
-                        if not _server_alive(args.base_url):
-                            print("[WARMUP] Server dead after warmup, skipping sweep")
-                            server_dead = True
+                print(f"\n[WARMUP] concurrency=32, 64 prompts (discarded) ...")
+                try:
+                    run_bench_serving(
+                        base_url=args.base_url,
+                        num_prompts=64,
+                        max_concurrency=32,
+                        random_input_len=args.random_input_len,
+                        random_output_len=args.random_output_len,
+                        random_range_ratio=args.random_range_ratio,
+                    )
+                    print("[WARMUP] done")
+                except Exception as e:
+                    print(f"[WARMUP] failed ({e})")
+                    if not _server_alive(args.base_url):
+                        print("[WARMUP] Server dead after warmup, skipping sweep")
+                        server_dead = True
 
                 # -- Concurrency sweep --
                 for conc in concurrency_values:
@@ -500,12 +444,6 @@ def main() -> None:
     # -------------------------------------------------------------------
     # Console summary
     # -------------------------------------------------------------------
-
-    _print_header("MMLU Sanity Check")
-    print(f"{'backend':28s} {'ep':>4s} {'mmlu_score':>12s}")
-    print("-" * 48)
-    for (backend, ep_size), score in sorted(mmlu_results.items()):
-        print(f"{backend:28s} {ep_size:4d} {score:12.4f}")
 
     for ep_size in args.ep_sizes:
         _print_header(f"Throughput Sweep: EP={ep_size}, TP={args.tp_size}")
