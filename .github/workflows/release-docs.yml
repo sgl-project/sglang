@@ -28,10 +28,10 @@ jobs:
       - name: Install Mintlify CLI
         run: npm install -g mintlify
 
-      - name: Build docs
+      - name: Validate docs
         run: |
           cd docs
-          mintlify build
+          mintlify validate
 
       - name: Check for broken links
         run: |
