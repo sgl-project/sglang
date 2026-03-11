@@ -380,7 +380,7 @@ class MambaPool:
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
-        if dst_index == None:
+        if dst_index is None:
             return None
         self.copy_from(src_index, dst_index)
         return dst_index

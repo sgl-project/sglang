@@ -23,7 +23,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "decord; platform_machine == 'x86_64'",
   "einops",
   "fastapi",
   "gguf",

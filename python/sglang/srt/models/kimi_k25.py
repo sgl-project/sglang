@@ -26,6 +26,7 @@ except ImportError:
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -120,7 +121,13 @@ class MoonViTEncoderLayer(nn.Module):
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation)
+
+        self.mlp = MLP2(
+            [hidden_dim, mlp_dim, hidden_dim],
+            activation,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
@@ -430,6 +437,8 @@ class MoonViT3dEncoder(nn.Module):
         num_layers: int,
         block_cfg: dict,
         video_attn_type: str = "spatial_temporal",
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -441,7 +450,14 @@ class MoonViT3dEncoder(nn.Module):
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
-            [MoonViTEncoderLayer(**block_cfg) for _ in range(num_layers)]
+            [
+                MoonViTEncoderLayer(
+                    **block_cfg,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                )
+                for layer_idx in range(num_layers)
+            ]
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
@@ -480,7 +496,15 @@ class MoonViT3dPretrainedModel(nn.Module):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
-    def __init__(self, config, *inputs, use_data_parallel: bool = False, **kwargs):
+    def __init__(
+        self,
+        config,
+        *inputs,
+        use_data_parallel: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        **kwargs,
+    ):
         super().__init__()
         config = deepcopy(config)
         self.config = config
@@ -509,6 +533,8 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "use_data_parallel": use_data_parallel,
             },
             video_attn_type=config.video_attn_type,
+            quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
         )
 
     @property
@@ -671,12 +697,23 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config, use_data_parallel=self.use_data_parallel
+            config.vision_config,
+            use_data_parallel=self.use_data_parallel,
+            quant_config=(
+                quant_config if isinstance(quant_config, ModelSlimConfig) else None
+            ),
+            prefix="vision_tower",
         )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
-        self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
+        self.language_model = DeepseekV3ForCausalLM(
+            config.text_config,
+            quant_config,
+            prefix=(
+                "language_model" if isinstance(quant_config, ModelSlimConfig) else ""
+            ),
+        )
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
@@ -718,6 +755,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.language_model.end_layer
 
     def forward(
         self,

@@ -1,10 +1,9 @@
-import os
-
 import torch
 import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack as jit_fn
 from sglang.srt.layers.quantization.utils import gptq_quantize_weights, pack_rows
 
@@ -15,18 +14,13 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
-# Fixed problem dimensions
 SIZE_N = 4096
 NUM_BITS = 4
 QUANT_TYPE = scalar_types.uint4b8
 GROUP_SIZE = 128
 
-# Pre-compute quantized weight for each size_k in the sweep
 _cache = {}
 
 
@@ -86,8 +80,6 @@ else:
 def benchmark(size_k, provider):
     q_w_gptq, sort_indices = _get_inputs(size_k)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "jit":
         fn = lambda: jit_fn(q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS)
     elif provider == "aot":
@@ -95,8 +87,7 @@ def benchmark(size_k, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
