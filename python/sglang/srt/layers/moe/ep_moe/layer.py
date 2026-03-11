@@ -747,7 +747,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+    if (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mooncake()
+        or get_moe_a2a_backend().is_nixl()
+    ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
