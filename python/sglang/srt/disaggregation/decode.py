@@ -521,6 +521,9 @@ class DecodePreallocQueue:
                         error_message,
                         status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    self.scheduler.stream_output([req], req.return_logprob)
                 continue
 
             need_query = []
