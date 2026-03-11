@@ -1,11 +1,13 @@
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls
 from sglang.srt.distributed import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
@@ -20,8 +22,10 @@ T = TypeVar("T")
 INF = 1 << 60
 
 
-# NOTE(dark): This is tuned on hopper GPUs, also need tuning on blackwell/ampere
-THRESHOLD_2_SHOT_MAP: Dict[int, int]
+@dataclass(frozen=True)
+class ModeConfig:
+    one_shot_push_threshold: int  # below this, use push
+    one_shot_pull_threshold: int  # below this, use one-shot
 
 
 class CustomAllReduceV2:
@@ -29,19 +33,10 @@ class CustomAllReduceV2:
         self,
         group: ProcessGroup,
         device: torch.device,
-        max_size: Optional[int] = None,
+        max_pull_size: Optional[int] = None,
+        max_push_size: Optional[int] = None,
     ) -> None:
-        if max_size is None:
-            max_size = 16 * 1024 * 1024  # default to 16MB
-
         _init_config()
-        self.max_size = max_size
-        self.group = group
-        self.disabled = True
-        self.rank = dist.get_rank(group=self.group)
-        self.world_size = dist.get_world_size(group=self.group)
-        self.override_shot(None)
-
         full_nvlink = can_use_custom_all_reduce_with_nvlink(
             group=group,
             device=device,
@@ -50,21 +45,38 @@ class CustomAllReduceV2:
         )
         if full_nvlink != True:
             return
-        from sglang.jit_kernel.all_reduce import get_custom_all_reduce_cls
 
-        MAX_GRAPH_INPUTS = 131072
-        cls = get_custom_all_reduce_cls()
-        self.obj = cls(self.rank, self.world_size, self.max_size, MAX_GRAPH_INPUTS)
+        self.group = group
+        self.disabled = True
+        self.rank = dist.get_rank(group=self.group)
+        self.world_size = dist.get_world_size(group=self.group)
+        self.override_shot(None)
+        if max_pull_size is None:
+            max_pull_size = 16 * 1024 * 1024  # default to 16MB
+        if max_push_size is None:
+            max_push_size = self.config.one_shot_push_threshold
+        max_push_size = min(max_push_size, max_pull_size)
+        self.max_pull_size = max_pull_size
+        self.max_push_size = max_push_size
+        self.override_algo: Optional[AllReduceAlgo] = None
+        self.obj = get_custom_all_reduce_cls()(
+            self.rank,
+            self.world_size,
+            self.max_pull_size,
+            self.max_push_size,
+            graph_input_count=131072,
+        )
         self._post_init_obj()
         self.disabled = False
         log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
 
     def override_shot(self, shot: int | None):
         if shot is None:
-            self.threshold = THRESHOLD_2_SHOT_MAP[self.world_size]
+            self.config = THRESHOLD_2_SHOT_MAP[self.world_size]
         else:
             assert shot in (1, 2)
-            self.threshold = INF if shot == 1 else 0
+            threshold = INF if shot == 1 else 0
+            self.config = replace(self.config, one_shot_pull_threshold=threshold)
 
     @contextmanager
     def capture(self):
@@ -97,15 +109,9 @@ class CustomAllReduceV2:
             return False
         if not is_weak_contiguous(inp):
             return False
-        return inp_size <= self.max_size
+        return inp_size <= self.max_pull_size
 
-    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
-        """Main allreduce API compatible with GroupCoordinator.
-
-        Returns the reduced tensor, or None if custom AR is disabled/unsuitable.
-        """
-        if self.disabled or not self.should_custom_ar(input):
-            return None
+    def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         if is_in_piecewise_cuda_graph():  # disable inplace optimization
             try:
                 self.obj.set_cuda_graph_capture(False)
@@ -120,9 +126,19 @@ class CustomAllReduceV2:
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
+        algo = self._determine_algo(input)
+        return torch.from_dlpack(self.obj.all_reduce(input, algo))
+
+    def _determine_algo(self, input: torch.Tensor) -> AllReduceAlgo:
+        if self.override_algo is not None:
+            return self.override_algo
         input_bytes = input.numel() * input.element_size()
-        shots = 1 if input_bytes <= self.threshold else 2
-        return torch.from_dlpack(self.obj.all_reduce(input, shots))
+        if input_bytes <= self.config.one_shot_push_threshold:
+            return AllReduceAlgo.ONE_SHOT_PUSH
+        if input_bytes <= self.config.one_shot_pull_threshold:
+            return AllReduceAlgo.ONE_SHOT_PULL
+        else:
+            return AllReduceAlgo.TWO_SHOT_PULL
 
     def _post_init_obj(self):
         handles = [self.obj.share_storage()]
@@ -144,23 +160,27 @@ class CustomAllReduceV2:
 def _init_config():
     global THRESHOLD_2_SHOT_MAP
     KB, MB = 1024, 1024 * 1024
-    THRESHOLD_2_SHOT_MAP = {
-        2: INF,
-        3: 512 * KB,
-        4: 256 * KB,
-        5: 256 * KB,
-        6: 256 * KB,
-        7: 192 * KB,
-        8: 192 * KB,
-    }
 
-    if is_sm100_supported:
+    if is_sm100_supported():
         THRESHOLD_2_SHOT_MAP = {
-            2: INF,
-            3: 4 * MB,
-            4: 2 * MB,
-            5: int(1.5 * MB),
-            6: 1 * MB,
-            7: 7 * 128 * KB,
-            8: 6 * 128 * KB,
+            2: ModeConfig(4 * MB, INF),
+            3: ModeConfig(4 * MB, 4 * MB),
+            4: ModeConfig(2 * MB, 2 * MB),
+            5: ModeConfig(2 * MB, 2 * MB),
+            6: ModeConfig(1 * MB, 1 * MB),
+            7: ModeConfig(7 * 128 * KB, 7 * 128 * KB),
+            8: ModeConfig(6 * 128 * KB, 6 * 128 * KB),
         }
+    else:
+        THRESHOLD_2_SHOT_MAP = {
+            2: ModeConfig(0, INF),
+            3: ModeConfig(0, 512 * KB),
+            4: ModeConfig(0, 256 * KB),
+            5: ModeConfig(0, 256 * KB),
+            6: ModeConfig(0, 256 * KB),
+            7: ModeConfig(0, 192 * KB),
+            8: ModeConfig(0, 192 * KB),
+        }
+
+
+THRESHOLD_2_SHOT_MAP: Dict[int, ModeConfig] = {}

@@ -6,7 +6,7 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
-#include <sgl_kernel/distributed/all_reduce.cuh>
+#include <sgl_kernel/distributed/custom_all_reduce.cuh>
 
 #include <cstdint>
 #include <cstring>
@@ -15,7 +15,7 @@ inline void register_custom_all_reduce() {
   namespace refl = tvm::ffi::reflection;
   using Class = host::distributed::CustomAllReduceBase;
   refl::ObjectDef<Class>()
-      .def(refl::init<uint32_t, uint32_t, uint32_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<uint32_t, uint32_t, uint32_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("share_storage", &Class::share_storage)
       .def("share_graph_inputs", &Class::share_graph_inputs)
       .def("post_init", &Class::post_init)

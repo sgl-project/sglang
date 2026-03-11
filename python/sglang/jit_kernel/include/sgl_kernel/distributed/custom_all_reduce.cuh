@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <sgl_kernel/distributed/common.cuh>
 
@@ -13,12 +14,15 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
 namespace host::distributed {
+
+using device::distributed::PullController, device::distributed::PushController;
 
 struct AllReduceData {
   constexpr AllReduceData() {}
@@ -28,7 +32,6 @@ struct AllReduceData {
 using ExternHandle = tvm::ffi::Array<char>;
 
 inline ExternHandle to_extern_handle(void* ptr) {
-  using namespace host;
   ExternHandle array;
   cudaIpcMemHandle_t handle;
   RuntimeDeviceCheck(cudaIpcGetMemHandle(&handle, ptr));
@@ -39,7 +42,6 @@ inline ExternHandle to_extern_handle(void* ptr) {
 }
 
 inline void* from_extern_handle(const ExternHandle& array) {
-  using namespace host;
   cudaIpcMemHandle_t handle;
   RuntimeCheck(array.size() == sizeof(handle), "Invalid IPC handle size: ", array.size());
   for (size_t i = 0; i < sizeof(handle); ++i) {
@@ -74,23 +76,27 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   using InputPair = tvm::ffi::Tuple<int64_t, ExternHandle>;  // (offset, ipc handle)
 
   CustomAllReduceBase(
-      uint32_t rank, uint32_t num_gpu, uint32_t max_num_cta, int64_t buffer_size_bytes, int64_t graph_buffer_count)
-      : m_buffer_size_bytes(buffer_size_bytes),
+      uint32_t rank,
+      uint32_t num_gpu,
+      uint32_t max_num_cta,
+      int64_t pull_buffer_size,
+      int64_t push_buffer_size,
+      int64_t graph_buffer_count)
+      : m_pull_buffer_bytes(pull_buffer_size),
+        m_push_buffer_bytes(push_buffer_size),
         m_graph_buffer_count(graph_buffer_count),
         m_rank(rank),
         m_num_gpu(num_gpu),
         m_max_num_cta(max_num_cta),
         m_num_cta(0),
         m_cta_size(0) {
-    // The buffer layout is as follows:
-    // | SignalArray | AllReduceData (local) |  GraphBuffer (AllReduceData) | buffer data |
-    using namespace host;
-    const auto needed_bytes = m_payload_bytes() + buffer_size_bytes;
-    RuntimeDeviceCheck(cudaMalloc(&m_storage, needed_bytes));
-    RuntimeCheck(rank < m_num_gpu, "Invalid rank: ", rank);
+    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    RuntimeCheck(rank < num_gpu, "Invalid rank: ", rank);
     const int64_t kU32Max = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
-    RuntimeCheck(m_buffer_size_bytes <= kU32Max, "Buffer size is too large: ", m_buffer_size_bytes);
-    this->configure(m_max_num_cta, 256);  // set default config
+    const int64_t push_buffer_size_all = push_all_ranks_bytes();
+    RuntimeCheck(pull_buffer_size <= kU32Max, "Buffer size is too large: ", pull_buffer_size);
+    RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
+    this->configure(max_num_cta, 256);  // set default config
   }
 
   ExternHandle share_storage() {
@@ -98,9 +104,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
   tvm::ffi::Array<InputPair> share_graph_inputs() {
-    using namespace host;
     tvm::ffi::Array<InputPair> result;
-    const auto new_inputs_count = m_registered_count() - m_cum_registered_count;
+    const auto new_inputs_count = registered_count() - m_cum_registered_count;
     RuntimeCheck(new_inputs_count >= 0, "Invalid new count: ", new_inputs_count);
     result.reserve(new_inputs_count);
     std::unordered_map<void*, ExternHandle> ipc_cache;
@@ -123,36 +128,42 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
   void post_init(tvm::ffi::Array<ExternHandle> ipc_storages) {
-    using namespace host;
     RuntimeCheck(ipc_storages.size() == m_num_gpu, "Invalid array size: ", ipc_storages.size());
-    m_storage_pointers.resize(m_num_gpu);
+    m_peer_storage.resize(m_num_gpu);
     for (const auto i : irange(m_num_gpu)) {
       if (i == m_rank) {
-        m_storage_pointers[i] = m_storage;
+        m_peer_storage[i] = m_storage;
       } else {
-        m_storage_pointers[i] = from_extern_handle(ipc_storages[i]);
+        m_peer_storage[i] = from_extern_handle(ipc_storages[i]);
       }
     }
 
     // set signal buffer to zero
-    RuntimeDeviceCheck(cudaMemset(m_storage, 0, m_semaphore_bytes()));
+    const auto pull_signal = get_pull_signal(m_storage);
+    RuntimeDeviceCheck(cudaMemset(pull_signal, 0, signal_bytes()));
 
-    // update the default data pointer
+    // update the pull controller and data pointer
+    RuntimeCheck(!m_pull_ctrl.has_value(), "Controller is already initialized");
+    m_pull_ctrl.emplace(m_peer_storage.data(), m_num_gpu);
     AllReduceData data;
     for (const auto i : irange(m_num_gpu)) {
-      data.input[i] = pointer::offset(m_storage_pointers[i], m_payload_bytes());
+      data.input[i] = get_pull_buffer(m_peer_storage[i]);
     }
-    RuntimeDeviceCheck(cudaMemcpy(m_get_data_ptr(), &data, sizeof(AllReduceData), cudaMemcpyHostToDevice));
+    const auto default_data_ptr = get_data_ptr();
+    RuntimeDeviceCheck(cudaMemcpy(default_data_ptr, &data, sizeof(AllReduceData), cudaMemcpyHostToDevice));
 
-    // update the controller
-    RuntimeCheck(!m_ctrl.has_value(), "Controller is already initialized");
-    m_ctrl.emplace(m_storage_pointers.data(), m_num_gpu);
+    // update the push controller and data pointer
+    RuntimeCheck(!m_push_ctrl.has_value(), "Controller is already initialized");
+    const auto push_signal = get_push_signal(m_storage);
+    RuntimeDeviceCheck(cudaMemset(push_signal, 0, signal_bytes()));
+    m_push_ctrl.emplace(push_signal);
+    const auto push_buffer = get_push_buffer(m_storage);
+    RuntimeDeviceCheck(cudaMemset(push_buffer, 0, push_all_ranks_bytes()));
   }
 
   void register_inputs(tvm::ffi::Array<tvm::ffi::Array<InputPair>> ipc_graph_inputs) {
-    using namespace host;
     RuntimeCheck(ipc_graph_inputs.size() == m_num_gpu);
-    const auto new_registered_count = m_registered_count() - m_cum_registered_count;
+    const auto new_registered_count = registered_count() - m_cum_registered_count;
     RuntimeCheck(new_registered_count >= 0, "Invalid registered count: ", new_registered_count);
     if (new_registered_count == 0) return;  // avoid `m_get_data_ptr()` out-of-bounds
     std::vector<AllReduceData> data;
@@ -189,7 +200,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     }
 
     const auto new_registered_bytes = sizeof(AllReduceData) * new_registered_count;
-    const auto dst_ptr = m_get_data_ptr(m_cum_registered_count);
+    const auto dst_ptr = get_data_ptr(m_cum_registered_count);
     m_cum_registered_count += new_registered_count;
     RuntimeDeviceCheck(cudaMemcpy(dst_ptr, data.data(), new_registered_bytes, cudaMemcpyHostToDevice));
   }
@@ -228,47 +239,76 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
  protected:
-  AllReduceData* m_allocate_graph_capture_input(void* data_ptr) {
-    using namespace host;
-    const auto count = m_registered_count();
+  AllReduceData* allocate_graph_capture_input(void* data_ptr) {
+    const auto count = registered_count();
     RuntimeCheck(count < m_graph_buffer_count, "Graph buffer overflow, increase `graph_buffer_count`!");
     m_graph_capture_inputs.push_back(data_ptr);
-    return m_get_data_ptr(count);
+    return get_data_ptr(count);
   }
-
-  AllReduceData* m_get_data_ptr(int64_t which = -1) {
-    using namespace host;
-    const auto count = m_registered_count();
+  AllReduceData* get_data_ptr(int64_t which = -1) {
+    const auto count = registered_count();
     RuntimeCheck(which >= -1 && which < count, "Invalid graph buffer index: ", which, ", count: ", count);
-    const auto start = pointer::offset(m_storage, m_semaphore_bytes());
+    const auto start = get_pull_params(m_storage);
     return static_cast<AllReduceData*>(start) + (1 + which);
   }
-
-  int64_t m_registered_count() const {
+  int64_t registered_count() const {
     return static_cast<int64_t>(m_graph_capture_inputs.size());
   }
-
-  int64_t m_semaphore_bytes() const {
+  int64_t signal_bytes() const {
     return sizeof(device::distributed::Semaphore) * m_max_num_cta;
   }
-
-  int64_t m_payload_bytes() const {
-    return m_semaphore_bytes() + sizeof(AllReduceData) * (1 + m_graph_buffer_count);
+  int64_t params_bytes() const {
+    return sizeof(AllReduceData) * (1 + m_graph_buffer_count);  // 1 for default
+  }
+  int64_t push_all_ranks_bytes() const {
+    return PushController::kNumStages * m_num_gpu * m_push_buffer_bytes;
+  }
+  int64_t storage_bytes() const {
+    // | SignalArray (push + pull) | GraphBuffers (params) | pull buffer | push buffer |
+    return _get_offset_impl(5);
+  }
+  void* get_pull_signal(void* ptr) const {
+    return pointer::offset(ptr, _get_offset_impl(0));
+  }
+  void* get_push_signal(void* ptr) const {
+    return pointer::offset(ptr, _get_offset_impl(1));
+  }
+  void* get_pull_params(void* ptr) const {
+    return pointer::offset(ptr, _get_offset_impl(2));
+  }
+  void* get_pull_buffer(void* ptr) const {
+    return pointer::offset(ptr, _get_offset_impl(3));
+  }
+  void* get_push_buffer(void* ptr) const {
+    return pointer::offset(ptr, _get_offset_impl(4));
+  }
+  int64_t _get_offset_impl(int64_t which) const {
+    const int64_t offset_map[5] = {
+        /*[0]=*/signal_bytes(),
+        /*[1]=*/signal_bytes(),
+        /*[2]=*/params_bytes(),
+        /*[3]=*/m_pull_buffer_bytes,
+        /*[4]=*/push_all_ranks_bytes(),
+    };
+    RuntimeCheck(which >= 0 && which <= 5, "Invalid offset index: ", which);
+    return std::accumulate(offset_map, offset_map + which, int64_t(0));
   }
 
-  const int64_t m_buffer_size_bytes;
+  const int64_t m_pull_buffer_bytes;
+  const int64_t m_push_buffer_bytes;
   const int64_t m_graph_buffer_count;
   const uint32_t m_rank;
   const uint32_t m_num_gpu;
   const uint32_t m_max_num_cta;
   uint32_t m_num_cta;
   uint32_t m_cta_size;
-  int64_t m_cum_registered_count = 0;
   bool m_is_graph_capturing = false;
+  int64_t m_cum_registered_count = 0;
+  std::optional<PullController> m_pull_ctrl;
+  std::optional<PushController> m_push_ctrl;
   void* m_storage = nullptr;
   std::vector<void*> m_graph_capture_inputs;
-  std::vector<void*> m_storage_pointers;
-  std::optional<device::distributed::Controller> m_ctrl;
+  std::vector<void*> m_peer_storage;
   std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> m_ipc_cache;
 };
 
@@ -277,3 +317,30 @@ struct CustomAllReduceRef : public tvm::ffi::ObjectRef {
 };
 
 }  // namespace host::distributed
+
+namespace device::distributed {
+
+template <typename DType2, size_t N, uint32_t M>
+SGL_DEVICE auto reduce_impl(AlignedVector<DType2, N> (&storage)[M]) -> AlignedVector<DType2, N> {
+  fp32x2_t acc[N] = {};
+#pragma unroll  // unroll num gpu
+  for (uint32_t i = 0; i < M; ++i) {
+#pragma unroll  // unroll vec
+    for (uint32_t j = 0; j < N; ++j) {
+      const auto [x, y] = cast<fp32x2_t>(storage[i][j]);
+      auto& [x_acc, y_acc] = acc[j];
+      x_acc += x;
+      y_acc += y;
+    }
+  }
+
+  AlignedVector<DType2, N> result;
+#pragma unroll
+  for (uint32_t j = 0; j < N; ++j) {
+    result[j] = cast<DType2>(acc[j]);
+  }
+
+  return result;
+}
+
+}  // namespace device::distributed

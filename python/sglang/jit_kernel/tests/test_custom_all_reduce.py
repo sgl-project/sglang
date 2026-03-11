@@ -25,6 +25,8 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+from sglang.jit_kernel.all_reduce import AllReduceAlgo
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -47,7 +49,11 @@ TEST_SIZES = [
     4 * 1024 * 1024,  # 4M elements
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-SHOTS = [1, 2]
+SHOTS = [
+    AllReduceAlgo.ONE_SHOT_PULL,
+    AllReduceAlgo.ONE_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_PULL,
+]
 USE_GRAPH_OPTIONS = [True, False]
 TEST_CONFIG = itertools.product(TEST_SIZES, TEST_DTYPES, SHOTS, USE_GRAPH_OPTIONS)
 TEST_LAYERS = 2
@@ -122,7 +128,7 @@ def init_distributed():
     assert nccl_group is not None
 
     max_size = max(TEST_SIZES) * 4
-    comm = CustomAllReduceV2(group=cpu_group, device=device, max_size=max_size)
+    comm = CustomAllReduceV2(cpu_group, device, max_size, max_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
 
@@ -137,9 +143,9 @@ def worker_test(
     size: int,
     dtype: torch.dtype,
     use_graph: bool,
-    shot: int,
+    algo: AllReduceAlgo,
 ) -> Optional[RuntimeError]:
-    comm.override_shot(shot)
+    comm.override_algo = algo
 
     def get_run_graph_fn():
         graph = torch.cuda.CUDAGraph()
@@ -184,8 +190,8 @@ def worker_test(
         nccl_group.barrier().wait()
     if num_errors > 0:
         return RuntimeError(
-            f"Test failed for size={size}, dtype={dtype}, shot={shot}, "
-            f"use_graph={use_graph} with {num_errors} errors. "
+            f"Test failed for {size=}, {dtype=}, {algo=}, "
+            f"{use_graph=} with {num_errors} errors. "
         )
     return None
 
@@ -201,12 +207,12 @@ def worker_main() -> None:
     items = list(enumerate(TEST_CONFIG))
     disable_pbar = os.environ.get("DISABLE_PBAR", "0") == "1" or rank != 0
     pbar = tqdm(items, desc=f"Testing {world_size} GPUs", disable=disable_pbar)
-    for i, (size, dtype, shot, use_graph) in pbar:
-        error = worker_test(device, nccl_group, comm, size, dtype, use_graph, shot)
+    for i, (size, dtype, algo, use_graph) in pbar:
+        error = worker_test(device, nccl_group, comm, size, dtype, use_graph, algo)
         if error is not None:
             print(
-                f"Worker {rank} failed for size={size}, dtype={dtype}, "
-                f"shot={shot}, use_graph={use_graph}, iteration={i}\n"
+                f"Worker {rank} failed for {size=}, {dtype=}, "
+                f"{algo=}, {use_graph=}, iteration={i}\n"
                 f"Error: {error}"
             )
         # communicate the result to rank 0 for logging
@@ -216,7 +222,7 @@ def worker_main() -> None:
         if failed:
             raise RuntimeError(
                 f"Test failed on rank {rank} for config: "
-                f"size={size}, dtype={dtype}, shot={shot}, use_graph={use_graph}"
+                f"{size=}, {dtype=}, {algo=}, {use_graph=}"
             )
 
     comm.close()

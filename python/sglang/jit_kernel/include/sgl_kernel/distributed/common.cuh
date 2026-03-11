@@ -32,13 +32,13 @@ struct alignas(128) Semaphore {
   }
 
   // Only called by the owning GPU - plain load is sufficient
-  SGL_DEVICE uint32_t counter() const {
+  SGL_DEVICE uint32_t get_counter() const {
     return m_counter;
   }
 
   // Only called by the owning GPU - plain store is sufficient
-  SGL_DEVICE void advance(uint32_t val) {
-    m_counter += val;
+  SGL_DEVICE void set_counter(uint32_t val) {
+    m_counter = val;
   }
 
  private:
@@ -46,9 +46,9 @@ struct alignas(128) Semaphore {
   uint32_t m_counter;
 };
 
-struct Controller {
+struct PullController {
  public:
-  Controller(void** signals, uint32_t num_gpu) {
+  PullController(void** signals, uint32_t num_gpu) {
     for (uint32_t i = 0; i < num_gpu; ++i) {
       m_signals[i] = static_cast<Semaphore*>(signals[i]);
     }
@@ -73,11 +73,11 @@ struct Controller {
         const auto target = num_gpu * kStage;
         /// NOTE: correctness here:
         /// - base is only read/updated locally by the owning GPU
-        const auto base = signal.counter();
+        const auto base = signal.get_counter();
         while (signal.get<kFence>() - base < target)
           ;
         if constexpr (!kStart) {
-          signal.advance(target);
+          signal.set_counter(base + target);
         }
       }
     }
@@ -86,6 +86,29 @@ struct Controller {
 
  private:
   Semaphore* __restrict__ m_signals[kMaxNumGPU];
+};
+
+struct PushController {
+ public:
+  static constexpr int64_t kNumStages = 2;
+
+  PushController(void* ptr) : m_local_signal(static_cast<Semaphore*>(ptr)) {}
+
+  SGL_DEVICE uint32_t epoch() const {
+    return m_local_signal[blockIdx.x].get_counter();
+  }
+
+  SGL_DEVICE void exit() const {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      auto& signal = m_local_signal[blockIdx.x];
+      const auto epoch = signal.get_counter();
+      signal.set_counter((epoch + 1) % kNumStages);
+    }
+  }
+
+ private:
+  Semaphore* m_local_signal;
 };
 
 }  // namespace device::distributed

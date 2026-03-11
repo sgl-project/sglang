@@ -21,6 +21,8 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci
+
 DTYPE_MAP = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -46,8 +48,6 @@ MESSAGE_SIZES_BYTES = [
     8 * 1024 * 1024,  # 8M
     16 * 1024 * 1024,  # 16M
     32 * 1024 * 1024,  # 32M
-    64 * 1024 * 1024,  # 64M
-    128 * 1024 * 1024,  # 128M
 ]
 
 
@@ -60,8 +60,6 @@ MESSAGE_SIZES_BYTES = [
 
 
 class NCCLBackend:
-    """torch.distributed NCCL all-reduce (in-place, used as baseline)."""
-
     name = "NCCL"
 
     def __init__(self, group: dist.ProcessGroup):
@@ -76,9 +74,7 @@ class NCCLBackend:
 
 
 class AOTAllReduceBackend:
-    """AOT sgl-kernel custom all-reduce (v1)."""
-
-    name = "AOT-CAR"
+    name = "AOT"
 
     def __init__(self, group: dist.ProcessGroup, device: torch.device):
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -86,7 +82,7 @@ class AOTAllReduceBackend:
         )
 
         max_size = max(MESSAGE_SIZES_BYTES)
-        self.comm = CustomAllreduce(group=group, device=device, max_size=max_size)
+        self.comm = CustomAllreduce(group, device, max_size=max_size)
         if self.comm.disabled:
             raise RuntimeError("AOT CustomAllreduce is disabled on this system")
 
@@ -99,17 +95,15 @@ class AOTAllReduceBackend:
 
 
 class JITAllReduceBackend:
-    """JIT custom all-reduce (v2)."""
+    name = "JIT"
 
-    def __init__(self, group: dist.ProcessGroup, device: torch.device, shot):
+    def __init__(self, group: dist.ProcessGroup, device: torch.device):
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
 
-        self.name = f"JIT-CAR-{shot}shot" if shot is not None else "JIT-CAR"
         max_size = max(MESSAGE_SIZES_BYTES)
-        self.comm = CustomAllReduceV2(group=group, device=device, max_size=max_size)
-        self.comm.override_shot(shot)
+        self.comm = CustomAllReduceV2(group, device, max_pull_size=max_size)
         if self.comm.disabled:
             raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
 
@@ -119,6 +113,41 @@ class JITAllReduceBackend:
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         assert self.comm.should_custom_ar(tensor), str(tensor.shape)
         return self.comm.custom_all_reduce(tensor)
+
+
+class FlashInferBackend:
+    name = "FI"
+
+    def __init__(self, group: dist.ProcessGroup, dtype: torch.dtype):
+        import flashinfer.comm as comm
+
+        rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        max_size = max(MESSAGE_SIZES_BYTES)
+        hidden_dim = min(MESSAGE_SIZES_BYTES) // 2
+        num_tokens = max_size // hidden_dim
+        self.comm = comm
+        self.hidden_dim = hidden_dim
+        self.workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=num_tokens,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+        )
+
+    def capture(self, *_):
+        return contextlib.nullcontext()
+
+    def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        return self.comm.allreduce_fusion(
+            input=tensor.view(-1, self.hidden_dim),
+            workspace=self.workspace,
+            pattern=self.comm.AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=True,
+            fp32_acc=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +327,12 @@ def main():
     # Instantiate backends.
     backends = [
         NCCLBackend(nccl_group),
-        JITAllReduceBackend(cpu_group, device, None),
-        JITAllReduceBackend(cpu_group, device, 1),
-        JITAllReduceBackend(cpu_group, device, 2),
+        JITAllReduceBackend(cpu_group, device),
     ]
-
     if world_size in [2, 4, 6, 8]:
         backends.insert(1, AOTAllReduceBackend(cpu_group, device))
+    if world_size in [2, 4, 8]:
+        backends.append(FlashInferBackend(cpu_group, dtype))
 
     # Run benchmarks.
     all_results: Dict[str, Dict[int, float]] = {}
@@ -342,5 +370,5 @@ def main():
     dist.destroy_process_group()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not is_in_ci():
     main()
