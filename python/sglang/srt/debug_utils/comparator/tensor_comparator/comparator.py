@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
+    DEFAULT_PERCENTILES,
     DiffInfo,
     TensorComparisonInfo,
     TensorInfo,
@@ -11,6 +12,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     argmax_coord,
+    calc_per_token_rel_diff,
     calc_rel_diff,
     compute_smaller_dtype,
     try_unify_shape,
@@ -26,6 +28,7 @@ def compare_tensor_pair(
     x_target: torch.Tensor,
     name: str = "",
     diff_threshold: float = 1e-3,
+    seq_dim: Optional[int] = None,
 ) -> TensorComparisonInfo:
     baseline_info = TensorInfo(
         shape=list(x_baseline.shape),
@@ -54,10 +57,11 @@ def compare_tensor_pair(
     downcast_dtype: Optional[torch.dtype] = None
 
     if not shape_mismatch:
-        diff = _compute_diff(
+        diff = compute_diff(
             x_baseline=x_baseline_f,
             x_target=x_target_f,
             diff_threshold=diff_threshold,
+            seq_dim=seq_dim,
         )
 
         needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
@@ -70,7 +74,7 @@ def compare_tensor_pair(
                 Pair(x=baseline_original_dtype, y=target_original_dtype)
             )
             if downcast_dtype is not None:
-                diff_downcast = _compute_diff(
+                diff_downcast = compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
                     diff_threshold=diff_threshold,
@@ -89,28 +93,53 @@ def compare_tensor_pair(
 
 
 def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
-    include_quantiles = x.numel() < QUANTILE_NUMEL_THRESHOLD
+    if x.numel() == 0:
+        return TensorStats(
+            mean=0.0,
+            abs_mean=0.0,
+            std=0.0,
+            min=0.0,
+            max=0.0,
+            percentiles={},
+        )
+
+    include_quantiles: bool = x.numel() < QUANTILE_NUMEL_THRESHOLD
     return TensorStats(
         mean=torch.mean(x).item(),
+        abs_mean=torch.mean(x.abs()).item(),
         std=torch.std(x).item(),
         min=torch.min(x).item(),
         max=torch.max(x).item(),
-        p1=_quantile_or_none(x, q=0.01, include=include_quantiles),
-        p5=_quantile_or_none(x, q=0.05, include=include_quantiles),
-        p95=_quantile_or_none(x, q=0.95, include=include_quantiles),
-        p99=_quantile_or_none(x, q=0.99, include=include_quantiles),
+        percentiles=_compute_percentiles(x, include=include_quantiles),
     )
 
 
-def _quantile_or_none(x: torch.Tensor, *, q: float, include: bool) -> Optional[float]:
-    return torch.quantile(x, q).item() if include else None
+def _compute_percentiles(x: torch.Tensor, *, include: bool) -> dict[int, float]:
+    if not include:
+        return {}
+    x_float: torch.Tensor = x.float()
+    return {p: torch.quantile(x_float, p / 100.0).item() for p in DEFAULT_PERCENTILES}
 
 
-def _compute_diff(
+def compute_diff(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     diff_threshold: float = 1e-3,
+    seq_dim: Optional[int] = None,
 ) -> DiffInfo:
+    if x_baseline.numel() == 0:
+        return DiffInfo(
+            rel_diff=0.0,
+            max_abs_diff=0.0,
+            mean_abs_diff=0.0,
+            abs_diff_percentiles={},
+            max_diff_coord=[],
+            baseline_at_max=0.0,
+            target_at_max=0.0,
+            diff_threshold=diff_threshold,
+            passed=True,
+        )
+
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = argmax_coord(raw_abs_diff)
 
@@ -118,17 +147,25 @@ def _compute_diff(
     max_abs_diff = raw_abs_diff.max().item()
     mean_abs_diff = raw_abs_diff.mean().item()
 
+    include_quantiles: bool = raw_abs_diff.numel() < QUANTILE_NUMEL_THRESHOLD
+
+    per_token_rel_diff: Optional[list[float]] = None
+    if seq_dim is not None and x_baseline.dim() > seq_dim:
+        per_token_rel_diff = calc_per_token_rel_diff(
+            x_baseline, x_target, seq_dim=seq_dim
+        ).tolist()
+
     return DiffInfo(
         rel_diff=rel_diff,
         max_abs_diff=max_abs_diff,
         mean_abs_diff=mean_abs_diff,
+        abs_diff_percentiles=_compute_percentiles(
+            raw_abs_diff, include=include_quantiles
+        ),
         max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
         diff_threshold=diff_threshold,
-        passed=(
-            rel_diff <= diff_threshold
-            and max_abs_diff <= diff_threshold
-            and mean_abs_diff <= diff_threshold
-        ),
+        passed=rel_diff <= diff_threshold,
+        per_token_rel_diff=per_token_rel_diff,
     )

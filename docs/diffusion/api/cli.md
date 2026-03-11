@@ -41,6 +41,13 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
+**Post-Processing** (frame interpolation & upscaling)
+
+SGLang diffusion supports optional post-processing steps — frame interpolation
+(RIFE) for smoother video and upscaling (Real-ESRGAN) for higher resolution.
+See the dedicated **[Post-Processing](post_processing.md)** page for full
+details, supported models, and examples.
+
 **Output Options**
 
 - `--output-path {PATH}`: Directory to save the generated video
@@ -258,6 +265,8 @@ SGLang diffusion supports a **diffusers backend** that allows you to run any dif
 | `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
 | `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
 | `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+| `--enable-torch-compile` | flag | Enable `torch.compile` for diffusers pipelines. |
+| `--cache-dit-config` | `{PATH}` | Path to a Cache-DiT YAML/JSON config file for accelerating diffusers pipelines with Cache-DiT. |
 
 ### Example: Running Ovis-Image-7B
 

@@ -125,6 +125,27 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
+    """Wait for the server to become ready by polling the given URL."""
+    print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
+    start_time = time.perf_counter()
+    headers = get_auth_headers()
+    while True:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                elapsed = time.perf_counter() - start_time
+                print(f"Server ready in {elapsed:.1f}s.")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        elapsed = time.perf_counter() - start_time
+        if elapsed >= timeout_sec:
+            print(f"Server did not become ready within {timeout_sec}s timeout.")
+            return False
+        time.sleep(1)
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -226,6 +247,9 @@ async def async_request_openai_completions(
         # Add ignore_eos default only if not specified in extra_request_body
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
+
+        if args.return_logprob and args.top_logprobs_num > 0:
+            payload["logprobs"] = args.top_logprobs_num
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
@@ -588,9 +612,13 @@ async def async_request_sglang_generate(
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": -1,
+            "logprob_start_len": args.logprob_start_len,
             **request_func_input.extra_request_body,
         }
+        if args.top_logprobs_num > 0:
+            payload["top_logprobs_num"] = args.top_logprobs_num
+        if args.token_ids_logprob is not None:
+            payload["token_ids_logprob"] = args.token_ids_logprob
 
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
@@ -709,6 +737,14 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 # stop_profile doesn't need any parameters
                 body = {}
             print(f"async_request_profile {api_url=} {body=}")
+            # Add optional profiling parameters if provided
+            if (
+                hasattr(args, "profile_start_step")
+                and args.profile_start_step is not None
+            ):
+                body["start_step"] = str(args.profile_start_step)
+            if hasattr(args, "profile_steps") and args.profile_steps is not None:
+                body["num_steps"] = str(args.profile_steps)
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -1291,8 +1327,10 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
-    # Stop profiler
-    if profile:
+    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
+    if profile and not (
+        hasattr(args, "profile_steps") and args.profile_steps is not None
+    ):
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
@@ -1571,6 +1609,15 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "plot_throughput"):
         args.plot_throughput = False
 
+    if not hasattr(args, "top_logprobs_num"):
+        args.top_logprobs_num = 0
+    if not hasattr(args, "token_ids_logprob"):
+        args.token_ids_logprob = None
+    if not hasattr(args, "logprob_start_len"):
+        args.logprob_start_len = -1
+    if not hasattr(args, "return_logprob"):
+        args.return_logprob = False
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -1662,6 +1709,13 @@ def run_benchmark(args_: argparse.Namespace):
     base_url = (
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
+
+    # Wait for server to be ready
+    if args.ready_check_timeout_sec > 0:
+        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
+            print(f"Server at {health_url} is not ready. Exiting.")
+            sys.exit(1)
 
     # Get model name
     if args.model is None:
@@ -1787,6 +1841,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=60,
+        help="Maximum time in seconds to wait for the server to be ready before benchmarking. Set to 0 to skip. Default: 60.",
     )
     parser.add_argument(
         "--dataset-name",
@@ -1943,6 +2003,25 @@ if __name__ == "__main__":
         help="Return logprob.",
     )
     parser.add_argument(
+        "--top-logprobs-num",
+        type=int,
+        default=0,
+        help="Number of top logprobs to return per token. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--token-ids-logprob",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Token IDs to probe logprobs for. E.g. --token-ids-logprob 1 2 10 100 1000. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--logprob-start-len",
+        type=int,
+        default=-1,
+        help="Start position for returning input logprobs. -1 means no input logprobs, 0 means all. Only used with --return-logprob.",
+    )
+    parser.add_argument(
         "--return-routed-experts",
         action="store_true",
         help="Return routed experts.",
@@ -1982,7 +2061,20 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER"],
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help="Start profiling after this many forward steps. Useful for warmup.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Number of steps to profile. If specified, profiling stops automatically after this many steps.",
     )
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)

@@ -161,6 +161,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
@@ -242,6 +243,7 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -269,14 +271,18 @@ class Envs:
     # Override the distributed init method used by torch.distributed.init_process_group.
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
+    SGLANG_TCP_STORE_PORT = EnvInt(29600)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
+    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
@@ -286,6 +292,7 @@ class Envs:
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
@@ -302,6 +309,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
+    # MPS (Apple Silicon)
+    SGLANG_USE_MLX = EnvBool(False)
+
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
@@ -310,6 +320,8 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
+    # Delay all-gather after qlora for better performance for Deepseek v3.2
+    SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -320,6 +332,7 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -366,12 +379,15 @@ class Envs:
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
 
+    # NIXL-EP
+    SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
-    SGLANG_NSA_FORCE_MLA = EnvBool(False)
+    SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -415,6 +431,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
+    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -457,8 +475,16 @@ class Envs:
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 
+    # HTTP Server
+    SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # Encoder gRPC
+    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # Encoder receiver selection: http|grpc (used by EPD paths).
+    SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
@@ -467,6 +493,7 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
@@ -488,6 +515,7 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)

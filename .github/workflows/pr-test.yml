@@ -96,6 +96,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Show test partition assignments
+        continue-on-error: true
+        run: python3 test/show_partitions.py
+
       - name: Determine run mode
         id: run-mode
         run: |
@@ -245,7 +249,7 @@ jobs:
           # Use kernel-build runner only when sgl_kernel changes are detected AND we're not in target_stage mode
           # (target_stage skips wheel builds, so we can't use custom kernels)
           # Use API-based detection (filter-api) for target_stage mode, otherwise use dorny/paths-filter (filter)
-          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}"
+          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}"
           target_stage="${{ inputs.target_stage }}"
           if [[ "$sgl_kernel" == "true" && -z "$target_stage" ]]; then
             echo "b200_runner=4-gpu-b200-kernel" >> $GITHUB_OUTPUT
@@ -826,6 +830,79 @@ jobs:
         run: |
           cd python/sglang/jit_kernel
           pytest tests/
+
+  jit-kernel-unit-test-nightly:
+    needs: [check-changes]
+    if: |
+      github.event_name == 'schedule' &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run full nightly test
+        timeout-minutes: 60
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
+
+  jit-kernel-benchmark-test:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs and when target_stage is set
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      CI: true
+      RUNNER_LABELS: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run benchmark smoke tests
+        timeout-minutes: 45
+        run: |
+          cd python/sglang/jit_kernel/benchmark
+          echo "Running jit-kernel benchmark smoke tests in CI mode..."
+
+          failures=()
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            if ! timeout 120 python3 "$bench_file"; then
+              failures+=("$bench_file")
+            fi
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          if [ ${#failures[@]} -ne 0 ]; then
+            echo "The following benchmark smoke tests failed: ${failures[*]}"
+            exit 1
+          fi
+
+          echo "All jit-kernel benchmark smoke tests completed successfully!"
 
   # =============================================== primary ====================================================
 
@@ -1482,6 +1559,18 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            lmsys/sglang-ci-dsv3-test:4
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            lmsys/sglang-ci-dsv3-test:4
+
       - name: Run test
         timeout-minutes: 20
         run: |
@@ -1679,6 +1768,8 @@ jobs:
         wait-for-stage-b,
 
         jit-kernel-unit-test,
+        jit-kernel-unit-test-nightly,
+        jit-kernel-benchmark-test,
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,

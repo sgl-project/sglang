@@ -11,15 +11,18 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import (
         apply_shuffle_mul_sum,
-        cutlass_fp4_group_mm,
         es_fp8_blockwise_scaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
-        scaled_fp4_experts_quant,
         shuffle_rows,
         silu_and_mul,
+    )
+
+    from sglang.jit_kernel.nvfp4 import (
+        cutlass_fp4_group_mm,
+        scaled_fp4_experts_quant,
     )
 
 
@@ -460,7 +463,6 @@ def cutlass_moe_fp4(
         w1_blockscale,
         w1_alphas,
         out_dtype,
-        device,
         params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
@@ -485,7 +487,6 @@ def cutlass_moe_fp4(
         w2_blockscale,
         w2_alphas,
         out_dtype,
-        device,
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale

@@ -56,7 +56,7 @@ HIDDEN_SIZE_LIST = get_benchmark_range(
     ci_range=[512, 2048],
 )
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
+LINE_VALS = ["aot", "jit", "flashinfer", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
@@ -84,7 +84,7 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     FN_MAP = {
         "aot": sglang_aot_rmsnorm,
         "jit": sglang_jit_rmsnorm,
-        "fi": flashinfer_rmsnorm,
+        "flashinfer": flashinfer_rmsnorm,
         "torch": torch_impl_rmsnorm,
     }
     fn = lambda: FN_MAP[provider](input.clone(), weight)
