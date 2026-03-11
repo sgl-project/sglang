@@ -139,8 +139,6 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
-            self.maybe_send_health_check_signal()
-
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.self_check_during_idle()
@@ -315,8 +313,6 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
-
-            self.maybe_send_health_check_signal()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -507,8 +503,6 @@ class SchedulerPPMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            self.maybe_send_health_check_signal()
 
             if server_is_idle and queue_size == 0:
                 self.self_check_during_idle()

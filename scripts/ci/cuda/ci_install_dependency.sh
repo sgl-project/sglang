@@ -328,6 +328,9 @@ fi
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
+# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
+$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
