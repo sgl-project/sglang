@@ -179,6 +179,7 @@ def sample_image_requests(
     image_resolution: str,
     backend: str,
     random_image_count: bool = False,
+    skip_special_tokens: bool = False,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -241,6 +242,47 @@ def sample_image_requests(
         image_bytes = len(image_data.encode("utf-8"))
         return img, image_data, image_bytes
 
+    # Build merged special tokens set for filtering
+    special_tokens = None
+    if (
+        skip_special_tokens
+        and hasattr(processor.tokenizer, "all_special_ids")
+        and processor.tokenizer.all_special_ids is not None
+    ):
+        special_tokens = set(processor.tokenizer.all_special_ids)
+
+    # Extract special token strings and convert to token_id
+    special_token_strings = []
+    special_token_ids = set()
+
+    if hasattr(processor.tokenizer, "special_tokens"):
+        # Extract all special tokens from tokenizer.special_tokens dictionary
+        for key, value in processor.tokenizer.special_tokens.items():
+            if isinstance(value, str):
+                special_token_strings.append(value)
+            elif isinstance(value, list):
+                special_token_strings.extend(value)
+
+    # Also extract from additional_special_tokens
+    if hasattr(processor.tokenizer, "additional_special_tokens"):
+        special_token_strings.extend(processor.tokenizer.additional_special_tokens)
+
+    # Convert to token_id
+    if special_token_strings and hasattr(processor.tokenizer, "convert_tokens_to_ids"):
+        special_token_ids = set(
+            processor.tokenizer.convert_tokens_to_ids(special_token_strings)
+        )
+
+    # Merge all_special_ids and special_token_ids converted from strings
+    if special_tokens is not None and special_token_ids:
+        merged_special_tokens = special_tokens | special_token_ids
+    elif special_tokens is not None:
+        merged_special_tokens = special_tokens
+    elif special_token_ids:
+        merged_special_tokens = special_token_ids
+    else:
+        merged_special_tokens = None
+
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
     for i in range(num_requests):
@@ -252,6 +294,7 @@ def sample_image_requests(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
+            merged_special_tokens,
         )
 
         # Generate image list
