@@ -109,7 +109,7 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 
 ### DSA Attention Backend (NSA)
 
-DSA (Dynamic Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it (i.e., when `is_deepseek_nsa` is true) and is selected via `--attention-backend nsa`.
+DSA (Deepseek Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it and is selected via `--attention-backend nsa`.
 
 Internally, the NSA backend dispatches to different sub-backends for prefill and decode phases. You can override these with `--nsa-prefill-backend` and `--nsa-decode-backend`:
 
