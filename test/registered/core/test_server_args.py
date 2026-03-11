@@ -1,13 +1,20 @@
 import json
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    CustomTestCase,
+)
 
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=1, suite="stage-b-test-small-1-gpu-amd")
+register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
+
+# Mock get_device() so all tests run on CPU-only CI runners
+_mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
+_mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -15,14 +22,12 @@ class TestPrepareServerArgs(CustomTestCase):
         server_args = prepare_server_args(
             [
                 "--model-path",
-                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                 "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
             ]
         )
-        self.assertEqual(
-            server_args.model_path, "meta-llama/Meta-Llama-3.1-8B-Instruct"
-        )
+        self.assertEqual(server_args.model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
@@ -44,10 +49,29 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestPortArgs(unittest.TestCase):
-    @patch("sglang.srt.server_args.is_port_available")
+    @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
-    def test_init_new_standard_case(self, mock_temp_file, mock_is_port_available):
-        mock_is_port_available.return_value = True
+    def test_init_new_with_nccl_port_none(self, mock_temp_file, mock_get_free_port):
+        """Test that get_free_port() is called when nccl_port is None"""
+        mock_temp_file.return_value.name = "temp_file"
+        mock_get_free_port.return_value = 45678  # Mock ephemeral port
+
+        # Use MagicMock here to verify get_free_port is called
+        server_args = MagicMock()
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.tokenizer_worker_num = 1
+
+        port_args = PortArgs.init_new(server_args)
+
+        # Verify get_free_port was called
+        mock_get_free_port.assert_called_once()
+
+        # Verify the returned port is used
+        self.assertEqual(port_args.nccl_port, 45678)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
 
         server_args = ServerArgs(model_path="dummy")
@@ -62,9 +86,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_single_node_dp_attention(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
+    def test_init_new_with_single_node_dp_attention(self):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -82,10 +104,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_dp_rank(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_dp_rank(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -102,13 +121,9 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_ipv4_address(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
-
         server_args.nccl_port = None
 
         server_args.enable_dp_attention = True
@@ -124,10 +139,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv4_address(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -136,19 +148,12 @@ class TestPortArgs(unittest.TestCase):
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1"
 
-        with self.assertRaises(AssertionError) as context:
+        with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
 
-        self.assertIn(
-            "please provide --dist-init-addr as host:port", str(context.exception)
-        )
+        self.assertIn("Missing port", str(context.exception))
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv4_address_invalid_port(
-        self, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_malformed_ipv4_address_invalid_port(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -157,135 +162,174 @@ class TestPortArgs(unittest.TestCase):
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
 
-        with self.assertRaises(ValueError) as context:
+        with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_ipv6_address(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
 
+class TestSSLArgs(unittest.TestCase):
+    def test_default_ssl_fields_are_none(self):
         server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
+        self.assertIsNone(server_args.ssl_keyfile)
+        self.assertIsNone(server_args.ssl_certfile)
+        self.assertIsNone(server_args.ssl_ca_certs)
+        self.assertIsNone(server_args.ssl_keyfile_password)
 
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]:25000"
+    def test_ssl_keyfile_without_certfile_raises(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", ssl_keyfile="key.pem")
+        self.assertIn("--ssl-certfile", str(context.exception))
 
-        port_args = PortArgs.init_new(server_args)
+    def test_ssl_certfile_without_keyfile_raises(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", ssl_certfile="cert.pem")
+        self.assertIn("--ssl-keyfile", str(context.exception))
 
-        self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://[2001:db8::1]:"))
-        self.assertTrue(
-            port_args.scheduler_input_ipc_name.startswith("tcp://[2001:db8::1]:")
+    @patch("os.path.isfile", return_value=True)
+    def test_ssl_both_keyfile_and_certfile_accepted(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
         )
-        self.assertTrue(
-            port_args.detokenizer_ipc_name.startswith("tcp://[2001:db8::1]:")
+        self.assertEqual(server_args.ssl_keyfile, "key.pem")
+        self.assertEqual(server_args.ssl_certfile, "cert.pem")
+
+    def test_url_returns_http_without_ssl(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertTrue(server_args.url().startswith("http://"))
+
+    def test_url_rewrites_all_interfaces_to_loopback(self):
+        server_args = ServerArgs(model_path="dummy", host="0.0.0.0")
+        self.assertEqual(server_args.url(), "http://127.0.0.1:30000")
+
+    def test_url_rewrites_empty_host_to_loopback(self):
+        server_args = ServerArgs(model_path="dummy", host="")
+        self.assertEqual(server_args.url(), "http://127.0.0.1:30000")
+
+    @patch("os.path.isfile", return_value=True)
+    def test_url_returns_https_with_ssl(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
         )
-        self.assertIsInstance(port_args.nccl_port, int)
+        self.assertTrue(server_args.url().startswith("https://"))
 
-    @patch("sglang.srt.server_args.is_port_available")
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=False)
-    def test_init_new_with_invalid_ipv6_address(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[invalid-ipv6]:25000"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("invalid IPv6 address", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv6_address_missing_bracket(
-        self, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1:25000"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn("invalid IPv6 address format", str(context.exception))
-
-    @patch("sglang.srt.server_args.is_port_available")
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_missing_port(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]"
-
-        with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
-
-        self.assertIn(
-            "a port must be specified in IPv6 address", str(context.exception)
+    @patch("os.path.isfile", return_value=True)
+    def test_ssl_cli_args_parsed(self, _mock_isfile):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--ssl-keyfile",
+                "key.pem",
+                "--ssl-certfile",
+                "cert.pem",
+                "--ssl-ca-certs",
+                "ca.pem",
+                "--ssl-keyfile-password",
+                "secret",
+            ]
         )
+        self.assertEqual(server_args.ssl_keyfile, "key.pem")
+        self.assertEqual(server_args.ssl_certfile, "cert.pem")
+        self.assertEqual(server_args.ssl_ca_certs, "ca.pem")
+        self.assertEqual(server_args.ssl_keyfile_password, "secret")
 
-    @patch("sglang.srt.server_args.is_port_available")
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_invalid_port(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_ssl_verify_without_ssl(self):
         server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
+        self.assertIs(server_args.ssl_verify(), True)
 
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]:abcde"
+    @patch("os.path.isfile", return_value=True)
+    def test_ssl_verify_with_ssl_no_ca(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
+        )
+        self.assertIs(server_args.ssl_verify(), False)
 
+    @patch("os.path.isfile", return_value=True)
+    def test_ssl_verify_with_ssl_and_ca(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy",
+            ssl_keyfile="key.pem",
+            ssl_certfile="cert.pem",
+            ssl_ca_certs="ca.pem",
+        )
+        self.assertEqual(server_args.ssl_verify(), "ca.pem")
+
+    def test_ssl_ca_certs_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
+            ServerArgs(model_path="dummy", ssl_ca_certs="ca.pem")
+        self.assertIn("--ssl-ca-certs", str(context.exception))
 
-        self.assertIn("invalid port in IPv6 address", str(context.exception))
+    def test_ssl_keyfile_password_without_certfile_raises(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", ssl_keyfile_password="secret")
+        self.assertIn("--ssl-keyfile-password", str(context.exception))
 
-    @patch("sglang.srt.server_args.is_port_available")
-    @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_malformed_ipv6_address_wrong_separator(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
+    def test_ssl_keyfile_not_found_raises(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                ssl_keyfile="/nonexistent/key.pem",
+                ssl_certfile="/nonexistent/cert.pem",
+            )
+        self.assertIn("not found", str(context.exception))
 
+    def test_ssl_certfile_not_found_raises(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as keyfile:
+            with self.assertRaises(ValueError) as context:
+                ServerArgs(
+                    model_path="dummy",
+                    ssl_keyfile=keyfile.name,
+                    ssl_certfile="/nonexistent/cert.pem",
+                )
+            self.assertIn("SSL certificate file not found", str(context.exception))
+
+    def test_ssl_ca_certs_not_found_raises(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as keyfile:
+            with tempfile.NamedTemporaryFile(suffix=".pem") as certfile:
+                with self.assertRaises(ValueError) as context:
+                    ServerArgs(
+                        model_path="dummy",
+                        ssl_keyfile=keyfile.name,
+                        ssl_certfile=certfile.name,
+                        ssl_ca_certs="/nonexistent/ca.pem",
+                    )
+                self.assertIn(
+                    "SSL CA certificates file not found", str(context.exception)
+                )
+
+    def test_enable_ssl_refresh_default_false(self):
         server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
+        self.assertFalse(server_args.enable_ssl_refresh)
 
-        server_args.enable_dp_attention = True
-        server_args.nnodes = 2
-        server_args.dist_init_addr = "[2001:db8::1]#25000"
-
+    def test_enable_ssl_refresh_without_ssl_raises(self):
         with self.assertRaises(ValueError) as context:
-            PortArgs.init_new(server_args)
+            ServerArgs(model_path="dummy", enable_ssl_refresh=True)
+        self.assertIn("--enable-ssl-refresh", str(context.exception))
+        self.assertIn("--ssl-certfile", str(context.exception))
 
-        self.assertIn("expected ':' after ']'", str(context.exception))
+    @patch("os.path.isfile", return_value=True)
+    def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy",
+            ssl_keyfile="key.pem",
+            ssl_certfile="cert.pem",
+            enable_ssl_refresh=True,
+        )
+        self.assertTrue(server_args.enable_ssl_refresh)
+
+    @patch("os.path.isfile", return_value=True)
+    def test_enable_ssl_refresh_cli_flag(self, _mock_isfile):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--ssl-keyfile",
+                "key.pem",
+                "--ssl-certfile",
+                "cert.pem",
+                "--enable-ssl-refresh",
+            ]
+        )
+        self.assertTrue(server_args.enable_ssl_refresh)
 
 
 if __name__ == "__main__":

@@ -30,8 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
@@ -747,7 +749,8 @@ impl PDRouter {
             headers,
             hash_ring.clone(),
             "prefill",
-        )?;
+        )
+        .await?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -756,7 +759,8 @@ impl PDRouter {
             headers,
             hash_ring,
             "decode",
-        )?;
+        )
+        .await?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
@@ -776,7 +780,7 @@ impl PDRouter {
         Ok((prefill, decode))
     }
 
-    fn pick_worker_by_policy_arc(
+    async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
@@ -814,6 +818,7 @@ impl PDRouter {
                     hash_ring,
                 },
             )
+            .await
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1370,6 +1375,34 @@ impl RouterTrait for PDRouter {
         };
 
         self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/embeddings; returning bad request");
+        error::bad_request(
+            "pd_unsupported_embeddings",
+            "PD mode does not support /v1/embeddings",
+        )
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/classify; returning bad request");
+        error::bad_request(
+            "pd_unsupported_classify",
+            "PD mode does not support /v1/classify",
+        )
     }
 
     fn router_type(&self) -> &'static str {

@@ -7,6 +7,8 @@ from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
+MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
+
 
 class AttentionBackendRegistry:
     _handlers = {}
@@ -23,7 +25,7 @@ class AttentionBackendRegistry:
 def _dispatch_mla_subtype(attn, forward_batch):
     if _is_hip:
         if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA_FUSED_ROPE
+            return AttnForwardMethod.MLA_FUSED_ROPE_ROCM
         else:
             return AttnForwardMethod.MLA
     else:
@@ -60,7 +62,7 @@ def _get_sum_extend_prefix_lens(forward_batch):
 
 
 def _support_mha_one_shot(attn, forward_batch, backend_name):
-    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
+    attn_supported = backend_name in MHA_ONE_SHOT_SUPPORTED_BACKENDS
     sum_seq_lens = (
         sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
     )

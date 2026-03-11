@@ -15,13 +15,20 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -148,17 +155,23 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
 ) -> torch.Tensor:
+    # preprocessed video
+    is_video_obj = isinstance(vr, VideoDecoderWrapper)
+    if not is_video_obj:
+        return vr
     entry_time = time.perf_counter()
 
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    total_frames, video_fps = len(vr), vr.avg_fps
+
     nframes = smart_nframes(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
-    video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
+
+    video = vr.get_frames_as_tensor(idx.tolist())
+
+    video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
 
     nframes, _, height, width = video.shape
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
@@ -226,6 +239,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen2_5_VLForConditionalGeneration,
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5MoeForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -326,7 +341,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        if self.hf_config.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
