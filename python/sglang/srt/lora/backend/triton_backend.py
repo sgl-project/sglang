@@ -2,6 +2,7 @@ import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
+    embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
@@ -21,6 +22,24 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run LoRA A embedding lookup using Triton kernel."""
+        return embedding_lora_a_fwd(
+            input_ids=input_ids,
+            weights=weights,
+            batch_info=self.batch_info,
+            vocab_size=vocab_size,
+            extra_embeddings=extra_embeddings,
+        )
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -107,7 +126,7 @@ class TritonLoRABackend(BaseLoRABackend):
                 seg_lens=torch.full(
                     (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
                 ),
-                seg_indptr=torch.empty(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 max_len=num_tokens_per_bs,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
@@ -161,7 +180,7 @@ class TritonLoRABackend(BaseLoRABackend):
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
+                else torch.ones(bs, dtype=torch.int32, device=self.device)
             )
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)

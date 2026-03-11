@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -9,6 +8,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -17,11 +17,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
-    RequestStage,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -42,24 +41,82 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _get_storage_backend_type(self) -> str:
+        """Get storage backend type from tree_cache."""
+        storage_backend_type = "none"
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller and hasattr(cache_controller, "storage_backend"):
+            storage_backend = cache_controller.storage_backend
+            if storage_backend is not None:
+                storage_backend_type = type(storage_backend).__name__
+        return storage_backend_type
+
+    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+        """Get detailed cache breakdown for a request, if available.
+
+        Returns:
+            - None if HiCache is not enabled
+            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
+            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+        """
+        # Only show details if HiCache is enabled
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return None
+
+        # Only show if there are any cached tokens
+        if (
+            req.cached_tokens_device > 0
+            or req.cached_tokens_host > 0
+            or req.cached_tokens_storage > 0
+        ):
+            details = {
+                "device": req.cached_tokens_device,
+                "host": req.cached_tokens_host,
+            }
+            # Only include storage fields if L3 storage is enabled
+            if getattr(self, "enable_hicache_storage", False):
+                details["storage"] = req.cached_tokens_storage
+                details["storage_backend"] = self._get_storage_backend_type()
+            return details
+        return None
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
+            req.time_stats.set_decode_prebuilt_finish_time()
             req.check_finished()
             if req.finished():
-                req.time_stats.forward_entry_time = req.time_stats.completion_time = (
-                    time.perf_counter()
-                )
-                trace_slice_end(
-                    RequestStage.DECODE_QUICK_FINISH,
-                    req.rid,
-                    thread_finish_flag=True,
-                )
+                req.time_stats.set_quick_finish_time()
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
-        trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
         self.stream_output(batch.reqs, batch.return_logprob)
+
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
+    def maybe_collect_customized_info(
+        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ):
+        if logits_output is not None and logits_output.customized_info is not None:
+            if req.customized_info is None:
+                req.customized_info = {}
+            for k, v in logits_output.customized_info.items():
+                if k not in req.customized_info:
+                    req.customized_info[k] = []
+                # Copy the element so it doesn't retain the entire batch
+                # tensor/array via a view reference.
+                elem = v[i]
+                if isinstance(elem, torch.Tensor):
+                    elem = elem.clone()
+                elif hasattr(elem, "copy") and callable(elem.copy):
+                    elem = elem.copy()
+                req.customized_info[k].append(elem)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -107,16 +164,20 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
+                    req.time_stats.set_prefill_finished_time()
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
                     if req.finished():
+                        self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
-                        req.time_stats.completion_time = time.perf_counter()
+                        req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+
+                    self.maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -168,13 +229,6 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                    trace_slice(
-                        RequestStage.PREFILL_FORWARD,
-                        req.rid,
-                        auto_next_anon=not req.finished(),
-                        thread_finish_flag=req.finished(),
-                    )
-
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -203,13 +257,12 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    trace_slice(
-                        RequestStage.PREFILL_CHUNKED_FORWARD,
-                        req.rid,
-                        auto_next_anon=True,
-                    )
+                    req.time_stats.set_last_chunked_prefill_finish_time()
 
         else:  # embedding or reward model
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
             embeddings = result.embeddings
@@ -236,26 +289,29 @@ class SchedulerOutputProcessorMixin:
 
                 req.embedding = embeddings[i]
                 if req.is_chunked <= 0:
+                    req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-
-                trace_slice(
-                    RequestStage.PREFILL_FORWARD,
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+                    req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        self.report_prefill_stats(
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -267,6 +323,7 @@ class SchedulerOutputProcessorMixin:
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -277,11 +334,14 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i] - 1
+
+            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
 
-    def process_batch_result_dllm(
+    def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
@@ -289,27 +349,9 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        next_token_ids = result.next_token_ids.tolist()
-        self.num_generated_tokens += len(next_token_ids)
-
-        self.token_to_kv_pool_allocator.free_group_begin()
-
-        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
-        req = batch.reqs[0]
-
-        for next_token_id in next_token_ids:
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.completion_time = time.perf_counter()
-                break
-
-            self.tree_cache.cache_unfinished_req(req)
-
-        self.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
+        self.stream_output_generation(
+            batch.reqs, batch.return_logprob, is_idle_batch=True
+        )
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -325,16 +367,35 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
-            next_token_ids = next_token_ids.tolist()
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+            if batch.is_spec_v2:
+                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            else:
+                next_token_ids = next_token_ids.tolist()
+
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_v2_eagle:
-            next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+
+                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+        if self.enable_metrics:
+            self.metrics_collector.increment_decode_cuda_graph_pass(
+                value=can_run_cuda_graph
+            )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -354,41 +415,78 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif batch.is_v2_eagle:
-                # Only v2 eagle's output_ids are updated here.
+            elif batch.is_spec_v2:
+                # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
+            # Update Mamba last track seqlen
+            self._mamba_prefix_cache_update(req, batch, result, i)
+
+            req.time_stats.set_last_decode_finish_time()
+
             req.check_finished(new_accepted_len)
 
+            if (
+                self.server_args.disaggregation_decode_enable_offload_kvcache
+                and not req.finished()
+            ):
+                self.decode_offload_manager.offload_kv_cache(req)
+
             if req.finished():
+                # delete feature to save memory
+                if req.multimodal_inputs is not None:
+                    for mm_item in req.multimodal_inputs.mm_items:
+                        pixel_values = mm_item.feature
+                        if isinstance(pixel_values, torch.Tensor):
+                            mm_item.feature = None
+                            del pixel_values
+                self.maybe_collect_routed_experts(req)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
                     release_kv_cache(req, self.tree_cache)
 
-                req.time_stats.completion_time = time.perf_counter()
+                req.time_stats.set_completion_time()
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
+            self.maybe_collect_customized_info(i, req, logits_output)
+
+            if req.return_logprob and (
+                batch.spec_algorithm.is_none() or batch.is_spec_v2
+            ):
+                # Spec v1 handles logprobs inside its own worker.
+                # Normalize: non-spec has 1 token, spec v2 has multiple.
+                if batch.is_spec_v2:
+                    accepted_logprobs = next_token_logprobs[i]
+                    accepted_ids = next_token_id
+                    max_accept = len(accepted_logprobs)
+                else:
+                    accepted_logprobs = [next_token_logprobs[i]]
+                    accepted_ids = [next_token_id]
+                    max_accept = 1
+
+                for j, tok_id in enumerate(accepted_ids):
+                    req.output_token_logprobs_val.append(accepted_logprobs[j])
+                    req.output_token_logprobs_idx.append(tok_id)
+                    if req.top_logprobs_num > 0:
+                        flat_idx = i * max_accept + j
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[flat_idx]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[flat_idx]
+                        )
+                    if req.token_ids_logprob is not None:
+                        flat_idx = i * max_accept + j
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[flat_idx]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                        )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -401,7 +499,7 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    elif batch.is_v2_eagle:
+                    elif batch.is_spec_v2:
                         # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
@@ -418,11 +516,45 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if (
-            self.current_scheduler_metrics_enabled()
-            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
-        ):
-            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+        self.report_decode_stats(
+            can_run_cuda_graph,
+            running_batch=batch,
+            num_accepted_tokens=result.num_accepted_tokens,
+        )
+
+    def _mamba_prefix_cache_update(
+        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+    ) -> None:
+        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        if req.mamba_ping_pong_track_buffer is not None:
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
+                req.mamba_next_track_idx = (
+                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                )
+                req.mamba_last_track_seqlen = seq_len
+            elif (
+                not batch.spec_algorithm.is_none()
+                and result.accept_length_per_req_cpu is not None
+            ):
+                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
+                actual_seq_len = req.seqlen - 1
+                if (
+                    actual_seq_len // mamba_track_interval
+                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                    // mamba_track_interval
+                ):
+                    req.mamba_next_track_idx = (
+                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
+                        )
+                    )
+                    req.mamba_last_track_seqlen = (
+                        actual_seq_len // mamba_track_interval * mamba_track_interval
+                    )
 
     def _process_input_token_logprobs(
         self, req: Req, input_token_logprobs: List
@@ -525,10 +657,10 @@ class SchedulerOutputProcessorMixin:
         For regular requests, all positions from logprob_start_len onwards have logprobs.
         """
         is_multi_item_scoring = self._is_multi_item_scoring(req)
+        relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
 
         if is_multi_item_scoring:
             # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
-            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
             return sum(
                 1
                 for token_id in relevant_tokens
@@ -536,7 +668,7 @@ class SchedulerOutputProcessorMixin:
             )
         else:
             # Regular request: all tokens from logprob_start_len onwards
-            return len(req.origin_input_ids) - req.logprob_start_len
+            return len(relevant_tokens)
 
     def _calculate_num_input_logprobs(
         self, req: Req, extend_input_len: int, extend_logprob_start_len: int
@@ -731,11 +863,28 @@ class SchedulerOutputProcessorMixin:
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
+        if envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get() > 0:
+            self._trigger_crash_for_tests(
+                envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
+            )
+
+    def _trigger_crash_for_tests(self, crash_threshold: int):
+        # Crash trigger: crash after stream_output is called N times
+        # This is used for testing purposes.
+        if not hasattr(self, "_test_stream_output_count"):
+            self._test_stream_output_count = 0
+        self._test_stream_output_count += 1
+        if self._test_stream_output_count >= crash_threshold:
+            raise RuntimeError(
+                f"Test crash after stream_output called {self._test_stream_output_count} times"
+            )
+
     def stream_output_generation(
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        is_idle_batch: bool = False,
     ):
         rids = []
         http_worker_ipcs = []
@@ -752,15 +901,17 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
+        spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
+        load = self.get_load()
+        routed_experts = None
+        customized_info = {}
 
-        queue_times = []
-        forward_entry_times = []
-        prefill_launch_delays = []
-        prefill_launch_latencies = []
+        time_stats = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -860,19 +1011,18 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
+
                 retraction_counts.append(req.retraction_count)
 
-                queue_times.append(req.time_stats.get_queueing_time())
-                forward_entry_times.append(req.time_stats.forward_entry_time)
-
-                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
-                prefill_launch_latencies.append(
-                    req.time_stats.get_prefill_launch_latency()
-                )
+                time_stats.append(req.time_stats)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_acceptance_histogram.append(req.spec_acceptance_histogram)
 
                 if return_logprob:
                     if (
@@ -946,6 +1096,16 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
+                if req.return_routed_experts:
+                    if routed_experts is None:
+                        routed_experts = []
+                    routed_experts.append(req.routed_experts)
+
+                if req.customized_info is not None:
+                    for k, v in req.customized_info.items():
+                        if k not in customized_info:
+                            customized_info[k] = []
+                        customized_info[k].append(v[send_token_offset:])
 
             if (
                 req.finished()
@@ -954,21 +1114,20 @@ class SchedulerOutputProcessorMixin:
             ):
                 req.log_time_stats()
 
+        dp_ranks = [self.dp_rank] * len(rids) if rids else None
+
         # Send to detokenizer
-        if rids:
+        if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
-                    queue_time=queue_times,
-                    forward_entry_time=forward_entry_times,
-                    prefill_launch_delay=prefill_launch_delays,
-                    prefill_launch_latency=prefill_launch_latencies,
+                    spec_acceptance_histogram=spec_acceptance_histogram,
+                    time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -980,6 +1139,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
@@ -994,9 +1154,13 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
+                    routed_experts=routed_experts,
+                    customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    load=load,
+                    dp_ranks=dp_ranks,
                 )
             )
 
@@ -1008,10 +1172,8 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
-        queue_times = []
-        forward_entry_times = []
-        prefill_launch_delays = []
-        prefill_launch_latencies = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
+        time_stats = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1022,26 +1184,20 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
 
-                queue_times.append(req.time_stats.get_queueing_time())
-                forward_entry_times.append(req.time_stats.forward_entry_time)
-
-                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
-                prefill_launch_latencies.append(
-                    req.time_stats.get_prefill_launch_latency()
-                )
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
+                time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                queue_time=queue_times,
-                forward_entry_time=forward_entry_times,
-                prefill_launch_delay=prefill_launch_delays,
-                prefill_launch_latency=prefill_launch_latencies,
+                time_stats=time_stats,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
+                cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,

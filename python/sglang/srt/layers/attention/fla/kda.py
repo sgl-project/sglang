@@ -5,12 +5,12 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
 )
@@ -102,8 +102,11 @@ def fused_recurrent_kda_fwd(
         # stride_final_state_token=stride_final_state_token,
         # stride_indices_seq=stride_indices_seq,
         # stride_indices_tok=stride_indices_tok,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         # INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=True,
         num_warps=num_warps,
@@ -152,255 +155,6 @@ def fused_recurrent_kda(
     return o, final_state
 
 
-@triton.heuristics(
-    {
-        "STORE_RESIDUAL_OUT": lambda args: args["residual_out"] is not None,
-        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
-        "HAS_WEIGHT": lambda args: args["w"] is not None,
-        "HAS_BIAS": lambda args: args["b"] is not None,
-    }
-)
-@triton.jit
-def layer_norm_gated_fwd_kernel(
-    x,  # pointer to the input
-    g,  # pointer to the gate
-    y,  # pointer to the output
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    residual,  # pointer to the residual
-    residual_out,  # pointer to the residual
-    mean,  # pointer to the mean
-    rstd,  # pointer to the 1/std
-    eps,  # epsilon to avoid division by zero
-    T,  # number of rows in x
-    D: tl.constexpr,  # number of columns in x
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    i_t = tl.program_id(0)
-
-    o_d = tl.arange(0, BD)
-    m_d = o_d < D
-
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(
-            residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
-    if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(
-            residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
-    if not IS_RMS_NORM:
-        b_mean = tl.sum(b_x, axis=1) / D
-        p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), boundary_check=(0,))
-        b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
-        b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
-    else:
-        b_xbar = tl.where(m_d[None, :], b_x, 0.0)
-        b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
-    b_rstd = 1 / tl.sqrt(b_var + eps)
-
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
-
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
-    b_x_hat = (
-        (b_x - b_mean[:, None]) * b_rstd[:, None]
-        if not IS_RMS_NORM
-        else b_x * b_rstd[:, None]
-    )
-    b_y = b_x_hat * b_w[None, :] if HAS_WEIGHT else b_x_hat
-    if HAS_BIAS:
-        b_y = b_y + b_b[None, :]
-
-    # swish/sigmoid output gate
-    p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    if ACTIVATION == "swish" or ACTIVATION == "silu":
-        b_y = b_y * b_g * tl.sigmoid(b_g)
-    elif ACTIVATION == "sigmoid":
-        b_y = b_y * tl.sigmoid(b_g)
-
-    # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.heuristics(
-    {
-        "STORE_RESIDUAL_OUT": lambda args: args["residual_out"] is not None,
-        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
-        "HAS_WEIGHT": lambda args: args["w"] is not None,
-        "HAS_BIAS": lambda args: args["b"] is not None,
-    }
-)
-@triton.jit
-def layer_norm_gated_fwd_kernel1(
-    x,  # pointer to the input
-    g,  # pointer to the gate
-    y,  # pointer to the output
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    residual,  # pointer to the residual
-    residual_out,  # pointer to the residual
-    mean,  # pointer to the mean
-    rstd,  # pointer to the 1/std
-    eps,  # epsilon to avoid division by zero
-    D: tl.constexpr,  # number of columns in x
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    i_t = tl.program_id(0)
-    x += i_t * D
-    y += i_t * D
-    g += i_t * D
-    if HAS_RESIDUAL:
-        residual += i_t * D
-    if STORE_RESIDUAL_OUT:
-        residual_out += i_t * D
-
-    o_d = tl.arange(0, BD)
-    m_d = o_d < D
-    b_x = tl.load(x + o_d, mask=m_d, other=0.0).to(tl.float32)
-    if HAS_RESIDUAL:
-        b_x += tl.load(residual + o_d, mask=m_d, other=0.0).to(tl.float32)
-    if STORE_RESIDUAL_OUT:
-        tl.store(residual_out + o_d, b_x, mask=m_d)
-    if not IS_RMS_NORM:
-        b_mean = tl.sum(b_x, axis=0) / D
-        tl.store(mean + i_t, b_mean)
-        b_xbar = tl.where(m_d, b_x - b_mean, 0.0)
-        b_var = tl.sum(b_xbar * b_xbar, axis=0) / D
-    else:
-        b_xbar = tl.where(m_d, b_x, 0.0)
-        b_var = tl.sum(b_xbar * b_xbar, axis=0) / D
-    b_rstd = 1 / tl.sqrt(b_var + eps)
-    tl.store(rstd + i_t, b_rstd)
-
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
-    b_x_hat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
-    b_y = b_x_hat * b_w if HAS_WEIGHT else b_x_hat
-    if HAS_BIAS:
-        b_y = b_y + b_b
-
-    # swish/sigmoid output gate
-    b_g = tl.load(g + o_d, mask=m_d, other=0.0).to(tl.float32)
-    if ACTIVATION == "swish" or ACTIVATION == "silu":
-        b_y = b_y * b_g * tl.sigmoid(b_g)
-    elif ACTIVATION == "sigmoid":
-        b_y = b_y * tl.sigmoid(b_g)
-
-    # Write output
-    tl.store(y + o_d, b_y, mask=m_d)
-
-
-def layer_norm_gated_fwd(
-    x: torch.Tensor,
-    g: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    activation: str = "swish",
-    eps: float = 1e-5,
-    residual: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
-    residual_dtype: torch.dtype = None,
-    is_rms_norm: bool = False,
-):
-    if residual is not None:
-        residual_dtype = residual.dtype
-    T, D = x.shape
-    if residual is not None:
-        assert residual.shape == (T, D)
-    if weight is not None:
-        assert weight.shape == (D,)
-    if bias is not None:
-        assert bias.shape == (D,)
-    # allocate output
-    y = x if out_dtype is None else torch.empty_like(x, dtype=out_dtype)
-    if residual is not None or (
-        residual_dtype is not None and residual_dtype != x.dtype
-    ):
-        residual_out = torch.empty(T, D, device=x.device, dtype=residual_dtype)
-    else:
-        residual_out = None
-    mean = (
-        torch.empty((T,), dtype=torch.float, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd = torch.empty((T,), dtype=torch.float, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-
-    if D <= 512:
-        BT = 32
-        layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
-            x=x,
-            g=g,
-            y=y,
-            w=weight,
-            b=bias,
-            residual=residual,
-            residual_out=residual_out,
-            mean=mean,
-            rstd=rstd,
-            eps=eps,
-            T=T,
-            D=D,
-            BD=BD,
-            BT=BT,
-            ACTIVATION=activation,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=4,
-        )
-    else:
-        layer_norm_gated_fwd_kernel1[(T,)](
-            x=x,
-            g=g,
-            y=y,
-            w=weight,
-            b=bias,
-            residual=residual,
-            residual_out=residual_out,
-            mean=mean,
-            rstd=rstd,
-            eps=eps,
-            D=D,
-            BD=BD,
-            ACTIVATION=activation,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=4,
-        )
-    # residual_out is None if residual is None and residual_dtype == input_dtype
-    return y, mean, rstd, residual_out if residual_out is not None else x
-
-
 def rms_norm_gated(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -439,55 +193,6 @@ def rms_norm_gated(
     return y if not prenorm else (y, residual_out.reshape(x_shape_og))
 
 
-class FusedRMSNormGated(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        elementwise_affine: bool = True,
-        eps: float = 1e-5,
-        activation: str = "swish",
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.elementwise_affine = elementwise_affine
-        self.eps = eps
-        self.activation = activation
-
-        if self.activation not in ["swish", "silu", "sigmoid"]:
-            raise ValueError(f"Unsupported activation: {self.activation}")
-
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
-        else:
-            self.register_parameter("weight", None)
-        self.register_parameter("bias", None)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        g: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        prenorm: bool = False,
-        residual_in_fp32: bool = False,
-    ) -> torch.Tensor:
-        return rms_norm_gated(
-            x,
-            g,
-            self.weight,
-            self.bias,
-            self.activation,
-            residual=residual,
-            eps=self.eps,
-            prenorm=prenorm,
-            residual_in_fp32=residual_in_fp32,
-        )
-
-
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
@@ -495,7 +200,7 @@ class FusedRMSNormGated(nn.Module):
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BC"],
+    key=["BC", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
@@ -598,10 +303,9 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["BK", "BT"],
+    key=["BK", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
@@ -755,6 +459,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         NC=NC,
+        IS_VARLEN=cu_seqlens is not None,
     )
 
     grid = (NT, NC, B * H)
@@ -774,17 +479,11 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         BK=BK,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return A, Aqk
 
 
-@triton.heuristics(
-    {
-        "STORE_QG": lambda args: args["qg"] is not None,
-        "STORE_KG": lambda args: args["kg"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -979,12 +678,14 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        STORE_QG=False,
+        STORE_KG=kg is not None,
+        IS_VARLEN=cu_seqlens is not None,
         DOT_PRECISION="ieee",
     )
     return w, u, None, kg
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
@@ -993,7 +694,7 @@ def recompute_w_u_fwd(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BT"],
+    key=["BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1143,6 +844,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return o
 
@@ -1155,7 +857,7 @@ def chunk_kda_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
 ):
     chunk_size = 64
@@ -1181,13 +883,13 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
     )
     del A
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
         u=u,
         gk=g,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
     del w, u, kg
@@ -1203,7 +905,7 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
     )
     del Aqk, v_new, h
-    return o, final_state
+    return o
 
 
 def chunk_kda(
@@ -1214,7 +916,7 @@ def chunk_kda(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
+    initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     **kwargs,
@@ -1226,18 +928,18 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o, final_state = chunk_kda_fwd(
+    o = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
         g=g.contiguous(),
         beta=beta.contiguous(),
         scale=scale,
-        initial_state=initial_state.contiguous(),
-        output_final_state=output_final_state,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
-    return o, final_state
+    return o
 
 
 @triton.autotune(

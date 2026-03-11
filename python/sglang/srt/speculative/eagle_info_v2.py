@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -28,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -47,7 +48,6 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
-    from sgl_kernel.top_k import fast_topk
 
 
 @triton.jit
@@ -80,6 +80,8 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        batch.maybe_evict_swa()
+
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
@@ -91,13 +93,15 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
+        alloc_len_per_decode = get_alloc_len_per_decode()
         for r in batch.reqs:
             # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
             r.kv_allocated_len += x
+            r.decode_batch_idx += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
@@ -165,8 +169,8 @@ class EagleDraftInputV2Mixin:
             )
 
         # Get a forward batch
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_req = topk
+        self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -228,6 +232,19 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                batch.mamba_track_indices = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -263,7 +280,7 @@ class EagleVerifyInputV2Mixin:
         (which contains spec decoding information).
         """
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
             accept_length = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
@@ -371,56 +388,6 @@ class EagleVerifyInputV2Mixin:
         return predict, accept_length, accept_index
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
-def select_top_k_tokens_tmp(
-    i: int,
-    topk_p: torch.Tensor,
-    topk_index: torch.Tensor,
-    hidden_states: torch.Tensor,
-    scores: torch.Tensor,
-    topk: int,
-):
-    # FIXME(lsyin): remove this duplicate code
-    if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-            0, hidden_states.shape[0], step=topk, device=hidden_states.device
-        ).repeat_interleave(topk)
-        hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
-
-
 @triton.jit
 def fill_new_verified_id(
     verified_id,
@@ -519,8 +486,6 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
@@ -533,6 +498,5 @@ def assign_extend_cache_locs_func(
             end_offset,
             out_cache_loc,
         )
-        out_cache_loc = out_cache_loc.to(dtype=torch.int64)
 
         return out_cache_loc

@@ -13,11 +13,12 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import direct_register_custom_op, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import gptq_marlin_gemm, gptq_marlin_repack
+    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
+    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -62,7 +63,6 @@ def apply_fp8_marlin_linear(
         a=reshaped_x,
         c=None,
         b_q_weight=weight,
-        b_bias=bias,
         b_scales=weight_scale,
         global_scale=None,
         b_zeros=None,
@@ -77,7 +77,34 @@ def apply_fp8_marlin_linear(
         use_fp32_reduce=use_fp32_reduce,
     )
 
+    if bias is not None:
+        output.add_(bias)
+
     return output.reshape(out_shape)
+
+
+def fake_apply_fp8_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+
+    out_shape = input.shape[:-1] + (size_n,)
+    fake_output = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    return fake_output
+
+
+direct_register_custom_op(
+    op_name="apply_fp8_marlin_linear",
+    op_func=apply_fp8_marlin_linear,
+    mutates_args=[],
+    fake_impl=fake_apply_fp8_marlin_linear,
+)
 
 
 def prepare_fp8_layer_for_marlin(

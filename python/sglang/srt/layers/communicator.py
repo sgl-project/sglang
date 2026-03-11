@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -29,12 +29,19 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -56,9 +63,9 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_sm90_supported,
     is_sm100_supported,
-    prepare_weight_cache,
 )
 
 _is_cuda = is_cuda()
@@ -67,13 +74,47 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_npu = is_npu()
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+elif _is_npu:
+    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
+
+# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+def apply_flashinfer_allreduce_fusion(batch_size: int):
+    return (
+        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
+        # Ref: https://github.com/sgl-project/sglang/issues/17237
+        (_is_sm90_supported or _is_sm100_supported)
+        and _is_flashinfer_available
+        and batch_size > 0
+        and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        and not is_dp_attention_enabled()
+        and get_global_server_args().enable_flashinfer_allreduce_fusion
+    )
+
+
+def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
+    n = input_tensor.shape[-1]
+    total_bytes = input_tensor.numel() * input_tensor.element_size()
+    return (
+        _use_aiter
+        and total_bytes > 0
+        and n <= 16384
+        and total_bytes < 8 * 1024 * 8192
+        and get_tensor_model_parallel_world_size() != 6
+        and not is_dp_attention_enabled()
+        and get_global_server_args().enable_aiter_allreduce_fusion
+    )
 
 
 class ScatterMode(Enum):
@@ -92,6 +133,8 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
+        if is_nsa_enable_prefill_cp():
+            return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -148,14 +191,14 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_nsa):
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
-            and _is_cuda
+            and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_nsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and not get_global_server_args().enable_piecewise_cuda_graph
+            and get_global_server_args().disable_piecewise_cuda_graph
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -214,14 +257,16 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
+    is_next_layer_sparse: Optional[bool]
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
         return _LayerModeComputationContext(
+            num_layers=self.num_layers,
             layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-            num_layers=self.num_layers,
+            is_next_layer_sparse=self.is_layer_sparse,
         )
 
 
@@ -271,6 +316,15 @@ class LayerScatterModes:
             )
 
     @classmethod
+    def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
+        return (
+            not context.is_layer_sparse
+            and context.is_next_layer_sparse
+            and enable_moe_dense_fully_dp()
+            and get_global_server_args().enable_two_batch_overlap
+        )
+
+    @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
@@ -285,6 +339,8 @@ class LayerScatterModes:
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
+            if cls._should_gather_for_tbo(context):
+                return ScatterMode.TP_ATTN_FULL
             return ScatterMode.SCATTERED
         if mlp_mode == ScatterMode.FULL:
             return ScatterMode.TP_ATTN_FULL
@@ -314,6 +370,12 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
 
         self._context = CommunicateContext.init_new()
+        self._post_init_communicate()
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+
+    def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -337,19 +399,19 @@ class LayerCommunicator:
             )
         )
 
-        self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
-        )
-
     def prepare_attn_and_capture_last_layer_outputs(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ):
         hidden_states, residual = self.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -369,6 +431,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -383,11 +446,20 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                hidden_states, residual = (
-                    self.input_layernorm.forward_with_allreduce_fusion(
+                if (
+                    apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    hidden_states, residual = (
+                        self.input_layernorm.forward_with_allreduce_fusion(
+                            hidden_states, residual
+                        )
+                    )
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
-                )
             else:
                 if residual is None:
                     residual = hidden_states
@@ -450,7 +522,9 @@ class LayerCommunicator:
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(
-                            hidden_states, residual
+                            hidden_states,
+                            residual,
+                            post_residual_addition,
                         )
 
         hidden_states = self._communicate_simple_fn(
@@ -525,10 +599,13 @@ class LayerCommunicator:
             and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
+        if nsa_use_prefill_cp(forward_batch):
+            return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
         return False
 
+    # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
@@ -547,24 +624,19 @@ class LayerCommunicator:
             if hasattr(forward_batch, "input_ids")
             else 0
         )
-        if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
-            return False
-
-        static_conditions_met = (
-            (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-            and not is_dp_attention_enabled()
-            and get_global_server_args().enable_flashinfer_allreduce_fusion
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return False
 
         return (
-            batch_size > 0
-            and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+            (
+                apply_flashinfer_allreduce_fusion(batch_size)
+                or (
+                    _use_aiter
+                    and batch_size > 0
+                    and get_tensor_model_parallel_world_size() != 6
+                    and get_global_server_args().enable_aiter_allreduce_fusion
+                )
+            )
             and (not self.is_last_layer)
+            and (self._context.tp_size > 1)
         )
 
 
@@ -574,6 +646,8 @@ class CommunicateContext:
     attn_tp_rank: int
     attn_tp_size: int
     attn_dp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     tp_size: int
     cache = None
     tp_rank: int
@@ -586,6 +660,8 @@ class CommunicateContext:
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
+        attn_cp_size = get_attention_cp_size()
+        attn_cp_rank = get_attention_cp_rank()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         process_group_sizes = {
@@ -599,6 +675,8 @@ class CommunicateContext:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
@@ -617,6 +695,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if _use_ag_after_qlora:
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
@@ -631,10 +711,32 @@ class CommunicateSimpleFn:
 
     @staticmethod
     def _scattered_to_tp_attn_full(
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(hidden_states, tuple):
+            gathered_hidden_states = []
+            for local_hidden_states in hidden_states:
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    output = torch.empty(
+                        (
+                            local_hidden_states.shape[0] * context.attn_tp_size,
+                            *local_hidden_states.shape[1:],
+                        ),
+                        dtype=local_hidden_states.dtype,
+                        device=local_hidden_states.device,
+                    )
+                attn_tp_all_gather_into_tensor(
+                    output,
+                    local_hidden_states,
+                )
+                gathered_hidden_states.append(output)
+            return tuple(gathered_hidden_states)
+
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
@@ -738,18 +840,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
@@ -762,21 +862,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+            handled = False
             if (
-                (_is_sm100_supported or _is_sm90_supported)
-                and _is_flashinfer_available
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and get_global_server_args().enable_flashinfer_allreduce_fusion
-                and hidden_states.shape[0] <= 2048
-            ):
+                apply_aiter_all_reduce_fusion(hidden_states)
+                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
-            else:
+                handled = True
+
+            if not handled:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                if context.cache is not None:
+                if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual

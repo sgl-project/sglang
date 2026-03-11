@@ -32,11 +32,11 @@ python3 -m sglang.launch_server \
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
 - **Enable Multi-Modal**: Add `--enable-multimodal` for multi-modal capabilities.
-- **Enable Hybrid-KVCache**: Add `--hybrid-kvcache-ratio` for hybrid kv cache. Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/6563)
+- **Enable Hybrid-KVCache**: Set `--swa-full-tokens-ratio` to adjust the ratio of SWA layer (for Llama4, it's local attention layer) KV tokens / full layer KV tokens. (default: 0.8, range: 0-1)
 
 
 ### EAGLE Speculative Decoding
-**Description**: SGLang has supported Llama 4 Maverick (400B) with [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding).
+**Description**: SGLang has supported Llama 4 Maverick (400B) with [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding).
 
 **Usage**:
 Add arguments `--speculative-draft-model-path`, `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:

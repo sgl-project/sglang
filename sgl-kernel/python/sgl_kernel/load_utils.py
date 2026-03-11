@@ -166,6 +166,14 @@ def _load_architecture_specific_ops():
     )
 
     # All attempts failed
+    cuda_version = torch.version.cuda
+    if cuda_version and cuda_version.startswith("13"):
+        install_hint = (
+            "pip install sgl-kernel --index-url https://docs.sglang.ai/whl/cu130/"
+        )
+    else:
+        install_hint = "pip install --upgrade sgl_kernel"
+
     error_msg = f"""
 [sgl_kernel] CRITICAL: Could not load any common_ops library!
 
@@ -177,9 +185,10 @@ Attempted locations:
 GPU Info:
 - Compute capability: {compute_capability}
 - Expected variant: {variant_name}
+- CUDA version: {cuda_version}
 
 Please ensure sgl_kernel is properly installed with:
-pip install --upgrade sgl_kernel
+{install_hint}
 
 Error details from previous import attempts:
 {attempt_error_msg}
@@ -205,20 +214,34 @@ def _find_cuda_home():
 
 
 def _preload_cuda_library():
+    """Preload the CUDA runtime library to help avoid 'libcudart.so not found' issues."""
     cuda_home = Path(_find_cuda_home())
 
-    if (cuda_home / "lib").is_dir():
-        cuda_path = cuda_home / "lib"
-    elif (cuda_home / "lib64").is_dir():
-        cuda_path = cuda_home / "lib64"
-    else:
-        # Search for 'libcudart.so.12' in subdirectories
-        for path in cuda_home.rglob("libcudart.so.12"):
-            cuda_path = path.parent
-            break
-        else:
-            raise RuntimeError("Could not find CUDA lib directory.")
+    candidate_dirs = [
+        cuda_home / "lib",
+        cuda_home / "lib64",
+        Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib/aarch64-linux-gnu"),
+        Path("/usr/lib64"),
+        Path("/usr/lib"),
+    ]
 
-    cuda_include = (cuda_path / "libcudart.so.12").resolve()
-    if cuda_include.exists():
-        ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
+    # Determine CUDA major version to try the matching library first.
+    # On CUDA 13 systems (e.g., DGX Spark), only libcudart.so.13 exists.
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else "12"
+    lib_versions = list(dict.fromkeys([cuda_major, "13", "12"]))
+
+    for base in candidate_dirs:
+        for lib_version in lib_versions:
+            candidate = base / f"libcudart.so.{lib_version}"
+            if candidate.exists():
+                try:
+                    cuda_runtime_lib = candidate.resolve()
+                    ctypes.CDLL(str(cuda_runtime_lib), mode=ctypes.RTLD_GLOBAL)
+                    logger.debug(f"Preloaded CUDA runtime under {cuda_runtime_lib}")
+                    return
+                except Exception as e:
+                    logger.debug(f"Failed to load {candidate}: {e}")
+                    continue
+
+    logger.debug("[sgl_kernel] Could not preload CUDA runtime library")

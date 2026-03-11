@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """SGLang LLaDA2MoeModelLM model."""
+
 import logging
 from typing import Iterable, Optional, Tuple, Union
 
@@ -71,15 +72,23 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
+    apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    is_npu,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -187,6 +196,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
+
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+        if _is_npu:
+            self.norm_topk_prob = False
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -349,11 +363,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
-            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
@@ -494,28 +506,6 @@ class LLaDA2MoeAttention(nn.Module):
 
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.key_layernorm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.key_layernorm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -527,7 +517,18 @@ class LLaDA2MoeAttention(nn.Module):
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+        can_fuse_set_kv = (
+            self.head_dim == self.rotary_emb.rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -538,7 +539,7 @@ class LLaDA2MoeAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if can_fuse_set_kv
                 else None
             ),
         )
@@ -547,7 +548,7 @@ class LLaDA2MoeAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not can_fuse_set_kv,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output
@@ -581,12 +582,14 @@ class LLaDA2MoeBlock(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
         is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
+        is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
@@ -688,7 +691,7 @@ class LLaDA2MoeModel(nn.Module):
                 self.embed_dim,
                 quant_config=quant_config,
                 prefix=add_prefix("word_embeddings", prefix),
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.word_embeddings = PPMissingLayer()

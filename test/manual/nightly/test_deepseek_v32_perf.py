@@ -1,7 +1,6 @@
 import unittest
 
-from nightly_utils import NightlyBenchmarkRunner
-
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
@@ -25,6 +24,9 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "8",
+                    "--dp",
+                    "8",
+                    "--enable-dp-attention",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
@@ -35,6 +37,9 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "8",
+                    "--dp",
+                    "8",
+                    "--enable-dp-attention",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-num-steps",
@@ -51,6 +56,25 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
             },
             {
                 "name": "nsa",
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--dp",
+                    "8",
+                    "--enable-dp-attention",
+                    "--attention-backend",
+                    "nsa",
+                    "--nsa-prefill-backend",
+                    "flashmla_sparse",
+                    "--nsa-decode-backend",
+                    "flashmla_kv",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            },
+            {
+                "name": "pure_tp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -88,7 +112,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    self.runner.add_report(results)
+                    self.runner.add_report(results, variant=variant_config["name"])
         finally:
             self.runner.write_final_report()
 

@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/olmo.py#L1
 """Inference-only OLMo model compatible with HuggingFace weights."""
+
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -318,6 +319,7 @@ class OlmoForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

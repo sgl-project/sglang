@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -17,8 +17,9 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -46,6 +47,14 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
@@ -117,26 +126,15 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_cuda or _is_hip:
-        assign_req_to_token_pool[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-    elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
-        torch.ops.npu.cache_loc_assign(
-            req_pool_indices,
-            req_to_token,
-            start_offset.to(torch.int64),
-            end_offset.to(torch.int64),
-            out_cache_loc,
-        )
+    assign_req_to_token_pool[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(batch_size),
+    )
 
 
 @triton.jit
@@ -476,13 +474,14 @@ def select_top_k_tokens(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -573,6 +572,7 @@ def traverse_tree(
     draft_tokens: torch.Tensor,
     grammar: BaseGrammarObject,
     allocate_token_bitmask: torch.Tensor,
+    vocab_size: Optional[int] = None,
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
@@ -580,8 +580,6 @@ def traverse_tree(
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
-
-    allocate_token_bitmask.fill_(0)
 
     def dfs(
         curr: int,
@@ -596,10 +594,13 @@ def traverse_tree(
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
-            # 32 boolean bitmask values are packed into 32-bit integers
-            accepted = (
-                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
-            ) != 0
+            if vocab_size and curr_token_id >= vocab_size:
+                accepted = False
+            else:
+                # 32 boolean bitmask values are packed into 32-bit integers
+                accepted = (
+                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                ) != 0
 
         if accepted:
             if curr != 0:
@@ -672,6 +673,7 @@ def generate_token_bitmask(
                 allocate_token_bitmask[
                     i * num_draft_tokens : (i + 1) * num_draft_tokens
                 ],
+                vocab_size=vocab_size,
             )
             tree_traverse_time = time.perf_counter() - s
             if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
@@ -686,11 +688,30 @@ def generate_token_bitmask(
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+        repo_id = os.path.dirname(token_map_path)
+        file_name = os.path.basename(token_map_path)
+
+        cache_dir = None
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.utils.file_utils import get_model_cache_root
+
+            cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
+            if os.path.exists(cached_repo_path):
+                cache_dir = cached_repo_path
+
+        if cache_dir is None:
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as download_func,
+                )
+            else:
+                download_func = snapshot_download
+            cache_dir = download_func(
+                repo_id,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+
+        token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
@@ -703,8 +724,56 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-def detect_nan(logits_output: LogitsProcessorOutput):
-    logits = logits_output.next_token_logits
-    if torch.any(torch.isnan(logits)):
-        logger.error("Detected errors during sampling! NaN in the logits.")
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
+def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
+    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
+        return
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+
+
+def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
+        return
+    if indices.numel() == 0:
+        return
+    torch._assert_async(
+        (indices.min() >= low) & (indices.max() < high),
+        f"OOB indices not in [{low}, {high}): {msg}",
+    )
+
+
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
+def get_last_loc_large_page_size_large_top_k(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    speculative_num_steps: int,
+    topk: int,
+    page_size: int,
+):
+    prefix_lens = seq_lens
+    last_page_lens = prefix_lens % page_size
+    num_new_pages_per_topk = (
+        last_page_lens + speculative_num_steps + page_size - 1
+    ) // page_size
+    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
+        page_size * topk
+    )
+    extend_lens = seq_lens - prefix_lens
+    last_loc = get_last_loc(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )

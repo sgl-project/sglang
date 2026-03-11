@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -29,6 +29,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -40,13 +42,26 @@ def grouped_gemm_nt_f8f8bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        deep_gemm.fp8_m_grouped_gemm_nt_masked(
-            lhs,
-            rhs,
-            out,
-            masked_m,
-            expected_m,
-        )
+        with configure_deep_gemm_num_sms(
+            overlap_args.num_sms if overlap_args is not None else None
+        ):
+
+            return deep_gemm.fp8_m_grouped_gemm_nt_masked(
+                lhs,
+                rhs,
+                out,
+                masked_m,
+                expected_m,
+                **(
+                    dict(
+                        enable_overlap=True,
+                        max_block_n=max_block_n,
+                        signal=overlap_args.signal,
+                    )
+                    if overlap_args is not None
+                    else {}
+                ),
+            )
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -85,6 +100,20 @@ def gemm_nt_f8f8bf16(
             rhs,
             out,
         )
+
+
+def gemm_nt_bf16bf16f32(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+):
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16F32
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):

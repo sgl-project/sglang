@@ -25,3 +25,27 @@ It learns from [Copybara](https://github.com/google/copybara), a tool used at Go
     - For example, you can have a PR that changes both `python/sglang/srt` and `python/sglang/private/srt`. Once you merge the PR into the private repo, `python/sglang/srt` becomes desynced between the two repos. You need to run this action on your merge commit immediately to open a PR to send your diff to the OSS repo. Then, we need to merge the OSS PR as soon as possible. Once your OSS PR is merged, we can run action A again.
     - Action A copies files directly, but Action B applies diff. This is because OSS is the source of truth; action A can just copy files. Action B cannot copy, so it uses diff instead.
 - This action currently needs a manual trigger in order to prevent incidental code leaks. One can also consider making it automatic.
+
+## Examples
+- If you want to have some private server arguments, you can create a new file `python/sglang/private/server_args.py`. It defines a class that inherits the oss ServerArgs.
+    ```python
+    from sglang.srt.server_args import ServerArgs as ServerArgsOSS
+
+    @dataclasses.dataclass
+    class ServerArgs(ServerArgsOSS):
+        private_flag: str = "foo"
+
+        @staticmethod
+        def add_cli_args(parser: argparse.ArgumentParser):
+            # Get all public args
+            ServerArgsOSS.add_cli_args(parser)
+
+            # Add your private flags
+            parser.add_argument(
+                "--private-flag",
+                type=str,
+                default=ServerArgs.private_flag,
+            )
+    ```
+- Similarly, you can inherit `Engine` and override its fields. You can override `server_args_class` to use your own ServerArgs,
+  override `init_tokenizer_manager_func` to use your own TokenizerManager, override `run_scheduler_process_func` to use your own scheduler.

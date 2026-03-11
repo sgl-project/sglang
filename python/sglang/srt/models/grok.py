@@ -18,6 +18,7 @@ import math
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -59,7 +60,9 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +145,8 @@ class Grok1MoE(nn.Module):
         self.topk = TopK(
             top_k=top_k,
             renormalize=False,
-            custom_routing_function=custom_routing_function,
+            layer_id=layer_id,
+            custom_routing_function=None if _is_npu else custom_routing_function,
         )
 
         self.experts = FusedMoE(
@@ -161,8 +165,21 @@ class Grok1MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        topk_output = self.topk(hidden_states, self.gate.weight)
-        return self.experts(hidden_states, topk_output)
+        if not _is_npu:
+            topk_output = self.topk(hidden_states, self.gate.weight)
+            return self.experts(hidden_states, topk_output)
+        else:
+            orig_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_size)
+
+            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.router_logit_softcapping * F.tanh(
+                router_logits / self.router_logit_softcapping
+            )
+            topk_output = self.topk(hidden_states, router_logits)
+
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            return final_hidden_states.view(orig_shape)
 
 
 def _yarn_linear_ramp_mask(
@@ -227,6 +244,8 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        if _is_npu:
+            dtype = torch.float32
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -395,6 +414,7 @@ class Grok1Attention(nn.Module):
                 max_position=max_position,
                 base=int(self.rope_theta),
                 is_neox_style=True,
+                dtype=torch.float32 if _is_npu else None,
             )
             pos_encoding_mode = "NONE"
 
@@ -424,7 +444,12 @@ class Grok1Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if not _is_npu:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            odtype = q.dtype
+            q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
+            q, k = q.to(odtype), k.to(odtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -689,19 +714,12 @@ class Grok1ForCausalLM(nn.Module):
             config, "load_presharded_embedding", False
         )
 
-        self.is_weights_presharded = (
-            self.load_presharded_mlp
-            or self.load_presharded_moe
-            or self.load_presharded_attn
-            or self.load_presharded_embedding
-        )
-
         default_replicate_lm_head = False
         self.replicate_lm_head = getattr(
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if self.is_weights_presharded:
+        if get_tensor_model_parallel_world_size() > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)

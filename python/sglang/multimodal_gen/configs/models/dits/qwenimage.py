@@ -20,10 +20,18 @@ class QwenImageArchConfig(DiTArchConfig):
     pooled_projection_dim: int = 768
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
+    zero_cond_t: bool = False
+
+    stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
+            # SVDquant mappings
+            r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
+            r"(transformer_blocks\.\d+\.(img_mlp|txt_mlp)\..*\.(smooth_factor_orig|wcscales))$": r"\1",
+            r".*\.wtscale$": r"",
         }
     )
 
@@ -35,7 +43,21 @@ class QwenImageArchConfig(DiTArchConfig):
 
 
 @dataclass
+class QwenImageEditPlus_2511_ArchConfig(QwenImageArchConfig):
+    zero_cond_t: bool = True
+
+
+@dataclass
 class QwenImageDitConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=QwenImageArchConfig)
 
     prefix: str = "qwenimage"
+
+
+@dataclass
+class QwenImageEditPlus_2511_DitConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(
+        default_factory=QwenImageEditPlus_2511_ArchConfig
+    )
+
+    prefix: str = "qwenimageedit"

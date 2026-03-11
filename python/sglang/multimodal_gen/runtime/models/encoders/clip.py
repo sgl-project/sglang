@@ -5,6 +5,7 @@
 # Adapted from transformers: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/clip/modeling_clip.py
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
+
 from collections.abc import Iterable
 from typing import Optional
 
@@ -32,6 +33,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
+)
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -181,7 +186,7 @@ class CLIPAttention(nn.Module):
             self.head_dim,
             self.num_heads_per_partition,
             softmax_scale=self.scale,
-            causal=False,
+            causal=True,
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -195,6 +200,7 @@ class CLIPAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ):
         """Input shape: Batch x Time x Channel"""
 
@@ -219,7 +225,53 @@ class CLIPAttention(nn.Module):
             self.num_heads_per_partition,
             self.head_dim,
         )
-        attn_output = self.attn(query_states, key_states, value_states)
+
+        if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
+            query_states = query_states.transpose(1, 2)  # [B, H, S, D]
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            if current_platform.is_rocm() or current_platform.is_musa():
+                # ROCm: Using both is_causal=True and attn_mask causes NaN.
+                # Use is_causal=True alone (padding mask not needed for CLIP
+                # since pooler_output comes from EOS token before padding).
+                # XXX (MUSA): Torch SDPA on MUSA currently does not support
+                # using both `attn_mask` and `is_causal=True` simultaneously.
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=None,
+                    is_causal=True,
+                    scale=self.scale,
+                )
+            else:
+                if attention_mask is not None:
+                    # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
+                    if attention_mask.dim() == 2:
+                        attn_mask = attention_mask[:, None, None, :].to(
+                            dtype=query_states.dtype
+                        )
+                        attn_mask = (1.0 - attn_mask) * torch.finfo(
+                            query_states.dtype
+                        ).min
+                    else:
+                        attn_mask = attention_mask
+                else:
+                    attn_mask = None
+
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attn_mask,
+                    is_causal=attention_mask is None,
+                    scale=self.scale,
+                )
+            attn_output = attn_output.transpose(1, 2)
+        else:
+            # Use LocalAttention (doesn't support attention_mask, but maintains compatibility)
+            attn_output = self.attn(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(
             attn_output.shape[0],
@@ -283,11 +335,18 @@ class CLIPEncoderLayer(nn.Module):
         self.mlp = CLIPMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, _ = self.self_attn(hidden_states=hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -334,13 +393,19 @@ class CLIPEncoder(nn.Module):
         )
 
     def forward(
-        self, inputs_embeds: torch.Tensor, return_all_hidden_states: bool
+        self,
+        inputs_embeds: torch.Tensor,
+        return_all_hidden_states: bool,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         hidden_states_pool = [inputs_embeds]
         hidden_states = inputs_embeds
 
         for idx, encoder_layer in enumerate(self.layers):
-            hidden_states = encoder_layer(hidden_states)
+            hidden_states = encoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+            )
             if return_all_hidden_states:
                 hidden_states_pool.append(hidden_states)
         # If we have multiple feature sample layers, we return all hidden
@@ -385,10 +450,6 @@ class CLIPTextTransformer(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseEncoderOutput:
-        r"""
-        Returns:
-
-        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -417,11 +478,8 @@ class CLIPTextTransformer(nn.Module):
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
-            # attention_mask=attention_mask,
-            # causal_attention_mask=causal_attention_mask,
-            # output_attentions=output_attentions,
             return_all_hidden_states=output_hidden_states,
-            # return_dict=return_dict,
+            attention_mask=attention_mask,
         )
 
         last_hidden_state = encoder_outputs[-1]

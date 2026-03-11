@@ -2,19 +2,28 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
-"""Utilities for downloading and initializing model weights."""
+"""Utilities for downloading, loading, initializing and verifying model weights."""
+
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import filelock
 import huggingface_hub.constants
 import torch
 from safetensors.torch import safe_open
+from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
+
+try:
+    from runai_model_streamer import SafetensorsStreamer
+
+    HAS_RUNAI_MODEL_STREAMER = True
+except ImportError:
+    HAS_RUNAI_MODEL_STREAMER = False
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -142,6 +151,7 @@ def _validate_safetensors_file(file_path: str) -> bool:
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
+    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -185,16 +195,45 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
-    ):
-        with safe_open(st_file, framework="pt", device=device) as f:
-            for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
-                yield name, param
+    if use_runai_model_streamer:
+        with SafetensorsStreamer() as streamer:
+            streamer.stream_files(hf_weights_files)
+            for name, tensor in streamer.get_tensors():
+                if to_cpu:
+                    yield name, tensor.clone().detach()
+                else:
+                    yield name, tensor.to(device)
+    else:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            with safe_open(st_file, framework="pt", device=device) as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
+
+
+def _load_pt_file(bin_file: str, device: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location=device, weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location=device, weights_only=False)
+        raise
 
 
 def pt_weights_iterator(
@@ -212,7 +251,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location=device, weights_only=True)
+        state = _load_pt_file(bin_file, device)
         yield from state.items()
         del state
 
@@ -298,3 +337,23 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+def compute_weights_checksum(
+    named_params: Iterable[tuple[str, torch.Tensor]],
+) -> str:
+    """Compute a SHA-256 checksum for a set of (name, tensor) pairs.
+
+    Used to verify the correctness of weight refitting. After a refit,
+    compare the checksum of the in-GPU model weights against the checksum
+    of the on-disk tensors or the tensors in the training engine.
+    """
+    hasher = hashlib.sha256()
+    for name, tensor in sorted(named_params, key=lambda x: x[0]):
+        hasher.update(name.encode())
+        t = tensor.detach()
+        # DTensor doesn't support .numpy(); extract the local tensor.
+        if isinstance(t, DTensor):
+            t = t._local_tensor
+        hasher.update(t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
+    return hasher.hexdigest()

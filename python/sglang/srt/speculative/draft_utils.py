@@ -18,11 +18,16 @@ class DraftBackendFactory:
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        backend_type = getattr(self.server_args, backend_name)
+        backend_type = (
+            self.draft_attn_backend
+            if self.draft_attn_backend
+            else getattr(self.server_args, backend_name)
+        )
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 
@@ -176,7 +181,7 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import (
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnMultiStepDraftBackend,
         )
 
@@ -231,7 +236,9 @@ class DraftBackendFactory:
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
 
         return AscendAttnBackend(self.draft_model_runner)
 

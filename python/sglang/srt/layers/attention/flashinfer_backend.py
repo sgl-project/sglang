@@ -16,12 +16,14 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
@@ -120,13 +122,17 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
+        self.prefill_backend = "fa2"
+        self.decode_backend = "fa2"
 
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
-        self.is_dllm_model = model_runner.server_args.dllm_algorithm is not None
+        # FIXME: remove dllm workarounds from flashinfer
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = self.dllm_config is not None
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -161,6 +167,10 @@ class FlashInferAttnBackend(AttentionBackend):
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLMoeForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
         ):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
@@ -234,7 +244,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
-            if model_runner.server_args.enable_piecewise_cuda_graph:
+            if not model_runner.server_args.disable_piecewise_cuda_graph:
                 logger.warning(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
                     "due to TMA descriptor initialization issues on B200. "
@@ -257,19 +267,21 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend=self.prefill_backend,
                     )
                 )
                 self.prefill_wrappers_verify.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
+                        backend=self.prefill_backend,
                     )
                 )
             self.decode_wrappers.append(
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     "NHD",
+                    backend=self.decode_backend,
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
@@ -468,7 +480,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = not self.enable_deterministic
+                use_ragged = (
+                    not self.enable_deterministic and not is_in_piecewise_cuda_graph()
+                )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
@@ -548,6 +562,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
+                        backend=self.decode_backend,
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
                         paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
@@ -583,6 +598,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
+                        backend=self.prefill_backend,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
@@ -612,7 +628,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend=self.prefill_backend,
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
@@ -635,6 +651,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_dllm_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.prefill_backend,
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=True,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -684,6 +729,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+        elif forward_mode.is_dllm_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=True,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -745,13 +802,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
+            # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
+            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+            # previously cached context without re-materializing KV tensors (e.g., the
+            # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
+            if k is None and v is None:
+                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:

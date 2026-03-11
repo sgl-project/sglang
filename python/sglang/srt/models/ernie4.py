@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-""" Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights. """
+"""Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights."""
 
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -87,6 +87,7 @@ class Ernie4Moe(nn.Module):
 
         self.topk = TopK(
             top_k=config.moe_k,
+            layer_id=layer_id,
             renormalize=True,
             use_grouped_topk=False,
             correction_bias=self.gate.e_score_correction_bias,

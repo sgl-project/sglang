@@ -51,15 +51,17 @@
         {%- set ns.is_tool = false -%}
         {%- set ns.is_output_first = true %}
         {%- for tool in message['tool_calls'] %}
+            {%- set tool_type = tool['type'] if tool['type'] is defined else 'function' -%}
+            {%- set tool_args = tool['function']['arguments'] if tool['function']['arguments'] is string else tool['function']['arguments'] | tojson -%}
             {%- if not ns.is_first %}
                 {%- if content is none %}
-                    {{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                    {{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool_type + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool_args + '\n' + '```' + '<｜tool▁call▁end｜>'}}
                 {%- else %}
-                    {{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                    {{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool_type + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool_args + '\n' + '```' + '<｜tool▁call▁end｜>'}}
                 {%- endif %}
                 {%- set ns.is_first = true -%}
             {%- else %}
-                {{'\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                {{'\n' + '<｜tool▁call▁begin｜>' + tool_type + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool_args + '\n' + '```' + '<｜tool▁call▁end｜>'}}
             {%- endif %}
         {%- endfor %}
         {{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}

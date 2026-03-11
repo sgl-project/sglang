@@ -6,7 +6,10 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
-from sglang.srt.models.pixtral import PixtralVisionModel
+from sglang.srt.models.pixtral import (
+    PixtralForConditionalGeneration,
+    PixtralVisionModel,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -14,7 +17,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class PixtralProcessor(BaseMultimodalProcessor):
-    models = [PixtralVisionModel]
+    models = [PixtralVisionModel, PixtralForConditionalGeneration]
 
     PAD_TOKEN = "<pad>"
     IMG_BREAK_TOKEN_ID = 12
@@ -30,7 +33,6 @@ class PixtralProcessor(BaseMultimodalProcessor):
         patch_width = patch_height = self.patch_size
 
         ratio = max(image_width / max_width, image_height / max_height)
-
         if ratio > 1:
             image_width = int(math.floor(image_width / ratio))
             image_height = int(math.floor(image_height / ratio))
@@ -52,6 +54,11 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self.vision_config = hf_config.vision_config
         self.image_size = self.vision_config.image_size
         self.patch_size = self.vision_config.patch_size
+
+        self._processor.patch_size = self.patch_size
+        if hasattr(self.vision_config, "spatial_merge_size"):
+            self._processor.spatial_merge_size = self.vision_config.spatial_merge_size
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token,
             image_token_id=self.IM_TOKEN_ID,
