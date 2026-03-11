@@ -48,17 +48,25 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
-    UsageInfo,
+    Tool,
+    ToolChoice,
+    ResponseUsageInfo,
+    OutputTokenUsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.utils import parse_tool_calls_from_content
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
+from sglang.srt.function_call.utils import _is_complete_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -87,7 +95,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.enable_force_include_usage = enable_force_include_usage
 
         # Get default sampling params from model config if available
-        self.default_sampling_params = {}
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if self.default_sampling_params:
+            logger.info(
+                f"OpenAIServingResponses init,  Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
 
         self.supports_browsing = (
             tool_server.has_tool("browser") if tool_server else False
@@ -124,6 +138,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+
+    def _get_function_tools(self, request: ResponsesRequest) -> list[Tool]:
+        """Extract function tools from request and convert to Tool format."""
+        function_tools = []
+        for tool in request.tools:
+            if tool.type == "function":
+                function_tools.append(
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=tool.name,
+                            description=tool.description,
+                            parameters=tool.parameters,
+                            strict=tool.strict or False,
+                        ),
+                    )
+                )
+        return function_tools
 
     # error helpers dedicated for v1/responses
     def create_error_response(
@@ -190,11 +222,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             tokenizer = self.tokenizer_manager.tokenizer
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
+                messages, request_prompts, engine_prompts, processed_messages = (
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
+                messages, request_prompts, engine_prompts, processed_messages = await self._make_request(
                     request, prev_response, tokenizer
                 )
 
@@ -262,7 +294,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context_len - prompt_length, 512
                     )  # Ensure minimum 512 tokens
                     sampling_params = request.to_sampling_params(
-                        default_max_tokens, self.default_sampling_params
+                        default_max_tokens=default_max_tokens,
+                        default_params=self.default_sampling_params,
+                        tool_call_constraint=processed_messages.tool_call_constraint if processed_messages else None,
                     )
 
                     context: ConversationContext
@@ -274,6 +308,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    print(f"context type: {type(context)} \n")
+                    print(f"use_harmony: {self.use_harmony} \n")
+                    print(f"sampling_params: {json.dumps(sampling_params)}\n")
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
                         input_ids=engine_prompt,
@@ -375,6 +412,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
+        function_tools = self._get_function_tools(request)
 
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
@@ -383,6 +421,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=function_tools,
+                tool_choice=request.tool_choice,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -408,8 +448,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_ids = tokenizer.encode(prompt_text)
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
+            processed_messages = None
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, processed_messages
 
     def _make_request_with_harmony(
         self,
@@ -423,7 +464,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = prompt_token_ids
-        return messages, [prompt_token_ids], [engine_prompt]
+        return messages, [prompt_token_ids], [engine_prompt], None
 
     async def responses_full_generator(
         self,
@@ -464,40 +505,43 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request, final_res["text"], tokenizer
             )
 
+            num_reasoning_tokens = 0
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-            elif hasattr(final_res, "prompt_token_ids") and hasattr(
-                final_res, "outputs"
-            ):
+            if "meta_info" in final_res:
+                meta_info = final_res.get("meta_info", {})
+                num_prompt_tokens = meta_info.get("prompt_tokens", 0)
+                num_generated_tokens = meta_info.get("completion_tokens", 0)
+                num_cached_tokens = meta_info.get("cached_tokens", 0)
+            elif "prompt_token_ids" in final_res and "outputs" in final_res:
                 # Fallback calculation if meta_info not available
                 num_prompt_tokens = (
-                    len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
-                )
-                num_generated_tokens = (
-                    len(final_res.outputs[0].token_ids)
-                    if final_res.outputs and final_res.outputs[0].token_ids
+                    len(final_res["prompt_token_ids"])
+                    if final_res.get("prompt_token_ids")
                     else 0
                 )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
-                num_reasoning_tokens = 0
+                num_generated_tokens = (
+                    len(final_res["outputs"][0]["token_ids"])
+                    if (final_res.get("outputs") and
+                        final_res["outputs"][0].get("token_ids"))
+                    else 0
+                )
+                num_cached_tokens = final_res.get("num_cached_tokens", 0)
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
-                num_reasoning_tokens = 0
 
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
+        usage = ResponseUsageInfo(
+            input_tokens=num_prompt_tokens,
+            output_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+            output_tokens_details=OutputTokenUsageInfo(
+                reasoning_tokens=num_reasoning_tokens
+            ),
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
+        if self.enable_prompt_tokens_details:
+            usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
         request_metadata.final_usage_info = usage
@@ -554,6 +598,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
+
+        if (
+            request.tool_choice != "none"
+            and request.tools
+            and self.tool_call_parser
+            and content
+        ):
+            # Check for function tools and parse tool calls
+            function_tools = self._get_function_tools(request)
+            if function_tools:
+                remaining_text, tool_calls = parse_tool_calls_from_content(
+                    content=content,
+                    tools=function_tools,
+                    tool_call_parser=self.tool_call_parser,
+                    generate_tool_call_id=self._process_tool_call_id,
+                )
+                output_items.extend(tool_calls)
+                content = remaining_text
+
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -870,6 +933,39 @@ class OpenAIServingResponses(OpenAIServingChat):
                 response=initial_response,
             )
         )
+        # Initialize function call parser for streaming if function tools are present
+        function_tools = self._get_function_tools(request)
+        streaming_fc_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
+        if (
+            function_tools
+            and self.tool_call_parser
+            and not self.use_harmony
+            and request.tool_choice != "none"
+        ):
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                streaming_fc_parser = JsonArrayParser()
+            else:
+                streaming_fc_parser = FunctionCallParser(
+                    function_tools, self.tool_call_parser
+                )
+
+        reasoning_parser: Optional[ReasoningParser] = None
+        if self.reasoning_parser:
+            reasoning_parser = ReasoningParser(
+                model_type=self.reasoning_parser, stream_reasoning=True
+            )
+
+        # Track state for non-Harmony streaming with function tools
+        simple_ctx_prev_text = ""
+        simple_ctx_sent_message_added = False
+        simple_ctx_accumulated_text = ""
+        simple_ctx_sent_reasoning_done = False
+        simple_ctx_reasoning_text = ""
+
+        # store function call state
+        tool_call_states = {}  # tool_index -> state dict
 
         async for ctx in result_generator:
 
@@ -878,6 +974,253 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Contexts without this method are skipped, as they do not represent a new turn
             # or are not compatible with per-turn handling in the /v1/responses endpoint.
             if not hasattr(ctx, "is_expecting_start"):
+                if hasattr(ctx, "last_output") and ctx.last_output:
+                    current_output_index += 1
+                    current_content_index += 1
+                    current_text = ""
+                    if isinstance(ctx.last_output, dict):
+                        current_text = ctx.last_output.get("text", "")
+                    elif hasattr(ctx.last_output, "text"):
+                        current_text = ctx.last_output.text
+
+                    # Get new text since last iteration
+                    if current_text and len(current_text) > len(simple_ctx_prev_text):
+                        new_chunk = current_text[len(simple_ctx_prev_text) :]
+                        simple_ctx_prev_text = current_text
+
+                        print(f"current_text: {current_text}")
+                        print(f"new_chunk: {new_chunk}")
+                        if reasoning_parser:
+                            reasoning_content, new_chunk = reasoning_parser.parse_stream_chunk(new_chunk)
+                            print(f"reasoning_content: {reasoning_content}")
+                            print(f"content: {new_chunk} \n")
+                            if reasoning_content:
+                                yield _send_event(
+                                    openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                        type="response.reasoning_text.delta",
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        item_id=current_item_id,
+                                        content_index=current_content_index,
+                                        delta=reasoning_content,
+                                    )
+                                )
+                                simple_ctx_reasoning_text += reasoning_content
+                            elif (
+                                new_chunk
+                                and simple_ctx_reasoning_text
+                                and not simple_ctx_sent_reasoning_done
+                            ):
+                                yield _send_event(
+                                    openai_responses_types.ResponseReasoningTextDoneEvent(
+                                        type="response.reasoning_text.done",
+                                        item_id=current_item_id,
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        content_index=current_content_index,
+                                        text=simple_ctx_reasoning_text,
+                                    )
+                                )
+                                simple_ctx_sent_reasoning_done = True
+
+
+                        if new_chunk:
+                            # Parse for function calls if parser is available
+                            if streaming_fc_parser:
+                                if isinstance(streaming_fc_parser, JsonArrayParser):
+                                    result = streaming_fc_parser.parse_streaming_increment(new_chunk, function_tools)
+                                    normal_text, tool_calls = result.normal_text, result.calls
+                                else:
+                                    normal_text, tool_calls = streaming_fc_parser.parse_stream_chunk(
+                                        new_chunk
+                                    )
+
+                                # Emit text delta for normal text
+                                if normal_text:
+                                    if not simple_ctx_sent_message_added:
+                                        simple_ctx_sent_message_added = True
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                                type="response.output_item.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=openai_responses_types.ResponseOutputMessage(
+                                                    id=current_item_id,
+                                                    type="message",
+                                                    role="assistant",
+                                                    content=[],
+                                                    status="in_progress",
+                                                ),
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseContentPartAddedEvent(
+                                                type="response.content_part.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item_id=current_item_id,
+                                                content_index=current_content_index,
+                                                part=openai_responses_types.ResponseOutputText(
+                                                    type="output_text",
+                                                    text="",
+                                                    annotations=[],
+                                                    logprobs=None,
+                                                ),
+                                            )
+                                        )
+                                    simple_ctx_accumulated_text += normal_text
+                                    yield _send_event(
+                                        openai_responses_types.ResponseTextDeltaEvent(
+                                            type="response.output_text.delta",
+                                            sequence_number=-1,
+                                            content_index=current_content_index,
+                                            output_index=current_output_index,
+                                            item_id=current_item_id,
+                                            delta=normal_text,
+                                            logprobs=[],
+                                        )
+                                    )
+
+                                print(f"new_chunk: {new_chunk}\n")
+                                print(f"tool_calls: {tool_calls}\n")
+
+                                # Emit function call events for detected tool calls
+                                for call_info in tool_calls:
+                                    tool_index = call_info.tool_index
+
+                                    args_str = call_info.parameters or ""
+                                    if isinstance(args_str, dict):
+                                        args_str = json.dumps(args_str)
+                                    function_name = call_info.name or ""
+
+                                    if tool_index not in tool_call_states:
+                                        fc_item_id = f"fc_{random_uuid()[:16]}"
+                                        fc_call_id = f"call_{random_uuid()[:24]}"
+                                        tool_call_states[tool_index] = {
+                                            'item_id': fc_item_id,
+                                            'call_id': fc_call_id,
+                                            'name': function_name,
+                                            'arguments': args_str,
+                                            'emitted_added': False,
+                                            'emitted_done': False
+                                        }
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                                type="response.output_item.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=ResponseFunctionToolCall(
+                                                    id=fc_item_id,
+                                                    type="function_call",
+                                                    call_id=fc_call_id,
+                                                    name=function_name,
+                                                    arguments="",
+                                                    status="in_progress",
+                                                ),
+                                            )
+                                        )
+                                        tool_call_states[tool_index]['emitted_added'] = True
+                                    else:
+                                        # update existing function calls
+                                        state = tool_call_states[tool_index]
+                                        if function_name and not state['name']:
+                                            state['name'] = function_name
+                                        if args_str:
+                                            state['arguments'] += args_str
+
+                                    current_state = tool_call_states[tool_index]
+                                    # Emit arguments delta
+                                    if args_str:
+                                        yield _send_event(
+                                            openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                                type="response.function_call_arguments.delta",
+                                                sequence_number=-1,
+                                                item_id=current_state['item_id'],
+                                                output_index=current_output_index,
+                                                call_id=current_state['call_id'],
+                                                delta=args_str,
+                                            )
+                                        )
+
+                                    if (
+                                        not current_state['emitted_done']
+                                        and current_state['arguments']
+                                        and _is_complete_json(current_state['arguments'])
+                                    ):
+                                        # Emit function call done
+                                        yield _send_event(
+                                            openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                                                type="response.function_call_arguments.done",
+                                                sequence_number=-1,
+                                                item_id=current_state['item_id'],
+                                                output_index=current_output_index,
+                                                call_id=current_state['call_id'],
+                                                name=current_state['name'],
+                                                arguments=current_state['arguments'],
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                                type="response.output_item.done",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=ResponseFunctionToolCall(
+                                                    id=current_state['item_id'],
+                                                    type="function_call",
+                                                    call_id=current_state['call_id'],
+                                                    name=current_state['name'],
+                                                    arguments=current_state['arguments'],
+                                                    status="completed",
+                                                ),
+                                            )
+                                        )
+                                        current_state['emitted_done'] = True
+                            else:
+                                # No function call parser, just emit text deltas
+                                if not simple_ctx_sent_message_added:
+                                    simple_ctx_sent_message_added = True
+                                    yield _send_event(
+                                        openai_responses_types.ResponseOutputItemAddedEvent(
+                                            type="response.output_item.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item=openai_responses_types.ResponseOutputMessage(
+                                                id=current_item_id,
+                                                type="message",
+                                                role="assistant",
+                                                content=[],
+                                                status="in_progress",
+                                            ),
+                                        )
+                                    )
+                                    yield _send_event(
+                                        openai_responses_types.ResponseContentPartAddedEvent(
+                                            type="response.content_part.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item_id=current_item_id,
+                                            content_index=current_content_index,
+                                            part=openai_responses_types.ResponseOutputText(
+                                                type="output_text",
+                                                text="",
+                                                annotations=[],
+                                                logprobs=None,
+                                            ),
+                                        )
+                                    )
+                                simple_ctx_accumulated_text += new_chunk
+                                yield _send_event(
+                                    openai_responses_types.ResponseTextDeltaEvent(
+                                        type="response.output_text.delta",
+                                        sequence_number=-1,
+                                        content_index=current_content_index,
+                                        output_index=current_output_index,
+                                        item_id=current_item_id,
+                                        delta=new_chunk,
+                                        logprobs=[],
+                                    )
+                                )
+
                 continue
 
             if ctx.is_expecting_start():
@@ -1218,6 +1561,37 @@ class OpenAIServingResponses(OpenAIServingChat):
             if False:
                 yield
 
+        if isinstance(context, SimpleContext) and simple_ctx_sent_message_added:
+            content = openai_responses_types.ResponseOutputText(
+                        type="output_text",
+                        text=simple_ctx_accumulated_text,
+                        annotations=[],
+                    )
+            yield _send_event(
+                openai_responses_types.ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=current_item_id,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    part=content,
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=openai_responses_types.ResponseOutputMessage(
+                        id=current_item_id,
+                        type="message",
+                        role="assistant",
+                        content=[content],
+                        status="completed",
+                    ),
+                )
+            )
+
         final_response = await self.responses_full_generator(
             request,
             sampling_params,
@@ -1232,19 +1606,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         response_dict = final_response.model_dump()
 
         # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
+        # if response_dict.get("usage"):
+        #     usage_info = response_dict["usage"]
+        #     response_dict["usage"] = {
+        #         "input_tokens": usage_info.get("prompt_tokens", 0),
+        #         "input_tokens_details": {
+        #             "cached_tokens": usage_info.get("cached_tokens", 0)
+        #         },
+        #         "output_tokens": usage_info.get("completion_tokens", 0),
+        #         "output_tokens_details": {
+        #             "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+        #         },
+        #         "total_tokens": usage_info.get("total_tokens", 0),
+        #     }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -1275,6 +1649,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             async for res in generator:
+                print(f"res: {res}")
                 context.append_output(res)
                 # NOTE(woosuk): The stop condition is handled by the engine.
                 yield context

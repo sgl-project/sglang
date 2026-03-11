@@ -257,12 +257,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
 
+        print(f"processed_messages: {processed_messages}")
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
+
+        print(f"default_sampling_params: {json.dumps(self.default_sampling_params)}\n")
+        print(f"sampling_params: {json.dumps(sampling_params)}\n")
 
         # Handle single vs multiple requests
         if is_multimodal:
@@ -351,12 +355,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
+
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
+        print(f"chat_template_name: {self.template_manager.chat_template_name}\n")
+        print(f"request: {request.model_dump_json()}\n")
+        print(f"tool_call_constraint: {tool_call_constraint}\n")
+        print(f"result: {result}\n")
         result.tool_call_constraint = tool_call_constraint
         return result
 
@@ -699,11 +708,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
+                print(f"content: {content}")
+                print(f"delta: {delta}")
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    print(f"reasoning_text: {reasoning_text}")
+                    print(f"reasoning_parser delta: {delta}\n")
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -893,6 +906,7 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        print(f"res: {ret}")
         if not isinstance(ret, list):
             ret = [ret]
 
