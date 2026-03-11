@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -9,6 +10,17 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_logprob(value):
+    """Replace non-finite float values (e.g. -inf) with None.
+
+    The OpenAI API returns null for logprob values that are not finite,
+    and standard JSON serialization rejects -inf/inf/nan floats.
+    """
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return None
+    return value
 
 
 def to_openai_style_logprobs(
@@ -22,7 +34,7 @@ def to_openai_style_logprobs(
     def append_token_logprobs(token_logprobs):
         for logprob, _, token_text in token_logprobs:
             ret_logprobs.tokens.append(token_text)
-            ret_logprobs.token_logprobs.append(logprob)
+            ret_logprobs.token_logprobs.append(_sanitize_logprob(logprob))
 
             # Not supported yet
             ret_logprobs.text_offset.append(-1)
@@ -31,7 +43,7 @@ def to_openai_style_logprobs(
         for tokens in top_logprobs:
             if tokens is not None:
                 ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
+                    {token[2]: _sanitize_logprob(token[0]) for token in tokens}
                 )
             else:
                 ret_logprobs.top_logprobs.append(None)
