@@ -29,7 +29,6 @@ These options **do not** affect output quality. The generated images/videos are 
 | **Pin CPU Memory** | `--pin-cpu-memory` | Uses pinned (page-locked) memory for CPU offload transfers. | Faster H2D transfers | Slightly higher host memory usage. Enabled by default; disable only as workaround for CUDA errors. |
 | **Attention Backend (lossless)** | `--attention-backend fa` | Selects lossless attention kernel: `fa` (FlashAttention 2/3/4), `torch_sdpa`. FA is the fastest lossless option. | FA >> SDPA for long sequences | FA requires compatible GPU (Ampere+). `fa3`/`fa4` are aliased to `fa`. Ring attention only works with `fa` or `sage_attn`. |
 | **Parallel Folding** | *(automatic when SP > 1)* | Reuses the SP process group as TP for the T5 text encoder, so text encoding is parallelized "for free". | Faster text encoding on multi-GPU | Automatic; no user action needed. Only applies to T5-based pipelines. |
-| **Fused JIT Kernels** | *(automatic in sglang backend)* | Fused LayerNorm, RMSNorm, AdaLN kernels that eliminate GPU bubbles and reduce memory traffic. | Micro-optimization; cumulative ~5–10% on denoising | Automatic when using `--backend sglang` (default). Not available in `--backend diffusers`. |
 
 ---
 
