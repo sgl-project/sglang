@@ -42,9 +42,6 @@ class LogprobResult:
     token_ids_logprobs_idx: Optional[List] = None
 
 
-InputLogprobsResult = LogprobResult
-
-
 # ============================================================
 # Core Utilities
 # ============================================================
@@ -462,14 +459,6 @@ class OutputLogprobProcessor(nn.Module):
 
         return logits
 
-    def compute_logprobs_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute log-probabilities from raw logits via log_softmax."""
-        return torch.nn.functional.log_softmax(logits, dim=-1)
-
-    def compute_logprobs_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
-        """Compute log-probabilities from a probability distribution."""
-        return torch.log(probs)
-
     def forward(
         self,
         logits: torch.Tensor,
@@ -479,7 +468,12 @@ class OutputLogprobProcessor(nn.Module):
         return_original_logprob: bool,
         rl_on_policy: bool,
         use_ascend_backend: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Preprocess logits and compute logprobs / probs for sampling.
 
         Single entry point that handles preprocessing, original-logprob caching,
@@ -490,57 +484,64 @@ class OutputLogprobProcessor(nn.Module):
             sampling_info: Batch sampling metadata (temperatures, etc.)
             return_logprob: Whether output logprobs are needed
             is_all_greedy: If True, skip temperature-scaled logprob computation
-            return_original_logprob: If True, output logprobs use pre-temperature logits
+            return_original_logprob: If True, also return pre-temperature logprobs
             rl_on_policy: If True, use bfloat16 log_softmax to match the RL trainer
             use_ascend_backend: If True, return unmodified logits for ascend sampling
 
         Returns:
-            (logits, output_logprobs, sampling_input):
-            - logits: preprocessed logits (for greedy argmax or ascend sampling)
-            - output_logprobs: logprobs for output reporting (None if not return_logprob)
-            - sampling_input: input fed to the sampler — logprobs for RL on-policy,
-              probs (in-place softmax) for standard path, None for greedy / ascend
+            (logits, probs, logprobs, original_logprobs):
+            - logits: preprocessed logits for greedy argmax or ascend sampling
+              (None on the standard path where logits are consumed in-place)
+            - probs: sampling probabilities from softmax (standard path only;
+              None for greedy / RL / ascend)
+            - logprobs: temperature-scaled logprobs — log_softmax(logits/T) for
+              RL and greedy, log(probs) for standard path; None when not needed
+            - original_logprobs: pre-temperature logprobs, only set when
+              return_original_logprob is True
         """
         logits = self.preprocess_logits(logits, sampling_info)
 
+        # Greedy: no temperature applied, logprobs computed from raw logits.
         if is_all_greedy:
-            output_logprobs = (
-                self.compute_logprobs_from_logits(logits) if return_logprob else None
+            logprobs = (
+                torch.nn.functional.log_softmax(logits, dim=-1)
+                if return_logprob
+                else None
             )
-            return logits, output_logprobs, None
+            return logits, None, logprobs, None
 
-        # If requested, cache original logprobs before temperature scaling.
-        output_logprobs = None
+        # Cache original (pre-temperature) logprobs if requested.
+        original_logprobs = None
         if return_logprob and return_original_logprob:
-            output_logprobs = self.compute_logprobs_from_logits(logits)
+            original_logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
+        # RL on-policy: log_softmax in bfloat16 to match the trainer.
         if rl_on_policy:
             # TODO: use more inplace ops to save memory
             logits_div_temperature = (
                 logits.bfloat16().div(sampling_info.temperatures).bfloat16()
             )
-            sampling_input = self.compute_logprobs_from_logits(logits_div_temperature)
+            logprobs = torch.nn.functional.log_softmax(logits_div_temperature, dim=-1)
             del logits_div_temperature
-            if return_logprob and not return_original_logprob:
-                output_logprobs = sampling_input
-            return logits, output_logprobs, sampling_input
+            return logits, None, logprobs, original_logprobs
 
         # Ascend backend: return unmodified logits for fused sampling kernels.
         if use_ascend_backend:
-            if return_logprob and output_logprobs is None:
-                output_logprobs = self.compute_logprobs_from_logits(
+            logprobs = None
+            if return_logprob and original_logprobs is None:
+                logprobs = torch.nn.functional.log_softmax(
                     logits.div(sampling_info.temperatures)
                 )
-            return logits, output_logprobs, None
+            return logits, None, logprobs, original_logprobs
 
-        # Standard path: in-place op to save memory
+        # Standard path: in-place op to save memory.
         logits.div_(sampling_info.temperatures)
         logits[:] = torch.softmax(logits, dim=-1)
         probs = logits
-        if return_logprob and output_logprobs is None:
-            output_logprobs = self.compute_logprobs_from_probs(probs)
-        return probs, output_logprobs, probs
+        logprobs = None
+        if return_logprob and original_logprobs is None:
+            logprobs = torch.log(probs)
+        return None, probs, logprobs, original_logprobs
 
     def process_output_logprobs(
         self,

@@ -79,11 +79,9 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
-        logits = logits_output.next_token_logits
-
         # Preprocess logits and compute logprobs / probs
-        logits, output_logprobs, sampling_input = self.output_logprob_processor(
-            logits,
+        logits, probs, logprobs, original_logprobs = self.output_logprob_processor(
+            logits_output.next_token_logits,
             sampling_info,
             return_logprob,
             sampling_info.is_all_greedy,
@@ -94,7 +92,6 @@ class Sampler(nn.Module):
 
         # Sample
         if sampling_info.is_all_greedy:
-            # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
         elif self.use_ascend_backend:
             simple_sampling_case = (
@@ -102,7 +99,6 @@ class Sampler(nn.Module):
                 and not sampling_info.need_top_k_sampling
                 and not sampling_info.need_min_p_sampling
             )
-            # Ascend backend: sample from logits directly.
             batch_next_token_ids, _ = self._forward_ascend_backend(
                 logits, sampling_info, simple_sampling_case, return_logprob=False
             )
@@ -117,26 +113,27 @@ class Sampler(nn.Module):
                 and self.enable_deterministic
                 and simple_sampling_case
             ):
-                # RL on-policy path: sample from logprobs to match the trainer.
                 batch_next_token_ids = self._sample_from_logprobs(
-                    sampling_input,
+                    logprobs,
                     sampling_info,
                     positions,
                 )
             else:
-                # sampling_input is probs (standard) or logprobs (RL complex)
-                probs = (
-                    torch.exp(sampling_input)
+                sampling_probs = (
+                    torch.exp(logprobs)
                     if self.rl_on_policy_target is not None
-                    else sampling_input
+                    else probs
                 )
                 batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
+                    sampling_probs, sampling_info, positions, simple_sampling_case
                 )
-                del probs
+                del sampling_probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
+            output_logprobs = (
+                original_logprobs if original_logprobs is not None else logprobs
+            )
             self.output_logprob_processor.process_output_logprobs(
                 logits_output,
                 output_logprobs,
@@ -270,9 +267,7 @@ class Sampler(nn.Module):
         )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = self.output_logprob_processor.compute_logprobs_from_logits(
-                logits
-            )
+            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         return batch_next_token_ids, logprobs
 
     def _sync_token_ids_across_tp(
@@ -321,7 +316,7 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
-        _, logprobs, _ = self.output_logprob_processor(
+        _, _, logprobs, _ = self.output_logprob_processor(
             logits_output.next_token_logits,
             sampling_info,
             return_logprob=True,
