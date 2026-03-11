@@ -6,11 +6,13 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+
 from functools import lru_cache
 from typing import Any
 
 import torch
 
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -29,6 +31,10 @@ class RocmPlatform(Platform):
     device_type: str = "cuda"  # torch uses 'cuda' backend string
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
@@ -165,3 +171,8 @@ class RocmPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """ROCm performs better without DIT layerwise offload on Wan."""
+        return False

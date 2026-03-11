@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn import (
+    SageSparseLinearAttentionBackend,
     SparseLinearAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
@@ -77,7 +78,7 @@ def async_a2a_communicate(
     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
     cp_size: int,
     cp_group: ProcessGroup,
-    cp_stream: torch.cuda.Stream,
+    cp_stream: torch.get_device_module().Stream,
     local_seq_2_local_head: bool,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
@@ -96,7 +97,7 @@ def async_a2a_communicate(
                 )
                 a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
             if i > 1:
-                with torch.cuda.stream(cp_stream):
+                with torch.get_device_module().stream(cp_stream):
                     a2a_reqs[i - 2].wait()
                     a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
             if i < len(a2a_inputs):
@@ -116,10 +117,10 @@ def async_a2a_communicate(
                     a2a_inputs[i], "bs (w s) h d -> w bs s h d", w=cp_size
                 ).contiguous()
             if i > 1:
-                with torch.cuda.stream(cp_stream):
+                with torch.get_device_module().stream(cp_stream):
                     a2a_reqs[i - 2].wait()
                     a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-    torch.cuda.current_stream().wait_stream(cp_stream)
+    torch.get_device_module().current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 
@@ -151,7 +152,7 @@ class _SeqAllToAllQKV(torch.autograd.Function):
         k: Tensor,
         v: Tensor,
         cp_size: int,
-        cp_stream: torch.cuda.Stream,
+        cp_stream: torch.get_device_module().Stream,
         local_seq_2_local_head: bool,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         ctx.group = group
@@ -233,22 +234,30 @@ class MinimalA2AAttnOp(DistributedAttention):
         attention_type: str,
         topk: float,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
     ):
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         # Maintained for compatibility purposes; can be removed when CI allows setting Attention_backend or when TurboWan supports FA.
-        if attn_backend is not SparseLinearAttentionBackend:
-            logger.warning(
-                "TurboWan now only supports `sla_attn` and has been automatically set to `sla_attn`. Please set --attention-backend to `sla_attn`."
+        if attn_backend not in (
+            SparseLinearAttentionBackend,
+            SageSparseLinearAttentionBackend,
+        ):
+            logger.warning_once(
+                "TurboWan now only supports `sla_attn` or `sage_sla_attn` and has been automatically set to attention_type. Please set --attention-backend to `sla_attn` or `sage_sla_attn`."
             )
-            attn_backend = SparseLinearAttentionBackend
+            if attention_type == "sagesla":
+                attn_backend = SageSparseLinearAttentionBackend
+            else:
+                attn_backend = SparseLinearAttentionBackend
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         local_attn = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             topk_ratio=topk,
+            prefix=f"{prefix}.impl",
         )
         super(MinimalA2AAttnOp, self).__init__(local_attn)
 
