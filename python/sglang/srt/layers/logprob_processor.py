@@ -466,7 +466,7 @@ class OutputLogprobProcessor(nn.Module):
         return_logprob: bool,
         is_all_greedy: bool,
         return_original_logprob: bool,
-        rl_on_policy: bool,
+        match_rl_trainer: bool,
         use_ascend_backend: bool = False,
     ) -> Tuple[
         Optional[torch.Tensor],
@@ -485,7 +485,7 @@ class OutputLogprobProcessor(nn.Module):
             return_logprob: Whether output logprobs are needed
             is_all_greedy: If True, skip temperature-scaled logprob computation
             return_original_logprob: If True, also return pre-temperature logprobs
-            rl_on_policy: If True, use bfloat16 log_softmax to match the RL trainer
+            match_rl_trainer: If True, use bfloat16 log_softmax to match the RL trainer
             use_ascend_backend: If True, return unmodified logits for ascend sampling
 
         Returns:
@@ -508,15 +508,16 @@ class OutputLogprobProcessor(nn.Module):
                 if return_logprob
                 else None
             )
-            return logits, None, logprobs, None
+            original_logprobs = logprobs if return_original_logprob else None
+            return logits, None, logprobs, original_logprobs
 
         # Cache original (pre-temperature) logprobs if requested.
         original_logprobs = None
         if return_logprob and return_original_logprob:
             original_logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        # RL on-policy: log_softmax in bfloat16 to match the trainer.
-        if rl_on_policy:
+        # In RL on-policy mode, we use log_softmax in bfloat16 to compute logprobs to match the trainer.
+        if match_rl_trainer:
             # TODO: use more inplace ops to save memory
             logits_div_temperature = (
                 logits.bfloat16().div(sampling_info.temperatures).bfloat16()
