@@ -144,12 +144,10 @@ class TestPortArgs(unittest.TestCase):
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1"
 
-        with self.assertRaises(AssertionError) as context:
+        with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
 
-        self.assertIn(
-            "please provide --dist-init-addr as host:port", str(context.exception)
-        )
+        self.assertIn("Missing port", str(context.exception))
 
     def test_init_new_with_malformed_ipv4_address_invalid_port(self):
         server_args = ServerArgs(model_path="dummy")
