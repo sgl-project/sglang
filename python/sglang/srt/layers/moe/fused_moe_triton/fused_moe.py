@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -77,6 +76,7 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
 
 @register_custom_op(mutates_args=["hidden_states"])
 def inplace_fused_experts(

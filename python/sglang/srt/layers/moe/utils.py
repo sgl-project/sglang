@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
@@ -339,8 +340,4 @@ def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return 128
     else:
-        return (
-            128
-            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
-            else 0
-        )
+        return 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
