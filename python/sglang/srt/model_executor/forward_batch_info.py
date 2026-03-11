@@ -375,9 +375,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For POD mode
-    decode_start_or_none: Optional[int] = None
-    decoding_reqs: Optional[List] = None
+    # For mixed chunked prefill (POD mode)
+    num_decoding_reqs: Optional[int] = None
 
     @classmethod
     def init_new(
@@ -392,8 +391,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            decode_start_or_none=batch.decode_start_or_none,
-            decoding_reqs=batch.decoding_reqs,
+            num_decoding_reqs=batch.num_decoding_reqs or 0,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
