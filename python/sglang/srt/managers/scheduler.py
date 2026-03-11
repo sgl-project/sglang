@@ -792,7 +792,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.return_health_check_ct = 0
+        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1499,7 +1499,9 @@ class Scheduler(
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ct += 1
+                self.return_health_check_ipcs.append(
+                    getattr(recv_req, "http_worker_ipc", None)
+                )
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -2603,12 +2605,15 @@ class Scheduler(
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ct:
+        if self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_output(HealthCheckOutput())
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(
+                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+                )
+            )
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
