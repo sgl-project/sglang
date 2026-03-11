@@ -716,8 +716,8 @@ class FusedMoE(torch.nn.Module):
                     param._ep_to_tp_buf[num_routed_local * tp_size:] = shared
                     del shared
 
-            # Swap buffer into param
-            param.data = param._ep_to_tp_buf
+            # Clone buffer into param so the buffer can be reused for the next layer
+            param.data = param._ep_to_tp_buf.clone()
             del param._ep_to_tp_buf
 
         # Restore TP/EP fields to normal TP values

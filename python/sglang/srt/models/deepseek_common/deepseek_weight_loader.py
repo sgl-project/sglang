@@ -714,11 +714,6 @@ class DeepseekV2WeightLoaderMixin:
 
             moe_layer.ep_to_tp_transform()
 
-            # After transform, param.data points to the buffer.
-            # Clone so buffer can be reused for next layer.
-            for name, param in moe_layer.named_parameters():
-                param.data = param.data.clone()
-
         # Free cached buffers
         buf_cache.clear()
 
