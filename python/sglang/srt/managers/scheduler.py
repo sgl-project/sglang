@@ -2387,7 +2387,11 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
                 )
 
             msg_prefix = (
@@ -2412,6 +2416,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if batch.is_empty():
+            return batch
 
         # Update batch tensors
         batch.prepare_for_decode()
