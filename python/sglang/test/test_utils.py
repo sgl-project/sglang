@@ -888,16 +888,8 @@ def popen_launch_server(
             *[str(x) for x in other_args],
         ]
     else:
-
-        def _sglang_cmd():
-            import shutil
-
-            if shutil.which("sglang"):
-                return ["sglang"]
-            # fallback: run the real CLI module (replace sglang.cli with actual one from pyproject)
-            return [sys.executable, "-m", "sglang.cli"]
-
-        command = _sglang_cmd() + [
+        command = [
+            "sglang",
             "serve",
             "--model-path",
             model,
