@@ -620,12 +620,20 @@ class DeepseekV2WeightLoaderMixin:
         Returns:
             A function (name: str) -> bool
         """
+        import re
+
+        # Regex pattern to extract layer_id and expert_id from weight name
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 
         def weight_name_filter(name: str) -> bool:
-            for layer_id in logical_experts_map:
-                for expert in logical_experts_map[layer_id]:
-                    if f"layers.{layer_id}.mlp.experts.{expert}." in name:
-                        return True
+            match = pattern.search(name)
+            if match:
+                layer_id, expert = int(match.group(1)), int(match.group(2))
+                # First check if layer_id exists, then check if expert is in the list
+                return (
+                    layer_id in logical_experts_map
+                    and expert in logical_experts_map[layer_id]
+                )
             return False
 
         return weight_name_filter
