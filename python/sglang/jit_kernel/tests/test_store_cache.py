@@ -4,10 +4,14 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.jit_kernel.utils import get_ci_test_range
 
 BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-HIDDEN_DIMS = [64, 128, 256, 512, 1024, 96, 98, 100]
+BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 16399])
+HIDDEN_DIMS = get_ci_test_range(
+    [64, 128, 256, 512, 1024, 96, 98, 100], [64, 512, 1024, 98]
+)
 CACHE_SIZE = 1024 * 1024
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -32,8 +36,8 @@ def test_store_cache(batch_size: int, element_dim: int) -> None:
 
 
 # Smaller subset for targeted tests below
-REPR_BS = [1, 7, 128]
-REPR_DIMS = [64, 128, 512, 1024, 96]
+REPR_BS = get_ci_test_range([1, 7, 128], [1, 128])
+REPR_DIMS = get_ci_test_range([64, 128, 512, 1024, 96], [64, 1024, 96])
 SMALL_CACHE = 4096
 
 

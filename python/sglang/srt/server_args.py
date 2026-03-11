@@ -51,6 +51,8 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -179,6 +181,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -1045,8 +1048,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -2097,6 +2100,8 @@ class ServerArgs:
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "flashinfer" if is_flashinfer_available() else "triton"
         else:
@@ -2112,6 +2117,8 @@ class ServerArgs:
                     return "aiter"
                 else:
                     return "triton"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "triton"
 
@@ -2454,12 +2461,19 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2476,6 +2490,7 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
+                "mxfp8",
                 "modelopt_fp8",
                 "compressed-tensors",
                 None,
@@ -2483,6 +2498,16 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
@@ -2691,7 +2716,8 @@ class ServerArgs:
         if self.speculative_moe_runner_backend is None:
             self.speculative_moe_runner_backend = (
                 "auto"
-                if self.moe_runner_backend == "flashinfer_trtllm"
+                if self.moe_runner_backend
+                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
                 else self.moe_runner_backend
             )
         else:

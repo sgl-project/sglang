@@ -1,11 +1,9 @@
-import os
-
 import torch
 import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack as jit_fn
 from sglang.srt.layers.quantization.utils import gptq_quantize_weights, pack_rows
 
@@ -16,10 +14,7 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 SIZE_N = 4096
 NUM_BITS = 4
