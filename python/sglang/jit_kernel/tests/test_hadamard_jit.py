@@ -211,7 +211,7 @@ def hadamard_transform_mn_ref(x, multiple, scale=1.0):
     x = torch.einsum("bmn,km->bkn", x, H_m)
 
     x = x.reshape(batch, -1) * scale
-    return x[..., :x_shape[-1]].reshape(*x_shape)
+    return x[..., : x_shape[-1]].reshape(*x_shape)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -239,9 +239,7 @@ def test_hadamard_transform(dim, dtype):
 
     out = hadamard_transform(x, scale=scale)
     # Compute reference in float32 from a detached copy to avoid precision loss
-    out_ref = hadamard_transform_ref(
-        x.detach().clone().float(), scale=scale
-    )
+    out_ref = hadamard_transform_ref(x.detach().clone().float(), scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -270,9 +268,7 @@ def test_hadamard_transform_non_power_of_two(dim, dtype):
     scale = 1.0 / math.sqrt(dim)
 
     out = hadamard_transform(x, scale=scale)
-    out_ref = hadamard_transform_ref(
-        x.detach().clone().float(), scale=scale
-    )
+    out_ref = hadamard_transform_ref(x.detach().clone().float(), scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -294,9 +290,7 @@ def test_hadamard_transform_3d_input(dtype):
     out = hadamard_transform(x, scale=scale)
     assert out.shape == x.shape
 
-    out_ref = hadamard_transform_ref(
-        x.detach().clone().float(), scale=scale
-    )
+    out_ref = hadamard_transform_ref(x.detach().clone().float(), scale=scale)
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
@@ -314,9 +308,7 @@ def test_hadamard_transform_scale_one(dtype):
     x = torch.randn(8, 64, device=device, dtype=dtype)
 
     out = hadamard_transform(x, scale=1.0)
-    out_ref = hadamard_transform_ref(
-        x.detach().clone().float(), scale=1.0
-    )
+    out_ref = hadamard_transform_ref(x.detach().clone().float(), scale=1.0)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -325,10 +317,10 @@ def test_hadamard_transform_scale_one(dtype):
 # M = 12/20/28/40 are the non-power-of-2 Hadamard sizes registered in
 # python/sglang/jit_kernel/hadamard.py (Hadamard12NKernel, ..., Hadamard40NKernel).
 # range(2,9) gives N = 4,8,...,256 so dims cover a practical range.
-_12N_DIMS = [12 * (2**k) for k in range(2, 9)]   # 48, 96, ... , 3072
-_20N_DIMS = [20 * (2**k) for k in range(2, 9)]   # 80, 160, ... , 5120
-_28N_DIMS = [28 * (2**k) for k in range(2, 9)]   # 112, 224, ... , 7168
-_40N_DIMS = [40 * (2**k) for k in range(2, 9)]   # 160, 320, ... , 10240
+_12N_DIMS = [12 * (2**k) for k in range(2, 9)]  # 48, 96, ... , 3072
+_20N_DIMS = [20 * (2**k) for k in range(2, 9)]  # 80, 160, ... , 5120
+_28N_DIMS = [28 * (2**k) for k in range(2, 9)]  # 112, 224, ... , 7168
+_40N_DIMS = [40 * (2**k) for k in range(2, 9)]  # 160, 320, ... , 10240
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -350,9 +342,7 @@ def test_hadamard_transform_12n(dim, dtype):
     scale = 1.0 / math.sqrt(dim)
 
     out = hadamard_transform_12n(x, scale=scale)
-    out_ref = hadamard_transform_mn_ref(
-        x.detach().clone().float(), 12, scale=scale
-    )
+    out_ref = hadamard_transform_mn_ref(x.detach().clone().float(), 12, scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -376,9 +366,7 @@ def test_hadamard_transform_20n(dim, dtype):
     scale = 1.0 / math.sqrt(dim)
 
     out = hadamard_transform_20n(x, scale=scale)
-    out_ref = hadamard_transform_mn_ref(
-        x.detach().clone().float(), 20, scale=scale
-    )
+    out_ref = hadamard_transform_mn_ref(x.detach().clone().float(), 20, scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -402,9 +390,7 @@ def test_hadamard_transform_28n(dim, dtype):
     scale = 1.0 / math.sqrt(dim)
 
     out = hadamard_transform_28n(x, scale=scale)
-    out_ref = hadamard_transform_mn_ref(
-        x.detach().clone().float(), 28, scale=scale
-    )
+    out_ref = hadamard_transform_mn_ref(x.detach().clone().float(), 28, scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
@@ -428,9 +414,7 @@ def test_hadamard_transform_40n(dim, dtype):
     scale = 1.0 / math.sqrt(dim)
 
     out = hadamard_transform_40n(x, scale=scale)
-    out_ref = hadamard_transform_mn_ref(
-        x.detach().clone().float(), 40, scale=scale
-    )
+    out_ref = hadamard_transform_mn_ref(x.detach().clone().float(), 40, scale=scale)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 

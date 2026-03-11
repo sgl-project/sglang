@@ -90,16 +90,16 @@ def benchmark(batch_size: int, dim: int, provider: str) -> Tuple[float, float, f
         "jit_kernel": lambda: hadamard_transform(x.clone(), scale=scale),
     }
     if AOT_AVAILABLE:
-        FN_MAP["aot_kernel"] = lambda: hadamard_transform_aot(
-            x.clone(), scale=scale
-        )
+        FN_MAP["aot_kernel"] = lambda: hadamard_transform_aot(x.clone(), scale=scale)
     if SCIPY_AVAILABLE:
         # Precompute Hadamard matrix on GPU to avoid CPU-GPU transfer
         # during CUDA graph capture.
         log_dim = math.ceil(math.log2(dim)) if dim > 0 else 0
         dim_padded = 2**log_dim if dim > 0 else 1
         H = torch.tensor(
-            hadamard(dim_padded, dtype=float), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+            hadamard(dim_padded, dtype=float),
+            dtype=DEFAULT_DTYPE,
+            device=DEFAULT_DEVICE,
         )
         FN_MAP["naive"] = lambda: torch_hadamard_transform(
             x.clone(), scale, H, dim, dim_padded
