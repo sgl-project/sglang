@@ -54,7 +54,7 @@ Given a PR number, fetch the diff and run the full checklist. Report findings cl
 ### 10. Build check
 Run after reviewing:
 ```bash
-cd docs && npx mintlify build
+cd docs && npx mintlify validate
 ```
 Fix any import errors before approving.
 

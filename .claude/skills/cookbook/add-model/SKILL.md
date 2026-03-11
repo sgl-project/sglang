@@ -138,10 +138,10 @@ Key considerations:
 
 ## Phase 3: Build Check
 
-Run the Mintlify build to verify everything compiles:
+Run the Mintlify validation to verify everything compiles:
 
 ```bash
-cd docs && npx mintlify build
+cd docs && npx mintlify validate
 ```
 
 Start the dev server to verify rendering:
