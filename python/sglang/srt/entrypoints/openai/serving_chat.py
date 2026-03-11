@@ -459,10 +459,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
+            # Optimization: For multimodal, skip tokenization (tokenize=False)
+            # The processor will do tokenization later with proper multimodal placeholders
+            # For non-multimodal, tokenize here (tokenize=True) to avoid redundant tokenization
+            should_tokenize = not is_multimodal
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                result = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=should_tokenize,
                     add_generation_prompt=True,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
@@ -484,7 +488,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 try:
                     prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=should_tokenize,
                         add_generation_prompt=True,
                         tools=tools,
                         reasoning_effort=request.reasoning_effort,
@@ -506,8 +510,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
 
+            # Assign to prompt or prompt_ids based on type
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                # For multimodal: result is text string
+                prompt = result
+                prompt_ids = []
+            else:
+                # For non-multimodal: result is token IDs list
+                prompt = ""
+                prompt_ids = result
 
         stop = request.stop
         image_data = image_data if image_data else None
