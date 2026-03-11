@@ -1723,6 +1723,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if backend_str not in [
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:
