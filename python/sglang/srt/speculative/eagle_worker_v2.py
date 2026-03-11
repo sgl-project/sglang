@@ -254,6 +254,9 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        if self.server_args.model_impl == "mindspore":
+            return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,

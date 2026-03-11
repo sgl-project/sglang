@@ -44,7 +44,7 @@ ${PIP_INSTALL} triton-ascend
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.02.01.post2"
+SGLANG_KERNEL_NPU_TAG="2026.03.10.rc1"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \

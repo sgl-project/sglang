@@ -889,6 +889,8 @@ def popen_launch_server(
         ]
     else:
         command = [
+            sys.executable,
+            "-m",
             "sglang",
             "serve",
             "--model-path",
