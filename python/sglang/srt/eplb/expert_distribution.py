@@ -302,23 +302,33 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> "_SinglePassGatherer":
+        # Import here to avoid circular dependency
+        from sglang.srt.layers.moe.utils import get_deepep_mode
+
+        deepep_mode = get_deepep_mode()
+
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend != "none" and (
-                server_args.deepep_mode == "normal"
-            ):
+            if server_args.moe_a2a_backend != "none" and deepep_mode.enable_normal():
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
+        if server_args.expert_distribution_recorder_mode == "per_pass":
+            # For per_pass mode, use _DetailSinglePassGatherer to capture topk_ids
+            # This is needed for cross-node traffic ratio calculation
+            return _DetailSinglePassGatherer(
+                server_args, expert_location_metadata, rank
+            )
+
         if server_args.moe_a2a_backend != "none":
-            if server_args.deepep_mode == "normal":
+            if deepep_mode.enable_normal():
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
+            elif deepep_mode.enable_low_latency():
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )
@@ -684,7 +694,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         if self._enable:
             return self._append_utilization_rate(
-                forward_pass_id, single_pass_data["global_physical_count"], outputs
+                forward_pass_id, single_pass_data, outputs
             )
 
     def reset(self):
@@ -695,9 +705,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def _append_utilization_rate(
         self,
         forward_pass_id: int,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
+        single_pass_global_physical_count = single_pass_data["global_physical_count"]
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
@@ -725,16 +736,28 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
                 gpu_physical_count_sum = gpu_physical_count.sum().item()
 
+                # Compute cross-node traffic ratio for decode phase
+                # Uses topk_ids_of_layer which contains physical expert IDs per token
+                # Cross-node = fraction of expert accesses where src_node != dest_node
+                cross_node_ratio = 0.0
+                if "topk_ids_of_layer" in single_pass_data:
+                    cross_node_ratio = compute_cross_node_ratio_from_topk_ids(
+                        topk_ids_of_layer=single_pass_data["topk_ids_of_layer"],
+                        current_rank=self._rank,
+                        num_ranks=self._expert_location_metadata.ep_size,
+                        ranks_per_node=8,  # 8 GPUs per node
+                        num_physical_experts=self._expert_location_metadata.num_physical_experts,
+                    )
+
                 logger.info(
                     f"[Expert Balancedness] "
                     f"forward_pass_id={forward_pass_id} "
-                    f"current_pass_balancedness={utilization_rate_cpu:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                    # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
+                    f"balancedness={utilization_rate_cpu:.03f} "
+                    f"{''.join(f'avg{size}={value:.03f} ' for size, value in self._history.mean().items())}"
+                    f"cross_node_ratio={cross_node_ratio:.03f} "
+                    f"tokens={gpu_physical_count_sum}"
                 )
 
-    # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
         # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
         interval = get_int_env_var("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
@@ -1046,3 +1069,56 @@ def compute_utilization_rate(
         "mean",
     )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
+
+
+def compute_cross_node_ratio_from_topk_ids(
+    topk_ids_of_layer: torch.Tensor,  # (num_layer, num_tokens, top_k)
+    current_rank: int,
+    num_ranks: int,
+    ranks_per_node: int,
+    num_physical_experts: int,
+):
+    """Compute cross-node traffic ratio from topk_ids for decode mode.
+
+    This is used when we have per-token expert selection data but not
+    per-rank RDMA data from DeepEP (e.g., in low-latency decode mode).
+
+    Args:
+        topk_ids_of_layer: [L, T, K] tensor of physical expert IDs
+        current_rank: The rank this data is from (source rank)
+        num_ranks: Total number of ranks (EP size)
+        ranks_per_node: Number of ranks per node (e.g., 8 for 8 GPUs per node)
+        num_physical_experts: Total number of physical experts
+
+    Returns:
+        float: Cross-node traffic ratio (0.0 to 1.0)
+    """
+    L, T, K = topk_ids_of_layer.shape
+    experts_per_rank = num_physical_experts // num_ranks
+
+    # Source node of current rank
+    src_node = current_rank // ranks_per_node
+
+    # Destination node for each physical expert
+    # Physical expert p is on rank p // experts_per_rank
+    # Rank r is on node r // ranks_per_node
+
+    # Flatten topk_ids for efficient computation
+    topk_flat = topk_ids_of_layer.flatten()  # [L * T * K]
+
+    # Filter out invalid IDs (-1)
+    valid_mask = topk_flat >= 0
+    valid_ids = topk_flat[valid_mask]
+
+    if len(valid_ids) == 0:
+        return 0.0
+
+    # Compute destination ranks and nodes
+    dest_ranks = valid_ids // experts_per_rank
+    dest_nodes = dest_ranks // ranks_per_node
+
+    # Count cross-node accesses
+    cross_node_count = (dest_nodes != src_node).sum().item()
+    total_count = len(valid_ids)
+
+    return cross_node_count / total_count if total_count > 0 else 0.0
