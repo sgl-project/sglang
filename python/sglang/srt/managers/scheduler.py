@@ -1821,6 +1821,11 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if not self._set_or_validate_priority(req):
+            return
+        if self._abort_on_queued_limit(req):
+            return
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1871,10 +1876,18 @@ class Scheduler(
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
-        if (
-            self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
-        ):
+        # Queue limit isn't set. Never abort on queued limit.
+        if self.max_queued_requests is None:
+            return False
+
+        # We need to check for bootstrap queue size as well for PD Disagg.
+        queued_req_num = len(self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queued_req_num += len(self.disagg_prefill_bootstrap_queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            queued_req_num += len(self.disagg_decode_prealloc_queue)
+        # Queue size limit hasn't been reached. Return early.
+        if queued_req_num + 1 <= self.max_queued_requests:
             return False
 
         # Reject the incoming request by default.

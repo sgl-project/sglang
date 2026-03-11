@@ -1973,8 +1973,12 @@ async def send_concurrent_generate_requests(
 async def send_concurrent_generate_requests_with_custom_params(
     base_url: str,
     custom_params: List[dict[str, Any]],
+    use_sglang_header_for_priority: bool = False,
 ) -> Tuple[int, Any]:
-    """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests."""
+    """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests.
+
+    Has an option to use sglang header for request priority.
+    """
 
     base_payload = {
         "text": """
@@ -1988,20 +1992,27 @@ async def send_concurrent_generate_requests_with_custom_params(
         },
     }
 
-    async def async_generate_with_priority(req):
+    async def async_generate_with_priority(req, headers):
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{base_url}/generate",
                 json=req,
+                headers=headers,
             ) as response:
                 resp_json = await response.json()
                 return (response.status, resp_json)
 
     tasks = []
-    for c in custom_params:
+    for i in range(len(custom_params)):
+        custom_param = custom_params[i]
+        headers = None
+        if use_sglang_header_for_priority:
+            headers = {"x-sglang-request-priority": str(custom_param["priority"])}
+            del custom_param["priority"]
+
         req = base_payload.copy()
-        req.update(c)
-        tasks.append(asyncio.create_task(async_generate_with_priority(req)))
+        req.update(custom_param)
+        tasks.append(asyncio.create_task(async_generate_with_priority(req, headers)))
     return await asyncio.gather(*tasks)
 
 

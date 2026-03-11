@@ -132,7 +132,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
-            priority=request.priority,
+            priority=self.extract_priority(request, raw_request),
             routing_key=self.extract_routing_key(raw_request),
             dimensions=request.dimensions,
             lora_path=lora_path,

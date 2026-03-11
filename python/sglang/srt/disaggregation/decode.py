@@ -1076,6 +1076,9 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
+        # Get priority queue
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue

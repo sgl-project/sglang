@@ -213,6 +213,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name.eq_ignore_ascii_case("x-sglang-request-priority")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))

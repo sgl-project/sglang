@@ -118,7 +118,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            priority=request.priority,
+            priority=self.extract_priority(request, raw_request),
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,

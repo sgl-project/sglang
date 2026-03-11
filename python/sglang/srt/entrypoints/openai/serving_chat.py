@@ -304,7 +304,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
-            priority=request.priority,
+            priority=self.extract_priority(request, raw_request),
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,

@@ -1183,7 +1183,8 @@ class Req(ReqDllmMixin):
             f"Req(rid={self.rid}, "
             f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
             f"{self.grammar=}, "
-            f"{self.sampling_params=})"
+            f"{self.sampling_params=}, "
+            f"{self.priority=})"
         )
 
 

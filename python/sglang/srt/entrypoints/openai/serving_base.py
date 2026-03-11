@@ -268,3 +268,20 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+
+    def extract_priority(self, request, raw_request):
+        return extract_priority(request, raw_request)
+
+
+def extract_priority(request, raw_request):
+    """Extract request priority for priority scheduling.
+
+    Field set in the request body takes precedence over the header.
+    """
+    if request.priority:
+        return request.priority
+    if raw_request is not None:
+        priority = raw_request.headers.get("x-sglang-request-priority")
+        if priority is not None:
+            return int(priority)
+    return None

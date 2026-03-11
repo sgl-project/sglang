@@ -22,6 +22,8 @@ register_amd_ci(est_time=195, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestPriorityScheduling(CustomTestCase):
+    _use_sglang_header_for_priority = True
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -69,6 +71,7 @@ class TestPriorityScheduling(CustomTestCase):
                     {"priority": 1},  # fourth
                     {"priority": 2},  # second
                 ],
+                use_sglang_header_for_priority=self._use_sglang_header_for_priority,
             )
         )
 
@@ -103,6 +106,7 @@ class TestPriorityScheduling(CustomTestCase):
                     {"priority": 6},  # third
                     {"priority": 7},  # second
                 ],
+                use_sglang_header_for_priority=self._use_sglang_header_for_priority,
             )
         )
 
@@ -140,6 +144,7 @@ class TestPriorityScheduling(CustomTestCase):
                     {"priority": 2},  # rejected
                     {"priority": 1},  # rejected
                 ],
+                use_sglang_header_for_priority=self._use_sglang_header_for_priority,
             )
         )
 
@@ -179,6 +184,7 @@ class TestPriorityScheduling(CustomTestCase):
                         "sampling_params": {"max_new_tokens": 10000},
                     },  # finishes first.
                 ],
+                use_sglang_header_for_priority=self._use_sglang_header_for_priority,
             )
         )
 
@@ -211,6 +217,7 @@ class TestPriorityScheduling(CustomTestCase):
                         "sampling_params": {"max_new_tokens": 10000},
                     },
                 ],
+                use_sglang_header_for_priority=self._use_sglang_header_for_priority,
             )
         )
 
@@ -225,6 +232,10 @@ class TestPriorityScheduling(CustomTestCase):
         )
 
         assert e2e_latencies[0] < e2e_latencies[1]
+
+
+class TestPrioritySchedulingWithHeader(TestPriorityScheduling):
+    _use_sglang_header_for_priority = True
 
 
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
@@ -396,6 +407,7 @@ def _verify_genereate_responses(
             assert got_json["object"] == "error"
             assert got_json["message"] == expected_err_msg
         else:
+            # print(f"checking if")
             assert "object" not in got_json
             assert "message" not in got_json
 

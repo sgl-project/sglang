@@ -92,6 +92,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
+from sglang.srt.entrypoints.openai.serving_base import extract_priority
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -669,6 +670,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    obj.priority = extract_priority(obj, request)
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
