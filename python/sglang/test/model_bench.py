@@ -127,11 +127,8 @@ class ModelBench(ABC):
         self._model_config = ModelConfig.from_server_args(self._server_args)
         self._load_config = LoadConfig(LoadFormat.DUMMY)
         self._model_class, _ = get_model_architecture(self._model_config)
-        packed_modules_mapping = getattr(
-            self._model_class, "packed_modules_mapping", {}
-        )
         self._quant_config = _get_quantization_config(
-            self._model_config, self._load_config, packed_modules_mapping
+            self._model_config, self._load_config
         )
         self._hf_config = self._model_config.hf_config
 

@@ -24,12 +24,8 @@ from transformers import LlamaConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import is_flashinfer_rmsnorm_quant_kernels_available
 from sglang.test.model_bench import LlamaBench, ModelBenchArgs
-
-_use_flashinfer_rmsnorm_quant_ops = get_bool_env_var(
-    "SGLANG_USE_FLASHINFER_RMSNORM_QUANT_OPS"
-)
 
 
 def init_llama_decoder(
@@ -41,7 +37,7 @@ def init_llama_decoder(
 test_data = [
     {
         "models": [
-            # "RedHatAI/Llama-2-7b-chat-hf-FP8",
+            "RedHatAI/Llama-2-7b-chat-hf-FP8",
             "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
         ],
         "model_initializer": init_llama_decoder,
@@ -56,7 +52,7 @@ for data in test_data:
 
 
 @pytest.mark.parametrize("model, model_initializer", test_cases)
-def test_fused_add_rmsnorm_quant_pass(model, model_initializer):
+def test_rmsnorm_quant_pass(model, model_initializer):
     server_args = ServerArgs(
         model_path=model,
         attention_backend="dummy",
@@ -92,7 +88,7 @@ def test_fused_add_rmsnorm_quant_pass(model, model_initializer):
 
         torch.testing.assert_close(ref_res, res)
 
-        if _use_flashinfer_rmsnorm_quant_ops:
+        if is_flashinfer_rmsnorm_quant_kernels_available():
             assert "sglang.flashinfer_rmsnorm_quant" in code
             assert "sgl_kernel.rmsnorm" not in code
 

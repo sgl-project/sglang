@@ -1,80 +1,38 @@
-from typing import Optional
+# Copyright 2023-2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 
 import torch
-from sgl_kernel.utils import is_arch_support_pdl
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
-from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
-from sglang.srt.utils import direct_register_custom_op, get_bool_env_var
-
-_use_flashinfer_rmsnorm_quant_ops = get_bool_env_var(
-    "SGLANG_USE_FLASHINFER_RMSNORM_QUANT_OPS"
+from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.compilation.fusion.pattern import OpPattern, pattern_builder
+from sglang.srt.compilation.fusion.pattern.quant_fp8_pattern import (
+    QuantFp8PatternRegistery,
+    StaticQuantFp8Pattern,
 )
-
-if _use_flashinfer_rmsnorm_quant_ops:
-    import flashinfer
-
-    def _flashinfer_rms_norm_quant(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        eps: float = 1e-6,
-        enable_pdl: Optional[bool] = None,
-    ) -> torch.Tensor:
-        return flashinfer.norm.rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
-
-    def _flashinfer_rms_norm_quant_fake(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        eps: float,
-        enable_pdl: Optional[bool],
-    ) -> None:
-        pass
-
-    direct_register_custom_op(
-        op_name="flashinfer_rmsnorm_quant",
-        op_func=_flashinfer_rms_norm_quant,
-        mutates_args=["out"],
-        fake_impl=_flashinfer_rms_norm_quant_fake,
-    )
-
-    def _flashinfer_fused_add_rmsnorm_quant(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        eps: float = 1e-6,
-        enable_pdl: Optional[bool] = None,
-    ) -> torch.Tensor:
-        return flashinfer.norm.fused_add_rmsnorm_quant(
-            out, input, residual, weight, scale, eps, enable_pdl
-        )
-
-    def _flashinfer_fused_add_rmsnorm_quant_fake(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        eps: float = 1e-6,
-        enable_pdl: Optional[bool] = None,
-    ) -> None:
-        pass
-
-    direct_register_custom_op(
-        op_name="flashinfer_fused_add_rmsnorm_quant",
-        op_func=_flashinfer_fused_add_rmsnorm_quant,
-        mutates_args=["out", "residual"],
-        fake_impl=_flashinfer_fused_add_rmsnorm_quant_fake,
-    )
+from sglang.srt.compilation.fusion.pattern.rmsnorm_quant_fp8_pattern import (
+    FusedAddRmsnormQuantFp8PatternRegistery,
+    RmsnormQuantFp8PatternRegistery,
+)
+from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
 
 class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
-    def register_rmsnorm_quant_replacement_pattern(self):
+    def register_rmsnorm_quant_replacement_pattern(
+        self, quant_fp8_op: OpPattern, rmsnorm_quant_fp8_op: OpPattern
+    ):
         def pattern(x, rms_result, weight, scale, eps, output):
             rmsnorm = auto_functionalized_v2(
                 torch.ops.sgl_kernel.rmsnorm.default,
@@ -85,50 +43,29 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 _output_base_index=0,
                 _all_bases=[rms_result],
             )
-
-            per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sglang.per_tensor_quant_fp8.default,
-                input=rmsnorm[1],
-                is_static=True,
-                _output_q_base_index=0,
-                _output_s_base_index=1,
-                _all_bases=[output, scale],
-            )
+            quant_fp8_op_result = quant_fp8_op.pattern(rmsnorm, output, scale)
             return (
-                per_tensor_quant_fp8[1],
-                per_tensor_quant_fp8[2],
+                quant_fp8_op_result[0],
+                quant_fp8_op_result[1],
             )
 
         def replacement(x, rms_result, weight, scale, eps, output):
-            if _use_flashinfer_rmsnorm_quant_ops:
-                rms_norm_static_fp8_quant = auto_functionalized_v2(
-                    torch.ops.sglang.flashinfer_rmsnorm_quant.default,
-                    input=x,
-                    weight=weight,
-                    scale=scale,
-                    eps=eps,
-                    enable_pdl=is_arch_support_pdl(),
-                    _out_base_index=0,
-                    _all_bases=[output],
-                )
+            rmsnorm_quant_fp8_op_result = rmsnorm_quant_fp8_op.pattern(
+                x, weight, scale, eps, output
+            )
+            if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+                repeated_scale = scale.view(1, 1).expand(x.shape[0], 1)
             else:
-                rms_norm_static_fp8_quant = auto_functionalized_v2(
-                    torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default,
-                    input=x,
-                    weight=weight,
-                    scale=scale,
-                    epsilon=eps,
-                    _result_base_index=0,
-                    _all_bases=[output],
-                )
-            return rms_norm_static_fp8_quant[1], scale
+                repeated_scale = scale
+            return rmsnorm_quant_fp8_op_result[1], repeated_scale
 
+        M, N, K = 16, 16, 16
         example_inputs = [
-            torch.empty(16, 16).half().cuda(),
-            torch.empty(16, 16).half().cuda(),
-            torch.empty(16).half().cuda(),
+            torch.empty(M, K).half().cuda(),
+            torch.empty(N, K).half().cuda(),
+            torch.empty(M).half().cuda(),
             torch.empty(()).cuda(),
-            torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda(),
+            torch.empty(M, N).to(dtype=torch.float8_e4m3fn).cuda(),
         ]
 
         for eps in self.pass_config.rms_norm_eps:
@@ -136,7 +73,11 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 pattern, replacement, example_inputs, scalar_workaround={"eps": eps}
             )
 
-    def register_fused_add_rmsnorm_quant_replacement_pattern(self):
+    def register_fused_add_rmsnorm_quant_replacement_pattern(
+        self,
+        quant_fp8_op: OpPattern,
+        fused_add_rmsnorm_quant_fp8_op: OpPattern,
+    ):
         def pattern(x, residual, weight, scale, result, eps):
             fused_add_rmsnorm = auto_functionalized_v2(
                 torch.ops.sgl_kernel.fused_add_rmsnorm.default,
@@ -148,59 +89,39 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 _all_bases=[x, residual],
             )
 
-            per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sglang.per_tensor_quant_fp8.default,
-                input=fused_add_rmsnorm[1],
-                is_static=True,
-                _output_q_base_index=0,
-                _output_s_base_index=1,
-                _all_bases=[result, scale],
-            )
+            quant_fp8_op_result = quant_fp8_op.pattern(fused_add_rmsnorm, result, scale)
 
             return (
-                per_tensor_quant_fp8[1],
-                per_tensor_quant_fp8[2],
+                quant_fp8_op_result[0],
+                quant_fp8_op_result[1],
                 fused_add_rmsnorm[1],
                 fused_add_rmsnorm[2],
             )
 
         def replacement(x, residual, weight, scale, result, eps):
-            if _use_flashinfer_rmsnorm_quant_ops:
-                fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
-                    torch.ops.sglang.flashinfer_fused_add_rmsnorm_quant.default,
-                    input=x,
-                    weight=weight,
-                    scale=scale,
-                    eps=eps,
-                    enable_pdl=is_arch_support_pdl(),
-                    _out_base_index=0,
-                    _residual_base_index=1,
-                    _all_bases=[result, residual],
+            fused_add_rmsnorm_quant_fp8_op_result = (
+                fused_add_rmsnorm_quant_fp8_op.pattern(
+                    x, residual, weight, scale, result, eps
                 )
+            )
+            if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+                repeated_scale = scale.view(1, 1).expand(x.shape[0], 1)
             else:
-                fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
-                    torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default,
-                    input=x,
-                    weight=weight,
-                    scale=scale,
-                    epsilon=eps,
-                    _result_base_index=0,
-                    _residual_base_index=1,
-                    _all_bases=[result, residual],
-                )
+                repeated_scale = scale
             return (
-                fused_add_rms_norm_static_fp8_quant[1],
-                scale,
-                fused_add_rms_norm_static_fp8_quant[2],
-                fused_add_rms_norm_static_fp8_quant[2],
+                fused_add_rmsnorm_quant_fp8_op_result[1],
+                repeated_scale,
+                fused_add_rmsnorm_quant_fp8_op_result[2],
+                fused_add_rmsnorm_quant_fp8_op_result[2],
             )
 
+        M, N, K = 16, 16, 16
         example_inputs = [
-            torch.empty(16, 16).half().cuda(),
-            torch.empty(16, 16).half().cuda(),
-            torch.empty(16).half().cuda(),
+            torch.empty(M, K).half().cuda(),
+            torch.empty(N, K).half().cuda(),
+            torch.empty(M).half().cuda(),
             torch.empty(()).cuda(),
-            torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda(),
+            torch.empty(M, N).to(dtype=torch.float8_e4m3fn).cuda(),
         ]
 
         for eps in self.pass_config.rms_norm_eps:
@@ -209,5 +130,11 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
             )
 
     def build_pass(self):
-        self.register_rmsnorm_quant_replacement_pattern()
-        self.register_fused_add_rmsnorm_quant_replacement_pattern()
+        pattern_builder(
+            self.register_rmsnorm_quant_replacement_pattern,
+            [QuantFp8PatternRegistery, RmsnormQuantFp8PatternRegistery],
+        )
+        pattern_builder(
+            self.register_fused_add_rmsnorm_quant_replacement_pattern,
+            [QuantFp8PatternRegistery, FusedAddRmsnormQuantFp8PatternRegistery],
+        )

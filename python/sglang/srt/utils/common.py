@@ -318,6 +318,17 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def is_flashinfer_rmsnorm_quant_kernels_available():
+    return False  # TODO: remove this once flashinfer fixes land
+
+    if importlib.util.find_spec("flashinfer") is not None:
+        import flashinfer.norm
+
+        return hasattr(flashinfer.norm, "rmsnorm_quant")
+    else:
+        return False
+
+
 def is_nvidia_cublas_version_ge_12_9():
     """
     temporary fix for issue #11272 (cublas 12.9+)

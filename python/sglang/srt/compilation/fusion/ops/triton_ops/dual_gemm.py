@@ -20,7 +20,7 @@
 # THE SOFTWARE.
 # ==============================================================================
 
-# Computes fused SwiGLU forward pass adapted from `GLU Variants Improve Transformer`
+# Computes fused dual GEMM forward pass adapted from `GLU Variants Improve Transformer`
 # <https://arxiv.org/abs/2002.05202>
 
 from typing import Optional
@@ -29,8 +29,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import direct_register_custom_op
-
 
 @triton.jit
 def silu(x):
@@ -38,7 +36,7 @@ def silu(x):
 
 
 @triton.jit
-def swiglu_kernel(
+def dual_gemm_kernel(
     x_ptr,
     w_gate_ptr,
     w_up_ptr,
@@ -140,7 +138,7 @@ def swiglu_kernel(
     tl.store(o_ptrs, acc_up.to(o_ptr.type.element_ty), mask=mask)
 
 
-def fused_swiglu(
+def dual_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scale: Optional[torch.Tensor] = None,
@@ -157,7 +155,7 @@ def fused_swiglu(
         )
 
     # fmt: off
-    swiglu_kernel[grid](
+    dual_gemm_kernel[grid](
         x,w_gate,w_up,out,x_scale,w_scale,o_scale,
         x_scale is not None and w_scale is not None and o_scale is not None,
         x.stride(0),x.stride(1),
@@ -173,7 +171,7 @@ def fused_swiglu(
     return out
 
 
-def fused_swiglu_fake(
+def dual_gemm_fake(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scale: Optional[torch.Tensor] = None,
@@ -182,21 +180,3 @@ def fused_swiglu_fake(
 ) -> torch.Tensor:
     M, N, K = x.shape[0], x.shape[1], w.shape[1] // 2
     return torch.empty((M, K), device=x.device, dtype=x.dtype)
-
-
-direct_register_custom_op(
-    op_name="fused_swiglu",
-    op_func=fused_swiglu,
-    mutates_args=[],
-    fake_impl=fused_swiglu_fake,
-)
-
-
-def fused_swiglu_fwd(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    o_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return torch.ops.sglang.fused_swiglu(x, w, x_scale, w_scale, o_scale)

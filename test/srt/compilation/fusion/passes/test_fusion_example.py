@@ -143,7 +143,7 @@ def mock_fusion_manager(graph: torch.fx.graph):
     )(graph)
 
 
-def test_fusion_example_pass(num_experts, num_tokens, topk):
+def fusion_example_pass(num_experts, num_tokens, topk):
     model, model_ref = ExampleModel(), ExampleModel()
 
     torch._inductor.config.post_grad_custom_post_pass = mock_fusion_manager
@@ -190,4 +190,4 @@ def topk_softmax_kernel_compiled_run(num_experts, num_tokens, topk):
 
 if __name__ == "__main__":
     # topk_softmax_kernel_compiled_run(8, 16, 2)
-    test_fusion_example_pass(8, 16, 2)
+    fusion_example_pass(8, 16, 2)

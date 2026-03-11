@@ -15,14 +15,26 @@
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
-# TODO: better handle operator import for registration
-import sglang.srt.compilation.fusion.triton_ops.fused_swiglu  # noqa: F401
+from sglang.srt.compilation.fusion.pattern import OpPattern, pattern_builder
+from sglang.srt.compilation.fusion.pattern.dual_gemm_pattern import (
+    DualGemmFp8PatternRegistery,
+    DualGemmPatternRegistery,
+)
+from sglang.srt.compilation.fusion.pattern.gemm_fp8_pattern import (
+    CutlassFp8ScaledMMPattern,
+    GemmFp8PatternRegistery,
+    TorchScaledMMPattern,
+)
+from sglang.srt.compilation.fusion.pattern.quant_fp8_pattern import (
+    PerTensorQuantFp8Pattern,
+    QuantFp8PatternRegistery,
+    StaticQuantFp8Pattern,
+)
 from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
 
 class FusedActivationPass(SGLangPatternMatcherInductorPass):
-    def register_swiglu_replacement_pattern(self) -> None:
-
+    def register_dual_gemm_replacement_pattern(self, dual_gemm_op: OpPattern) -> None:
         def pattern(x, w, out):
             mm = torch.ops.aten.mm.default(x, w)
             silu_and_mul = auto_functionalized_v2(
@@ -34,59 +46,85 @@ class FusedActivationPass(SGLangPatternMatcherInductorPass):
             return silu_and_mul[1]
 
         def replacement(x, w, out):
-            return torch.ops.sglang.fused_swiglu.default(x, w)
+            dual_gemm_fp8_op_result = dual_gemm_op.pattern(x, w, out)
+            return dual_gemm_fp8_op_result
 
+        M, K, N = 16, 16, 16
         example_inputs = [
-            torch.empty(16, 16).half().cuda(),  # X
-            torch.empty(16, 16).half().cuda().T,  # W.T
-            torch.empty(16, 8).half().cuda(),  # out
+            torch.empty(M, K).half().cuda(),  # X
+            torch.empty(K, N).half().cuda().T,  # W.T
+            torch.empty(M, N // 2).half().cuda(),  # out
         ]
 
         self.register_replacement_pattern(pattern, replacement, example_inputs)
 
-    def register_swiglu_fp8_replacement_pattern(self) -> None:
-
+    def register_dual_gemm_fp8_replacement_pattern(
+        self,
+        quant_fp8_op: OpPattern,
+        gemm_fp8_op: OpPattern,
+        dual_gemm_fp8_op: OpPattern,
+    ) -> None:
         def pattern(x, w, x_scale, w_scale, o_scale, out, output_q):
-            mm = torch.ops.aten._scaled_mm.default(
-                x, w, x_scale, w_scale, None, None, out.dtype
-            )
+            gemm_fp8_op_result = gemm_fp8_op.pattern(x, w, x_scale, w_scale, out.dtype)
             silu_and_mul = auto_functionalized_v2(
                 torch.ops.sgl_kernel.silu_and_mul.default,
-                input=mm,
+                input=gemm_fp8_op_result,
                 _out_base_index=0,
                 _all_bases=[out],
             )
-            per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sglang.per_tensor_quant_fp8.default,
-                input=silu_and_mul[1],
-                is_static=True,
-                _output_q_base_index=0,
-                _output_s_base_index=1,
-                _all_bases=[output_q, o_scale],
-            )
+            quant_fp8_op_result = quant_fp8_op.pattern(silu_and_mul, output_q, o_scale)
             return (
-                per_tensor_quant_fp8[1],
-                per_tensor_quant_fp8[2],
+                quant_fp8_op_result[0],
+                quant_fp8_op_result[1],
             )
 
         def replacement(x, w, x_scale, w_scale, o_scale, out, output_q):
-            return (
-                torch.ops.sglang.fused_swiglu.default(x, w, x_scale, w_scale, o_scale),
-                o_scale,
+            dual_gemm_fp8_op_result = dual_gemm_fp8_op.pattern(
+                x, w, x_scale, w_scale, o_scale, output_q
             )
+            if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+                repeated_o_scale = o_scale.view(1, 1).expand(x.shape[0], 1)
+            else:
+                repeated_o_scale = o_scale
+            return dual_gemm_fp8_op_result, repeated_o_scale
+
+        M, K, N = 16, 16, 16
+        if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+            SM, SN = M, N
+        else:
+            SM, SN = 1, 1
 
         example_inputs = [
-            torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda(),  # X
-            torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda().T,  # W.T
-            torch.empty(()).cuda(),  # X_Scale
-            torch.empty(()).cuda(),  # W_Scale
-            torch.empty(()).cuda(),  # O_Scale
-            torch.empty(16, 8).half().cuda(),  # out
-            torch.empty(16, 8).to(dtype=torch.float8_e4m3fn).cuda(),  # output_q
+            torch.empty(M, K, device="cuda", dtype=torch.float8_e4m3fn),  # X
+            torch.empty(K, N, device="cuda", dtype=torch.float8_e4m3fn).T,  # W.T
+            torch.empty(SM, 1, device="cuda", dtype=torch.float32),  # X_Scale [M, 1]
+            torch.empty(SN, 1, device="cuda", dtype=torch.float32),  # W_Scale [N, 1]
+            torch.empty(
+                1, device="cuda", dtype=torch.float32
+            ),  # O_Scale (or (1,1) if needed)
+            torch.empty(M, N // 2, device="cuda", dtype=torch.float16),  # out
+            torch.empty(
+                M, N // 2, device="cuda", dtype=torch.float8_e4m3fn
+            ),  # output_q
         ]
 
         self.register_replacement_pattern(pattern, replacement, example_inputs)
 
     def build_pass(self):
-        self.register_swiglu_replacement_pattern()
-        self.register_swiglu_fp8_replacement_pattern()
+        pattern_builder(
+            self.register_dual_gemm_replacement_pattern,
+            [DualGemmPatternRegistery],
+        )
+
+        pattern_builder(
+            self.register_dual_gemm_fp8_replacement_pattern,
+            [
+                QuantFp8PatternRegistery,
+                GemmFp8PatternRegistery,
+                DualGemmFp8PatternRegistery,
+            ],
+            ignore_combinations=[
+                (StaticQuantFp8Pattern, TorchScaledMMPattern),
+                (PerTensorQuantFp8Pattern, CutlassFp8ScaledMMPattern),
+            ],
+        )

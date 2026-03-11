@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.compilation.fusion.triton_ops.fused_swiglu import fused_swiglu_fwd
+from sglang.srt.compilation.fusion.triton_ops.dual_gemm import dual_gemm_fwd
 
 
 def seed_rng():
@@ -58,7 +58,7 @@ def make_input_and_weights(
     return x, w
 
 
-def swiglu_ref_torch(
+def dual_gemm_ref_torch(
     x: torch.HalfTensor, w_gate: torch.HalfTensor, w_up: torch.HalfTensor
 ) -> torch.HalfTensor:
     """Reference PyTorch implementation."""
@@ -75,11 +75,11 @@ def swiglu_ref_torch(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16, torch.float16], ids=["bfloat16", "float16"]
 )
-def test_fused_swiglu(d_model, d_intermediate, batch_size, seq_len, dtype):
+def test_dual_gemm(d_model, d_intermediate, batch_size, seq_len, dtype):
     x, w = make_input_and_weights(batch_size, seq_len, d_model, d_intermediate, dtype)
     w_gate, w_up = torch.split(w, w.shape[1] // 2, dim=1)
-    out_ref = swiglu_ref_torch(x, w_gate, w_up)
-    out = fused_swiglu_fwd(x, w)
+    out_ref = dual_gemm_ref_torch(x, w_gate, w_up)
+    out = dual_gemm_fwd(x, w)
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=2e-2)
 
 

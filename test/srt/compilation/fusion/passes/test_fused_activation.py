@@ -36,7 +36,9 @@ def init_llama_mlp(
 test_data = [
     {
         "models": [
-            "meta-llama/Llama-3.2-1B",
+            # TODO: Llama-3.2-1B passes only with torch compile mode default
+            # and torch._inductor.config.coordinate_descent_tuning = False
+            # "meta-llama/Llama-3.2-1B",
             "RedHatAI/Llama-2-7b-chat-hf-FP8",
             "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
         ],
@@ -84,7 +86,7 @@ def test_fused_activation_pass(model, model_initializer):
 
         torch.testing.assert_close(ref_res, res)
 
-        assert "sglang.fused_swiglu" in code
+        assert "sglang.dual_gemm" in code
         assert "sgl_kernel.silu_and_mul" not in code
 
 

@@ -19,6 +19,7 @@ from torch._inductor.pattern_matcher import (
     fwd_only,
     register_replacement,
 )
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from sglang.srt.compilation.pass_config import PassConfig
 
@@ -188,6 +189,31 @@ class SGLangPatternMatcherInductorPass(SGLangInductorPass):
             **kwargs,
         )
 
+        if self.pass_config.enable_torch_compile_graph_trace_logs:
+            scalar_workaround = kwargs.get("scalar_workaround", {})
+            trace_inputs = self._build_trace_inputs(
+                pattern, example_inputs, scalar_workaround
+            )
+
+            pattern_trace = types.SimpleNamespace(
+                owning_module=make_fx(pattern, tracing_mode="symbolic")(*trace_inputs)
+            )
+            replacement_trace = types.SimpleNamespace(
+                owning_module=make_fx(replacement, tracing_mode="symbolic")(
+                    *trace_inputs
+                )
+            )
+
+            logger.info(
+                "%s", str(self.dump_graph(pattern_trace, f"{self.pass_name}_Pattern"))
+            )
+            logger.info(
+                "%s",
+                str(
+                    self.dump_graph(replacement_trace, f"{self.pass_name}_Replacement")
+                ),
+            )
+
     def end_and_log(self, count: int):
         self._end_time = time.perf_counter_ns()
         duration_ms = float(self._end_time - self._start_time) / 1.0e6
@@ -197,3 +223,23 @@ class SGLangPatternMatcherInductorPass(SGLangInductorPass):
             duration_ms,
             count,
         )
+
+    @staticmethod
+    def _build_trace_inputs(fn, example_inputs, scalar_workaround):
+        """Insert scalar_workaround values into example_inputs at the
+        correct positions based on the function signature."""
+        if not scalar_workaround:
+            return example_inputs
+
+        params = list(inspect.signature(fn).parameters.keys())
+        # Map scalar param names to their positional index
+        scalar_positions = {
+            name: idx for idx, name in enumerate(params) if name in scalar_workaround
+        }
+
+        result = list(example_inputs)
+        # Insert in order of position (so earlier inserts don't shift later indices)
+        for name, idx in sorted(scalar_positions.items(), key=lambda x: x[1]):
+            result.insert(idx, scalar_workaround[name])
+
+        return result

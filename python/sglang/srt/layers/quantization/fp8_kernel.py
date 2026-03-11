@@ -31,6 +31,7 @@ except:
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
+    direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
@@ -646,18 +647,19 @@ def _static_quant_fp8(
         tl.store(y_s_repeat_ptr, y_s)
 
 
-def static_quant_fp8(
+def _static_quant_fp8_fwd(
     x: torch.Tensor,
+    x_q: torch.Tensor,
     x_s: torch.Tensor,
     repeat_scale: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Function to perform static quantization using the given scale on an input tensor `x`.
 
     It converts the tensor values into signed float8 values and returns the
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tensor with ndim >= 2.
+        x: The input tenosr with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
         dtype: The dype of output tensor.
@@ -668,7 +670,6 @@ def static_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     if repeat_scale:
@@ -679,6 +680,10 @@ def static_quant_fp8(
         )
     else:
         x_s_repeat = None
+
+    # convert scalars to vectors because torch.compile can't deal with tl.load on a scalar
+    if x_s.shape == ():
+        x_s = x_s.unsqueeze(0)
 
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
@@ -699,6 +704,43 @@ def static_quant_fp8(
         num_stages=num_stages,
     )
     x_s = x_s_repeat if repeat_scale else x_s
+    return x_s
+
+
+def _static_quant_fp8_fake(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    repeat_scale: bool = False,
+) -> torch.Tensor:
+    M = x.numel() // x.shape[-1]
+    if repeat_scale:
+        x_s_repeat = torch.empty(
+            (M, 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+    else:
+        x_s_repeat = None
+    x_s = x_s_repeat if repeat_scale else x_s
+    return x_s
+
+
+direct_register_custom_op(
+    op_name="static_quant_fp8",
+    op_func=_static_quant_fp8_fwd,
+    mutates_args=["x_q"],
+    fake_impl=_static_quant_fp8_fake,
+)
+
+
+def static_quant_fp8(
+    x: torch.Tensor,
+    x_s: torch.Tensor,
+    repeat_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    x_s = torch.ops.sglang.static_quant_fp8(x, x_q, x_s, repeat_scale)
     return x_q, x_s
 
 
