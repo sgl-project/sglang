@@ -432,6 +432,81 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
         )
 
+    def mla_fp8_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        total_q = q.shape[0]
+        nhead = layer.tp_q_head_num
+        v_head_dim = layer.v_head_dim
+
+        if q.dtype != fp8_dtype:
+            q = q.to(fp8_dtype)
+        if k.dtype != fp8_dtype:
+            k = k.to(fp8_dtype)
+        if v.dtype != fp8_dtype:
+            v = v.to(fp8_dtype)
+        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
+
+        tile_q = 256
+        reduce_indptr = self.forward_metadata.reduce_indptr
+        reduce_final_map = self.forward_metadata.reduce_final_map
+        reduce_partial_map = self.forward_metadata.reduce_partial_map
+
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        final_lse = torch.empty(
+            (total_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = q.new_empty(
+            (total_q, nhead, v_head_dim),
+            dtype=self.input_dtype,
+        )
+
+        mla_prefill_ps_asm_fwd(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.fp8_prefill_kv_indices,
+            self.forward_metadata.work_indptr,
+            self.forward_metadata.work_info_set,
+            self.forward_metadata.max_q_len,
+            layer.scaling,
+            True,
+            logits,
+            attn_lse,
+            output,
+            one_scale,
+            one_scale,
+            one_scale,
+        )
+        mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            tile_q,
+            output,
+            final_lse,
+        )
+        return output
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -749,6 +824,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
                 qo_indptr = self.mla_indices_updater_prefill.qo_indptr
+                kv_indptr = self.mla_indices_updater_prefill.kv_indptr
 
                 work_metadata = None
                 work_indptr = None
@@ -774,7 +850,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     self.make_mla_prefill_ps_meta_data(
                         qo_indptr,
-                        qo_indptr,
+                        kv_indptr,
                         forward_batch.seq_lens,
                         work_metadata,
                         work_indptr,
@@ -785,7 +861,7 @@ class AiterAttnBackend(AttentionBackend):
                         is_causal=True,
                     )
 
-                    total_s = int(forward_batch.extend_seq_lens.sum())
+                    total_s = forward_batch.seq_lens_sum
                     fp8_prefill_kv_indices = torch.arange(
                         total_s, device=self.device, dtype=torch.int32
                     )
@@ -1456,77 +1532,11 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
-                        total_s = q.shape[0]
-                        nhead = layer.tp_q_head_num
-                        v_head_dim = layer.v_head_dim
-
-                        # q is cast here (after RoPE).
-                        # k/v are already FP8 for MXFP4 main model (fused kv_b_proj),
-                        # but need casting for FP8/BF16 weights (e.g. MTP draft model).
-                        if q.dtype != fp8_dtype:
-                            q = q.to(fp8_dtype)
-                        if k.dtype != fp8_dtype:
-                            k = k.to(fp8_dtype)
-                        if v.dtype != fp8_dtype:
-                            v = v.to(fp8_dtype)
-                        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
-
-                        kv_indptr_asm = qo_indptr
-                        kv_indices_asm = self.forward_metadata.fp8_prefill_kv_indices
-
-                        tile_q = 256
-                        reduce_indptr = self.forward_metadata.reduce_indptr
-                        reduce_final_map = self.forward_metadata.reduce_final_map
-                        reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-                        logits = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        attn_lse = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        final_lse = torch.empty(
-                            (total_s, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        output = q.new_empty(
-                            (total_s, nhead, v_head_dim),
-                            dtype=self.input_dtype,
-                        )
-
-                        mla_prefill_ps_asm_fwd(
+                        output = self.mla_fp8_prefill_attn(
                             q,
                             k,
                             v,
-                            qo_indptr,
-                            kv_indptr_asm,
-                            kv_indices_asm,
-                            self.forward_metadata.work_indptr,
-                            self.forward_metadata.work_info_set,
-                            max_q_len,
-                            layer.scaling,
-                            True,
-                            logits,
-                            attn_lse,
-                            output,
-                            one_scale,
-                            one_scale,
-                            one_scale,
-                        )
-                        mla_reduce_v1(
-                            logits,
-                            attn_lse,
-                            reduce_indptr,
-                            reduce_final_map,
-                            reduce_partial_map,
-                            tile_q,
-                            output,
-                            final_lse,
+                            layer,
                         )
                     else:
                         output = flash_attn_varlen_func(
@@ -1553,44 +1563,61 @@ class AiterAttnBackend(AttentionBackend):
                         kvc = kvc.to(dtype)
                         k_pe = k_pe.to(dtype)
 
-                    kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
+                    if (
+                        _use_fp8_prefill_attn
+                        and layer.kv_b_proj.weight.dtype == torch.uint8
+                    ):
+                        # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
+                        # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
+                        # directly in FP8, avoiding a separate elementwise cast
+                        k, v = layer.kv_b_proj(
+                            (
+                                kvc.squeeze(1),
+                                k_pe.expand(-1, layer.tp_k_head_num, -1),
+                                qk_nope_head_dim,
+                                layer.v_head_dim,
+                                fp8_dtype,
+                            )
+                        )[0]
+                    else:
+                        kv = layer.kv_b_proj(kvc.contiguous())[0]
 
-                    kvprefix = kvprefix.view(
-                        -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
-                    )
-                    k_prefix, v_prefix = torch.split(
-                        kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
-                    )
-                    k_prefix = torch.cat(
-                        [
-                            k_prefix,
-                            torch.broadcast_to(
-                                k_pe,
-                                (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
-                            ),
-                        ],
-                        dim=-1,
-                    )
+                        kv = kv.view(
+                            -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                        )
+                        k, v = torch.split(
+                            kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                        )
+                        k = torch.cat(
+                            [
+                                k,
+                                torch.broadcast_to(
+                                    k_pe,
+                                    (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
+                                ),
+                            ],
+                            dim=-1,
+                        )
+
                     assert (
                         forward_batch.extend_prefix_lens.shape
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    k = k_prefix
-                    v = v_prefix
-
-                    o = flash_attn_varlen_func(
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        kv_indptr,
-                        max_q_len,
-                        max_kv_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                    )
-                    return o
+                    if _use_fp8_prefill_attn:
+                        return self.mla_fp8_prefill_attn(q, k, v, layer)
+                    else:
+                        return flash_attn_varlen_func(
+                            q,
+                            k,
+                            v,
+                            qo_indptr,
+                            kv_indptr,
+                            max_q_len,
+                            max_kv_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        )
 
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:

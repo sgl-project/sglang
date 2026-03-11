@@ -5,6 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -74,6 +75,19 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
                 "environment variable SGLANG_FLASHINFER_FP4_GEMM_BACKEND. "
                 "Using server argument value."
             )
+
+    if backend == "auto":
+        if is_sm120_supported():
+            # flashinfer_cutlass produces NaN in dense MLP layers with
+            # heterogeneous batches on SM120 (Blackwell).  cudnn is stable.
+            # See: https://github.com/sgl-project/sglang/issues/20043
+            backend = "flashinfer_cudnn"
+            logger.info(
+                "SM120 (Blackwell) detected: auto-selecting "
+                "fp4-gemm-backend=flashinfer_cudnn"
+            )
+        else:
+            backend = "flashinfer_cutlass"
 
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
 

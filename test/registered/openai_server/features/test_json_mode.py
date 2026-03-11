@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -105,6 +106,9 @@ class ServerWithGrammarBackend(CustomTestCase):
             "--grammar-backend",
             cls.backend,
         ]
+
+        if is_in_amd_ci():
+            other_args.append("--constrained-json-disable-any-whitespace")
 
         cls.process = popen_launch_server(
             cls.model,
