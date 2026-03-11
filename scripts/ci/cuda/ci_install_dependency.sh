@@ -28,10 +28,10 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
 # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
 apt-get update || true
-apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
-    for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+    for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils ffmpeg; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
             echo "ERROR: Required package $pkg is not installed and apt-get failed"
             exit 1
@@ -327,6 +327,9 @@ fi
 
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
+
+# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
+$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
 
 # Show current packages
 $PIP_CMD list
