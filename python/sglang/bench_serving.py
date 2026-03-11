@@ -1767,7 +1767,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer, model_id)
+    input_requests = get_dataset(args, tokenizer, args.model)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
