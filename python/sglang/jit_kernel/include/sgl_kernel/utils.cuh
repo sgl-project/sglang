@@ -1,3 +1,18 @@
+/// \file utils.cuh
+/// \brief Core CUDA/device utilities: type aliases, PDL helpers,
+///        typed pointer access, kernel launch wrapper, and error checking.
+///
+/// This header is included (directly or transitively) by nearly every
+/// JIT kernel. It provides:
+/// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, ...).
+/// - `SGL_DEVICE` macro (forced-inline device function qualifier).
+/// - `kWarpThreads` constant (32).
+/// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
+/// - Typed `load_as` / `store_as` for void-pointer access.
+/// - `pointer::offset` for safe void-pointer arithmetic.
+/// - `host::LaunchKernel` - kernel launcher with optional PDL.
+/// - `host::RuntimeDeviceCheck` - CUDA error checking.
+
 #pragma once
 
 #include <sgl_kernel/utils.h>
@@ -70,11 +85,21 @@ using fp32x4_t = float4;
 
 namespace device {
 
+/// \brief Macro: forced-inline device function qualifier.
 #define SGL_DEVICE __forceinline__ __device__
 
+/// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
+/// \brief Full warp active mask (all 32 lanes).
 inline constexpr auto kFullMask = 0xffffffffu;
 
+/**
+ * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
+ *
+ * On Hopper (sm_90+), inserts a `griddepcontrol.wait` instruction to
+ * synchronize with a preceding kernel in the same stream. On older
+ * architectures or ROCm this is a no-op.
+ */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
 #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -84,6 +109,12 @@ SGL_DEVICE void PDLWaitPrimary() {
 #endif
 }
 
+/**
+ * \brief PDL: trigger dependent (secondary) kernel launch.
+ *
+ * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
+ * instruction. On older architectures or ROCm this is a no-op.
+ */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -118,6 +149,7 @@ SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset 
   static_cast<T*>(ptr)[offset] = val;
 }
 
+/// \brief Safe void-pointer arithmetic (byte-level by default).
 namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
@@ -138,6 +170,9 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 namespace host {
 
+/**
+ * \brief Check the CUDA error code and panic with location info on failure.
+ */
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
@@ -145,10 +180,25 @@ inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   }
 }
 
+/// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
+/**
+ * \brief Kernel launcher with automatic stream resolution and PDL support.
+ *
+ * Usage:
+ * \code
+ *   host::LaunchKernel(grid, block, device)
+ *       .enable_pdl(true)
+ *       (my_kernel, arg1, arg2);
+ * \endcode
+ *
+ * The constructor resolves the CUDA stream from a `DLDevice` (via
+ * `TVMFFIEnvGetStream`) or accepts a raw `cudaStream_t`. The call
+ * operator launches the kernel and checks for errors.
+ */
 struct LaunchKernel {
  public:
   explicit LaunchKernel(
