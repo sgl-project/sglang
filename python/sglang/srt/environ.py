@@ -161,6 +161,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
