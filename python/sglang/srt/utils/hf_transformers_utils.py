@@ -465,7 +465,14 @@ def get_context_length(config):
     """Get the context length of a model from a huggingface model configs."""
     text_config = config
     rope_scaling = getattr(text_config, "rope_scaling", None)
-    if rope_scaling:
+
+    # NOTE: Gemma3's max_position_embeddings is already the final (scaled)
+    # context length (128K), so we must not multiply by the RoPE factor again.
+    # This matches the same special-case handling in vLLM.
+    model_type = getattr(text_config, "model_type", "") or ""
+    is_gemma3 = "gemma3" in model_type
+
+    if rope_scaling and not is_gemma3:
         rope_scaling_factor = rope_scaling.get("factor", 1)
         if "original_max_position_embeddings" in rope_scaling:
             rope_scaling_factor = 1

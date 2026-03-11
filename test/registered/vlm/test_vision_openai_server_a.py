@@ -7,7 +7,12 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 import unittest
 
 import openai
+from transformers import AutoConfig
 
+from sglang.srt.utils.hf_transformers_utils import (
+    get_context_length,
+    get_hf_text_config,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import *
 from sglang.test.vlm_utils import (
@@ -135,6 +140,15 @@ class TestGemma3itServer(ImageOpenAITestMixin):
     extra_args = [
         "--cuda-graph-max-bs=4",
     ]
+
+    def test_context_length_not_inflated_by_rope_scaling(self):
+        # Gemma3's rope_scaling factor=8 must NOT be multiplied onto
+        # max_position_embeddings (131072), which is already the final
+        # context length. Without the fix, context_len becomes 1,048,576
+        # causing an OOM crash on devices with limited VRAM.
+        cfg = AutoConfig.from_pretrained(self.model)
+        text_cfg = get_hf_text_config(cfg)
+        self.assertEqual(get_context_length(text_cfg), 131072)
 
 
 class TestKimiVLServer(ImageOpenAITestMixin):
