@@ -1609,7 +1609,6 @@ class ServerArgs:
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"
-            and self.moe_runner_backend != "flashinfer_cutedsl"
         ):
             self.enable_flashinfer_allreduce_fusion = True
 
