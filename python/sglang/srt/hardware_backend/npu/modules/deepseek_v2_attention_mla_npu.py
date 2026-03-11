@@ -223,7 +223,7 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe, layer_id=m.layer_id)
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
