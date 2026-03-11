@@ -38,8 +38,8 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
-        tree_cache.inc_lock_ref.return_value = IncLockRefResult
-        tree_cache.dec_lock_ref.return_value = DecLockRefResult
+        tree_cache.inc_lock_ref.return_value = IncLockRefResult()
+        tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         return tree_cache
 
     def create_token_allocator(

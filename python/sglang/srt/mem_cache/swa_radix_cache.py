@@ -705,7 +705,7 @@ class SWARadixCache(BasePrefixCache):
         It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
         """
-        swa_uuid_for_lock = params.swa_uuid_for_lock
+        swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
 
         if self.disable:
             return DecLockRefResult()
