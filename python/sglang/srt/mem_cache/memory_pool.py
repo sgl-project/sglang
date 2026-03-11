@@ -380,7 +380,7 @@ class MambaPool:
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
-        if dst_index == None:
+        if dst_index is None:
             return None
         self.copy_from(src_index, dst_index)
         return dst_index
@@ -465,11 +465,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
-            raise ValueError(
-                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
-                "Please set `--mamba-scheduler-strategy extra_buffer`."
-            )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
@@ -1865,8 +1860,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -1881,7 +1878,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(

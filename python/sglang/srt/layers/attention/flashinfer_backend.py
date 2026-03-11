@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -479,7 +480,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = not self.enable_deterministic
+                use_ragged = (
+                    not self.enable_deterministic and not is_in_piecewise_cuda_graph()
+                )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch

@@ -183,11 +183,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
 
-        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
-            raise ValueError(
-                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
-                "Please set `--mamba-scheduler-strategy extra_buffer`."
-            )
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
@@ -480,6 +475,7 @@ class DecodePreallocQueue:
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:

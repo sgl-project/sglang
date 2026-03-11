@@ -66,6 +66,7 @@ class PrefillDelayer:
         self._metrics_collector = metrics_collector
 
         self._curr_state: Optional[_State] = None
+        self.skip_first_delayer = True
 
         assert (
             server_args.disaggregation_mode == "null"
@@ -146,16 +147,21 @@ class PrefillDelayer:
             if (
                 max_running_requests - global_running_batch.max().item()
                 < global_max_prefill_bs.max().item()
-                and not self.enable_dp_attention
             ):
-                next_state = prev_state or _State()
-                next_state = next_state.bump_delayed_count()
-                return _NegotiateOutput(
-                    next_state=next_state,
-                    output_allow=False,
-                    output_reason="delay",
-                    **debug_info,
-                )
+                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
+                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
+                if self.skip_first_delayer:
+                    self.skip_first_delayer = False
+                    pass
+                else:
+                    next_state = prev_state or _State()
+                    next_state = next_state.bump_delayed_count()
+                    return _NegotiateOutput(
+                        next_state=next_state,
+                        output_allow=False,
+                        output_reason="delay",
+                        **debug_info,
+                    )
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
                 next_state=None,

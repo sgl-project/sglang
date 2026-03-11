@@ -43,3 +43,20 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
 ]
+
+EIGHT_NPU_CASES: list[DiffusionTestCase] = [
+    # === Text to Video (T2V) ===
+    DiffusionTestCase(
+        "wan2_2_t2v_14b_w8a8_8npu",
+        DiffusionServerArgs(
+            model_path="/root/.cache/modelscope/hub/models/Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8",
+            modality="video",
+            custom_validator="video",
+            num_gpus=8,
+            tp_size=4,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+]
