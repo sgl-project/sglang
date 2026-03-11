@@ -184,7 +184,7 @@ class CommonKVManager(BaseKVManager):
             self.failure_records[bootstrap_room] = failure_reason
 
     def ensure_parallel_info(
-        self, bootstrap_addr: str, max_retries: int = 20, retry_interval: float = 1.0
+        self, bootstrap_addr: str, max_retries: int = 5, retry_interval: float = 1.0
     ) -> bool:
         """Fetch and cache prefill parallel info if not yet available.
         Returns True if info is available (cached or freshly fetched).
