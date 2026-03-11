@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -84,10 +85,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         w13_processed = 2 * intermediate_size_per_partition
         w2_processed = intermediate_size_per_partition // 2
         if _use_aiter:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                padding_size,  # Avoid circular import
-            )
-
+            padding_size = get_moe_padding_size(_use_aiter)
             align_aiter = (
                 lambda n: ((n + padding_size - 1) // padding_size) * padding_size
             )

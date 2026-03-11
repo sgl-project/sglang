@@ -26,7 +26,11 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_padding_size,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -747,11 +751,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                padding_size,  # Avoid circular import
-            )
-
+            padding_size = get_moe_padding_size(_use_aiter)
             if _use_aiter and padding_size == block_n == block_k:
                 align_aiter = (
                     lambda n: ((n + padding_size - 1) // padding_size) * padding_size
@@ -1345,10 +1345,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
     def process_weights_hip_scale_padding(self, layer: Module):
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            padding_size,  # Avoid circular import
-        )
-
+        padding_size = get_moe_padding_size(_use_aiter)
         if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),

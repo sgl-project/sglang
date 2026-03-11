@@ -333,3 +333,14 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+def get_moe_padding_size(is_aiter_moe):
+    if is_aiter_moe:
+        return 128
+    else:
+        return (
+            128
+            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+            else 0
+        )
