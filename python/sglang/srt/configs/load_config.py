@@ -34,6 +34,7 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    INSTANTTENSOR = "instanttensor"
 
 
 @dataclass

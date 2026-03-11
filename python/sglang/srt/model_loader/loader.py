@@ -102,6 +102,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -426,6 +427,7 @@ class DefaultModelLoader(BaseModelLoader):
         elif (
             load_format == LoadFormat.SAFETENSORS
             or load_format == LoadFormat.FASTSAFETENSORS
+            or load_format == LoadFormat.INSTANTTENSOR
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -554,6 +556,10 @@ class DefaultModelLoader(BaseModelLoader):
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                )
+            elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+                weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                 )
             elif use_multithread:

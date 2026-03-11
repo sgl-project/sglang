@@ -134,6 +134,7 @@ LOAD_FORMAT_CHOICES = [
     "fastsafetensors",
     "private",
     "runai_streamer",
+    "instanttensor",
 ]
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
