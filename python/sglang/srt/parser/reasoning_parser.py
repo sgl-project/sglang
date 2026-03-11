@@ -268,6 +268,34 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK2Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi K2 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    Kimi K2 can switch from reasoning to tool-call section with
+    `<|tool_calls_section_begin|>` before emitting `</think>`.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<|tool_calls_section_begin|>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class Glm45Detector(BaseReasoningFormatDetector):
     """
     Detector for GLM-4.5 models.
@@ -390,9 +418,9 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
-class NanoV3Detector(BaseReasoningFormatDetector):
+class Nemotron3Detector(BaseReasoningFormatDetector):
     """
-    Detector for NanoV3 model.
+    Detector for Nemotron3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
 
     """
@@ -431,14 +459,14 @@ class ReasoningParser:
         "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": Qwen3Detector,
+        "kimi_k2": KimiK2Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
-        "nano_v3": NanoV3Detector,
+        "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
     }
 

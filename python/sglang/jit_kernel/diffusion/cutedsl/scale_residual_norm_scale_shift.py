@@ -162,7 +162,7 @@ class ScaleResidualNormScaleShift:
         @cute.jit
         def copy_if(src, dst):
             if cutlass.const_expr(
-                isinstance(src, cute.Tensor) and isinstance(src, cute.Tensor)
+                isinstance(src, cute.Tensor) and isinstance(dst, cute.Tensor)
             ):
                 cute.autovec_copy(src, dst)  # LDG.128
 
@@ -341,7 +341,7 @@ def fused_norm_scale_shift(
 
 
 @fused_norm_scale_shift.register_fake
-def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps):
+def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps=1e-5):
     y = x.new_empty(x.shape)
     return y
 
@@ -424,7 +424,7 @@ def fused_scale_residual_norm_scale_shift(
 
 @fused_scale_residual_norm_scale_shift.register_fake
 def _fused_scale_residual_norm_scale_shift_fake(
-    residual, x, gate, weight, bias, scale, shift, norm_type, eps
+    residual, x, gate, weight, bias, scale, shift, norm_type, eps=1e-5
 ):
     y = x.new_empty(x.shape)
     residual_out = x.new_empty(x.shape)

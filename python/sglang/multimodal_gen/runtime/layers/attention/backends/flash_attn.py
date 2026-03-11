@@ -23,7 +23,7 @@ try:
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
             return flash_attn_varlen_func_fa4(*args, **kwargs)
-        return flash_attn_varlen_func(*args, ver=ver, **kwargs)
+        return flash_attn_varlen_func(*args, **kwargs)
 
 except ImportError as e:
     raise e
