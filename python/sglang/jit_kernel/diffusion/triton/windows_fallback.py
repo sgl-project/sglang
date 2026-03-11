@@ -70,6 +70,13 @@ def apply_rotary_embedding_native(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
     """Native fallback for rotary embedding."""
+    head_size = x.shape[-1]
+    if interleaved and cos.shape[-1] == head_size:
+        cos = cos[..., ::2].contiguous()
+        sin = sin[..., ::2].contiguous()
+    else:
+        cos = cos.contiguous()
+        sin = sin.contiguous()
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
     x1 = x[..., ::2]

@@ -89,11 +89,11 @@ Native Windows support uses the `sglang` backend with `torch_sdpa` attention.
 Note:
 - Flash Attention (`fa`) is not supported on the native Windows CUDA path.
 - Use the Windows-specific dependency profile (`pyproject_other.toml`) for now.
+- Ensure you have a CUDA-enabled PyTorch build on Windows (`torch.cuda.is_available()` must be true).
 
 ```powershell
 # From repo root
-Remove-Item -Force python/pyproject.toml
-Copy-Item python/pyproject_other.toml python/pyproject.toml
+Copy-Item python/pyproject_other.toml python/pyproject.toml -Force
 pip install -e "python[diffusion_windows]"
 ```
 

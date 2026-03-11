@@ -17,7 +17,8 @@ _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
 _has_sgl_kernel_silu = False
-if _is_cuda or _is_hip:
+_is_windows = current_platform.is_windows()
+if (_is_cuda or _is_hip) and not _is_windows:
     try:
         from sgl_kernel import silu_and_mul
 
