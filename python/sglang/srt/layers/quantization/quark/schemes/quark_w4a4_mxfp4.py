@@ -10,6 +10,9 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 if _is_hip:
+    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+        fused_gemm_afp4wfp4_split_cat,
+    )
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -87,20 +90,29 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         assert bias is None, "bias is not supported"
 
         three_d = False
+        fused_gemm_split_cat = False
         x_s = None
         y = None
+
         if isinstance(x, tuple):
             assert len(x) in [
                 2,
                 3,
-            ], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+                5,
+            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:
                 x, x_s, y = x
+            elif len(x) == 5:
+                x, y, S1, S2, out_dtype = x
+                fused_gemm_split_cat = True
 
         use_fused_quant_gemm = (
-            x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
+            not fused_gemm_split_cat
+            and x_s is None
+            and y is not None
+            and layer.weight.shape[0] == y.shape[1]
         )
 
         if x.dim() == 3:
@@ -126,10 +138,23 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if use_fused_quant_gemm:
             gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
             y = y.to(x.dtype)
+        elif fused_gemm_split_cat:
+            k, v = fused_gemm_afp4wfp4_split_cat(
+                x=x_q,
+                w=layer.weight,
+                y=y,
+                x_scale=x_s,
+                w_scale=layer.weight_scale,
+                S1=S1,
+                S2=S2,
+                dtype=out_dtype,
+            )
         else:
             gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
 
-        if three_d:
+        if fused_gemm_split_cat:
+            return k, v
+        elif three_d:
             return y.view(*output_shape)
-
-        return y
+        else:
+            return y

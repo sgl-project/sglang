@@ -112,7 +112,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            max_concurrent_jobs: 10,
+            max_concurrent_jobs: 200,
         }
     }
 }

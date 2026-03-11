@@ -13,12 +13,15 @@
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -27,8 +30,12 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+if TYPE_CHECKING:
+    from prometheus_client import Gauge
 
+    from sglang.srt.managers.schedule_batch import Req
+
+SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +55,38 @@ def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
 
 
 @dataclass
+class QueueCount:
+    """Holds both the total count and optional per-priority breakdown for a queue."""
+
+    total: int = 0
+    by_priority: Optional[Dict[int, int]] = None
+
+    @classmethod
+    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+        # NOTE: If requests have priority=None (no --default-priority-value set),
+        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
+        # Set --default-priority-value when enabling priority scheduling to avoid this.
+        by_priority = (
+            dict(Counter(req.priority for req in reqs))
+            if enable_priority_scheduling
+            else None
+        )
+        return cls(total=len(reqs), by_priority=by_priority)
+
+
+@dataclass
 class SchedulerStats:
     # Basics
-    num_running_reqs: int = 0
+    num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
     decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
-    num_queue_reqs: int = 0
+    num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
@@ -74,15 +102,12 @@ class SchedulerStats:
     num_paused_reqs: int = 0
 
     # PD disaggregation
-    num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_inflight_queue_reqs: int = 0
-    num_decode_prealloc_queue_reqs: int = 0
-    num_decode_transfer_queue_reqs: int = 0
+    num_prefill_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
-    kv_transfer_bootstrap_ms: float = 0.0
-    kv_transfer_alloc_ms: float = 0.0
-    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -100,6 +125,10 @@ class SchedulerStats:
     lora_pool_slots_used: int = 0
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
+
+    # HiCache metrics
+    hicache_host_used_tokens: int = 0
+    hicache_host_total_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -144,6 +173,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        enable_hierarchical_cache: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -151,7 +181,9 @@ class SchedulerMetricsCollector:
 
         self.labels = labels
         self.enable_lora = enable_lora
+        self.enable_hierarchical_cache = enable_hierarchical_cache
         self.last_log_time = time.perf_counter()
+        self._known_priorities: Set[int] = set()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -168,6 +200,12 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.full_token_usage = Gauge(
+            name="sglang:full_token_usage",
+            documentation="The token usage for full attention layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -316,35 +354,35 @@ class SchedulerMetricsCollector:
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
-        self.kv_transfer_speed_gb_s = Gauge(
+        self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
-            documentation="The transfer speed of the KV cache in GB/s.",
+            documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
-        self.kv_transfer_latency_ms = Gauge(
+        self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
-            documentation="The transfer latency of the KV cache in ms.",
+            documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
         )
-        self.kv_transfer_bootstrap_ms = Gauge(
+        self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
-            documentation="The bootstrap time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_alloc_ms = Gauge(
+        self.kv_transfer_alloc_ms = Histogram(
             name="sglang:kv_transfer_alloc_ms",
-            documentation="The allocation waiting time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer allocation waiting time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_total_mb = Gauge(
+        self.kv_transfer_total_mb = Histogram(
             name="sglang:kv_transfer_total_mb",
-            documentation="The total number of tokens transferred in the KV cache.",
+            documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
 
         # Utilization
@@ -599,6 +637,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # HiCache host-tier metrics (only created when hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self.hicache_host_used_tokens = Gauge(
+                name="sglang:hicache_host_used_tokens",
+                documentation="Number of tokens currently used in the host KV cache.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_total_tokens = Gauge(
+                name="sglang:hicache_host_total_tokens",
+                documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -638,6 +691,14 @@ class SchedulerMetricsCollector:
             documentation=(
                 "Total time that GPU is busy executing a workload. "
                 "Refer to ForwardMode for category labels."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
+        self.gpu_overlap_wait_seconds_total = Counter(
+            name="sglang:gpu_overlap_wait_seconds_total",
+            documentation=(
+                "Total time that GPU forward stream was idle waiting for "
+                "the CPU schedule stream (overlap bubble)."
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
@@ -712,9 +773,23 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
-        # Convenience function for logging to gauge.
+    def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
+        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
+        # NOTE: When priority scheduling is enabled, the total is recorded under
+        # priority="" (the default label value). Per-priority breakdowns are recorded
+        # with priority="<int>". Grafana queries should use priority="" for totals.
+        gauge.labels(**self.labels).set(data.total)
+        if data.by_priority is not None:
+            self._known_priorities.update(data.by_priority.keys())
+            for priority in self._known_priorities:
+                value = data.by_priority.get(priority, 0)
+                labels = dict(self.labels)
+                labels["priority"] = str(priority)
+                gauge.labels(**labels).set(value)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -728,6 +803,24 @@ class SchedulerMetricsCollector:
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def observe_kv_transfer_metrics(
+        self,
+        latency_ms: float,
+        total_mb: float,
+        speed_gb_s: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
+        self._log_histogram(self.kv_transfer_total_mb, total_mb)
+        self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+
+    def observe_kv_transfer_bootstrap(
+        self,
+        bootstrap_ms: float,
+        alloc_ms: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
+        self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -773,9 +866,12 @@ class SchedulerMetricsCollector:
             num_retracted_output_tokens
         )
 
-    def increment_cuda_graph_pass(self, value: bool) -> None:
-        # leave room for piecewise cuda graph, etc
+    def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
+        mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
     def increment_eplb_balancedness(
@@ -807,6 +903,16 @@ class SchedulerMetricsCollector:
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
+    def increment_gpu_overlap_wait_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
+        self.gpu_overlap_wait_seconds_total.labels(
+            **self.labels, category=category
+        ).inc(t)
+
     def increment_gpu_execution_seconds(
         self,
         category: str,
@@ -823,9 +929,10 @@ class SchedulerMetricsCollector:
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
+        self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
@@ -833,7 +940,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
@@ -847,24 +954,18 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
-        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
-        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
-        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
-
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
@@ -893,6 +994,15 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        # HiCache host-tier metrics (only logged if hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self._log_gauge(
+                self.hicache_host_used_tokens, stats.hicache_host_used_tokens
+            )
+            self._log_gauge(
+                self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
 
         self._log_gauge(
             self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys

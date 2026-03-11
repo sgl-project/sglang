@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -74,6 +75,7 @@ _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -189,14 +191,14 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_nsa):
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
-            and _is_cuda
+            and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_nsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and not get_global_server_args().enable_piecewise_cuda_graph
+            and get_global_server_args().disable_piecewise_cuda_graph
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -693,6 +695,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if _use_ag_after_qlora:
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
@@ -707,10 +711,32 @@ class CommunicateSimpleFn:
 
     @staticmethod
     def _scattered_to_tp_attn_full(
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(hidden_states, tuple):
+            gathered_hidden_states = []
+            for local_hidden_states in hidden_states:
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    output = torch.empty(
+                        (
+                            local_hidden_states.shape[0] * context.attn_tp_size,
+                            *local_hidden_states.shape[1:],
+                        ),
+                        dtype=local_hidden_states.dtype,
+                        device=local_hidden_states.device,
+                    )
+                attn_tp_all_gather_into_tensor(
+                    output,
+                    local_hidden_states,
+                )
+                gathered_hidden_states.append(output)
+            return tuple(gathered_hidden_states)
+
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
@@ -814,18 +840,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),

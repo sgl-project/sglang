@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 
 
 @cache_once
+def _jit_rotary_embedding_module() -> Module:
+    return load_jit(
+        "rotary_embedding",
+        cuda_files=["elementwise/pos_enc.cuh"],
+        cuda_wrappers=[("rotary_embedding", "RotaryEmbeddingKernel::run")],
+    )
+
+
+@cache_once
 def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype)
     return load_jit(
@@ -29,6 +38,56 @@ def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> 
             ("run_rope_store", f"FusedRopeKernel<{args}>::run_fused"),
         ],
     )
+
+
+@register_custom_op(
+    op_name="rotary_embedding_with_key",
+    mutates_args=["query", "key"],
+)
+def rotary_embedding_with_key(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    module = _jit_rotary_embedding_module()
+    module.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+
+@register_custom_op(
+    op_name="rotary_embedding_without_key",
+    mutates_args=["query"],
+)
+def rotary_embedding_without_key(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    module = _jit_rotary_embedding_module()
+    module.rotary_embedding(positions, query, None, head_size, cos_sin_cache, is_neox)
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+):
+    if key is None:
+        rotary_embedding_without_key(
+            positions, query, head_size, cos_sin_cache, is_neox
+        )
+    else:
+        rotary_embedding_with_key(
+            positions, query, key, head_size, cos_sin_cache, is_neox
+        )
+    return query, key
 
 
 @dataclass
@@ -78,7 +137,7 @@ def apply_rope_inplace(
     module.run_rope(q, k, cos_sin_cache, positions)
 
 
-@register_custom_op(mutates_args=["q", "k_cache", "v_cache"])
+@register_custom_op(mutates_args=["q", "k", "k_cache", "v_cache"])
 def apply_rope_inplace_with_kvcache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,8 +154,8 @@ def apply_rope_inplace_with_kvcache(
     """
     Fused inplace RoPE + KV cache store.
 
-    Applies rotary position embedding to q inplace. For k, applies RoPE and
-    stores the result in k_cache. The original v is also stored in v_cache.
+    Applies rotary position embedding to q and k inplace. The rotated k is also
+    stored in k_cache. The original v is also stored in v_cache.
 
     Args:
         q: Query tensor of shape [num_tokens, num_qo_heads, head_dim].
