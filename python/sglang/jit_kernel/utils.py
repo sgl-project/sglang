@@ -11,6 +11,22 @@ if TYPE_CHECKING:
     from tvm_ffi import Module
 
 F = TypeVar("F", bound=Callable[..., Any])
+_FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
+
+
+def is_in_ci() -> bool:
+    ci_env_vars = ("SGLANG_IS_IN_CI", "CI", "GITHUB_ACTIONS")
+    return any(os.getenv(env_var, "false").lower() == "true" for env_var in ci_env_vars)
+
+
+def should_run_full_tests() -> bool:
+    return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
+
+
+def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
+    if should_run_full_tests():
+        return full_range
+    return ci_range if is_in_ci() else full_range
 
 
 def cache_once(fn: F) -> F:
@@ -52,7 +68,7 @@ def _resolve_kernel_path() -> pathlib.Path:
 
     path = _environment_install() or _package_install()
     if path is None:
-        raise RuntimeError("Cannot find sgl-kernel/jit path")
+        raise RuntimeError("Cannot find sglang.jit_kernel path")
     return path
 
 
