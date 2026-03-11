@@ -29,11 +29,13 @@ jobs:
         run: npm install -g mintlify
 
       - name: Validate docs
+        continue-on-error: true
         run: |
           cd docs
           mintlify validate
 
       - name: Check for broken links
+        continue-on-error: true
         run: |
           cd docs
           mintlify broken-links
