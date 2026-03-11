@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark_no_cudagraph
 
 
 def torch_top_k_renorm_probs(probs, top_k):
@@ -171,7 +171,7 @@ configs_p = list(itertools.product(batch_size_range, vocab_size_range, p_range))
         x_vals=configs_k,
         line_arg="provider",
         line_vals=["torch", "sglang"],
-        line_names=["Torch Reference", "SGL Kernel (FlashInfer)"],
+        line_names=["Torch Reference", "SGL Kernel"],
         styles=[("red", "-"), ("green", "-")],
         ylabel="us",
         plot_name="top-k-renorm-probs-performance",
@@ -195,8 +195,7 @@ def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
     elif provider == "sglang":
         fn = lambda: sgl_kernel.top_k_renorm_prob(probs.clone(), top_k_tensor)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark_no_cudagraph(fn)
 
 
 @triton.testing.perf_report(
@@ -205,7 +204,7 @@ def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
         x_vals=configs_p,
         line_arg="provider",
         line_vals=["torch", "sglang"],
-        line_names=["Torch Reference", "SGL Kernel (FlashInfer)"],
+        line_names=["Torch Reference", "SGL Kernel"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="us",
         plot_name="top-p-renorm-probs-performance",
@@ -225,8 +224,7 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
     elif provider == "sglang":
         fn = lambda: sgl_kernel.top_p_renorm_prob(probs.clone(), top_p_tensor)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark_no_cudagraph(fn)
 
 
 @triton.testing.perf_report(
@@ -235,7 +233,7 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
         x_vals=configs_k,
         line_arg="provider",
         line_vals=["torch", "sglang"],
-        line_names=["Torch Reference", "SGL Kernel (FlashInfer)"],
+        line_names=["Torch Reference", "SGL Kernel"],
         styles=[("red", "-"), ("orange", "-")],
         ylabel="us",
         plot_name="top-k-mask-logits-performance",
@@ -258,8 +256,7 @@ def benchmark_top_k_mask(batch_size, vocab_size, k, provider):
     elif provider == "sglang":
         fn = lambda: sgl_kernel.top_k_mask_logits(logits.clone(), top_k_tensor)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark_no_cudagraph(fn)
 
 
 if __name__ == "__main__":
