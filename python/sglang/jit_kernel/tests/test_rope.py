@@ -2,6 +2,8 @@ import pytest
 import torch
 import triton
 
+from sglang.jit_kernel.utils import get_ci_test_range
+
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
@@ -87,11 +89,16 @@ def torch_impl_rope(
 
 BS_LIST = [2**x for x in range(12)]
 BS_LIST += [x + 1 for x in BS_LIST]  # odd sizes to stress non-aligned paths
-NUM_KV_HEADS_LIST = [1, 2, 8]
-GQA_RATIO = [1, 4, 8]
-ROPE_DIM_LIST = [64, 128, 256, 512]
+BS_LIST = get_ci_test_range(BS_LIST, [1, 129, 2048, 2049])
+NUM_KV_HEADS_LIST = get_ci_test_range([1, 2, 8], [1, 8])
+GQA_RATIO = get_ci_test_range([1, 4, 8], [1, 8])
+ROPE_DIM_LIST = get_ci_test_range([64, 128, 256, 512], [64, 256])
 IS_NEOX_LIST = [False, True]
-DTYPE_LIST = [torch.bfloat16, torch.float16]
+DTYPE_LIST = get_ci_test_range(
+    [torch.bfloat16, torch.float16], [torch.bfloat16, torch.float16]
+)
+PARTIAL_ROPE_DIM_LIST = get_ci_test_range([64, 80, 96, 128], [64, 96])
+HEAD_DIM_LIST = get_ci_test_range([64, 128, 256], [64, 256])
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -151,8 +158,8 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
-@pytest.mark.parametrize("rope_dim", [64, 80, 96, 128])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("rope_dim", PARTIAL_ROPE_DIM_LIST)
+@pytest.mark.parametrize("head_dim", HEAD_DIM_LIST)
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")

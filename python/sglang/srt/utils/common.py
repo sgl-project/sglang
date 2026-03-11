@@ -94,7 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -192,6 +192,11 @@ def is_musa() -> bool:
     except ImportError:
         return False
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -596,6 +601,8 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+    elif device == "mps":
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -845,57 +852,67 @@ def decode_video_base64(video_base64):
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
+    if sr is None:
+        sr = 16000
+
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
+    if isinstance(audio_file, bytes):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str):
+        source = audio_file
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
     import soundfile as sf
     import torch
     import torchaudio
 
-    if sr is None:
-        sr = 16000
-
-    # Load audio data
-    if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
-    elif audio_file.startswith("file://"):
-        audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
-    elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
     else:
-        raise ValueError(f"Invalid audio format: {audio_file}")
+        audio, original_sr = sf.read(source)
 
-    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
-    # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
         else:
-            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
-
+            audio_tensor = audio_tensor.T
         audio_tensor = torchaudio.functional.resample(
             audio_tensor, orig_freq=original_sr, new_freq=sr
         )
-
         if audio_tensor.shape[0] == 1:
             audio = audio_tensor.squeeze(0).numpy()
         else:
-            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
+            audio = audio_tensor.T.numpy()
 
     return audio
 
@@ -1470,9 +1487,16 @@ def get_zmq_socket_on_host(
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    # Bind to random TCP port
+    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
+    if host:
+        if is_valid_ipv6_address(host):
+            socket.setsockopt(zmq.IPV6, 1)
+            bind_host = f"tcp://[{host}]"
+        else:
+            bind_host = f"tcp://{host}"
+    else:
+        bind_host = "tcp://*"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
 
@@ -2089,7 +2113,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2643,48 +2672,6 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def maybe_wrap_ipv6_address(address: str) -> str:
-    if is_valid_ipv6_address(address):
-        return f"[{address}]"
-    return address
-
-
-def format_tcp_address(ip: str, port: int) -> str:
-    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
-
-
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):

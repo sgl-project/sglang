@@ -808,6 +808,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import sys
+
 import torch
 import triton
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
+from sglang.srt.utils import is_sm100_supported
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 BLOCK_SIZE = 16
+_NVFP4_SUPPORTED = is_sm100_supported()
 
 try:
     from flashinfer import fp4_quantize as flashinfer_fp4_quantize
@@ -59,6 +63,8 @@ def _aot_scaled_fp4_quant(input: torch.Tensor, input_global_scale: torch.Tensor)
 def _probe_legacy_aot_quant() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return False, "CUDA is not available."
+    if not _NVFP4_SUPPORTED:
+        return False, "NVFP4 benchmarks require sm100+ with CUDA 12.8+."
     try:
         import sgl_kernel  # noqa: F401
     except Exception as e:
@@ -88,6 +94,8 @@ def _probe_flashinfer_quant() -> tuple[bool, str]:
         return False, "import flashinfer.fp4_quantize failed."
     if not torch.cuda.is_available():
         return False, "CUDA is not available."
+    if not _NVFP4_SUPPORTED:
+        return False, "NVFP4 benchmarks require sm100+ with CUDA 12.8+."
     try:
         x = torch.randn((16, 64), dtype=torch.bfloat16, device="cuda")
         global_scale = (
@@ -172,6 +180,9 @@ def benchmark(m, n, provider):
 
 
 if __name__ == "__main__":
+    if not _NVFP4_SUPPORTED:
+        print("[skip] NVFP4 quant benchmark requires sm100+ with CUDA 12.8+.")
+        sys.exit(0)
     if not _FLASHINFER_QUANT_AVAILABLE:
         print(
             f"[info] flashinfer quant baseline unavailable: {_FLASHINFER_QUANT_REASON}"
