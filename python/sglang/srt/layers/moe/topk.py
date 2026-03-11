@@ -29,6 +29,7 @@ from typing import (
 )
 
 import torch
+import torch.nn.functional as F
 
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
@@ -801,15 +802,9 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append placeholder columns for shared experts.  The actual IDs and
             # weights will be overwritten by _remap_topk_ids_for_deepep_fusion
-            # before dispatch, so the values here don't matter.
-            shared_ids = topk_ids.new_full(
-                (num_tokens, num_fused_shared_experts), num_experts
-            )
-            shared_weights = topk_weights.new_zeros(
-                (num_tokens, num_fused_shared_experts)
-            )
-            topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
-            topk_weights = torch.cat([topk_weights, shared_weights], dim=-1)
+            # before dispatch, so the fill values here don't matter.
+            topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
+            topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
 
         return topk_weights, topk_ids
 

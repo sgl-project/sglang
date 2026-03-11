@@ -335,6 +335,12 @@ class MoEGate(nn.Module):
         return logits
 
 
+def _is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -355,11 +361,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _is_deepep_backend = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_mori()
-        )
+        _is_deepep_backend = _is_deepep_class_backend()
         _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
 
         # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
@@ -819,13 +821,10 @@ class DeepseekV2MoE(nn.Module):
                     layer_id=self.layer_id,
                 ),
             )
-            if self._deepep_fusion_enabled:
-                topk_output = self._remap_topk_ids_for_deepep_fusion(topk_output)
-
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if self._deepep_fusion_enabled:
-                topk_output = self._remap_topk_ids_for_deepep_fusion(topk_output)
+        if self._deepep_fusion_enabled:
+            topk_output = self._remap_topk_ids_for_deepep_fusion(topk_output)
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1012,9 +1011,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_ids=topk_ids.new_empty((0, topk_ids.shape[-1] + 1)),
                 topk_weights=topk_weights.new_empty((0, topk_weights.shape[-1] + 1)),
             )
-        # Remap routed IDs: e → e + e // num_local_routed (interleave shared slots)
         topk_ids[:, :-1] += topk_ids[:, :-1] // self._deepep_num_local_routed
-        # Set shared expert to home rank's local slot; weight compensates routed_scaling_factor
         topk_ids[:, -1] = (
             self.experts.moe_ep_rank * self._deepep_num_local_experts
             + self._deepep_num_local_routed
@@ -2201,11 +2198,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # home EP rank's local expert slot (expanded 256+EP_size expert layout).
         # num_fused_shared_experts=n_shared_experts enables weight remapping in
         # deepseek_weight_loader: mlp.shared_experts → mlp.experts.256.
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_mori()
-        ):
+        if _is_deepep_class_backend():
             log_info_on_rank0(
                 logger,
                 "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
