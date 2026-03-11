@@ -55,10 +55,11 @@ class PrefillDelayer:
         )
         # The global_info contains four pieces of information:
         # prefillable, token_watermark_force_allow, running_batch, and max_prefill_bs.
+        self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
-        dp_size = dp_size if self.enable_dp_attention else 1
+        dp_size_dim = dp_size if self.enable_dp_attention else 1
         self._global_info_buffer = torch.empty(
-            (dp_size, attn_tp_size, 4),
+            (dp_size_dim, attn_tp_size, 4),
             dtype=torch.int64,
             device=device,
         )
@@ -68,7 +69,6 @@ class PrefillDelayer:
 
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
-        self.dp_size = dp_size
 
         assert (
             server_args.disaggregation_mode == "null"
