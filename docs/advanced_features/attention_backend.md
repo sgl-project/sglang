@@ -43,7 +43,6 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
 | **FA4**                    | 1                         | ❌               | ✅               | ✅                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ❌               | ❌                       | ❌              | ❌              |
-| **NSA (DSA)**              | any                       | ✅               | ❌               | ✅                       | ✅              | ❌              |
 
 ```{note}
 Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
@@ -51,7 +50,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 ```{note}
 - FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
-- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend (NSA)](#dsa-attention-backend-nsa) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md) for details.
 ```
 
 ```{warning}
@@ -116,38 +115,15 @@ Internally, the NSA backend dispatches to different sub-backends for prefill and
 
 | **Sub-backend**       | **Prefill** | **Decode** | **Notes**                                     |
 |-----------------------|-------------|------------|-----------------------------------------------|
-| **flashmla_sparse**   | ✅          | ❌         | Default prefill on Hopper and Blackwell (bf16) |
-| **flashmla_kv**       | ✅          | ✅         | Default decode for FP8                        |
-| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv   |
+| **flashmla_sparse**   | ✅          | ✅         | Default prefill on Hopper and Blackwell (bf16) |
+| **flashmla_kv**       | ✅          | ✅         | Default decode for FP8 on Blackwell with DP   |
+| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype |
 | **fa3**               | ✅          | ✅         | Default decode on Hopper (bf16)               |
-| **trtllm**            | ✅          | ✅         | Default decode on Blackwell (bf16); default for both on Blackwell without DP (FP8) |
+| **trtllm**            | ✅          | ✅         | Default decode on Blackwell (bf16); default for both on Blackwell without DP |
 | **tilelang**          | ✅          | ✅         | Default on AMD (ROCm)                         |
+| **aiter**             | ✅          | ✅         | AMD-specific kernel library (requires aiter package) |
 
-```bash
-# DeepSeek V3.2 with NSA on Hopper (auto-selects sub-backends)
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-V3-0324 \
-  --attention-backend nsa \
-  --trust-remote-code
-
-# DeepSeek V3.2 with FP8 KV cache
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-V3-0324 \
-  --attention-backend nsa \
-  --kv-cache-dtype fp8_e4m3 \
-  --trust-remote-code
-
-# Explicit sub-backend override
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-V3-0324 \
-  --attention-backend nsa \
-  --nsa-prefill-backend flashmla_sparse \
-  --nsa-decode-backend trtllm \
-  --trust-remote-code
-```
+For deployment examples, see the [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md).
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
