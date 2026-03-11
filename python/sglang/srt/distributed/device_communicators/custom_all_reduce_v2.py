@@ -173,13 +173,13 @@ def _init_config():
         }
     else:
         THRESHOLD_2_SHOT_MAP = {
-            2: ModeConfig(0, INF),
-            3: ModeConfig(0, 512 * KB),
-            4: ModeConfig(0, 256 * KB),
-            5: ModeConfig(0, 256 * KB),
-            6: ModeConfig(0, 256 * KB),
-            7: ModeConfig(0, 192 * KB),
-            8: ModeConfig(0, 192 * KB),
+            2: ModeConfig(2 * MB, INF),
+            3: ModeConfig(512 * MB, 512 * KB),
+            4: ModeConfig(384 * KB, 256 * KB),
+            5: ModeConfig(256 * KB, 256 * KB),
+            6: ModeConfig(192 * KB, 192 * KB),
+            7: ModeConfig(192 * KB, 192 * KB),
+            8: ModeConfig(160 * KB, 160 * KB),
         }
 
 
