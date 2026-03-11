@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    apply_chat_template_to_additional_message,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
@@ -262,6 +263,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        request.pretokenize_mismatch = processed_messages.pretokenize_mismatch
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -636,11 +638,19 @@ class OpenAIServingChat(OpenAIServingBase):
         N = request.pretokenized_num_message
         messages = request.messages
 
-        # FIXME
+        # Only reject pretokenized input when the request actually contains
+        # multimodal content (e.g. images/videos).  Text-only requests on
+        # multimodal-capable models are fine.
         if self.tokenizer_manager.model_config.is_multimodal:
-            raise ValueError(
-                "Pretokenized token IDs input is not supported for multimodal models"
-            )
+            for msg in messages:
+                content = getattr(msg, "content", None)
+                if isinstance(content, list) and any(
+                    getattr(part, "type", None) not in (None, "text")
+                    for part in content
+                ):
+                    raise ValueError(
+                        "Pretokenized token IDs input is not supported when the request contains multimodal content"
+                    )
 
         if N > len(messages):
             raise ValueError(
@@ -660,7 +670,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
         all_msg_dicts = [msg.model_dump() for msg in messages]
-        prefix_msgs = all_msg_dicts[:N]
 
         # Process tool_calls arguments: str -> dict (consistent with standard path)
         for msg in all_msg_dicts:
@@ -679,45 +688,35 @@ class OpenAIServingChat(OpenAIServingBase):
 
         chat_template_kwargs = request.chat_template_kwargs or {}
 
-        # Tokenize first N messages (no generation prompt)
-        prefix_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-            prefix_msgs,
-            tokenize=True,
-            add_generation_prompt=False,
+        new_msgs = all_msg_dicts[N:]
+        tokenization_result = apply_chat_template_to_additional_message(
+            new_msgs,
+            self.tokenizer_manager.tokenizer,
             tools=tools,
             reasoning_effort=request.reasoning_effort,
-            return_dict=False,
-            **chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
+            pretokenized_last_token_id=request.pretokenized_token_ids[-1],
+        )
+        incremental_ids = tokenization_result.token_ids
+
+        # Debug info for pretokenized concat issues
+        pretokenized_text = self.tokenizer_manager.tokenizer.decode(
+            request.pretokenized_token_ids
+        )
+        incremental_text = self.tokenizer_manager.tokenizer.decode(incremental_ids)
+        logger.info(
+            "Pretokenized concat debug: rid=%s N=%s pretokenized_len=%d "
+            "incremental_len=%d pretokenized_text=%r incremental_text=%r "
+            "tokenization_meta=%s",
+            request.rid,
+            N,
+            len(request.pretokenized_token_ids),
+            len(incremental_ids),
+            pretokenized_text,
+            incremental_text,
+            tokenization_result.meta_info,
         )
 
-        # Tokenize all messages (with generation prompt)
-        full_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-            all_msg_dicts,
-            tokenize=True,
-            add_generation_prompt=True,
-            tools=tools,
-            reasoning_effort=request.reasoning_effort,
-            return_dict=False,
-            **chat_template_kwargs,
-        )
-
-        # Validate prefix match
-        if full_ids[: len(prefix_ids)] != prefix_ids:
-            raise ValueError(
-                "Prefix mismatch: tokenizing first N messages does not match "
-                "the prefix of tokenizing all messages. "
-                f"prefix_ids length={len(prefix_ids)}, full_ids length={len(full_ids)}"
-            )
-
-        incremental_ids = full_ids[len(prefix_ids) :]
-        # Fault tolerance: templates like qwen3 insert a trailing `\n` after
-        # the last assistant message.  Its loss-mask is 0, so we only prepend
-        # it for alignment when it really is a whitespace-only token.
-        if (
-            prefix_ids[-1] != request.pretokenized_token_ids[-1]
-            and self.tokenizer_manager.tokenizer.decode([prefix_ids[-1]]).strip() == ""
-        ):
-            incremental_ids = [prefix_ids[-1]] + incremental_ids
         prompt_ids = list(request.pretokenized_token_ids) + incremental_ids
 
         # Decode prompt_ids to text for the prompt field
@@ -732,6 +731,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=None,
             modalities=[],
             stop=stop,
+            pretokenize_mismatch=tokenization_result.meta_info["prefix_mismatch"],
         )
 
     async def _handle_streaming_request(
@@ -1041,6 +1041,14 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        logger.info(
+            "Build chat response start: rid=%s n_ret=%d logprobs=%s return_meta_info=%s return_prompt_token_ids=%s",
+            request.rid,
+            len(ret),
+            request.logprobs,
+            request.return_meta_info,
+            request.return_prompt_token_ids,
+        )
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)
@@ -1057,10 +1065,53 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         for idx, ret_item in enumerate(ret):
+            meta_info = ret_item.get("meta_info", {})
+            if request.pretokenize_mismatch is not None:
+                meta_info["pretokenize_mismatch"] = request.pretokenize_mismatch
+            output_ids = ret_item.get("output_ids") or []
+            output_token_logprobs = meta_info.get("output_token_logprobs", None)
+            completion_tokens = meta_info.get("completion_tokens", None)
+            output_logprobs_len = (
+                len(output_token_logprobs)
+                if isinstance(output_token_logprobs, list)
+                else None
+            )
+            text_for_debug = ret_item.get("text", "")
+            logger.info(
+                "Build chat response choice[%d]: finish_reason=%s completion_tokens=%s output_ids_len=%d output_logprobs_len=%s text_len=%d",
+                idx,
+                meta_info.get("finish_reason", None),
+                completion_tokens,
+                len(output_ids),
+                output_logprobs_len,
+                len(text_for_debug),
+            )
+            if (
+                request.logprobs
+                and isinstance(completion_tokens, int)
+                and isinstance(output_token_logprobs, list)
+                and completion_tokens != output_logprobs_len
+            ):
+                logger.warning(
+                    "Build chat response choice[%d] logprobs mismatch: completion_tokens=%d output_logprobs_len=%d output_ids_len=%d output_ids_tail=%s output_logprobs_tail=%s text_tail=%r",
+                    idx,
+                    completion_tokens,
+                    output_logprobs_len,
+                    len(output_ids),
+                    output_ids[-10:],
+                    output_token_logprobs[-10:],
+                    text_for_debug[-200:],
+                )
+
             # Process logprobs
             choice_logprobs = None
             if request.logprobs:
                 choice_logprobs = self._process_response_logprobs(ret_item)
+                logger.info(
+                    "Build chat response choice[%d]: processed_choice_logprobs_len=%d",
+                    idx,
+                    len(choice_logprobs.content),
+                )
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
