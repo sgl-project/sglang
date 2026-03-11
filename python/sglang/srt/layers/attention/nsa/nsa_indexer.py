@@ -1341,7 +1341,9 @@ class Indexer(MultiPlatformOp):
             k_pe = k_pe.unsqueeze(1)
 
             if layer_id == 0:
-                self.rotary_emb.sin_cos_cache = self.rotary_emb.cos_sin_cache.index_select(0, positions)
+                self.rotary_emb.sin_cos_cache = (
+                    self.rotary_emb.cos_sin_cache.index_select(0, positions)
+                )
 
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             k_pe = k_pe.squeeze(1)

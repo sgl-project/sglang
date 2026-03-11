@@ -15,9 +15,9 @@
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
-import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -222,7 +222,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        quant_config = quant_config if get_global_server_args().speculative_draft_model_quantization else None
+        quant_config = (
+            quant_config
+            if get_global_server_args().speculative_draft_model_quantization
+            else None
+        )
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()

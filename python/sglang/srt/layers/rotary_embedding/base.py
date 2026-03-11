@@ -206,7 +206,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        
+
         if hasattr(self, "sin_cos_cache"):
             cos_sin = self.sin_cos_cache
         else:
@@ -251,7 +251,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 cos_sin = self.sin_cos_cache
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
-            
+
             if query.shape[0] * query.shape[1] < 65535:
                 return fused_rope_qk_mqa(
                     query,
