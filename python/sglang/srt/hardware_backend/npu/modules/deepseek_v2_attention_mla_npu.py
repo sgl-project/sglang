@@ -395,6 +395,9 @@ def forward_dsa_prepare_npu(
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        if m.layer_id == 0:
+            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(0, positions)
+            
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):

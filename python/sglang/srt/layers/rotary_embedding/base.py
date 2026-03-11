@@ -203,7 +203,11 @@ class RotaryEmbedding(MultiPlatformOp):
 
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        
+        if hasattr(self, "sin_cos_cache"):
+            cos_sin = self.sin_cos_cache
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
@@ -240,11 +244,16 @@ class RotaryEmbedding(MultiPlatformOp):
             and self.cos_sin_cache.dtype == torch.float
             or key.ndim == 3
         ):
+            if hasattr(self, "sin_cos_cache"):
+                cos_sin = self.sin_cos_cache
+            else:
+                cos_sin = self.cos_sin_cache.index_select(0, positions)
+            
             if query.shape[0] * query.shape[1] < 65535:
                 return fused_rope_qk_mqa(
                     query,
                     key,
-                    self.cos_sin_cache.index_select(0, positions),
+                    cos_sin,
                     self.rotary_dim,
                     self.is_neox_style,
                 )
