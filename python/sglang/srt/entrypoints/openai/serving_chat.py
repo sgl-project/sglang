@@ -265,8 +265,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
-        request.pretokenize_mismatch = processed_messages.pretokenize_mismatch
-
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -702,22 +700,6 @@ class OpenAIServingChat(OpenAIServingBase):
             tools=tools,
         )
 
-        # Debug info for pretokenized concat issues
-        # pretokenized_text = self.tokenizer_manager.tokenizer.decode(
-        #     request.pretokenized_token_ids
-        # )
-        # incremental_text = self.tokenizer_manager.tokenizer.decode(incremental_ids)
-        # logger.info(
-        #     "Pretokenized concat debug: rid=%s N=%s pretokenized_len=%d "
-        #     "incremental_len=%d pretokenized_text=%r incremental_text=%r",
-        #     request.rid,
-        #     N,
-        #     len(request.pretokenized_token_ids),
-        #     len(incremental_ids),
-        #     pretokenized_text,
-        #     incremental_text,
-        # )
-
         prompt_ids = list(request.pretokenized_token_ids) + incremental_ids
 
         # Decode prompt_ids to text for the prompt field
@@ -1041,14 +1023,6 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
-        logger.info(
-            "Build chat response start: rid=%s n_ret=%d logprobs=%s return_meta_info=%s return_prompt_token_ids=%s",
-            request.rid,
-            len(ret),
-            request.logprobs,
-            request.return_meta_info,
-            request.return_prompt_token_ids,
-        )
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)
@@ -1065,53 +1039,10 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         for idx, ret_item in enumerate(ret):
-            meta_info = ret_item.get("meta_info", {})
-            if request.pretokenize_mismatch is not None:
-                meta_info["pretokenize_mismatch"] = request.pretokenize_mismatch
-            output_ids = ret_item.get("output_ids") or []
-            output_token_logprobs = meta_info.get("output_token_logprobs", None)
-            completion_tokens = meta_info.get("completion_tokens", None)
-            output_logprobs_len = (
-                len(output_token_logprobs)
-                if isinstance(output_token_logprobs, list)
-                else None
-            )
-            text_for_debug = ret_item.get("text", "")
-            logger.info(
-                "Build chat response choice[%d]: finish_reason=%s completion_tokens=%s output_ids_len=%d output_logprobs_len=%s text_len=%d",
-                idx,
-                meta_info.get("finish_reason", None),
-                completion_tokens,
-                len(output_ids),
-                output_logprobs_len,
-                len(text_for_debug),
-            )
-            if (
-                request.logprobs
-                and isinstance(completion_tokens, int)
-                and isinstance(output_token_logprobs, list)
-                and completion_tokens != output_logprobs_len
-            ):
-                logger.warning(
-                    "Build chat response choice[%d] logprobs mismatch: completion_tokens=%d output_logprobs_len=%d output_ids_len=%d output_ids_tail=%s output_logprobs_tail=%s text_tail=%r",
-                    idx,
-                    completion_tokens,
-                    output_logprobs_len,
-                    len(output_ids),
-                    output_ids[-10:],
-                    output_token_logprobs[-10:],
-                    text_for_debug[-200:],
-                )
-
             # Process logprobs
             choice_logprobs = None
             if request.logprobs:
                 choice_logprobs = self._process_response_logprobs(ret_item)
-                logger.info(
-                    "Build chat response choice[%d]: processed_choice_logprobs_len=%d",
-                    idx,
-                    len(choice_logprobs.content),
-                )
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)

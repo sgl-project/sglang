@@ -605,7 +605,6 @@ class ChatCompletionRequest(BaseModel):
     # Pretokenized input: skip tokenization for first N messages
     pretokenized_token_ids: Optional[List[int]] = None
     pretokenized_num_message: Optional[int] = None
-    pretokenize_mismatch: Optional[bool] = None
     # AdditionalMessageTokenizer type (e.g. "default", "qwen3", "glm47")
     additional_tokenizer: Optional[str] = None
 
@@ -1384,7 +1383,6 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
-    pretokenize_mismatch: Optional[bool] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
