@@ -369,7 +369,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
-  m.def("fused_add_layernorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, Tensor? bias, float eps) -> Tensor");
+  m.def(
+      "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
+      "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
 
   // topk
