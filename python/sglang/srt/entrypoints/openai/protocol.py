@@ -606,6 +606,8 @@ class ChatCompletionRequest(BaseModel):
     pretokenized_token_ids: Optional[List[int]] = None
     pretokenized_num_message: Optional[int] = None
     pretokenize_mismatch: Optional[bool] = None
+    # AdditionalMessageTokenizer type (e.g. "default", "qwen3", "glm47")
+    additional_tokenizer: Optional[str] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None

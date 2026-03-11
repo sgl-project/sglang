@@ -37,8 +37,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from miles.utils.chat_template_utils.additional_message_tokenizer import (
+    get_additional_message_tokenizer,
+)
 from sglang.srt.entrypoints.openai.utils import (
-    apply_chat_template_to_additional_message,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
@@ -688,34 +690,33 @@ class OpenAIServingChat(OpenAIServingBase):
 
         chat_template_kwargs = request.chat_template_kwargs or {}
 
-        new_msgs = all_msg_dicts[N:]
-        tokenization_result = apply_chat_template_to_additional_message(
-            new_msgs,
+        additional_tokenizer = get_additional_message_tokenizer(
             self.tokenizer_manager.tokenizer,
-            tools=tools,
-            reasoning_effort=request.reasoning_effort,
+            tokenizer_type=request.additional_tokenizer or "default",
             chat_template_kwargs=chat_template_kwargs,
-            pretokenized_last_token_id=request.pretokenized_token_ids[-1],
         )
-        incremental_ids = tokenization_result.token_ids
+        new_messages = all_msg_dicts[N:]
+        incremental_ids = additional_tokenizer.tokenize_additional(
+            new_messages=new_messages,
+            pretokenized_token_ids=request.pretokenized_token_ids,
+            tools=tools,
+        )
 
         # Debug info for pretokenized concat issues
-        pretokenized_text = self.tokenizer_manager.tokenizer.decode(
-            request.pretokenized_token_ids
-        )
-        incremental_text = self.tokenizer_manager.tokenizer.decode(incremental_ids)
-        logger.info(
-            "Pretokenized concat debug: rid=%s N=%s pretokenized_len=%d "
-            "incremental_len=%d pretokenized_text=%r incremental_text=%r "
-            "tokenization_meta=%s",
-            request.rid,
-            N,
-            len(request.pretokenized_token_ids),
-            len(incremental_ids),
-            pretokenized_text,
-            incremental_text,
-            tokenization_result.meta_info,
-        )
+        # pretokenized_text = self.tokenizer_manager.tokenizer.decode(
+        #     request.pretokenized_token_ids
+        # )
+        # incremental_text = self.tokenizer_manager.tokenizer.decode(incremental_ids)
+        # logger.info(
+        #     "Pretokenized concat debug: rid=%s N=%s pretokenized_len=%d "
+        #     "incremental_len=%d pretokenized_text=%r incremental_text=%r",
+        #     request.rid,
+        #     N,
+        #     len(request.pretokenized_token_ids),
+        #     len(incremental_ids),
+        #     pretokenized_text,
+        #     incremental_text,
+        # )
 
         prompt_ids = list(request.pretokenized_token_ids) + incremental_ids
 
@@ -731,7 +732,6 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=None,
             modalities=[],
             stop=stop,
-            pretokenize_mismatch=tokenization_result.meta_info["prefix_mismatch"],
         )
 
     async def _handle_streaming_request(
