@@ -94,7 +94,7 @@ Note:
 # From repo root
 Remove-Item -Force python/pyproject.toml
 Copy-Item python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_windows]"
+pip install -e "python[diffusion_windows]"
 ```
 
 Quick test:

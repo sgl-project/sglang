@@ -627,3 +627,12 @@ if current_platform.is_mps():
 
     norm_infer = norm_infer_native
     rms_norm_fn = rms_norm_fn_native
+
+if current_platform.is_windows():
+    from sglang.jit_kernel.diffusion.triton.windows_fallback import (
+        norm_infer_native,
+        rms_norm_fn_native,
+    )
+
+    norm_infer = norm_infer_native
+    rms_norm_fn = rms_norm_fn_native

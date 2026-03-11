@@ -1,5 +1,7 @@
 """Windows-specific CUDA platform policy for native diffusion runtime."""
 
+from functools import lru_cache
+
 from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatform
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -9,6 +11,10 @@ logger = init_logger(__name__)
 
 class WindowsCudaPlatform(CudaPlatform):
     """CUDA platform variant with conservative defaults for Windows."""
+
+    @lru_cache(maxsize=1)
+    def is_windows(self) -> bool:
+        return True
 
     @classmethod
     def get_torch_distributed_backend_str(cls) -> str:

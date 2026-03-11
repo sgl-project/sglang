@@ -1,11 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-import platform
-
-from sglang.multimodal_gen._triton_stub import install_triton_stub_if_needed
+import sys
 
 # Native Windows runtime needs import compatibility for Triton-backed modules.
-if platform.system() == "Windows":
-    install_triton_stub_if_needed()
+if sys.platform == "win32":
+    from sglang._triton_stub import install as _install_triton_stub
+
+    _install_triton_stub()
+    del _install_triton_stub
 
 from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 from sglang.multimodal_gen.configs.sample import SamplingParams
