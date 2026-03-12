@@ -17,10 +17,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -57,6 +59,7 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
@@ -64,6 +67,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +256,9 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        if self.server_args.model_impl == "mindspore":
+            return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
@@ -275,18 +282,27 @@ class EagleDraftWorker(BaseDraftWorker):
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
+        supports_hip_aiter_draft_extend_graph = False
+        if _is_hip:
+            # Keep import local so non-HIP environments do not require aiter.
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterMultiStepDraftBackend,
+            )
+
+            supports_hip_aiter_draft_extend_graph = isinstance(
+                self.draft_attn_backend, AiterMultiStepDraftBackend
+            )
+
+        supports_cuda_draft_extend_graph = _is_cuda and (
+            isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            or isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
+        )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
-            )
+            or supports_cuda_draft_extend_graph
+            or supports_hip_aiter_draft_extend_graph
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -834,6 +850,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
+
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -848,6 +867,72 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _compute_spec_v2_logprobs(
+        self,
+        batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+    ):
+        """Compute logprobs for accepted tokens on GPU in the forward stream.
+
+        Stores results in logits_output fields so they flow through copy_to_cpu().
+        """
+
+        bs = len(batch.seq_lens)
+        max_accept = self.speculative_num_steps + 1
+        device = predict.device
+
+        flat_accept_idx = accept_index.long().reshape(-1)
+        gathered_logits = logits_output.next_token_logits[flat_accept_idx]
+
+        if (
+            batch.sampling_info.is_all_greedy
+            or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
+        ):
+            gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
+        else:
+            temperatures = torch.repeat_interleave(
+                batch.sampling_info.temperatures,
+                max_accept,
+                dim=0,
+            )
+            gathered_logprobs = torch.nn.functional.log_softmax(
+                gathered_logits / temperatures, dim=-1
+            )
+        gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
+
+        accepted_token_ids = predict[flat_accept_idx]
+        token_logprobs = gathered_logprobs[
+            torch.arange(bs * max_accept, device=device),
+            accepted_token_ids.long(),
+        ]
+        logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+
+        if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+            top_logprobs_nums_expanded = [
+                num for num in batch.top_logprobs_nums for _ in range(max_accept)
+            ]
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
+            )
+
+        if batch.token_ids_logprobs and any(
+            x is not None for x in batch.token_ids_logprobs
+        ):
+            token_ids_logprobs_expanded = [
+                ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
+            ]
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(
+                gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
+            )
 
     def _mamba_verify_update(
         self,
