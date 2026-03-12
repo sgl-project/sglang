@@ -2529,9 +2529,9 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = (
-                False if envs.SGLANG_ENABLE_SPEC_V2.get() else True
-            )
+            # NOTE: overlap schedule is always enabled for ngram spec
+            self.disable_overlap_schedule = False
+            logger.info(f"Overlap schedule is forcefully enabled for ngram spec.")
             if not self.disable_overlap_schedule:
                 logger.warning("The page size is set to 1 for ngram spec v2.")
                 self.page_size = 1

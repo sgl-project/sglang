@@ -74,7 +74,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         verify_done: Optional[torch.cuda.Event] = None,
         verified_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
-        is_spec_v2: Optional[bool] = False,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -97,7 +96,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.verify_done = verify_done
         self.verified_tokens = verified_tokens
         self.accept_lens = accept_lens
-        self.is_spec_v2 = is_spec_v2
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
@@ -478,18 +476,14 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         return logits_output, self.verified_id, num_accepted_tokens
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        if self.is_spec_v2:
-            self.verified_tokens = self.verified_tokens.reshape(
-                -1, self.draft_token_num
-            )[new_indices, :]
-            self.verified_tokens = self.verified_tokens.flatten()
-            self.accept_lens = self.accept_lens[new_indices]
+        self.verified_tokens = self.verified_tokens.reshape(-1, self.draft_token_num)[
+            new_indices, :
+        ]
+        self.verified_tokens = self.verified_tokens.flatten()
+        self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
-        if self.is_spec_v2:
-            self.verified_tokens = torch.cat(
-                (self.verified_tokens, spec_info.verified_tokens), dim=0
-            )
-            self.accept_lens = torch.cat(
-                (self.accept_lens, spec_info.accept_lens), dim=0
-            )
+        self.verified_tokens = torch.cat(
+            (self.verified_tokens, spec_info.verified_tokens), dim=0
+        )
+        self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)

@@ -93,11 +93,7 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorker
         elif self.is_ngram():
-            if enable_overlap:
-                from sglang.srt.speculative.ngram_worker_v2 import NGRAMWorkerV2
-
-                return NGRAMWorkerV2
-
+            # NOTE: NgramWorker only supports spec v2, no longer supports spec v1
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
