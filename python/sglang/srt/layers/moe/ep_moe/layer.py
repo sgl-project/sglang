@@ -567,7 +567,6 @@ class NpuFuseEPMoE(DeepEPMoE):
                 layer.w2_weight_scale.data
             )
         else:
-            envs.SGLANG_NPU_FUSED_MOE_MODE.set(1)
             cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
             layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
             w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
