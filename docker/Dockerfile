@@ -224,11 +224,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # TODO: move from Tom's branch to DeepEP hybrid-ep branch
 # We use the nvshmem version that ships with torch 2.9.1
 # CU12 uses 3.3.20 and CU13 uses 3.3.24
+COPY docker/patches/deepep_topk10.patch /tmp/deepep_topk10.patch
+
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      # Backport DeepEP topk=10 support from DeepSeek PR 403
+      git apply --check /tmp/deepep_topk10.patch && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
@@ -240,12 +244,14 @@ RUN set -eux; \
       sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
-            https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
-        unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-        cd .. ; \
+      curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
+          https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
+      unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && \
+      mv DeepEP-${DEEPEP_COMMIT} DeepEP && \
+      cd DeepEP && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     fi
 
 # Install DeepEP
