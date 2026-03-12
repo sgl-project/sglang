@@ -850,7 +850,14 @@ class Scheduler(
                 )
                 from sglang.srt.mem_cache.kv_connector import BaseKVConnector
 
-                module_path, class_name = server_args.kv_connector_cls.rsplit(".", 1)
+                # module_path, class_name = server_args.kv_connector_cls.rsplit(".", 1)
+                _KV_CONNECTOR_ALIASES = {
+                    "flexkv": "sglang.srt.mem_cache.storage.flexkv.flexkv_connector.FlexKVConnector",
+                }
+                connector_cls_path = _KV_CONNECTOR_ALIASES.get(
+                    server_args.kv_connector_cls, server_args.kv_connector_cls
+                )
+                module_path, class_name = connector_cls_path.rsplit(".", 1)
                 module = importlib.import_module(module_path)
                 connector_cls = getattr(module, class_name)
                 if not issubclass(connector_cls, BaseKVConnector):
