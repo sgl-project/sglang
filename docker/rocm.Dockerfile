@@ -27,7 +27,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT="v0.1.11.post1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -37,7 +37,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT="v0.1.11.post1"
 
 # ===============================
 # Base image 950 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT="v0.1.11.post1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT="v0.1.11.post1"
 
 # ===============================
 # Chosen arch and args
@@ -105,6 +105,33 @@ ARG AINIC_VERSION=1.117.5
 ARG UBUNTU_CODENAME=jammy
 USER root
 
+# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
+# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
+# amdgpu.ids device-ID-to-marketing-name mapping file.
+# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# See https://github.com/ROCm/ROCm/issues/5992
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+        ;; \
+      *) \
+        echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
+          > /etc/apt/sources.list.d/amdgpu-graphics.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+             libdrm-amdgpu-common \
+             libdrm-amdgpu-amdgpu1 \
+             libdrm2-amdgpu \
+        && rm -rf /var/lib/apt/lists/* \
+        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+        ;; \
+    esac
+
+
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
@@ -145,6 +172,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter \
+ && pip install flydsl==0.0.1.dev95158637 \
  && pip install psutil pybind11 # Required by AITER setup.py
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -165,15 +193,21 @@ RUN set -eux; \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
-
+# [WA] from kk-huang
+# add sed -i '/c1 = torch.empty((M, D, S1 + S3) for aiter triton gemm config issue
+# the corresponding pr is https://github.com/ROCm/aiter/pull/2173
+# it will be removed when server launched issue is fixed by aiter
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
+     && sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         else \
-          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
