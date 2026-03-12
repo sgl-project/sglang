@@ -546,7 +546,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, fp_comm: bool = False) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
