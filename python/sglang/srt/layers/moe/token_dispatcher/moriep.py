@@ -173,29 +173,20 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
 
 @lru_cache(maxsize=4)
 def _get_mori_dispatch_quant_flags(is_nextn=False):
-    fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-    fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
+    fp8_var, fp4_var = "SGLANG_MORI_FP8_DISP", "SGLANG_MORI_FP4_DISP"
+    if is_nextn and (
+        "SGLANG_MORI_NEXTN_FP8_DISP" in os.environ
+        or "SGLANG_MORI_NEXTN_FP4_DISP" in os.environ
+    ):
+        fp8_var, fp4_var = "SGLANG_MORI_NEXTN_FP8_DISP", "SGLANG_MORI_NEXTN_FP4_DISP"
 
-    if is_nextn:
-        # If no NEXTN variables set, use base variables
-        if (
-            "SGLANG_MORI_NEXTN_FP8_DISP" in os.environ
-            or "SGLANG_MORI_NEXTN_FP4_DISP" in os.environ
-        ):
-            fp8_dispatch = get_bool_env_var("SGLANG_MORI_NEXTN_FP8_DISP", "False")
-            fp4_dispatch = get_bool_env_var("SGLANG_MORI_NEXTN_FP4_DISP", "False")
-
-            if fp8_dispatch and fp4_dispatch:
-                logger.warning(
-                    "Both SGLANG_MORI_NEXTN_FP8_DISP and SGLANG_MORI_NEXTN_FP4_DISP are set to True. "
-                    "Using SGLANG_MORI_NEXTN_FP4_DISP and ignoring SGLANG_MORI_NEXTN_FP8_DISP."
-                )
-                fp8_dispatch = False
+    fp8_dispatch = get_bool_env_var(fp8_var, "False")
+    fp4_dispatch = get_bool_env_var(fp4_var, "False")
 
     if fp8_dispatch and fp4_dispatch:
         logger.warning(
-            "Both SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are set to True. "
-            "Using SGLANG_MORI_FP4_DISP and ignoring SGLANG_MORI_FP8_DISP."
+            f"Both {fp8_var} and {fp4_var} are set to True. "
+            f"Using {fp4_var} and ignoring {fp8_var}."
         )
         fp8_dispatch = False
 
