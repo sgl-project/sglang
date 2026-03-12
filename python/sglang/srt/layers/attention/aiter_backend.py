@@ -1522,21 +1522,21 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_q_len,
-                    kv_indptr[-1].item(),
-                    work_metadata=work_metadata,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    num_kv_splits=num_kv_splits,
-                )
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                kv_indptr[-1].item(),
+                work_metadata=work_metadata,
+                work_info_set=work_info_set,
+                work_indptr=work_indptr,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                num_kv_splits=num_kv_splits,
+            )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
