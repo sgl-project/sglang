@@ -241,13 +241,10 @@ class EagleVerifyInputV2Mixin:
 
                 # Fully async: use non_blocking to avoid CPU-GPU sync
                 # Create tensor on CPU first, then async copy to GPU
-                next_track_indices_cpu = torch.tensor(
+                next_track_indices = torch.tensor(
                     [req.mamba_next_track_idx for req in batch.reqs],
                     dtype=torch.long,
-                )
-                next_track_indices = next_track_indices_cpu.to(
-                    device, non_blocking=True
-                )
+                ).to(device, non_blocking=True)
 
                 batch.mamba_track_indices = torch.gather(
                     ping_pong_buffers, dim=1, index=next_track_indices.unsqueeze(1)
