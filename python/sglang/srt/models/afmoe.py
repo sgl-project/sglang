@@ -32,7 +32,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -46,8 +45,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -148,12 +146,12 @@ class AfmoeMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
         self.n_routed_experts = getattr(config, "num_experts", None)
@@ -187,20 +185,17 @@ class AfmoeMoE(nn.Module):
             requires_grad=False,
         )
 
-        self.experts = nn.ModuleList(
-            [
-                AfmoeMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix(f"experts.{idx}", prefix),
-                )
-                for idx in range(self.n_routed_experts)
-            ]
+        self.experts = FusedMoE(
+            num_experts=self.n_routed_experts,
+            top_k=self.top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            layer_id=layer_id,
+            reduce_results=False,
+            quant_config=quant_config,
+            routed_scaling_factor=self.route_scale,
+            prefix=add_prefix("experts", prefix),
         )
-        self.pack_params()
 
         if self.num_shared_experts:
             intermediate_size = config.moe_intermediate_size * self.num_shared_experts
@@ -238,24 +233,6 @@ class AfmoeMoE(nn.Module):
             routed_scaling_factor=self.route_scale,
         )
 
-    def pack_params(self) -> None:
-        w1: list[torch.Tensor] = []
-        w2: list[torch.Tensor] = []
-        for expert in self.experts:
-            w1.append(expert.gate_up_proj.weight)
-            w2.append(expert.down_proj.weight)
-        self.w1 = torch._utils._flatten_dense_tensors(w1)
-        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
-        for data, param in zip(w1s, w1):
-            param.data = data
-        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
-
-        self.w2 = torch._utils._flatten_dense_tensors(w2)
-        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
-        for data, param in zip(w2s, w2):
-            param.data = data
-        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -266,16 +243,7 @@ class AfmoeMoE(nn.Module):
 
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe.fused_moe(
-            hidden_states,
-            w1=self.w1,
-            w2=self.w2,
-            topk_output=topk_output,
-            moe_runner_config=MoeRunnerConfig(
-                inplace=True,
-                routed_scaling_factor=self.route_scale,
-            ),
-        )
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -444,6 +412,7 @@ class AfmoeDecoderLayer(nn.Module):
         if use_moe:
             self.mlp = AfmoeMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -540,6 +509,12 @@ class AfmoeModel(nn.Module):
 
 
 class AfmoeForCausalLM(nn.Module):
+    # Map fused module names back to checkpoint names so quantization ignore
+    # lists like q_proj/k_proj/v_proj also skip the fused qkv_proj module.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -549,6 +524,8 @@ class AfmoeForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.quant_config = quant_config
         self.model = AfmoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -589,27 +566,31 @@ class AfmoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            # Skip rotary embedding inverse frequencies
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Remap router gate weights: HF uses .mlp.router.gate., SGLang uses .mlp.gate.
             if ".mlp.router.gate." in name:
                 name = name.replace(".mlp.router.gate.", ".mlp.gate.")
 
-            # Handle stacked params (qkv_proj, gate_up_proj)
             handled = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # Skip gate_proj/up_proj stacking for self_attn (attention uses separate gate_proj)
                 if ".self_attn." in name and weight_name in {"gate_proj", "up_proj"}:
+                    continue
+                if "mlp.experts." in name:
                     continue
 
                 new_name = name.replace(weight_name, param_name)
-                # Skip if parameter doesn't exist (e.g., bias for layers without bias)
                 if new_name not in params_dict:
                     handled = True
                     break
@@ -623,7 +604,27 @@ class AfmoeForCausalLM(nn.Module):
             if handled:
                 continue
 
-            # Load remaining weights directly
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    break
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                handled = True
+                break
+
+            if handled:
+                continue
+
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
