@@ -403,6 +403,8 @@ def globally_suppress_loggers():
         "python_multipart.multipart",
         "filelock",
         "urllib3",
+        "httpx",
+        "httpcore",
     ]
 
     for name in target_names:
