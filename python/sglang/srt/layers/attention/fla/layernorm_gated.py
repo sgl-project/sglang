@@ -21,11 +21,14 @@ from sglang.srt.utils import (
     device_context,
     is_cpu,
     is_npu,
+    is_cuda,
+    is_xpu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+_is_xpu = is_xpu()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
@@ -172,6 +175,8 @@ def _layer_norm_fwd_1pass_kernel(
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
     """Get and cache the SM count for a given device."""
+    if _is_xpu:
+        return torch.xpu.get_device_properties(device).gpu_eu_count
     props = torch.cuda.get_device_properties(device)
     return props.multi_processor_count
 
