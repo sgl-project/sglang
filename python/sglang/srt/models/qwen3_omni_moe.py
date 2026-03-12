@@ -108,9 +108,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
 
         if hidden_states.dtype == torch.float16:
@@ -459,9 +459,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
-        feature_attention_mask = torch.cat(
-            [item.feature_attention_mask for item in items], dim=0
-        ).type(torch.long)
+        device = next(self.audio_tower.parameters()).device
+        feature_attention_mask = (
+            torch.cat([item.feature_attention_mask for item in items], dim=0)
+            .type(torch.long)
+            .to(device)
+        )
         input_features = (
             torch.cat([item.feature for item in items])
             .type(self.audio_tower.dtype)
