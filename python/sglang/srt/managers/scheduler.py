@@ -1193,11 +1193,10 @@ class Scheduler(
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch
-            and batch.forward_mode.is_extend()
+            and getattr(batch, "is_extend_in_batch", batch.forward_mode.is_extend())
             and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and getattr(self.last_batch, "is_extend_in_batch", self.last_batch.forward_mode.is_extend())
         )
-
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
