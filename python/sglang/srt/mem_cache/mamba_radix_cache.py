@@ -21,7 +21,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 
 import heapq
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -82,8 +82,11 @@ class TreeNode:
         self.last_access_time = get_last_access_time()
 
         self.hit_count = 0
+        self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value = None
+        # store hash values of each pages
+        self.hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -103,6 +106,29 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -350,10 +376,10 @@ class LRUList:
 
             if self.mamba:
                 evictable_size = tree_cache.mamba_evictable_size()
-                lru_list_evictable_size = tree_cache.mamba_lru_list_evictable_size()
+                lru_list_evictable_size = self.sanity_check_evictable_size()
             else:
                 evictable_size = tree_cache.full_evictable_size()
-                lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
+                lru_list_evictable_size = self.sanity_check_evictable_size()
 
             assert (
                 evictable_size == lru_list_evictable_size
@@ -457,7 +483,7 @@ class MambaRadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value
+            self.root_node, key, value, mamba_value, params.chunked
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -639,7 +665,7 @@ class MambaRadixCache(BasePrefixCache):
         match_result = self.match_prefix(
             MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
-        (new_indices, new_last_node) = (
+        new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
@@ -857,14 +883,6 @@ class MambaRadixCache(BasePrefixCache):
     def mamba_evictable_size(self) -> int:
         return self.mamba_evictable_size_
 
-    # Note: this is expensive, only use for debug
-    def full_lru_list_evictable_size(self) -> int:
-        return self.full_lru_list.sanity_check_evictable_size()
-
-    # Note: this is expensive, only use for debug
-    def mamba_lru_list_evictable_size(self) -> int:
-        return self.mamba_lru_list.sanity_check_evictable_size()
-
     def protected_size(self) -> Tuple[int, int]:
         # Note: use full_protected_size() and mamba_protected_size() instead.
         raise NotImplementedError
@@ -899,6 +917,14 @@ class MambaRadixCache(BasePrefixCache):
 
         _dfs_helper(self.root_node)
         return torch.cat(values) if len(values) > 0 else torch.tensor([])
+
+    def available_and_evictable_str(self) -> str:
+        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_evictable_size = self.full_evictable_size()
+        return (
+            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+            f"Full LRU list evictable size: {self.full_lru_list.sanity_check_evictable_size()}\n"
+        )
 
     ##### Internal Helper Functions #####
 
@@ -1063,6 +1089,7 @@ class MambaRadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
+        chunked: bool = False,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first

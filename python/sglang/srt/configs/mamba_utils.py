@@ -102,7 +102,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
 
-    logger.info(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
@@ -217,11 +217,13 @@ class KimiLinearStateShape:
         conv_state_k_shape = (divide(proj_k_size, tp_world_size), conv_kernel_size - 1)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
 
-        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
-        conv_state_k_shape = conv_state_k_shape[1], conv_state_k_shape[0]
+        conv_state_shape = (
+            conv_state_shape[1],
+            conv_state_shape[0] + conv_state_k_shape[0] * 2,
+        )
 
         return KimiLinearStateShape(
-            conv=[conv_state_shape, conv_state_k_shape, conv_state_k_shape],
+            conv=[conv_state_shape],
             temporal=temporal_state_shape,
             num_heads=num_heads,
             head_dim=head_dim,

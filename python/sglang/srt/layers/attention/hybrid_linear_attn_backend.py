@@ -1,88 +1,35 @@
-from typing import Optional, Tuple, Union
+import logging
+from typing import Optional, Union
 
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 
-from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.srt.layers.attention.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_update,
-)
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    PAD_SLOT_ID,
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils import is_cpu
 
-if not is_cpu() and not is_npu():
-    # fix import error on CPU device, no impacts when non-CPU path
-    from sglang.jit_kernel.cutedsl_gdn import (
-        cutedsl_fused_sigmoid_gating_delta_rule_update,
-    )
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
-    from sglang.srt.layers.attention.fla.kda import chunk_kda
 
-if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
-    )
-
-    causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update_npu,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    chunk_gated_delta_rule = chunk_gated_delta_rule_npu
-    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
-elif is_cpu():
-    assert (
-        cpu_has_amx_support()
-    ), "CPU requires AMX support for hybrid linear attn backend"
-    from sgl_kernel.mamba import (
-        causal_conv1d_fn_cpu,
-        causal_conv1d_update_cpu,
-        chunk_gated_delta_rule_cpu,
-    )
-
-    chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
-    causal_conv1d_fn = causal_conv1d_fn_cpu
-    causal_conv1d_update = causal_conv1d_update_cpu
-    fused_sigmoid_gating_delta_rule_update = (
-        torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
-    )
-    fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+logger = logging.getLogger(__name__)
 
 
 # Kernel to track mamba states if needed based on track mask
@@ -223,8 +170,13 @@ class MambaAttnBackendBase(AttentionBackend):
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
-        elif forward_batch.forward_mode.is_extend():
-            if forward_batch.forward_mode.is_target_verify():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
+                # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
+                # the draft model, so mamba metadata can be skipped.
+                query_start_loc = None
+            elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
                     forward_batch.input_ids.shape[0] + 1,
@@ -432,6 +384,20 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
 
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        self.forward_metadata = self._capture_metadata(
+            bs, req_pool_indices, forward_mode, spec_info
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
@@ -470,6 +436,23 @@ class MambaAttnBackendBase(AttentionBackend):
             step=draft_token_num,
             dtype=torch.int32,
             device=self.device,
+        )
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        assert (
+            max_num_tokens % max_bs == 0
+        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        for i in range(max_bs):
+            self.state_indices_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.query_start_loc_list.append(
+                torch.empty((i + 2,), dtype=torch.int32, device=self.device)
+            )
+        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
         )
 
     def _capture_metadata(
@@ -578,6 +561,9 @@ class MambaAttnBackendBase(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1  # Mamba attn does not use seq lens to index kv cache
 
+    def get_cpu_graph_seq_len_fill_value(self):
+        return 1
+
     def _track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
@@ -641,399 +627,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
                 ]
-
-
-class KimiLinearAttnBackend(MambaAttnBackendBase):
-    """Attention backend using Mamba kernel."""
-
-    def forward_decode(
-        self,
-        layer: RadixLinearAttention,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        **kwargs,
-    ):
-        assert isinstance(mixed_qkv, Tuple)
-        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
-        (q_conv_weights, k_conv_weights, v_conv_weights) = layer.conv_weights
-        (q_conv_bias, k_conv_bias, v_conv_bias) = layer.bias
-
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
-        ssm_states = layer_cache.temporal
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
-
-        q_conv_state = q_conv_state.transpose(-1, -2)
-        k_conv_state = k_conv_state.transpose(-1, -2)
-        v_conv_state = v_conv_state.transpose(-1, -2)
-
-        q = causal_conv1d_update(
-            q_proj_states,
-            q_conv_state,
-            q_conv_weights,
-            q_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-        k = causal_conv1d_update(
-            k_proj_states,
-            k_conv_state,
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-        v = causal_conv1d_update(
-            v_proj_states,
-            v_conv_state,
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
-
-        return fused_sigmoid_gating_delta_rule_update(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            is_kda=True,
-        )
-
-    def forward_extend(
-        self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
-    ):
-        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-            causal_conv1d_fn,
-        )
-
-        assert isinstance(mixed_qkv, Tuple)
-        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
-        (q_conv_weights, k_conv_weights, v_conv_weights) = layer.conv_weights
-        (q_conv_bias, k_conv_bias, v_conv_bias) = layer.bias
-
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
-
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_state_q, conv_state_k, conv_state_v = mamba_cache_params.conv
-        # deal with strides
-        conv_state_q = conv_state_q.transpose(-1, -2)
-        conv_state_k = conv_state_k.transpose(-1, -2)
-        conv_state_v = conv_state_v.transpose(-1, -2)
-
-        ssm_states = mamba_cache_params.temporal
-
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
-        q_proj_states = q_proj_states.transpose(0, 1)
-        k_proj_states = k_proj_states.transpose(0, 1)
-        v_proj_states = v_proj_states.transpose(0, 1)
-
-        q = causal_conv1d_fn(
-            q_proj_states,
-            q_conv_weights,
-            q_conv_bias,
-            activation="silu",
-            conv_states=conv_state_q,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-
-        k = causal_conv1d_fn(
-            k_proj_states,
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_states=conv_state_k,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-
-        v = causal_conv1d_fn(
-            v_proj_states,
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_states=conv_state_v,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
-
-        core_attn_out = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=query_start_loc,
-        )
-
-        return core_attn_out
-
-
-class GDNAttnBackend(MambaAttnBackendBase):
-    """Attention backend using Mamba kernel."""
-
-    def __init__(self, model_runner: ModelRunner):
-        super().__init__(model_runner)
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
-        if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
-        self._kernel_func = (
-            cutedsl_fused_sigmoid_gating_delta_rule_update
-            if use_cutedsl
-            else fused_sigmoid_gating_delta_rule_update
-        )
-
-    def forward_decode(
-        self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
-    ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = layer_cache.conv[0]
-        ssm_states = layer_cache.temporal
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
-
-        assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-        # Reshape from [bs, h*d] to [1, bs, h, d]
-        bs = forward_batch.batch_size
-        query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
-
-        core_attn_out = self._kernel_func(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
-
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
-
-        return core_attn_out
-
-    def forward_extend(
-        self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
-    ):
-        assert isinstance(mixed_qkv, torch.Tensor)
-        seq_len = mixed_qkv.shape[0]
-
-        is_target_verify = forward_batch.forward_mode.is_target_verify()
-        forward_metadata = self.forward_metadata
-
-        query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
-        retrieve_next_token = forward_metadata.retrieve_next_token
-        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
-        retrieve_parent_token = forward_metadata.retrieve_parent_token
-
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = mamba_cache_params.conv[0]
-        ssm_states = mamba_cache_params.temporal
-        if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = (
-                mamba_cache_params.intermediate_conv_window[0]
-            )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
-        else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-
-        if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
-                # Gather all slices at once: [:, track_conv_indices] -> [d, num_masked, slice_len]
-                # track_conv_indices is already filtered and clamped in _init_track_conv_indices
-                mixed_qkv_to_track = mixed_qkv[
-                    :, forward_metadata.track_conv_indices
-                ].transpose(0, 1)
-                # Apply mask and assign to destinations
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
-
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
-
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-
-        if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-        else:
-            # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu() or is_cpu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
-            core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
-            )
-            if is_npu() or is_cpu():
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
-
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
-
-        return core_attn_out
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -1147,6 +740,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_cpu_graph_state(max_bs, max_num_tokens)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -1159,6 +756,27 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+            )
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_capture_cpu_graph(
                 bs,
                 num_tokens,
                 req_pool_indices,
@@ -1194,6 +812,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
 
+    def get_cpu_graph_seq_len_fill_value(self):
+        return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
+
     def forward_decode(
         self,
         layer: RadixAttention,
@@ -1202,7 +823,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1234,7 +855,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1266,11 +887,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         layer: RadixAttention = None,
         forward_batch: ForwardBatch = None,
         save_kv_cache: bool = True,
-        mixed_qkv: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-        ] = None,  # For GDN linear attention
-        a: Optional[torch.Tensor] = None,  # For GDN linear attention
-        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
@@ -1278,15 +897,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                # KDA:
-                if isinstance(mixed_qkv, tuple):
-                    return mixed_qkv[0].new_empty(
-                        mixed_qkv[0].shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
-                else:  # GDN:
-                    return mixed_qkv.new_empty(
-                        mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
+                return mixed_qkv.new_empty(
+                    mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
+                )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
@@ -1322,15 +935,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
     ):
+        """
+        Update mamba states after MTP verify using fully fused Triton kernel.
+
+        This replaces the original advanced indexing operations with a single fused
+        gather-scatter kernel that also handles masking internally, avoiding:
+        - index_elementwise_kernel from tensor[bool_mask]
+        - index_select kernel launches
+        - nonzero kernel launches
+        """
         request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
             ]
-        )
-        intermediate_state_indices = torch.arange(
-            request_number, dtype=torch.int32, device=state_indices_tensor.device
         )
 
         mamba_caches = (
@@ -1342,41 +961,34 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
-
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
-            :, src_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
-
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # Use fully fused kernel that handles masking internally
+        # This avoids separate nonzero() and index_select() calls
+        fused_mamba_state_scatter_with_mask(
+            ssm_states,
+            intermediate_state_cache,
+            state_indices_tensor,
+            accepted_steps,
+        )
+        fused_mamba_state_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            accepted_steps,
+        )
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            track_mask = mamba_steps_to_track >= 0
-            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-            if track_steps.numel() == 0:
-                # No track indices to update
-                return
-            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
-
-            # scatter into ssm_states at the chosen track states
-            ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-                :, src_track_indices, track_steps
-            ].to(ssm_states.dtype, copy=False)
-
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+            # Use fully fused kernel for track scatter operations
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            fused_mamba_state_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )

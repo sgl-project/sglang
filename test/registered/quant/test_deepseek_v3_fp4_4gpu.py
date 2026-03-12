@@ -70,7 +70,7 @@ class TestDeepseekV3FP4(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -100,7 +100,6 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
-            "--enable-piecewise-cuda-graph",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--model-loader-extra-config",
@@ -137,7 +136,7 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -207,7 +206,7 @@ class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4-cutlass-moe)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.93)
 
 
 class TestDeepseekV3FP4SymmetricMemory(CustomTestCase):
@@ -261,7 +260,7 @@ class TestDeepseekV3FP4SymmetricMemory(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":

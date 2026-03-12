@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.2
+FLASHINFER_VERSION=0.6.4
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -28,10 +28,10 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
 # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
 apt-get update || true
-apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
-    for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+    for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils ffmpeg; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
             echo "ERROR: Required package $pkg is not installed and apt-get failed"
             exit 1
@@ -118,7 +118,35 @@ fi
 
 # Clean up existing installations
 $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
-$PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+# Keep flashinfer packages installed if version matches to avoid re-downloading:
+# - flashinfer-cubin: 150+ MB, plus extra cubins from ci_download_flashinfer_cubin.sh
+# - flashinfer-jit-cache: 1.2+ GB, by far the largest download in CI
+FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+
+UNINSTALL_CUBIN=true
+UNINSTALL_JIT_CACHE=true
+
+if [ "$FLASHINFER_CUBIN_INSTALLED" = "$FLASHINFER_CUBIN_REQUIRED" ] && [ -n "$FLASHINFER_CUBIN_REQUIRED" ]; then
+    echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, keeping it"
+    UNINSTALL_CUBIN=false
+else
+    echo "flashinfer-cubin version mismatch (installed: ${FLASHINFER_CUBIN_INSTALLED:-none}, required: ${FLASHINFER_CUBIN_REQUIRED}), reinstalling"
+fi
+
+if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_VERSION" ] && [ -n "$FLASHINFER_VERSION" ]; then
+    echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed, keeping it"
+    UNINSTALL_JIT_CACHE=false
+else
+    echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_VERSION}), will reinstall"
+fi
+
+# Build uninstall list based on what needs updating
+FLASHINFER_UNINSTALL="flashinfer-python"
+[ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
+[ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
+$PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
 $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
 # Install the main package
@@ -236,52 +264,60 @@ fi
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
-# Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
-FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
-mkdir -p "${FLASHINFER_CACHE_DIR}"
-
-# Clean up old versions to avoid cache bloat
-find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_VERSION}*" -type f -delete 2>/dev/null || true
-
-FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
-CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-
+# The jit-cache wheel is 1.2+ GB, so we skip the download entirely if already installed.
 FLASHINFER_INSTALLED=false
-
-# Try to install from cache first
-if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-    echo "Found cached flashinfer wheel: $CACHED_WHEEL"
-    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
-        FLASHINFER_INSTALLED=true
-        echo "Successfully installed flashinfer-jit-cache from cache"
-    else
-        echo "Failed to install from cache, will try downloading..."
-        rm -f "$CACHED_WHEEL"
-    fi
+if [ "$UNINSTALL_JIT_CACHE" = false ]; then
+    FLASHINFER_INSTALLED=true
+    echo "flashinfer-jit-cache already at correct version, skipping download"
 fi
 
-# If not installed from cache, download with retry logic
 if [ "$FLASHINFER_INSTALLED" = false ]; then
-    for i in {1..5}; do
-        # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
-        if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
-            --index-url https://flashinfer.ai/whl/${CU_VERSION} \
-            -d "${FLASHINFER_CACHE_DIR}"; then
+    # Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
+    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    mkdir -p "${FLASHINFER_CACHE_DIR}"
 
-            CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-            if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-                if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
-                    FLASHINFER_INSTALLED=true
-                    echo "Successfully downloaded and installed flashinfer-jit-cache"
-                    break
-                fi
-            else
-                echo "Warning: Download succeeded but wheel file not found"
-            fi
+    # Clean up old versions to avoid cache bloat
+    find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_VERSION}*" -type f -delete 2>/dev/null || true
+
+    FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
+    CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+
+    # Try to install from cache first
+    if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+        echo "Found cached flashinfer wheel: $CACHED_WHEEL"
+        if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+            FLASHINFER_INSTALLED=true
+            echo "Successfully installed flashinfer-jit-cache from cache"
+        else
+            echo "Failed to install from cache, will try downloading..."
+            rm -f "$CACHED_WHEEL"
         fi
-        echo "Attempt $i to download flashinfer-jit-cache failed, retrying in 10 seconds..."
-        sleep 10
-    done
+    fi
+
+    # If not installed from cache, download with retry logic
+    if [ "$FLASHINFER_INSTALLED" = false ]; then
+        for i in {1..5}; do
+            # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
+            # Timeout after 10 minutes — the wheel is ~1.2 GB
+            if timeout 600 pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+                --index-url https://flashinfer.ai/whl/${CU_VERSION} \
+                -d "${FLASHINFER_CACHE_DIR}"; then
+
+                CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+                if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+                    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+                        FLASHINFER_INSTALLED=true
+                        echo "Successfully downloaded and installed flashinfer-jit-cache"
+                        break
+                    fi
+                else
+                    echo "Warning: Download succeeded but wheel file not found"
+                fi
+            fi
+            echo "Attempt $i to download flashinfer-jit-cache failed, retrying in 10 seconds..."
+            sleep 10
+        done
+    fi
 fi
 
 if [ "$FLASHINFER_INSTALLED" = false ]; then
@@ -289,9 +325,17 @@ if [ "$FLASHINFER_INSTALLED" = false ]; then
     exit 1
 fi
 
+# Download flashinfer cubins if the local set is incomplete
+bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
+
+# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
+$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+$PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
+python3 -c "import cutlass; import cutlass.cute;"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
