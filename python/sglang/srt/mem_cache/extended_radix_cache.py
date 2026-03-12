@@ -279,8 +279,8 @@ class ExtendedRadixCache(BasePrefixCache):
     def inc_lock_ref(self, node):
         return self._inner_radixtree.inc_lock_ref(node)
 
-    def dec_lock_ref(self, node, swa_uuid_for_lock=None):
-        return self._inner_radixtree.dec_lock_ref(node, swa_uuid_for_lock)
+    def dec_lock_ref(self, node):
+        return self._inner_radixtree.dec_lock_ref(node)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         return self._inner_radixtree.cache_unfinished_req(req, **kwargs)

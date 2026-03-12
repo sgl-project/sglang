@@ -2362,6 +2362,7 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
+                self.running_batch.batch_is_full = False
                 ret = None
 
         # Handle DP attention and log stats
