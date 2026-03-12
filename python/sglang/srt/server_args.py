@@ -5574,6 +5574,7 @@ class ServerArgs:
 
         parser.add_argument(
             "--quantize-tp-communications",
+            action="store_true",
             default=False,
             help="Enable INT8 quantization of TP communications (limited support).",
         )
