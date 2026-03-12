@@ -68,5 +68,60 @@ class TestSamplingParamsSubclass(unittest.TestCase):
             DiffusersGenericSamplingParams(num_frames=0)
 
 
+class TestNegativePromptMerge(unittest.TestCase):
+    """Regression tests for negative_prompt not being passed through CLI
+    when using diffusers backend (subclass default differs from base)."""
+
+    def test_get_cli_args_filters_none(self):
+        ns = argparse.Namespace(negative_prompt=None, prompt="hello")
+        result = SamplingParams.get_cli_args(ns)
+        self.assertNotIn("negative_prompt", result)
+        self.assertEqual(result["prompt"], "hello")
+
+    def test_get_cli_args_keeps_explicit_value(self):
+        ns = argparse.Namespace(negative_prompt="ugly, blurry")
+        result = SamplingParams.get_cli_args(ns)
+        self.assertEqual(result["negative_prompt"], "ugly, blurry")
+
+    def test_merge_preserves_subclass_default_when_user_unchanged(self):
+        """When user doesn't pass --negative-prompt, the subclass default
+        (empty string for DiffusersGeneric) should be preserved."""
+        target = DiffusersGenericSamplingParams()
+        self.assertEqual(target.negative_prompt, "")
+
+        user = SamplingParams()  # uses base default
+        target._merge_with_user_params(user)
+        self.assertEqual(target.negative_prompt, "")
+
+    def test_merge_applies_user_negative_prompt(self):
+        """When user explicitly passes --negative-prompt, it should override
+        the subclass default."""
+        target = DiffusersGenericSamplingParams()
+        user = SamplingParams(negative_prompt="ugly, blurry")
+        target._merge_with_user_params(user)
+        self.assertEqual(target.negative_prompt, "ugly, blurry")
+
+    def test_cli_roundtrip_no_negative_prompt(self):
+        """Simulate CLI without --negative-prompt: subclass default is kept."""
+        ns = argparse.Namespace(negative_prompt=None, width=512, height=512)
+        kwargs = SamplingParams.get_cli_args(ns)
+        user = SamplingParams(**kwargs)
+
+        target = DiffusersGenericSamplingParams()
+        target._merge_with_user_params(user)
+        self.assertEqual(target.negative_prompt, "")
+
+    def test_cli_roundtrip_with_negative_prompt(self):
+        """Simulate CLI with --negative-prompt: user value is applied."""
+        user_neg = "bad quality, watermark"
+        ns = argparse.Namespace(negative_prompt=user_neg, width=512, height=512)
+        kwargs = SamplingParams.get_cli_args(ns)
+        user = SamplingParams(**kwargs)
+
+        target = DiffusersGenericSamplingParams()
+        target._merge_with_user_params(user)
+        self.assertEqual(target.negative_prompt, user_neg)
+
+
 if __name__ == "__main__":
     unittest.main()
