@@ -346,11 +346,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "xpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
-            elif processor.__class__.__name__ not in {
-                "Qwen2_5_VLProcessor",
-                "Qwen3VLProcessor",
-            }:
+            else:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                    npu_apply_qwen_image_preprocess_patch,
+                )
+
+                npu_apply_qwen_image_preprocess_patch()
                 kwargs["device"] = "npu"
 
         result = processor.__call__(
