@@ -143,6 +143,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
+        pp_proxy_scatter_factor: int,
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
@@ -177,9 +178,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                pp_proxy_bs = max_bs // pp_proxy_scatter_factor
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((pp_proxy_bs, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((pp_proxy_bs, hidden_size), dtype=dtype),
                 }
             else:
                 pp_proxy_tensors = None
@@ -596,6 +598,14 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+
+        # When MoE uses a2a backends with scattered mode, inter-PP-stage tensors
+        # have shape (num_tokens / attn_tp_size, hidden_size) instead of the full
+        # (num_tokens, hidden_size). Scale the PP proxy buffer accordingly.
+        self.pp_proxy_scatter_factor = (
+            self.attn_tp_size if self.require_attn_tp_gather else 1
+        )
+
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -607,6 +617,7 @@ class CudaGraphRunner:
             pp_size=self.pp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
+            pp_proxy_scatter_factor=self.pp_proxy_scatter_factor,
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
@@ -839,10 +850,11 @@ class CudaGraphRunner:
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         buffers.num_token_non_padded[...] = num_tokens
 
-        # pipeline parallelism
+        # pipeline parallelism — account for scattered mode in MoE a2a
         if self.pp_size > 1:
+            pp_num_tokens = num_tokens // self.pp_proxy_scatter_factor
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if self.require_mlp_tp_gather:
