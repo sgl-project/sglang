@@ -13,6 +13,8 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+from __future__ import annotations
+
 import datetime
 import gc
 import inspect
@@ -30,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -131,6 +134,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -300,6 +304,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
     ):
         # Parse args
@@ -321,6 +326,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
@@ -391,8 +397,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
-        # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
+        # Get available memory before model loading
+        pre_model_load_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -413,7 +419,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # Initialize the model runner
-        self.initialize(min_per_gpu_memory)
+        self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
 
         if self.is_multimodal:
@@ -447,7 +453,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def initialize(self, min_per_gpu_memory: float):
+    def initialize(self, pre_model_load_memory: float):
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -600,17 +606,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        self.init_memory_pool(pre_model_load_memory)
 
-        # Init max running requests
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests // (self.dp_size)
-            ),
-            self.req_to_token_pool.size,
-        )
+        # Init ngram embedding token table
+        self.maybe_init_ngram_embedding()
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -809,6 +808,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -826,7 +826,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-        min_per_gpu_memory = get_available_gpu_memory(
+        pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -839,9 +839,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
-            if min_per_gpu_memory < local_gpu_memory * 0.9:
+            if pre_model_load_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                 if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
                     raise RuntimeError(msg)
                 else:
@@ -851,7 +851,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
-        return min_per_gpu_memory
+        return pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         """
@@ -2118,6 +2118,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         with torch.inference_mode(), run_ctx or empty_context():
             run_once()
 
+    def maybe_init_ngram_embedding(self):
+        self.use_ngram_embedding = self.model_config.use_ngram_embedding
+        if self.use_ngram_embedding:
+            from sglang.srt.layers.n_gram_embedding import NgramEmbedding
+
+            self.token_table = torch.empty(
+                self.req_to_token_pool.size,
+                self.model_config.context_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            chunked_prefill_size = self.server_args.chunked_prefill_size
+            assert (
+                chunked_prefill_size is not None and chunked_prefill_size > 0
+            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            for module in self.model.modules():
+                if isinstance(module, NgramEmbedding):
+                    module.init_buffers(
+                        self.max_running_requests, chunked_prefill_size, self.device
+                    )
+
+    def maybe_update_ngram_token_table(
+        self,
+        next_token_ids: torch.Tensor,
+        forward_batch: "ForwardBatch",
+    ):
+        """Update the ngram embedding token table after sampling."""
+        ngram_embedding_info = forward_batch.ngram_embedding_info
+        if ngram_embedding_info is None:
+            return
+        ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
+            forward_batch.seq_lens
+        )
+        ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
+        update_token_table(
+            ne_token_table=ngram_embedding_info.token_table,
+            tokens=next_token_ids.to(torch.int32),
+            row_indices=forward_batch.req_pool_indices,
+            column_starts=ngram_embedding_info.out_column_starts,
+            req_lens=torch.ones_like(ngram_embedding_info.out_column_starts),
+            ignore_tokens=None,
+        )
+
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
@@ -2195,24 +2238,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_layers = []
         self.moe_fusions = []
         for layer in language_model.model.layers:
+            attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                    attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
-                    self.attention_layers.append(layer.self_attn.attn_mqa)
+                    attn_layer = layer.self_attn.attn_mqa
             # For hybrid model
             elif hasattr(layer, "attn"):
-                self.attention_layers.append(layer.attn)
+                attn_layer = layer.attn
             elif hasattr(layer, "linear_attn"):
                 if hasattr(layer.linear_attn, "attn"):
-                    self.attention_layers.append(layer.linear_attn.attn)
+                    attn_layer = layer.linear_attn.attn
                 else:
-                    self.attention_layers.append(layer.linear_attn)
+                    attn_layer = layer.linear_attn
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
-                    self.attention_layers.append(layer.attention.attn)
+                    attn_layer = layer.attention.attn
+            # For NemotronH and similar hybrid models using 'mixer' attribute
+            elif hasattr(layer, "mixer"):
+                if hasattr(layer.mixer, "attn"):
+                    attn_layer = layer.mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    # Mamba layer with split op support - store the layer itself
+                    attn_layer = layer
+
+            if attn_layer is not None:
+                self.attention_layers.append(attn_layer)
 
             moe_block = None
             moe_fusion = None
@@ -2227,6 +2281,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
                 moe_block = layer.moe.experts
                 moe_fusion = layer.moe
+            # For NemotronH MoE layers using 'mixer' attribute
+            if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
+                moe_block = layer.mixer.experts
+                moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
 
@@ -2580,6 +2638,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+        self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 
     def compute_logprobs_only(

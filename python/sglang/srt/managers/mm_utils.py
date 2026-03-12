@@ -1045,6 +1045,110 @@ def embed_mm_inputs(
     return input_embeds, other_info
 
 
+def _embed_mm_inputs_with_split(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_embedding: nn.Embedding,
+    multimodal_model: nn.Module = None,
+    data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+):
+    """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
+    precomputed_req_indices = []
+    non_precomputed_req_indices = []
+    for idx, mm_input in enumerate(mm_inputs_list):
+        items = [item for item in mm_input.mm_items if item is not None]
+        if items and all(
+            getattr(item, "precomputed_embeddings", None) is not None for item in items
+        ):
+            precomputed_req_indices.append(idx)
+        else:
+            non_precomputed_req_indices.append(idx)
+
+    embed_kwargs = dict(
+        multimodal_model=multimodal_model,
+        input_embedding=input_embedding,
+        data_embedding_func_mapping=data_embedding_func_mapping,
+        placeholder_tokens=placeholder_tokens,
+        use_deepstack=use_deepstack,
+    )
+
+    if not precomputed_req_indices or not non_precomputed_req_indices:
+        return embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            **embed_kwargs,
+        )
+
+    all_seq_lens = forward_batch.extend_seq_lens_cpu
+    mm_batch_indices = [
+        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
+    ]
+    token_starts = []
+    cumulative = 0
+    for sl in all_seq_lens:
+        token_starts.append(cumulative)
+        cumulative += sl
+
+    vocab_size = input_embedding.num_embeddings
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
+    other_info = {}
+
+    input_deepstack_embeds = None
+    if use_deepstack and multimodal_model is not None:
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+        input_deepstack_embeds = torch.zeros(
+            input_ids.shape[0],
+            input_embedding.embedding_dim * num_deepstack_embeddings,
+            device=input_ids.device,
+            dtype=input_embedding.weight.dtype,
+        )
+        other_info["input_deepstack_embeds"] = input_deepstack_embeds
+
+    for group_req_indices in [precomputed_req_indices, non_precomputed_req_indices]:
+        sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
+        sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
+        sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
+        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
+        sub_slices = [
+            input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
+            for bi in group_batch_indices
+        ]
+        sub_input_ids = torch.cat(sub_slices)
+
+        sub_embeds, sub_info = embed_mm_inputs(
+            mm_inputs_list=sub_mm_inputs,
+            extend_prefix_lens=sub_prefix_lens,
+            extend_seq_lens=sub_seq_lens,
+            input_ids=sub_input_ids,
+            **embed_kwargs,
+        )
+
+        offset = 0
+        for bi in group_batch_indices:
+            req_len = all_seq_lens[bi]
+            start = token_starts[bi]
+            input_embeds[start : start + req_len] = sub_embeds[
+                offset : offset + req_len
+            ]
+            if (
+                input_deepstack_embeds is not None
+                and "input_deepstack_embeds" in sub_info
+            ):
+                input_deepstack_embeds[start : start + req_len] = sub_info[
+                    "input_deepstack_embeds"
+                ][offset : offset + req_len]
+            offset += req_len
+
+    return input_embeds, other_info
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1091,17 +1195,34 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            input_embeds, other_info = embed_mm_inputs(
-                mm_inputs_list=mm_inputs_list,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens=extend_seq_lens,
-                input_ids=input_ids,
-                multimodal_model=multimodal_model,
-                input_embedding=embed_tokens,
-                data_embedding_func_mapping=data_embedding_funcs,
-                placeholder_tokens=placeholder_tokens,
-                use_deepstack=use_deepstack,
-            )
+            server_args = get_global_server_args()
+            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                input_embeds, other_info = _embed_mm_inputs_with_split(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+            else:
+                input_embeds, other_info = embed_mm_inputs(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
@@ -1120,6 +1241,19 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
+                            if get_global_server_args().language_only:
+                                precomputed_embeddings = getattr(
+                                    mm_item, "precomputed_embeddings", None
+                                )
+                                if (
+                                    isinstance(precomputed_embeddings, torch.Tensor)
+                                    and precomputed_embeddings.is_cuda
+                                ):
+                                    mm_item.precomputed_embeddings = (
+                                        precomputed_embeddings.to(
+                                            "cpu", non_blocking=True
+                                        )
+                                    )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:

@@ -268,3 +268,34 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+
+    def extract_routed_dp_rank_from_header(
+        self, raw_request: Request, body_routed_dp_rank: Optional[int] = None
+    ) -> Optional[int]:
+        """Extract routed_dp_rank from HTTP header, with higher priority than routed_dp_rank in body.
+
+        Header name: X-Data-Parallel-Rank (case-insensitive in HTTP/1.1/2)
+        """
+        if raw_request is None:
+            return body_routed_dp_rank
+
+        header_value = raw_request.headers.get("x-data-parallel-rank")
+        if header_value is not None:
+            try:
+                header_dp_rank = int(header_value)
+                if (
+                    body_routed_dp_rank is not None
+                    and header_dp_rank != body_routed_dp_rank
+                ):
+                    logger.debug(
+                        f"X-Data-Parallel-Rank header ({header_dp_rank}) overrides "
+                        f"body routed_dp_rank ({body_routed_dp_rank})"
+                    )
+                return header_dp_rank
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid X-Data-Parallel-Rank header: must be an integer, got '{header_value}'",
+                )
+
+        return body_routed_dp_rank
