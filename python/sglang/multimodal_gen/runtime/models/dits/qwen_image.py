@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import diffusers
@@ -50,14 +51,57 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
+
+
+_DUAL_STREAM_FORWARD = os.environ.get("_DUAL_STREAM_FORWARD", "0") == "1"
+
+_alt_stream = None
+
+
+def _get_or_create_alt_stream(device_module, priority=0):
+    global _alt_stream
+    if _alt_stream is None:
+        _alt_stream = device_module.Stream(priority=priority)
+    return _alt_stream
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
     NunchakuFeedForward = None
+
+
+def _get_qkv_projections_img(attn: "QwenImageCrossAttention", hidden_states):
+    if attn.use_fused_qkv:
+        img_qkv, _ = attn.to_qkv(hidden_states)
+        img_query, img_key, img_value = [
+            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
+        ]
+    else:
+        img_query, _ = attn.to_q(hidden_states)
+        img_key, _ = attn.to_k(hidden_states)
+        img_value, _ = attn.to_v(hidden_states)
+    return img_query, img_key, img_value
+
+
+def _get_qkv_projections_txt(attn: "QwenImageCrossAttention", encoder_hidden_states):
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        if attn.use_fused_added_qkv:
+            txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+            txt_query, txt_key, txt_value = [
+                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
+            ]
+        else:
+            txt_query, _ = attn.add_q_proj(encoder_hidden_states)
+            txt_key, _ = attn.add_k_proj(encoder_hidden_states)
+            txt_value, _ = attn.add_v_proj(encoder_hidden_states)
+
+    return txt_query, txt_key, txt_value
 
 
 def _get_qkv_projections(
@@ -583,38 +627,57 @@ class QwenImageCrossAttention(nn.Module):
             },
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        **cross_attention_kwargs,
+        self.device_module = torch.get_device_module()
+
+    def forward_prepare_attn_dual_stream(
+        self, hidden_states, encoder_hidden_states, image_rotary_emb
     ):
-        seq_len_txt = encoder_hidden_states.shape[1]
-
-        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        high_priority_stream = _get_or_create_alt_stream(
+            self.device_module, priority=-1
         )
+        main_stream = get_current_device_stream_fast()
+        high_priority_stream.wait_stream(main_stream)
 
-        # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        with self.device_module.stream(high_priority_stream):
+            img_query, img_key, img_value = _get_qkv_projections_img(
+                self, hidden_states
+            )
+            # Reshape for multi-head attention
+            img_query = img_query.unflatten(-1, (self.num_heads, -1))
+            img_key = img_key.unflatten(-1, (self.num_heads, -1))
+            img_value = img_value.unflatten(-1, (self.num_heads, -1))
+            # Apply QK normalization
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=img_query.shape[-1],
+                    allow_inplace=True,
+                )
+            if image_rotary_emb is not None:
+                if not (
+                    isinstance(image_rotary_emb[0], torch.Tensor)
+                    and image_rotary_emb[0].dim() == 2
+                ):
+                    raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
 
+                img_cache, txt_cache = image_rotary_emb
+
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+
+        txt_query, txt_key, txt_value = _get_qkv_projections_txt(
+            self, encoder_hidden_states
+        )
         txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
         if self.qk_norm:
-            img_query, img_key = apply_qk_norm(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                allow_inplace=True,
-            )
             txt_query, txt_key = apply_qk_norm(
                 q=txt_query,
                 k=txt_key,
@@ -633,13 +696,78 @@ class QwenImageCrossAttention(nn.Module):
                 raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
 
             img_cache, txt_cache = image_rotary_emb
-
-            img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                img_query, img_key, img_cache, is_neox=False
-            )
             txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
                 txt_query, txt_key, txt_cache, is_neox=False
             )
+
+        main_stream.wait_stream(high_priority_stream)
+
+        return img_query, img_key, img_value, txt_query, txt_key, txt_value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        **cross_attention_kwargs,
+    ):
+        if _DUAL_STREAM_FORWARD:
+            img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+                self.forward_prepare_attn_dual_stream(
+                    hidden_states, encoder_hidden_states, image_rotary_emb
+                )
+            )
+        else:
+            seq_len_txt = encoder_hidden_states.shape[1]
+
+            img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+                _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+            )
+
+            # Reshape for multi-head attention
+            img_query = img_query.unflatten(-1, (self.num_heads, -1))
+            img_key = img_key.unflatten(-1, (self.num_heads, -1))
+            img_value = img_value.unflatten(-1, (self.num_heads, -1))
+
+            txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
+            txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
+            txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+
+            # Apply QK normalization
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=img_query.shape[-1],
+                    allow_inplace=True,
+                )
+                txt_query, txt_key = apply_qk_norm(
+                    q=txt_query,
+                    k=txt_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=txt_query.shape[-1],
+                    allow_inplace=True,
+                )
+
+            # Apply RoPE
+            if image_rotary_emb is not None:
+                if not (
+                    isinstance(image_rotary_emb[0], torch.Tensor)
+                    and image_rotary_emb[0].dim() == 2
+                ):
+                    raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+
+                img_cache, txt_cache = image_rotary_emb
+
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                    txt_query, txt_key, txt_cache, is_neox=False
+                )
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -778,6 +906,8 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
+        self.device_module = torch.get_device_module()
+
     def _modulate(
         self,
         x: torch.Tensor,
@@ -870,6 +1000,59 @@ class QwenImageTransformerBlock(nn.Module):
                 modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
                 return modulated, gate_result
 
+    def forward_after_attn_dual_stream(
+        self,
+        attn_output: torch.Tensor,
+        img_modulated2: torch.Tensor,
+        hidden_states: torch.Tensor,
+        img_gate2: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_mod2: torch.Tensor,
+        txt_gate1: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_attn_output, txt_attn_output = attn_output
+        high_priority_stream = _get_or_create_alt_stream(
+            self.device_module, priority=-1
+        )
+        main_stream = get_current_device_stream_fast()
+        high_priority_stream.wait_stream(main_stream)
+        with self.device_module.stream(high_priority_stream):
+            # Process image stream - MLP
+            img_mlp_output = self.img_mlp(img_modulated2)[0]
+
+            if img_mlp_output.dim() == 2:
+                img_mlp_output = img_mlp_output.unsqueeze(0)
+            hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
+
+            if hidden_states.dtype == torch.float16:
+                hidden_states = hidden_states.clip(-65504, 65504)
+
+        # Process text stream - norm2 + MLP
+        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
+        txt_modulated2, encoder_hidden_states = self.txt_norm2(
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            gate=txt_gate1,
+            shift=txt_shift2,
+            scale=txt_scale2,
+        )
+        txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        txt_mlp_output = self.txt_mlp(txt_modulated2)[0]
+
+        if txt_mlp_output.dim() == 2:
+            txt_mlp_output = txt_mlp_output.unsqueeze(0)
+        encoder_hidden_states = self.fuse_mul_add(
+            txt_mlp_output, txt_gate2, encoder_hidden_states
+        )
+
+        # Clip to prevent overflow for fp16
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+
+        main_stream.wait_stream(high_priority_stream)
+
+        return encoder_hidden_states, hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -946,6 +1129,18 @@ class QwenImageTransformerBlock(nn.Module):
             gate_x=img_gate1,
             residual_x=hidden_states,
         )
+
+        if _DUAL_STREAM_FORWARD:
+            return self.forward_after_attn_dual_stream(
+                attn_output,
+                img_modulated2,
+                hidden_states,
+                img_gate2,
+                encoder_hidden_states,
+                txt_mod2,
+                txt_gate1,
+            )
+
         img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
