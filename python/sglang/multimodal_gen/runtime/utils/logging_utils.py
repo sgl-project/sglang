@@ -18,6 +18,7 @@ from types import MethodType
 from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.server_args import _sanitize_for_logging
 
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
@@ -459,7 +460,7 @@ def log_generation_timer(
             "Processing prompt %d/%d: %s",
             request_idx,
             total_requests,
-            prompt[:100],
+            _sanitize_for_logging(prompt, key_hint="prompt"),
         )
 
     timer = GenerationTimer()
