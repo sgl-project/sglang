@@ -790,9 +790,10 @@ struct CollectiveMmaArrayMixedInput<
       Tensor gSA_mkl = local_tile(mSA_mkl, ScaleATileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
 
       // Tensor mSB_nkl = mainloop_params.tma_load_scaleB.get_tma_tensor(make_shape(N, scale_k, L));  // (n,scale_k,l)
-      Tensor mSB_nkl = mainloop_params.tma_load_scaleB.get_tma_tensor(shape(detail::get_gmem_layout(
-          make_shape(N, scale_k % 4 == 0 ? scale_k : scale_k * 4, L),
-          mainloop_params.dSB[0])));  // (m,k,l) scale_k need padding to 4 for B scale
+      Tensor mSB_nkl = mainloop_params.tma_load_scaleB.get_tma_tensor(shape(
+          detail::get_gmem_layout(
+              make_shape(N, scale_k % 4 == 0 ? scale_k : scale_k * 4, L),
+              mainloop_params.dSB[0])));  // (m,k,l) scale_k need padding to 4 for B scale
 
       Tensor gSB_nkl = local_tile(mSB_nkl, ScaleBTileShape{}, make_coord(_, _));  // (BLK_N,BLK_Scale_K,n,scale_k,l)
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
