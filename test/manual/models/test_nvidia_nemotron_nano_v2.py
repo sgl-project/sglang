@@ -52,28 +52,33 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, DefaultServerBase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+SPECULATIVE_DECODING_OTHER_ARGS = [
+    "--speculative-algorithm",
+    "STANDALONE",
+    "--speculative-num-steps",
+    "2",
+    "--speculative-eagle-topk",
+    "3",
+    "--speculative-num-draft-tokens",
+    "5",
+    "--speculative-draft-model-path",
+    "meta-llama/Llama-3.2-1B",
+    "--speculative-draft-load-format",
+    "dummy",
+    "--max-running-requests",
+    "8",
+    "--max-total-tokens",
+    "2048",
+    "--json-model-override-args",
+    '{"vocab_size": 131072, "hidden_size": 4480}',
+]
+
+
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
-    other_args = [
-        "--speculative-algorithm",
-        "STANDALONE",
-        "--speculative-num-steps",
-        "2",
-        "--speculative-eagle-topk",
-        "3",
-        "--speculative-num-draft-tokens",
-        "5",
-        "--speculative-draft-model-path",
-        "meta-llama/Llama-3.2-1B",
-        "--speculative-draft-load-format",
-        "dummy",
-        "--max-running-requests",
-        "8",
-        "--max-total-tokens",
-        "2048",
-        "--json-model-override-args",
-        '{"vocab_size": 131072, "hidden_size": 4480}',
+    other_args = SPECULATIVE_DECODING_OTHER_ARGS + [
+        "--disable-radix-cache",
     ]
 
 
@@ -82,7 +87,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
-    other_args = TestNvidiaNemotronNanoV2SpeculativeDecoding.other_args + [
+    other_args = SPECULATIVE_DECODING_OTHER_ARGS + [
         "--mamba-scheduler-strategy",
         "extra_buffer",
     ]
@@ -93,7 +98,8 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
-    other_args = TestNvidiaNemotronNanoV2SpeculativeDecoding.other_args + [
+    other_args = SPECULATIVE_DECODING_OTHER_ARGS + [
+        "--disable-radix-cache",
         "--mamba-ssm-dtype",
         "bfloat16",
     ]
