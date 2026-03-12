@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
-    _clean_hf_config_inplace,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -40,6 +39,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -127,6 +127,9 @@ class TextEncoderLoader(ComponentLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+            hf_weights_files.sort()
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
@@ -173,18 +176,12 @@ class TextEncoderLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the text encoders based on the model path, and inference args."""
-        # model_config: PretrainedConfig = get_hf_config(
-        #     model=model_path,
-        #     trust_remote_code=server_args.trust_remote_code,
-        #     revision=server_args.revision,
-        #     model_override_args=None,
-        # )
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
-        model_config = get_diffusers_component_config(model_path=component_model_path)
-        _clean_hf_config_inplace(model_config)
-        logger.debug("HF model config: %s", model_config)
+        model_config = get_diffusers_component_config(
+            component_path=component_model_path
+        )
 
         def is_not_first_encoder(module_name):
             return "2" in module_name
@@ -279,9 +276,34 @@ class TextEncoderLoader(ComponentLoader):
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
+                # NOTE:
+                # If we silently continue with uninitialized weights, the text encoder can
+                # produce NaNs/garbage embeddings that later fail stage verification in a
+                # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
+                #
+                # We allow a small set of known-optional parameters to be missing, but
+                # default to strict behavior for the rest.
+                allowed_missing_patterns = (
+                    getattr(model, "_allowed_missing_weights_patterns", []) or []
+                )
+                unexpected_missing = {
+                    n
+                    for n in weights_not_loaded
+                    if not any(pat in n for pat in allowed_missing_patterns)
+                }
+                if unexpected_missing:
+                    raise ValueError(
+                        "Following text encoder weights were not initialized from checkpoint: "
+                        f"{sorted(unexpected_missing)}. "
+                        "This usually indicates a checkpoint/model-arch mismatch or a broken "
+                        "weight-name mapping. If these are truly optional, set "
+                        "`model._allowed_missing_weights_patterns` to whitelist patterns."
+                    )
                 logger.warning(
-                    "Following model weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
+                    "Following (allowed) text encoder weights were not initialized from "
+                    "checkpoint: %s (allowed patterns: %s)",
+                    sorted(weights_not_loaded),
+                    allowed_missing_patterns,
                 )
 
         return model

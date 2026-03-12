@@ -7,11 +7,17 @@ from typing import Any
 
 
 @contextmanager
-def temp_set_env(**env_vars: dict[str, Any]):
-    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
-    for key in env_vars:
-        if key.startswith("SGLANG_") or key.startswith("SGL_"):
-            raise ValueError("temp_set_env should not be used for sglang env vars")
+def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
+    """Temporarily set environment variables, restoring originals on exit.
+
+    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
+    for those.  Pass ``allow_sglang=True`` only for special env vars that
+    intentionally bypass ``environ.py``.
+    """
+    if not allow_sglang:
+        for key in env_vars:
+            if key.startswith("SGLANG_") or key.startswith("SGL_"):
+                raise ValueError("temp_set_env should not be used for sglang env vars")
 
     backup = {key: os.environ.get(key) for key in env_vars}
     try:
@@ -155,6 +161,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
@@ -170,6 +177,8 @@ class Envs:
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_CUDA_COREDUMP = EnvBool(False)
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -177,8 +186,6 @@ class Envs:
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
-    # CuTe DSL GDN Decode
-    SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
@@ -236,6 +243,7 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -245,12 +253,13 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
-    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
+    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
-    SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
-    SGLANG_FORWARD_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -259,12 +268,21 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Override the distributed init method used by torch.distributed.init_process_group.
+    # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
+    SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
+    SGLANG_TCP_STORE_PORT = EnvInt(29600)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
+    SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
+    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
@@ -274,6 +292,7 @@ class Envs:
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
@@ -290,6 +309,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
+    # MPS (Apple Silicon)
+    SGLANG_USE_MLX = EnvBool(False)
+
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
@@ -298,6 +320,8 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
+    # Delay all-gather after qlora for better performance for Deepseek v3.2
+    SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -308,6 +332,7 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -354,10 +379,15 @@ class Envs:
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
 
+    # NIXL-EP
+    SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
-    SGLANG_NSA_FORCE_MLA = EnvBool(False)
+    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -401,6 +431,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
+    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -443,8 +475,16 @@ class Envs:
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 
+    # HTTP Server
+    SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # Encoder gRPC
+    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # Encoder receiver selection: http|grpc (used by EPD paths).
+    SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
@@ -453,6 +493,7 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
@@ -474,6 +515,10 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+
+    # Elastic EP Backup Port
+    SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
 
 envs = Envs()
@@ -509,6 +554,18 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
     )
+    _deprecated_ms_to_s = {
+        "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
+        "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",
+    }
+    for old_name, new_name in _deprecated_ms_to_s.items():
+        if old_name in os.environ:
+            ms_val = os.environ[old_name]
+            warnings.warn(
+                f"Environment variable {old_name} (in ms) is deprecated, "
+                f"please use {new_name} (in seconds) instead"
+            )
+            os.environ[new_name] = str(float(ms_val) / 1000.0)
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
@@ -549,6 +606,11 @@ _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
+
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
 
 
 def example_with_exit_stack():

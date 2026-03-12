@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -92,12 +93,10 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
-    from decord import VideoReader
-
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -195,6 +194,11 @@ def is_musa() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -245,7 +249,7 @@ is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
 is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version,
-        device_capability_majors=[10, 12],
+        device_capability_majors=[10, 11, 12],
         cuda_version=(12, 8),
     )
 )
@@ -597,6 +601,8 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+    elif device == "mps":
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -608,8 +614,12 @@ def get_available_gpu_memory(
     return free_gpu_memory / (1 << 30)
 
 
-def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+def is_pin_memory_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if device is not None and str(device) == "cpu":
+        return False
+    return True
 
 
 class LayerFn(Protocol):
@@ -842,44 +852,67 @@ def decode_video_base64(video_base64):
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
-    import soundfile as sf
-    from scipy.signal import resample
-
     if sr is None:
         sr = 16000
 
-    # Load audio data
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
-    elif audio_file.startswith("file://"):
-        audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+        source = audio_file
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    # Resample audio if the original sample rate is different from the desired sample rate
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
 
-    # Convert to mono if requested and audio is stereo
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
+    import soundfile as sf
+    import torch
+    import torchaudio
+
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
+    else:
+        audio, original_sr = sf.read(source)
+
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+
+    if original_sr != sr:
+        audio_tensor = torch.from_numpy(audio).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        else:
+            audio_tensor = audio_tensor.T
+        audio_tensor = torchaudio.functional.resample(
+            audio_tensor, orig_freq=original_sr, new_freq=sr
+        )
+        if audio_tensor.shape[0] == 1:
+            audio = audio_tensor.squeeze(0).numpy()
+        else:
+            audio = audio_tensor.T.numpy()
 
     return audio
 
@@ -951,75 +984,55 @@ def get_image_bytes(image_file: Union[str, bytes]):
         raise NotImplementedError(f"Invalid image: {image_file}")
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
-    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from decord import VideoReader, cpu, gpu
+def _normalize_video_input(
+    video_file: Union[str, bytes],
+) -> Union[str, bytes, None]:
+    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
 
-    try:
-        from decord.bridge import decord_bridge
-
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
-    except Exception:
-        ctx = cpu(0)
-
-    tmp_file = None
-    vr = None
-    try:
-        if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, str):
-            if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("file://"):
-                video_file = unquote(urlparse(video_file).path)
-                vr = VideoReader(video_file, ctx=ctx)
-            # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(unquote(urlparse(video_file).path)):
-                vr = VideoReader(video_file, ctx=ctx)
-            else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
-            vr = video_file
+    Returns a file path or bytes suitable for a decoder, or None on failure.
+    URLs and base64 are returned as bytes (no temp files needed since both
+    torchcodec and VideoDecoderWrapper accept bytes natively).
+    """
+    if isinstance(video_file, bytes):
+        return video_file
+    elif isinstance(video_file, str):
+        if video_file.startswith(("http://", "https://")):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            response = requests.get(video_file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            return response.content
+        elif video_file.startswith("data:"):
+            _, encoded = video_file.split(",", 1)
+            return pybase64.b64decode(encoded, validate=True)
+        elif video_file.startswith("file://"):
+            return unquote(urlparse(video_file).path)
+        elif os.path.isfile(unquote(urlparse(video_file).path)):
+            return video_file
         else:
-            raise ValueError(f"Unsupported video input type: {type(video_file)}")
-
-        return vr
-
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+            return pybase64.b64decode(video_file, validate=True)
+    else:
+        return None
 
 
-def sample_video_frames(
-    video: "VideoReader", *, desired_fps: int, max_frames: int
-) -> list[int]:
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+        return video_file
+
+    source = _normalize_video_input(video_file)
+    if source is None:
+        raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+    device = "cuda" if use_gpu else "cpu"
+    return VideoDecoderWrapper(source, device=device)
+
+
+def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
     total_frames = len(video)
     assert total_frames > 0, "Video must have at least one frame"
 
-    duration = total_frames / video.get_avg_fps()
-    fps = min(desired_fps, video.get_avg_fps())
+    avg_fps = video.avg_fps
+    duration = total_frames / avg_fps if avg_fps > 0 else 0
+    fps = min(desired_fps, avg_fps)
 
     num_frames = math.floor(duration * fps)
     num_frames = min(max_frames, num_frames, total_frames)
@@ -1031,9 +1044,6 @@ def sample_video_frames(
 
 
 def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
         return []
@@ -1046,14 +1056,23 @@ def encode_video(video_path, frame_count_limit=None):
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    decoder = VideoDecoderWrapper(video_path)
+    avg_fps = decoder.avg_fps
+    total_frames = len(decoder)
+
+    sample_fps = round(avg_fps / 1)
+    if sample_fps == 0:
+        sample_fps = 1
+    frame_indices = [i for i in range(0, total_frames, sample_fps)]
     if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
         frame_indices = uniform_sample(frame_indices, frame_count_limit)
 
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    if not frame_indices:
+        return []
+
+    frames_data = decoder.get_frames_at(frame_indices)
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames_data]
+
     return frames
 
 
@@ -1113,7 +1132,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.2")
+        min_version: Minimum version required (e.g., "0.6.4")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1127,10 +1146,6 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1472,9 +1487,16 @@ def get_zmq_socket_on_host(
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    # Bind to random TCP port
+    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
+    if host:
+        if is_valid_ipv6_address(host):
+            socket.setsockopt(zmq.IPV6, 1)
+            bind_host = f"tcp://[{host}]"
+        else:
+            bind_host = f"tcp://{host}"
+    else:
+        bind_host = "tcp://*"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
 
@@ -1724,6 +1746,39 @@ def get_device_sm():
     return 0
 
 
+def _cuda_mem_fallback(reason: str) -> int:
+    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
+
+    Queries all visible CUDA devices and returns the minimum total memory,
+    consistent with the nvidia-smi path that takes min(memory_values).
+
+    Returns the total memory in MiB, or raises RuntimeError if CUDA is
+    unavailable or mem_get_info() fails.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(reason)
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            # Include the original failure reason for diagnostics
+            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
+        memory_values = []
+        for i in range(device_count):
+            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
+            memory_values.append(total)
+        result = min(memory_values)
+        logger.warning(
+            f"{reason} Falling back to torch.cuda.mem_get_info(). "
+            f"Reported total GPU memory per device (MiB): {memory_values}, "
+            f"using min: {result} MiB."
+        )
+        return result
+    except (RuntimeError, ValueError, OSError) as e:
+        raise RuntimeError(
+            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
+        ) from e
+
+
 def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
@@ -1735,7 +1790,9 @@ def get_nvgpu_memory_capacity():
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+            return _cuda_mem_fallback(
+                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
+            )
 
         # Parse the output to extract memory values
         memory_values = [
@@ -1745,20 +1802,17 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # Fallback when nvidia-smi returns no parseable values,
             # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
-                )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
-            raise ValueError("No GPU memory values found.")
+            return _cuda_mem_fallback(
+                "Failed to get GPU memory capacity from nvidia-smi."
+            )
 
         # Return the minimum memory value
         return min(memory_values)
 
     except FileNotFoundError:
-        raise RuntimeError(
+        return _cuda_mem_fallback(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
 
@@ -2032,12 +2086,12 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "cuda:{}".format(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "xpu"
         return "xpu:{}".format(device_id)
 
     if is_npu():
-        if device_id == None:
+        if device_id is None:
             return "npu"
         return "npu:{}".format(device_id)
 
@@ -2046,20 +2100,25 @@ def get_device(device_id: Optional[int] = None) -> str:
             import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
-                if device_id == None:
+                if device_id is None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
     if is_musa():
-        if device_id == None:
+        if device_id is None:
             return "musa"
         return "musa:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2362,6 +2421,7 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "torch_npu.",
     }
 
     DENY_CLASSES = {
@@ -2612,48 +2672,6 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def maybe_wrap_ipv6_address(address: str) -> str:
-    if is_valid_ipv6_address(address):
-        return f"[{address}]"
-    return address
-
-
-def format_tcp_address(ip: str, port: int) -> str:
-    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
-
-
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -3380,7 +3398,12 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+            parts = line.strip().split(",")
+            if len(parts) != 4:
+                logger.warning("Skipping malformed lscpu line: %s", line.strip())
+                continue
+            cpu = int(parts[0])  # CPU id must always be present
+            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
             cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
@@ -3777,13 +3800,28 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+def get_libnuma():
+    libnuma = None
 
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+        try:
+            libnuma = ctypes.CDLL(libnuma_so)
+        except OSError as e:
+            logger.error(f"{e}")
+            libnuma = None
+        if libnuma is not None:
+            break
+    return libnuma
+
+
+def numa_bind_to_node(node: int):
+    libnuma = get_libnuma()
+
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.error("numa not available on this system, skip bind action")
+    else:
+        libnuma.numa_run_on_node(ctypes.c_int(node))
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
@@ -4092,13 +4130,13 @@ def get_numa_node_count() -> int:
     Returns:
         int: The number of NUMA nodes.
     """
-    libnuma = ctypes.CDLL("libnuma.so")
+    libnuma = get_libnuma()
     return libnuma.numa_max_node() + 1
 
 
 def is_numa_available() -> bool:
     try:
-        libnuma = ctypes.CDLL("libnuma.so")
+        libnuma = get_libnuma()
         return libnuma.numa_available() >= 0
     except Exception:
         return False
@@ -4126,9 +4164,9 @@ def get_system_nvgpu_count() -> int:
 
 
 @lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
+def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
     """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
 
     First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
     If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
@@ -4142,10 +4180,8 @@ def get_current_device_numa_node_cuda() -> int:
     Raises:
         RuntimeError: If device information cannot be retrieved.
     """
-    import torch
 
-    logical_device_id = torch.cuda.current_device()
-    physical_device_id = get_physical_device_id(logical_device_id)
+    physical_device_id = get_physical_device_id(gpu_id)
 
     # Query NUMA topology from nvidia-smi
     result = subprocess.run(
@@ -4175,6 +4211,32 @@ def get_current_device_numa_node_cuda() -> int:
             f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
         )
         numa_node = 0
+
+    return numa_node
+
+
+def get_numa_node(gpu_id):
+    numa_node = None
+    try:
+        device = get_device()
+        if device == "cuda":
+            numa_node = get_device_numa_node_cuda(gpu_id)
+        else:
+            logger.info(f"Now only supports NVIDIA devices")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+
+    return numa_node
+
+
+@lru_cache(maxsize=1)
+def get_current_device_numa_node_cuda() -> int:
+    """
+    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    """
+
+    logical_device_id = torch.cuda.current_device()
+    numa_node = get_device_numa_node_cuda(logical_device_id)
 
     return numa_node
 

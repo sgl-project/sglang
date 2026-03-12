@@ -6,7 +6,7 @@ import triton
 import triton.testing
 from sgl_kernel import rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
 from sglang.srt.utils import get_current_device_stream_fast
 
@@ -78,7 +78,7 @@ else:
     BS_RANGE = [2**n for n in range(0, 14)]
     HIDDEN_DIM_RANGE = [512, 1024, 2048, 4096, 8192]
 
-LINE_VALS = ["jit", "aot", "fi", "torch"]
+LINE_VALS = ["jit", "aot", "flashinfer", "torch"]
 LINE_NAMES = ["SGL JIT Kernel", "SGL AOT Kernel", "FlashInfer", "PyTorch"]
 STYLES = [("blue", "-"), ("orange", "--"), ("green", "-."), ("red", ":")]
 
@@ -108,13 +108,11 @@ def benchmark(
     FN_MAP = {
         "jit": sglang_jit_qknorm_across_heads,
         "aot": sglang_aot_qknorm_across_heads,
-        "fi": flashinfer_qknorm_across_heads,
+        "flashinfer": flashinfer_qknorm_across_heads,
         "torch": torch_impl_qknorm_across_heads,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

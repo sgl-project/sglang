@@ -118,10 +118,9 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
-        # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -232,7 +231,7 @@ class DecodingStage(PipelineStage):
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=trajectory_decoded,
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
 
         self.offload_model()

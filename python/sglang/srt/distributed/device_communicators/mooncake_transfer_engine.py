@@ -4,7 +4,8 @@ import os
 from typing import List, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_free_port, maybe_wrap_ipv6_address
+from sglang.srt.utils import get_free_port
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +118,9 @@ class MooncakeTransferEngine:
             hostname=self.hostname,
             device_name=self.ib_device,
         )
-        self.session_id = (
-            f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
-        )
+        self.session_id = NetworkAddress(
+            self.hostname, self.engine.get_rpc_port()
+        ).to_host_port_str()
 
     def register(self, ptr, length):
         try:
@@ -256,6 +257,9 @@ class MooncakeTransferEngine:
 
     def get_engine(self):
         return self.engine.get_engine()
+
+    def get_ib_device(self):
+        return self.ib_device
 
 
 def init_mooncake_transfer_engine(
