@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -94,15 +94,15 @@ class Sampler(nn.Module):
             sampling_info.is_all_greedy,
             SGLANG_RETURN_ORIGINAL_LOGPROB,
             match_rl_trainer,
-            self.use_ascend_backend,
+            skip_logprob_computation=self.use_ascend_backend,
         )
 
         # Sample
         if sampling_info.is_all_greedy:
             batch_next_token_ids = torch.argmax(logits, -1)
         elif self.use_ascend_backend:
-            batch_next_token_ids, _ = self._forward_ascend_backend(
-                logits, sampling_info, simple_sampling_case, return_logprob=False
+            batch_next_token_ids = self._forward_ascend_backend(
+                logits, sampling_info, simple_sampling_case
             )
         else:
             if match_rl_trainer:
@@ -238,25 +238,14 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
-        return_logprob: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Handle the full Ascend backend sampling path.
 
         Ascend backend has fused kernels that handle softmax internally,
         so we sample directly from temperature-scaled logits.
-
-        Returns:
-            A tuple of (batch_next_token_ids, logprobs). logprobs is None
-            when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
         logits.div_(sampling_info.temperatures)
-        batch_next_token_ids = self._sample_from_logits(
-            logits, sampling_info, simple_sampling_case
-        )
-        logprobs = None
-        if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-        return batch_next_token_ids, logprobs
+        return self._sample_from_logits(logits, sampling_info, simple_sampling_case)
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo

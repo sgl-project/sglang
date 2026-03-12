@@ -467,7 +467,7 @@ class OutputLogprobProcessor(nn.Module):
         is_all_greedy: bool,
         return_original_logprob: bool,
         match_rl_trainer: bool,
-        use_ascend_backend: bool = False,
+        skip_logprob_computation: bool = False,
     ) -> Tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -486,7 +486,8 @@ class OutputLogprobProcessor(nn.Module):
             is_all_greedy: If True, skip temperature-scaled logprob computation
             return_original_logprob: If True, also return pre-temperature logprobs
             match_rl_trainer: If True, use bfloat16 log_softmax to match the RL trainer
-            use_ascend_backend: If True, return unmodified logits for ascend sampling
+            skip_logprob_computation: If True, skip probs/logprobs computation and
+                return unmodified logits (used by ascend backend with fused kernels)
 
         Returns:
             (logits, probs, logprobs, original_logprobs):
@@ -526,8 +527,8 @@ class OutputLogprobProcessor(nn.Module):
             del logits_div_temperature
             return logits, None, logprobs, original_logprobs
 
-        # Ascend backend: return unmodified logits for fused sampling kernels.
-        if use_ascend_backend:
+        # Skip logprob computation: return unmodified logits for fused sampling kernels.
+        if skip_logprob_computation:
             logprobs = None
             if return_logprob and original_logprobs is None:
                 logprobs = torch.nn.functional.log_softmax(
