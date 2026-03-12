@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
@@ -96,16 +97,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
-        if lora_path:
-            first_adapter = (
-                lora_path
-                if isinstance(lora_path, str)
-                else next((a for a in lora_path if a), None)
-            )
-            if first_adapter:
-                self._validate_lora_enabled(first_adapter)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -119,7 +117,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            data_parallel_rank=request.data_parallel_rank,
+            routed_dp_rank=effective_routed_dp_rank,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
@@ -216,8 +215,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 index = content.get("index", 0)
 
                 text = content["text"]
-                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get(
+                    "completion_tokens", 0
+                )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
@@ -275,13 +276,27 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Generate delta
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
-                finish_reason = content["meta_info"]["finish_reason"]
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                # If the abort is from scheduler.
+                if finish_reason_type == "abort":
+                    code = finish_reason.get(
+                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    error = self.create_streaming_error_response(
+                        finish_reason.get("message", "Generation aborted."),
+                        code.name,
+                        code.value,
+                    )
+                    yield f"data: {error}\n\n"
+                    break
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
                     logprobs=logprobs,
-                    finish_reason=finish_reason["type"] if finish_reason else None,
+                    finish_reason=finish_reason_type,
                     matched_stop=(
                         finish_reason["matched"]
                         if finish_reason and "matched" in finish_reason

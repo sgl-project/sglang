@@ -74,8 +74,11 @@ class ImageEncodingStage(PipelineStage):
             self.move_to_device("cpu")
 
     def move_to_device(self, device):
+        if self.server_args.use_fsdp_inference:
+            return
         fields = [
             "image_processor",
+            "image_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)
@@ -102,63 +105,91 @@ class ImageEncodingStage(PipelineStage):
         cuda_device = get_local_torch_device()
 
         self.load_model()
-        image = batch.condition_image
 
         image_processor_kwargs = (
             server_args.pipeline_config.prepare_image_processor_kwargs(batch)
         )
+        per_prompt_images = image_processor_kwargs.pop("per_prompt_images", None)
+        texts = image_processor_kwargs.pop("text", None)
 
-        image_inputs = self.image_processor(
-            images=image, return_tensors="pt", **image_processor_kwargs
-        ).to(cuda_device)
-        if self.image_encoder:
-            # if an image encoder is provided
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.image_encoder(
-                    **image_inputs,
-                    **server_args.pipeline_config.image_encoder_extra_args,
-                )
-                image_embeds = server_args.pipeline_config.postprocess_image(outputs)
+        if per_prompt_images is None:
+            per_prompt_images = [batch.condition_image]
+            texts = [None] if texts is None else texts
 
-            batch.image_embeds.append(image_embeds)
-        elif self.text_encoder:
-            # if a text encoder is provided, e.g. Qwen-Image-Edit
-            # 1. neg prompt embeds
-            if batch.do_classifier_free_guidance:
-                neg_image_processor_kwargs = (
-                    server_args.pipeline_config.prepare_image_processor_kwargs(
-                        batch, neg=True
+        all_prompt_embeds = []
+        all_neg_prompt_embeds = []
+
+        for idx, prompt_images in enumerate(per_prompt_images):
+            if not prompt_images:
+                continue
+
+            cur_kwargs = image_processor_kwargs.copy()
+            if texts and idx < len(texts):
+                cur_kwargs["text"] = [texts[idx]]
+
+            image_inputs = self.image_processor(
+                images=prompt_images, return_tensors="pt", **cur_kwargs
+            ).to(cuda_device)
+
+            if self.image_encoder:
+                # if an image encoder is provided
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    outputs = self.image_encoder(
+                        **image_inputs,
+                        **server_args.pipeline_config.image_encoder_extra_args,
                     )
-                )
-
-                neg_image_inputs = self.image_processor(
-                    images=image, return_tensors="pt", **neg_image_processor_kwargs
-                ).to(cuda_device)
-
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.text_encoder(
-                    input_ids=image_inputs.input_ids,
-                    attention_mask=image_inputs.attention_mask,
-                    pixel_values=image_inputs.pixel_values,
-                    image_grid_thw=image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
+                    image_embeds = server_args.pipeline_config.postprocess_image(
+                        outputs
+                    )
+                batch.image_embeds.append(image_embeds)
+            elif self.text_encoder:
+                # if a text encoder is provided, e.g. Qwen-Image-Edit
+                # 1. neg prompt embeds
                 if batch.do_classifier_free_guidance:
-                    neg_outputs = self.text_encoder(
-                        input_ids=neg_image_inputs.input_ids,
-                        attention_mask=neg_image_inputs.attention_mask,
-                        pixel_values=neg_image_inputs.pixel_values,
-                        image_grid_thw=neg_image_inputs.image_grid_thw,
+                    neg_image_processor_kwargs = (
+                        server_args.pipeline_config.prepare_image_processor_kwargs(
+                            batch, neg=True
+                        )
+                    )
+                    neg_image_processor_kwargs.pop("per_prompt_images", None)
+                    neg_texts = neg_image_processor_kwargs.pop("text", None)
+                    if neg_texts and idx < len(neg_texts):
+                        neg_image_processor_kwargs["text"] = [neg_texts[idx]]
+                    neg_image_inputs = self.image_processor(
+                        images=prompt_images,
+                        return_tensors="pt",
+                        **neg_image_processor_kwargs,
+                    ).to(cuda_device)
+
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    outputs = self.text_encoder(
+                        input_ids=image_inputs.input_ids,
+                        attention_mask=image_inputs.attention_mask,
+                        pixel_values=image_inputs.pixel_values,
+                        image_grid_thw=image_inputs.image_grid_thw,
                         output_hidden_states=True,
                     )
-            batch.prompt_embeds.append(
-                self.encoding_qwen_image_edit(outputs, image_inputs)
-            )
+                    if batch.do_classifier_free_guidance:
+                        neg_outputs = self.text_encoder(
+                            input_ids=neg_image_inputs.input_ids,
+                            attention_mask=neg_image_inputs.attention_mask,
+                            pixel_values=neg_image_inputs.pixel_values,
+                            image_grid_thw=neg_image_inputs.image_grid_thw,
+                            output_hidden_states=True,
+                        )
 
-            if batch.do_classifier_free_guidance:
-                batch.negative_prompt_embeds.append(
-                    self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                all_prompt_embeds.append(
+                    self.encoding_qwen_image_edit(outputs, image_inputs)
                 )
+                if batch.do_classifier_free_guidance:
+                    all_neg_prompt_embeds.append(
+                        self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                    )
+
+        if all_prompt_embeds:
+            batch.prompt_embeds.append(torch.cat(all_prompt_embeds, dim=0))
+        if all_neg_prompt_embeds:
+            batch.negative_prompt_embeds.append(torch.cat(all_neg_prompt_embeds, dim=0))
 
         self.offload_model()
 
@@ -222,6 +253,10 @@ class ImageVAEEncodingStage(PipelineStage):
             images = [images]
 
         all_image_latents = []
+        prepare_condition_image_latent_ids = getattr(
+            server_args.pipeline_config, "prepare_condition_image_latent_ids", None
+        )
+        condition_latents = [] if callable(prepare_condition_image_latent_ids) else None
         for image in images:
             image = self.preprocess(
                 image,
@@ -306,12 +341,17 @@ class ImageVAEEncodingStage(PipelineStage):
             latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
 
+            if condition_latents is not None:
+                condition_latents.append(latent_condition)
+
             image_latent = server_args.pipeline_config.postprocess_image_latent(
                 latent_condition, batch
             )
             all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
+        if condition_latents is not None:
+            prepare_condition_image_latent_ids(condition_latents, batch)
 
         self.offload_model()
         return batch

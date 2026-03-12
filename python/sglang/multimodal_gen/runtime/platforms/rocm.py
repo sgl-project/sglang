@@ -6,6 +6,7 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+
 from functools import lru_cache
 from typing import Any
 
@@ -113,6 +114,16 @@ class RocmPlatform(Platform):
                 )
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
+            if dtype in (torch.float16, torch.bfloat16):
+                logger.info("Using AITER Sage backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
+            else:
+                logger.warning(
+                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    dtype,
+                )
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,

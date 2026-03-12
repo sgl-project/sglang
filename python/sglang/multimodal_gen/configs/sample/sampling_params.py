@@ -14,12 +14,15 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean
+from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def _json_safe(obj: Any):
@@ -66,12 +69,14 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    MESH = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
-        else:
+        if self == DataType.VIDEO:
             return "mp4"
+        return "glb"
 
 
 @dataclass
@@ -100,6 +105,21 @@ class SamplingParams:
     output_quality: str | None = "default"
     output_compression: int | None = None
 
+    # Frame interpolation
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1  # 1=2x, 2=4x
+    frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
+    frame_interpolation_model_path: str | None = (
+        None  # local dir or HF repo ID with flownet.pkl (default: elfgum/RIFE-4.22.lite)
+    )
+
+    # Upscaling
+    enable_upscaling: bool = False
+    upscaling_model_path: str | None = (
+        None  # local .pth, HF repo ID, or repo_id:filename (default: ai-forever/Real-ESRGAN)
+    )
+    upscaling_scale: int = 4
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
@@ -110,11 +130,14 @@ class SamplingParams:
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
+
+    # Subclasses can set these to provide model-specific default resolutions.
+    # The base __post_init__ will apply them when height/width are not provided.
+    _default_height: ClassVar[int | None] = None
+    _default_width: ClassVar[int | None] = None
+
     height: int | None = None
     width: int | None = None
-    # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
-    height_not_provided: bool = False
-    width_not_provided: bool = False
     fps: int = 24
 
     # Resolution validation
@@ -156,13 +179,13 @@ class SamplingParams:
     suppress_logs: bool = False
 
     return_file_paths_only: bool = True
-    enable_sequence_shard: bool = False
+    enable_sequence_shard: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp"]
+            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
         ):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -204,10 +227,10 @@ class SamplingParams:
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
 
-        if self.width is None:
-            self.width_not_provided = True
-        if self.height is None:
-            self.height_not_provided = True
+        if self.width is None and self._default_width is not None:
+            self.width = self._default_width
+        if self.height is None and self._default_height is not None:
+            self.height = self._default_height
 
         # Handle output_quality to output_compression conversion
         if self.output_compression is None and self.output_quality is not None:
@@ -330,6 +353,13 @@ class SamplingParams:
                     f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
+        if not pipeline_config.task_type.accepts_image_input():
+            # does not support image input
+            if self.image_path is not None:
+                raise ValueError(
+                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                )
+
     def _adjust(
         self,
         server_args,
@@ -337,18 +367,34 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
+        expand_path_fields(self)
+
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        if self.guidance_scale is None:
+            try:
+                from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+                    Hunyuan3D2PipelineConfig,
+                )
+
+                if isinstance(pipeline_config, Hunyuan3D2PipelineConfig):
+                    self.guidance_scale = pipeline_config.guidance_scale
+                else:
+                    self.guidance_scale = 1.0
+            except ImportError:
+                self.guidance_scale = 1.0
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
-        if self.output_path is None and server_args.output_path is not None:
-            self.output_path = server_args.output_path
-            logger.debug(
-                f"Overriding output_path with server configuration: {self.output_path}"
-            )
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -383,10 +429,20 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
+
+        if "wan" in pipeline_name_lower and (
+            self.enable_sequence_shard is None or self.enable_sequence_shard
+        ):
+            self.enable_sequence_shard = True
+            logger.debug("Automatically enabled enable_sequence_shard")
+        else:
+            self.enable_sequence_shard = False
+
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment"
+                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
@@ -395,52 +451,66 @@ class SamplingParams:
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
-        elif self.adjust_frames:
+        else:
+            # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
+            original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
+                original_num_frames
+            )
+            logger.info(
+                "Adjusting number of frames from %s to %s based on model",
+                original_num_frames,
+                self.num_frames,
             )
 
-            # Adjust number of frames based on number of GPUs for video task
-            use_temporal_scaling_frames = (
-                pipeline_config.vae_config.use_temporal_scaling_frames
-            )
-            num_frames = self.num_frames
-            num_gpus = server_args.num_gpus
-            temporal_scale_factor = (
-                pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
-
-            if use_temporal_scaling_frames:
-                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-
-            if orig_latent_num_frames % server_args.num_gpus != 0:
-                # Adjust latent frames to be divisible by number of GPUs
-                if self.num_frames_round_down:
-                    # Ensure we have at least 1 batch per GPU
-                    new_latent_num_frames = (
-                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                    )
-                else:
-                    new_latent_num_frames = (
-                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                    )
+            if self.adjust_frames:
+                # Adjust number of frames based on number of GPUs for video task
+                use_temporal_scaling_frames = (
+                    pipeline_config.vae_config.use_temporal_scaling_frames
+                )
+                num_frames = self.num_frames
+                num_gpus = server_args.num_gpus
+                temporal_scale_factor = (
+                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                )
 
                 if use_temporal_scaling_frames:
-                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                    new_num_frames = (
-                        new_latent_num_frames - 1
-                    ) * temporal_scale_factor + 1
+                    orig_latent_num_frames = (
+                        num_frames - 1
+                    ) // temporal_scale_factor + 1
+                else:
+                    orig_latent_num_frames = num_frames
 
-                logger.info(
-                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                    self.num_frames,
-                    new_num_frames,
-                    server_args.num_gpus,
-                )
-                self.num_frames = new_num_frames
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
+                    if self.num_frames_round_down:
+                        # Ensure we have at least 1 batch per GPU
+                        new_latent_num_frames = (
+                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                        )
+                    else:
+                        new_latent_num_frames = (
+                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                        )
+
+                    if use_temporal_scaling_frames:
+                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                        new_num_frames = (
+                            new_latent_num_frames - 1
+                        ) * temporal_scale_factor + 1
+                    else:
+                        new_num_frames = new_latent_num_frames
+
+                    logger.info(
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                        self.num_frames,
+                        new_num_frames,
+                        server_args.num_gpus,
+                    )
+                    self.num_frames = new_num_frames
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
@@ -450,15 +520,18 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         backend = kwargs.pop("backend", None)
-        model_info = get_model_info(model_path, backend=backend)
+        model_id = kwargs.pop("model_id", None)
+        model_info = get_model_info(model_path, backend=backend, model_id=model_id)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
-    def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
+    def from_user_sampling_params_args(
+        model_path: str, server_args: "ServerArgs", *args, **kwargs
+    ):
         try:
             sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend
+                model_path, backend=server_args.backend, model_id=server_args.model_id
             )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
@@ -561,8 +634,9 @@ class SamplingParams:
         parser.add_argument(
             "--prompt",
             type=str,
+            nargs="+",
             default=SamplingParams.prompt,
-            help="Text prompt for generation",
+            help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
         parser.add_argument(
             "--negative-prompt",
@@ -786,6 +860,53 @@ class SamplingParams:
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
         )
+        parser.add_argument(
+            "--enable-frame-interpolation",
+            action="store_true",
+            help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
+        )
+        parser.add_argument(
+            "--frame-interpolation-exp",
+            type=int,
+            default=SamplingParams.frame_interpolation_exp,
+            help="Frame interpolation exponent: 1=2x, 2=4x (default: 1).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-scale",
+            type=float,
+            default=SamplingParams.frame_interpolation_scale,
+            help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-model-path",
+            type=str,
+            default=SamplingParams.frame_interpolation_model_path,
+            help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
+            "(default: elfgum/RIFE-4.22.lite, downloaded automatically). "
+            "Only RIFE 4.22.lite architecture is supported; other RIFE versions or "
+            "frame interpolation models are not compatible.",
+        )
+        parser.add_argument(
+            "--enable-upscaling",
+            action="store_true",
+            help="Enable post-generation upscaling using Real-ESRGAN.",
+        )
+        parser.add_argument(
+            "--upscaling-model-path",
+            type=str,
+            default=SamplingParams.upscaling_model_path,
+            help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
+            "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
+            "Only RRDBNet (e.g. RealESRGAN_x4plus) and SRVGGNetCompact (e.g. realesr-animevideov3) "
+            "architectures are supported; other super-resolution models are not compatible. "
+            "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
+        )
+        parser.add_argument(
+            "--upscaling-scale",
+            type=int,
+            default=SamplingParams.upscaling_scale,
+            help="Upscaling factor (default: 4).",
+        )
         return parser
 
     @classmethod
@@ -807,11 +928,11 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        args.height_not_provided = False
-        args.width_not_provided = False
         return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
+        if self.output_path is None:
+            return None
         return os.path.join(self.output_path, self.output_file_name)
 
     def _merge_with_user_params(self, user_params: "SamplingParams"):
@@ -837,8 +958,6 @@ class SamplingParams:
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
-        self.height_not_provided = user_params.height_not_provided
-        self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
 
     @property

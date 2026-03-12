@@ -34,12 +34,24 @@ class AttentionBackendEnum(enum.Enum):
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    AITER_SAGE = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def is_sparse(self) -> bool:
+        return self in {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SLA_ATTN,
+            AttentionBackendEnum.SAGE_SLA_ATTN,
+        }
 
 
 class PlatformEnum(enum.Enum):
@@ -304,7 +316,7 @@ class Platform:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.get_device_module().manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
