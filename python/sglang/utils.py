@@ -416,7 +416,9 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     This prevents port conflicts that could occur if another process (e.g., a
     subprocess spawned during model loading) binds to the same port before the
     HTTP server starts. By binding early, we ensure the port is available and
-    reserved for the HTTP server.
+    reserved for the HTTP server. The socket is intentionally not put into
+    listening mode here to avoid accepting probe connections before uvicorn is
+    ready to serve requests.
 
     Args:
         host: The host address to bind to.
@@ -430,37 +432,23 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     """
     import errno
 
-    from sglang.srt.utils.common import is_valid_ipv6_address
+    from sglang.srt.utils.network import NetworkAddress
 
     # Determine socket family based on address type
-    if host and is_valid_ipv6_address(host):
-        family = socket.AF_INET6
-    else:
-        family = socket.AF_INET
-
-    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-
-    # Set socket options to allow port reuse
+    na = NetworkAddress(host or "0.0.0.0", port)
+    sock = socket.socket(family=na.family, type=socket.SOCK_STREAM)
     # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # SO_REUSEPORT: Allows multiple processes to bind to the same port
-    # This is useful for multi-worker mode
-    if hasattr(socket, "SO_REUSEPORT"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
     try:
-        sock.bind((host or "", port))
-        sock.listen(128)  # Put socket in listening state for uvicorn
+        sock.bind(na.to_bind_tuple())
         sock.set_inheritable(True)
-        logger.info(
-            f"Successfully reserved port {port} on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'"
-        )
+        logger.info(f"Successfully reserved port {port} on host '{na.host}'")
     except OSError as e:
         sock.close()
         if e.errno == errno.EADDRINUSE:
             raise RuntimeError(
-                f"Port {port} is already in use on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'. "
+                f"Port {port} is already in use on host '{na.host}'. "
                 f"Please choose a different port with --port or stop the process using this port. "
                 f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
             ) from e
@@ -471,9 +459,7 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
                 f"Consider using a port >= 1024 (e.g., --port 8000) or run with sudo."
             ) from e
         else:
-            raise RuntimeError(
-                f"Failed to bind to {host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}:{port}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to bind to {na}: {e}") from e
 
     return sock
 

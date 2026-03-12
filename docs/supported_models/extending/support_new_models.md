@@ -55,7 +55,7 @@ should give the same text output and very similar prefill logits:
 
 - Get the reference output:
   ```bash
-  python3 scripts/playground/reference_hf.py --model-path [new model] --model-type {text,mllm}
+  python3 scripts/playground/reference_hf.py --model-path [new model] --model-type {text,vlm}
   ```
 - Get the SGLang output:
   ```bash
@@ -65,7 +65,7 @@ should give the same text output and very similar prefill logits:
 ### Add the Model to the Test Suite
 
 To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
-the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py)
+the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/models/test_generation_models.py)
 file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
 MMMU-Pro, etc.) in your PR. \\
 For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_a.py), [test_vision_openai_server_b.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_b.py)).

@@ -41,33 +41,12 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
-**Frame Interpolation** (video only)
+**Post-Processing** (frame interpolation & upscaling)
 
-Frame interpolation is a post-processing step that synthesizes new frames
-between each pair of consecutive generated frames, producing smoother
-motion without re-running the diffusion model. The `--frame-interpolation-exp`
-flag controls how many rounds of interpolation to apply: each round inserts one
-new frame into every gap between adjacent frames, so the output frame count
-follows the formula **(N − 1) × 2^exp + 1** (e.g. 5 original frames with
-`exp=1` → 4 gaps × 1 new frame + 5 originals = **9** frames; with `exp=2` →
-**17** frames).
-
-- `--enable-frame-interpolation`: Enable frame interpolation. Model weights are downloaded automatically on first use.
-- `--frame-interpolation-exp {EXP}`: Interpolation exponent — `1` = 2× temporal resolution, `2` = 4×, etc. (default: `1`)
-- `--frame-interpolation-scale {SCALE}`: RIFE inference scale; use `0.5` for high-resolution inputs to save memory (default: `1.0`)
-- `--frame-interpolation-model-path {PATH}`: Local directory or HuggingFace repo ID containing RIFE `flownet.pkl` weights (default: `elfgum/RIFE-4.22.lite`, downloaded automatically)
-
-Example — generate a 5-frame video and interpolate to 9 frames ((5 − 1) × 2¹ + 1 = 9):
-
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --prompt "A dog running through a park" \
-  --num-frames 5 \
-  --enable-frame-interpolation \
-  --frame-interpolation-exp 1 \
-  --save-output
-```
+SGLang diffusion supports optional post-processing steps — frame interpolation
+(RIFE) for smoother video and upscaling (Real-ESRGAN) for higher resolution.
+See the dedicated **[Post-Processing](post_processing.md)** page for full
+details, supported models, and examples.
 
 **Output Options**
 
@@ -286,6 +265,8 @@ SGLang diffusion supports a **diffusers backend** that allows you to run any dif
 | `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
 | `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
 | `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+| `--enable-torch-compile` | flag | Enable `torch.compile` for diffusers pipelines. |
+| `--cache-dit-config` | `{PATH}` | Path to a Cache-DiT YAML/JSON config file for accelerating diffusers pipelines with Cache-DiT. |
 
 ### Example: Running Ovis-Image-7B
 
