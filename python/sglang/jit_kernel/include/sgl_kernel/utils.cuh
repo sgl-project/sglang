@@ -94,6 +94,10 @@ namespace device {
 #if !defined(USE_ROCM)
 #if defined(__CUDA_ARCH__)
 #define SGL_TARGET_CUDA_ARCH __CUDA_ARCH__
+#if defined(SGL_CUDA_ARCH)
+static_assert(__CUDA_ARCH__ == SGL_CUDA_ARCH,
+              "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
+#endif
 #elif defined(SGL_CUDA_ARCH)
 #define SGL_TARGET_CUDA_ARCH SGL_CUDA_ARCH
 #endif
