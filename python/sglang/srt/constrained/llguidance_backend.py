@@ -122,7 +122,7 @@ class GuidanceBackend(BaseGrammarBackend):
         self.whitespace_pattern = whitespace_pattern
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
-    def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
+    def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:
             return GuidanceGrammar(
                 llguidance_tokenizer=self.llguidance_tokenizer,
@@ -132,7 +132,7 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
-    def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         try:
             serialized_grammar = LLMatcher.grammar_from_json_schema(
                 key_string,
@@ -146,11 +146,11 @@ class GuidanceBackend(BaseGrammarBackend):
             return INVALID_GRAMMAR_OBJ
         return self._from_serialized(serialized_grammar)
 
-    def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         serialized_grammar = grammar_from("regex", key_string)
         return self._from_serialized(serialized_grammar)
 
-    def dispatch_ebnf(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
@@ -158,7 +158,7 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             structural_tag = json.loads(key_string)
             assert is_legacy_structural_tag(structural_tag)
