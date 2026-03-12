@@ -426,14 +426,15 @@ def run_one_case(
     gsp_system_prompt_len: int = BenchArgs.gsp_system_prompt_len,
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
+    seed: int = BenchArgs.seed,
 ):
     # Reset random seed before each case so repeated benchmark runs use
     # identical input data (same expert routing pattern every time).
     # Without this, random.shuffle in the data loader produces different
     # inputs across repeats, causing up to 25% throughput variance for
     # MoE models with expert-parallel dispatch.
-    random.seed(BenchArgs.seed)
-    np.random.seed(BenchArgs.seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -461,7 +462,7 @@ def run_one_case(
         dataset_path=dataset_path,
         tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
         backend=backend,
-        seed=BenchArgs.seed,
+        seed=seed,
         gsp_num_groups=actual_gsp_groups,
         gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
         gsp_system_prompt_len=gsp_system_prompt_len,
@@ -767,10 +768,6 @@ def run_benchmark_internal(
     bench_args: BenchArgs,
     launch_server_func: Callable = launch_server,
 ):
-    # set random seed
-    random.seed(bench_args.seed)
-    np.random.seed(bench_args.seed)
-
     # launch a server or use the provided base_url
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
@@ -872,6 +869,7 @@ def run_benchmark_internal(
                 parallel_batch=bench_args.parallel_batch,
                 backend=bench_args.backend,
                 model_name=model_name,
+                seed=bench_args.seed,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -908,6 +906,7 @@ def run_benchmark_internal(
                     cache_hit_rate=bench_args.cache_hit_rate,
                     backend=bench_args.backend,
                     model_name=model_name,
+                    seed=bench_args.seed,
                     **gsp_kwargs,
                 )
             )
@@ -953,6 +952,7 @@ def run_benchmark_internal(
                             profile_output_dir=bench_args.profile_output_dir,
                             backend=bench_args.backend,
                             model_name=model_name,
+                            seed=bench_args.seed,
                             **gsp_kwargs,
                         )
                     )
