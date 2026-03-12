@@ -10,7 +10,10 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn, rms_norm_ref
+from sglang.srt.layers.attention.fla.layernorm_gated import (
+    layernorm_fn,
+    rms_norm_ref,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

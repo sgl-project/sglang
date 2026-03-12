@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -97,6 +97,7 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
+        last_host_backup_node: The deepest backuped node for prefetch from storage.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -107,8 +108,10 @@ class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
+    last_host_backup_node: Any = None
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    cache_protected_len: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -222,3 +225,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
+
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.evictable_size()
+        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

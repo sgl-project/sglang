@@ -16,6 +16,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only Apertus model compatible with HuggingFace weights."""
+
 import copy
 import logging
 import math
@@ -124,8 +125,9 @@ def isin_list(
     elements: torch.Tensor,
     test_elements_list: list[int],
 ) -> torch.Tensor:
-    test_elements = torch.tensor(test_elements_list, pin_memory=True).to(
-        device=elements.device, non_blocking=True
+    use_pin = torch.cuda.is_available() and not getattr(torch.version, "hip", None)
+    test_elements = torch.tensor(test_elements_list, pin_memory=use_pin).to(
+        device=elements.device, non_blocking=use_pin
     )
 
     return torch.isin(elements, test_elements)
@@ -1216,9 +1218,18 @@ class CustomQwen2Decoder(nn.Module):
                 cache_position=None,
             ):
                 self._current_token_type_ids = token_type_ids
+                causal_mask_mapping = {
+                    "full_attention": self._update_causal_mask(
+                        attention_mask,
+                        inputs_embeds,
+                        cache_position,
+                        past_key_values,
+                        output_attentions,
+                    )
+                }
                 return super().forward(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=causal_mask_mapping,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     inputs_embeds=inputs_embeds,
@@ -1675,7 +1686,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_crop = (
             torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(torch.long)
+            .type(target_dtype)
             .to(device=pixel_values.device)
         )
         images_spatial_crop = (

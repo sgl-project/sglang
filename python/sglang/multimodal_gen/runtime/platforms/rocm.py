@@ -6,11 +6,13 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+
 from functools import lru_cache
 from typing import Any
 
 import torch
 
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -29,6 +31,10 @@ class RocmPlatform(Platform):
     device_type: str = "cuda"  # torch uses 'cuda' backend string
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
@@ -108,6 +114,16 @@ class RocmPlatform(Platform):
                 )
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
+            if dtype in (torch.float16, torch.bfloat16):
+                logger.info("Using AITER Sage backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
+            else:
+                logger.warning(
+                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    dtype,
+                )
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
