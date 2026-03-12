@@ -2059,13 +2059,20 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            # For prefill-only batch, we can avoid going through decoding step.
-            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+            if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+        # For prefill-only batch, filter out finished requests since they
+        # won't go through the decode step. This keeps running_batch accurate
+        # for load reporting (num_running_reqs via /get_load).
+        # Runs outside the last_batch block so stale requests are cleaned
+        # even when no new batches arrive (e.g. traffic stops).
+        if self.running_batch.is_prefill_only:
+            self.running_batch.filter_batch()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2085,8 +2092,11 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
+            # Run decode (skip for prefill-only batches)
+            if (
+                not self.running_batch.is_empty()
+                and not self.running_batch.is_prefill_only
+            ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2377,7 +2387,11 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
                 )
 
             msg_prefix = (
@@ -2402,6 +2416,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if batch.is_empty():
+            return batch
 
         # Update batch tensors
         batch.prepare_for_decode()
