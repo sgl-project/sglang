@@ -302,15 +302,18 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        Forward method with allreduce fusion, prioritizing flashinfer fused operations.
+        When quant_format contains "fp8", attempts fused AR+RMSNorm+FP8 quant.
         """
         if residual is not None:
             from sglang.srt.distributed import (
                 get_tensor_model_parallel_world_size,
                 tensor_model_parallel_all_reduce,
                 tensor_model_parallel_fused_allreduce_rmsnorm,
+                tensor_model_parallel_fused_allreduce_rmsnorm_quant,
             )
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 flashinfer_allreduce_residual_rmsnorm,
@@ -320,8 +323,19 @@ class RMSNorm(MultiPlatformOp):
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
 
-                # Prefer AITER fused AR+RMSNorm when enabled on AMD.
+                # Prefer AITER fused AR+RMSNorm+(fp8 quant) when enabled on AMD.
+                fp8_out = "fp8_e4m3fnuz" in quant_format
+
                 if _use_aiter:
+                    if fp8_out:
+                        fused_result = (
+                            tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                                x, residual, self.weight, self.variance_epsilon
+                            )
+                        )
+                        if fused_result is not None:
+                            return fused_result
+
                     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
                         x, residual, self.weight, self.variance_epsilon
                     )

@@ -406,11 +406,13 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
@@ -450,11 +452,15 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
+                    fused_result = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual
+                            hidden_states, residual, quant_format=quant_format,
                         )
                     )
+                    if len(fused_result) == 3:
+                        hidden_states, residual, _ = fused_result
+                    else:
+                        hidden_states, residual = fused_result
                 else:
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(

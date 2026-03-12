@@ -28,6 +28,19 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Fused TP all-reduce + RMSNorm + FP8 per-token quant.
+
+    Returns (out_fp8, residual_out, scale_out) or None if unavailable.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant(input_, residual_inp_, weight_, eps)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
