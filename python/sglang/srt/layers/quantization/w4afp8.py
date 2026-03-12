@@ -387,7 +387,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         hidden_states, hidden_states_scale, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
-            dispatch_output.hidden_states_scale,    
+            dispatch_output.hidden_states_scale,
             dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
@@ -420,4 +420,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 hidden_states_scale,
             )
         else:
-            return torch.empty_like(hidden_states, device=hidden_states.device, dtype=torch.bfloat16)
+            return torch.empty_like(
+                hidden_states, device=hidden_states.device, dtype=torch.bfloat16
+            )

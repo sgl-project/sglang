@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (

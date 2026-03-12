@@ -115,6 +115,7 @@ def deepep_permute_triton_kernel(
                 scale_dst_ptr = gateup_a_scale_ptr + dst_idx * scale_size
                 tl.store(scale_dst_ptr + off_s, sdata, mask=mask_s)
 
+
 @triton.jit
 def deepep_post_reorder_triton_kernel(
     down_output_ptr,
