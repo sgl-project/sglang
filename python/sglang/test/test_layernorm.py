@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -16,9 +17,9 @@ class TestRMSNorm(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
-        torch.set_default_device("cuda")
+        if get_device() not in ["cuda", "xpu"]:
+            raise unittest.SkipTest("Test only supports CUDA and XPU devices")
+        torch.set_default_device(get_device())
 
     def _run_rms_norm_test(self, num_tokens, hidden_size, add_residual, dtype, seed):
         torch.manual_seed(seed)
@@ -66,9 +67,9 @@ class TestGemmaRMSNorm(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
-        torch.set_default_device("cuda")
+        if get_device() not in ["cuda", "xpu"]:
+            raise unittest.SkipTest("Test only supports CUDA and XPU devices")
+        torch.set_default_device(get_device())
 
     def _run_gemma_rms_norm_test(
         self, num_tokens, hidden_size, add_residual, dtype, seed
@@ -120,9 +121,9 @@ class TestLayerNorm(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
-        torch.set_default_device("cuda")
+        if get_device() not in ["cuda", "xpu"]:
+            raise unittest.SkipTest("Test only supports CUDA and XPU devices")
+        torch.set_default_device(get_device())
 
     def _run_layer_norm_test(
         self, num_tokens, hidden_size, use_affine, use_bias, dtype, seed, param_dtype

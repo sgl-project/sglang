@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -17,11 +18,13 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
+        device = get_device()
+        if device not in ["cuda", "xpu"]:
+            raise unittest.SkipTest("Test only supports CUDA and XPU devices")
 
-        if torch.cuda.get_device_capability()[0] < 9:
-            raise unittest.SkipTest("FP8 requires compute capability >= 9.0")
+        if device == "cuda":
+            if torch.cuda.get_device_capability()[0] < 9:
+                raise unittest.SkipTest("FP8 requires compute capability >= 9.0")
 
     def _test_kernel_correctness(
         self,
@@ -34,7 +37,7 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
         cache_ndim,
     ):
         """Compare Triton kernel output against naive implementation."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         dtype = torch.bfloat16
 
         # Create input tensors
@@ -260,7 +263,7 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
 
     def test_empty_input(self):
         """Test edge case: empty input (0 tokens)."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         dtype = torch.bfloat16
         num_kv_heads = 8
         head_dim = 128
@@ -314,7 +317,7 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
         causing a type error when performing "1.0 / k_scale" inside the kernel.
         The fix converts tensor scales to Python floats in the wrapper.
         """
-        device = torch.device("cuda")
+        device = torch.device(get_device())
 
         num_tokens = 4
         num_kv_heads = 2
@@ -369,6 +372,8 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
         cudaErrorStreamCaptureUnsupported during graph capture. The fix computes
         inverse scales purely on GPU using tensor operations.
         """
+        if get_device() != "cuda":
+            raise unittest.SkipTest("CUDA graph capture is CUDA-only")
         device = torch.device("cuda")
 
         num_tokens = 4
@@ -431,6 +436,8 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
         The fix passes dummy pointers when use_provided_scale=False, as the kernel
         uses constant 1.0 and Triton optimizes away the pointer loads.
         """
+        if get_device() != "cuda":
+            raise unittest.SkipTest("CUDA graph capture is CUDA-only")
         device = torch.device("cuda")
 
         num_tokens = 4

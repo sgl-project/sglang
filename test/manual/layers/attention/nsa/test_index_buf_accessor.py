@@ -14,6 +14,11 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.nsa.index_buf_accessor import GetK, GetKAndS, GetS
+from sglang.srt.utils import get_device
+
+_DEVICE = get_device()
+_SKIP = _DEVICE not in ["cuda", "xpu"]
+_SKIP_REASON = "Test only supports CUDA and XPU devices"
 
 
 class MockNSATokenToKVPool:
@@ -24,7 +29,7 @@ class MockNSATokenToKVPool:
         page_size: int = 64,
         index_head_dim: int = 128,
         quant_block_size: int = 128,
-        device: str = "cuda",
+        device: str = get_device(),
     ):
         self.page_size = page_size
         self.index_head_dim = index_head_dim
@@ -36,7 +41,7 @@ def create_test_buffer(
     num_pages: int,
     page_size: int = 64,
     index_head_dim: int = 128,
-    device: str = "cuda",
+    device: str = get_device(),
 ) -> torch.Tensor:
     """
     Create a test buffer mimicking the K/S buffer structure.
@@ -61,7 +66,7 @@ def create_test_buffer(
     return buf
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 class TestGetK:
     """Test cases for GetK.triton() correctness."""
 
@@ -71,7 +76,7 @@ class TestGetK:
     @pytest.mark.parametrize("index_head_dim", [128])
     def test_getk_correctness(self, num_pages, seq_len, page_size, index_head_dim):
         """Test GetK.triton() produces same output as GetK.torch_fast()."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
 
         # Ensure seq_len doesn't exceed available pages
         max_seq_len = num_pages * page_size
@@ -113,7 +118,7 @@ class TestGetK:
 
     def test_getk_sequential_pages(self):
         """Test GetK with sequential page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 10
@@ -134,7 +139,7 @@ class TestGetK:
 
     def test_getk_repeated_pages(self):
         """Test GetK with repeated page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 5
@@ -154,7 +159,7 @@ class TestGetK:
         torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 class TestGetS:
     """Test cases for GetS.triton() correctness."""
 
@@ -164,7 +169,7 @@ class TestGetS:
     @pytest.mark.parametrize("index_head_dim", [128])
     def test_gets_correctness(self, num_pages, seq_len, page_size, index_head_dim):
         """Test GetS.triton() produces same output as GetS.torch_fast()."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
 
         # Ensure seq_len doesn't exceed available pages
         max_seq_len = num_pages * page_size
@@ -206,7 +211,7 @@ class TestGetS:
 
     def test_gets_sequential_pages(self):
         """Test GetS with sequential page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 10
@@ -227,7 +232,7 @@ class TestGetS:
 
     def test_gets_repeated_pages(self):
         """Test GetS with repeated page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 5
@@ -247,7 +252,7 @@ class TestGetS:
         torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 class TestGetKAndS:
     """Test cases for GetKAndS.triton() correctness."""
 
@@ -259,7 +264,7 @@ class TestGetKAndS:
         self, num_pages, seq_len, page_size, index_head_dim
     ):
         """Test GetKAndS.triton() produces same output as separate torch_fast calls."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
 
         # Ensure seq_len doesn't exceed available pages
         max_seq_len = num_pages * page_size
@@ -315,7 +320,7 @@ class TestGetKAndS:
 
     def test_get_k_and_s_sequential_pages(self):
         """Test GetKAndS with sequential page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 10
@@ -341,7 +346,7 @@ class TestGetKAndS:
 
     def test_get_k_and_s_repeated_pages(self):
         """Test GetKAndS with repeated page indices."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 5
@@ -367,7 +372,7 @@ class TestGetKAndS:
 
     def test_get_k_and_s_partial_page(self):
         """Test GetKAndS when seq_len is not a multiple of page_size."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 5
@@ -393,13 +398,13 @@ class TestGetKAndS:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 
     def test_single_token(self):
         """Test with seq_len=1 (single token)."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 2
@@ -428,7 +433,7 @@ class TestEdgeCases:
 
     def test_exact_page_boundary(self):
         """Test when seq_len exactly matches page boundaries."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 5
@@ -457,7 +462,7 @@ class TestEdgeCases:
 
     def test_large_seq_len(self):
         """Test with large sequence length."""
-        device = torch.device("cuda")
+        device = torch.device(get_device())
         page_size = 64
         index_head_dim = 128
         num_pages = 100
@@ -504,8 +509,8 @@ def print_test_summary():
 
 if __name__ == "__main__":
     # Run tests manually
-    if not torch.cuda.is_available():
-        print("CUDA not available. Skipping tests.")
+    if get_device() not in ["cuda", "xpu"]:
+        print("No supported device (CUDA/XPU) available. Skipping tests.")
         exit(0)
 
     print_test_summary()
