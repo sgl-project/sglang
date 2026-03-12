@@ -49,9 +49,9 @@ def get_moe_flops(
     """FLOPs for one MoE FFN layer on seqlen tokens.
     """
     routed_flops = (
-        4 * seqlen * hidden_size * expert_intermediate_size * num_experts_per_tok
+        6 * seqlen * hidden_size * expert_intermediate_size * num_experts_per_tok
     )
-    shared_flops = 4 * seqlen * hidden_size * shared_expert_intermediate_size
+    shared_flops = 6 * seqlen * hidden_size * shared_expert_intermediate_size
     return routed_flops + shared_flops
 
 
