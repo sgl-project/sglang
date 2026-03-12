@@ -121,7 +121,7 @@ class ObjectStorageModel:
         """
         Returns the local directory path.
         """
-        model_hash = hashlib.sha256(str(model_path).encode()).hexdigest()[:8]
+        model_hash = hashlib.sha256(str(model_path).encode()).hexdigest()[:16]
         base_dir = get_cache_dir()
 
         # Ensure base cache dir exists
