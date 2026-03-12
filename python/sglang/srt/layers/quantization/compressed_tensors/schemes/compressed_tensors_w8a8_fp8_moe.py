@@ -13,8 +13,8 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
-    get_moe_padding_size,
     get_moe_runner_backend,
+    get_moe_weight_sizes,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -123,17 +123,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
-        w13_processed = 2 * intermediate_size_per_partition
-        w2_processed = intermediate_size_per_partition
-        if _use_aiter:
-            padding_size = get_moe_padding_size(_use_aiter)
-            align_aiter = (
-                lambda n: ((n + padding_size - 1) // padding_size) * padding_size
-            )
-            if w2_processed % padding_size:
-                w2_processed = align_aiter(w2_processed)
-                # up proj + gate fusion : 2x
-                w13_processed = w2_processed * 2
+        w13_processed, w2_processed = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=True,
+            is_concat=True,
+            is_packed=False,
+        )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(

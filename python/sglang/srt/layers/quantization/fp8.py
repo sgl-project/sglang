@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_padding_size,
     get_moe_runner_backend,
+    get_moe_weight_sizes,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -744,22 +745,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
 
-        w13_processed = 2 * intermediate_size_per_partition
-        w2_processed = intermediate_size_per_partition
+        w13_processed, w2_processed = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=True,
+            is_concat=True,
+            is_packed=False,
+        )
+
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
+
             padding_size = get_moe_padding_size(_use_aiter)
-            if _use_aiter and padding_size == block_n == block_k:
-                align_aiter = (
-                    lambda n: ((n + padding_size - 1) // padding_size) * padding_size
-                )
-                if (intermediate_size_per_partition) % padding_size:
-                    w2_processed = align_aiter(intermediate_size_per_partition)
-                    w13_processed = w2_processed * 2
-            else:
+            if not (_use_aiter and padding_size == block_n == block_k):
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
                 if intermediate_size_per_partition % block_n != 0:

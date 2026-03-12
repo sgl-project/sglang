@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -82,20 +82,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         params_dtype = torch.uint8
 
-        w13_processed = 2 * intermediate_size_per_partition
-        w2_processed = intermediate_size_per_partition // 2
-        if _use_aiter:
-            padding_size = get_moe_padding_size(_use_aiter)
-            align_aiter = (
-                lambda n: ((n + padding_size - 1) // padding_size) * padding_size
-            )
-            if w2_processed % padding_size:
-                w2_processed = align_aiter(w2_processed)
-                # up proj + gate fusion : 2x
-                w13_processed = w2_processed * 2
-                if hasattr(torch, "float4_e2m1fn_x2"):
-                    # pack fp4: 2x
-                    w13_processed *= 2
+        w13_processed, w2_processed = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=True,
+            is_concat=True,
+            is_packed=True,
+        )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
