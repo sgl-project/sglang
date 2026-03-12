@@ -152,6 +152,7 @@ class EAGLEWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -795,6 +796,11 @@ class EAGLEWorker(TpModelWorker):
         spec_info: EagleVerifyInput,
         seq_lens_pre_verify: torch.Tensor,
     ):
+        # Under DP attention, some ranks can be IDLE during target verify and never
+        # initialize mamba forward metadata for this step.
+        if batch.forward_mode.is_idle():
+            return
+
         accepted_length = (
             torch.tensor(
                 res.accept_length_per_req_cpu,

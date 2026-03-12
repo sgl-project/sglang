@@ -106,6 +106,7 @@ class AiterAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        topk: int = 1,
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
@@ -123,6 +124,7 @@ class AiterAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -171,6 +173,7 @@ class AiterAttnBackend(AttentionBackend):
         self.mask_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
+        self._kv_indices_scratch: Optional[torch.Tensor] = None
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -432,8 +435,151 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
         )
 
+    def _resolve_v2_num_draft_tokens(
+        self,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens_cpu: Optional[list[int]] = None,
+    ) -> int:
+        """Resolve fixed per-request extend length for DRAFT_EXTEND_V2."""
+        num_draft_tokens = self.num_draft_tokens
+        if num_draft_tokens is None:
+            if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
+                # Avoid list scans in hot path when tensor lengths are already available.
+                num_draft_tokens = int(extend_seq_lens[0].item())
+            elif extend_seq_lens_cpu:
+                num_draft_tokens = max(extend_seq_lens_cpu)
+            else:
+                raise ValueError(
+                    "DRAFT_EXTEND_V2 requires speculative_num_draft_tokens or "
+                    "non-empty extend_seq_lens/extend_seq_lens_cpu."
+                )
+
+        num_draft_tokens = int(num_draft_tokens)
+        if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
+            if not torch.all(extend_seq_lens == num_draft_tokens):
+                raise ValueError(
+                    "DRAFT_EXTEND_V2 expects fixed extend length per request; got "
+                    f"extend_seq_lens={extend_seq_lens}, expected all == {num_draft_tokens}."
+                )
+        if extend_seq_lens_cpu and any(
+            x != num_draft_tokens for x in extend_seq_lens_cpu
+        ):
+            raise ValueError(
+                "DRAFT_EXTEND_V2 expects fixed extend length per request; got "
+                f"{extend_seq_lens_cpu}, expected all == {num_draft_tokens}."
+            )
+        return num_draft_tokens
+
+    def _get_kv_indices_scratch(
+        self, required_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        if (
+            self._kv_indices_scratch is None
+            or self._kv_indices_scratch.device != device
+            or self._kv_indices_scratch.numel() < required_tokens
+        ):
+            self._kv_indices_scratch = torch.empty(
+                required_tokens, dtype=torch.int32, device=device
+            )
+        return self._kv_indices_scratch[:required_tokens]
+
+    def _set_uniform_qo_indptr(
+        self, bs: int, tokens_per_req: int, device: torch.device
+    ) -> torch.Tensor:
+        qo_indptr = self.qo_indptr[: bs + 1]
+        qo_indptr[: bs + 1] = torch.arange(
+            0,
+            bs * tokens_per_req + 1,
+            step=tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
+        return qo_indptr
+
+    def _ensure_spec_v2_topk_supported(self):
+        if self.topk > 1:
+            raise NotImplementedError(
+                "AiterAttnBackend SPEC_V2 path currently supports topk <= 1 only. "
+                f"Got topk={self.topk}."
+            )
+
+    def mla_fp8_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        total_q = q.shape[0]
+        nhead = layer.tp_q_head_num
+        v_head_dim = layer.v_head_dim
+
+        if q.dtype != fp8_dtype:
+            q = q.to(fp8_dtype)
+        if k.dtype != fp8_dtype:
+            k = k.to(fp8_dtype)
+        if v.dtype != fp8_dtype:
+            v = v.to(fp8_dtype)
+        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
+
+        tile_q = 256
+        reduce_indptr = self.forward_metadata.reduce_indptr
+        reduce_final_map = self.forward_metadata.reduce_final_map
+        reduce_partial_map = self.forward_metadata.reduce_partial_map
+
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        final_lse = torch.empty(
+            (total_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = q.new_empty(
+            (total_q, nhead, v_head_dim),
+            dtype=self.input_dtype,
+        )
+
+        mla_prefill_ps_asm_fwd(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.fp8_prefill_kv_indices,
+            self.forward_metadata.work_indptr,
+            self.forward_metadata.work_info_set,
+            self.forward_metadata.max_q_len,
+            layer.scaling,
+            True,
+            logits,
+            attn_lse,
+            output,
+            one_scale,
+            one_scale,
+            one_scale,
+        )
+        mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            tile_q,
+            output,
+            final_lse,
+        )
+        return output
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
+        """Init auxiliary variables for aiter attention backend."""
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
@@ -456,8 +602,8 @@ class AiterAttnBackend(AttentionBackend):
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                kv_indices = self._get_kv_indices_scratch(
+                    forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -523,7 +669,97 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
             )
 
+        elif forward_batch.forward_mode.is_draft_extend_v2():
+            # EAGLE V2: DRAFT_EXTEND_V2 mode - extend draft KV cache with all predicted tokens
+            self._ensure_spec_v2_topk_supported()
+            if self.use_mla:
+                device = forward_batch.seq_lens.device
+                num_draft_tokens = self._resolve_v2_num_draft_tokens(
+                    extend_seq_lens=forward_batch.extend_seq_lens
+                )
+                qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
+
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+
+                kv_indices = self._get_kv_indices_scratch(
+                    forward_batch.seq_lens_sum, device
+                )
+
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+                if _use_mla_ps_kernel:
+                    max_seqlen_qo = num_draft_tokens
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+
+                    num_kv_splits = self.max_split_per_batch
+
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.kv_last_page_len[:bs],
+                        work_metadata,
+                        work_info_set,
+                        work_indptr,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                        max_seqlen_qo,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    self.kv_last_page_len[:bs],
+                    num_draft_tokens,
+                    forward_batch.seq_lens_cpu.max().item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    run_graph=False,
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
         elif forward_batch.forward_mode.is_draft_extend():
+            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.accept_length
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -611,20 +847,19 @@ class AiterAttnBackend(AttentionBackend):
                 kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
 
-                qo_indptr = torch.arange(
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
                     0,
                     (1 + bs) * draft_num,
                     step=draft_num,
                     dtype=torch.int32,
                     device=device,
                 )
-                kv_indptr = self.kv_indptr
+                kv_indptr = self.kv_indptr[: bs + 1]
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
+                kv_indices = self._get_kv_indices_scratch(
                     kv_lens_sum,
-                    dtype=torch.int32,
-                    device=device,
+                    device,
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -749,6 +984,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
                 qo_indptr = self.mla_indices_updater_prefill.qo_indptr
+                kv_indptr = self.mla_indices_updater_prefill.kv_indptr
 
                 work_metadata = None
                 work_indptr = None
@@ -774,7 +1010,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     self.make_mla_prefill_ps_meta_data(
                         qo_indptr,
-                        qo_indptr,
+                        kv_indptr,
                         forward_batch.seq_lens,
                         work_metadata,
                         work_indptr,
@@ -785,7 +1021,7 @@ class AiterAttnBackend(AttentionBackend):
                         is_causal=True,
                     )
 
-                    total_s = int(forward_batch.extend_seq_lens.sum())
+                    total_s = forward_batch.seq_lens_sum
                     fp8_prefill_kv_indices = torch.arange(
                         total_s, device=self.device, dtype=torch.int32
                     )
@@ -964,7 +1200,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
         elif forward_mode.is_target_verify():
@@ -1058,7 +1293,70 @@ class AiterAttnBackend(AttentionBackend):
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
                 )
+        elif forward_mode.is_draft_extend_v2():
+            # EAGLE V2: Uses fixed num_draft_tokens per batch
+            self._ensure_spec_v2_topk_supported()
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            qo_indptr = self._set_uniform_qo_indptr(bs, num_tokens_per_bs, self.device)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+
+            if _use_mla_ps_kernel:
+                num_kv_splits = self.max_split_per_batch
+
+                self.make_mla_meta_data(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_last_page_len,
+                    self.work_metadata,
+                    self.work_info_set,
+                    self.work_indptr,
+                    self.reduce_indptr,
+                    self.reduce_final_map,
+                    self.reduce_partial_map,
+                    max_q_len,
+                    fast_mode=fast_mode,
+                    max_split_per_batch=num_kv_splits,
+                    intra_batch_mode=intra_batch_mode,
+                )
+
+                work_metadata = self.work_metadata
+                work_info_set = self.work_info_set
+                work_indptr = self.work_indptr
+
+                reduce_indptr = self.reduce_indptr
+                reduce_final_map = self.reduce_final_map
+                reduce_partial_map = self.reduce_partial_map
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                kv_indptr[-1].item(),
+                work_metadata=work_metadata,
+                work_info_set=work_info_set,
+                work_indptr=work_indptr,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                num_kv_splits=num_kv_splits,
+            )
         elif forward_mode.is_draft_extend():
+            # EAGLE V1: Uses speculative_num_steps + 1
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -1238,7 +1536,6 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
 
         elif forward_mode.is_target_verify():
@@ -1332,8 +1629,78 @@ class AiterAttnBackend(AttentionBackend):
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
                 )
+        elif forward_mode.is_draft_extend_v2():
+            # EAGLE V2: Fixed num_draft_tokens per batch
+            self._ensure_spec_v2_topk_supported()
+            seq_lens = seq_lens[:bs]
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            extend_lens = torch.full(
+                (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
+            )
 
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+
+            if _use_mla_ps_kernel:
+
+                num_kv_splits = self.max_split_per_batch
+
+                self.make_mla_meta_data(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_last_page_len,
+                    self.work_metadata,
+                    self.work_info_set,
+                    self.work_indptr,
+                    self.reduce_indptr,
+                    self.reduce_final_map,
+                    self.reduce_partial_map,
+                    max_q_len,
+                    fast_mode=fast_mode,
+                    max_split_per_batch=num_kv_splits,
+                    intra_batch_mode=intra_batch_mode,
+                )
+
+                work_metadata = self.work_metadata
+                work_info_set = self.work_info_set
+                work_indptr = self.work_indptr
+
+                reduce_indptr = self.reduce_indptr
+                reduce_final_map = self.reduce_final_map
+                reduce_partial_map = self.reduce_partial_map
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                kv_indptr[-1].item(),
+                work_metadata=work_metadata,
+                work_info_set=work_info_set,
+                work_indptr=work_indptr,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                num_kv_splits=num_kv_splits,
+            )
         elif forward_mode.is_draft_extend():
+            # EAGLE V1: Uses spec_info.accept_length
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -1405,6 +1772,14 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # AITER verify path does not require post-draft buffer patching currently.
+        # This override prevents overlap-plan stream mode from failing with the
+        # base class NotImplementedError.
+        pass
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1452,81 +1827,16 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
-                        total_s = q.shape[0]
-                        nhead = layer.tp_q_head_num
-                        v_head_dim = layer.v_head_dim
-
-                        # q is cast here (after RoPE).
-                        # k/v are already FP8 for MXFP4 main model (fused kv_b_proj),
-                        # but need casting for FP8/BF16 weights (e.g. MTP draft model).
-                        if q.dtype != fp8_dtype:
-                            q = q.to(fp8_dtype)
-                        if k.dtype != fp8_dtype:
-                            k = k.to(fp8_dtype)
-                        if v.dtype != fp8_dtype:
-                            v = v.to(fp8_dtype)
-                        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
-
-                        kv_indptr_asm = qo_indptr
-                        kv_indices_asm = self.forward_metadata.fp8_prefill_kv_indices
-
-                        tile_q = 256
-                        reduce_indptr = self.forward_metadata.reduce_indptr
-                        reduce_final_map = self.forward_metadata.reduce_final_map
-                        reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-                        logits = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        attn_lse = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        final_lse = torch.empty(
-                            (total_s, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        output = q.new_empty(
-                            (total_s, nhead, v_head_dim),
-                            dtype=self.input_dtype,
-                        )
-
-                        mla_prefill_ps_asm_fwd(
+                        output = self.mla_fp8_prefill_attn(
                             q,
                             k,
                             v,
-                            qo_indptr,
-                            kv_indptr_asm,
-                            kv_indices_asm,
-                            self.forward_metadata.work_indptr,
-                            self.forward_metadata.work_info_set,
-                            max_q_len,
-                            layer.scaling,
-                            True,
-                            logits,
-                            attn_lse,
-                            output,
-                            one_scale,
-                            one_scale,
-                            one_scale,
-                        )
-                        mla_reduce_v1(
-                            logits,
-                            attn_lse,
-                            reduce_indptr,
-                            reduce_final_map,
-                            reduce_partial_map,
-                            tile_q,
-                            output,
-                            final_lse,
+                            layer,
                         )
                     else:
                         output = flash_attn_varlen_func(
@@ -1553,44 +1863,61 @@ class AiterAttnBackend(AttentionBackend):
                         kvc = kvc.to(dtype)
                         k_pe = k_pe.to(dtype)
 
-                    kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
+                    if (
+                        _use_fp8_prefill_attn
+                        and layer.kv_b_proj.weight.dtype == torch.uint8
+                    ):
+                        # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
+                        # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
+                        # directly in FP8, avoiding a separate elementwise cast
+                        k, v = layer.kv_b_proj(
+                            (
+                                kvc.squeeze(1),
+                                k_pe.expand(-1, layer.tp_k_head_num, -1),
+                                qk_nope_head_dim,
+                                layer.v_head_dim,
+                                fp8_dtype,
+                            )
+                        )[0]
+                    else:
+                        kv = layer.kv_b_proj(kvc.contiguous())[0]
 
-                    kvprefix = kvprefix.view(
-                        -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
-                    )
-                    k_prefix, v_prefix = torch.split(
-                        kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
-                    )
-                    k_prefix = torch.cat(
-                        [
-                            k_prefix,
-                            torch.broadcast_to(
-                                k_pe,
-                                (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
-                            ),
-                        ],
-                        dim=-1,
-                    )
+                        kv = kv.view(
+                            -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                        )
+                        k, v = torch.split(
+                            kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                        )
+                        k = torch.cat(
+                            [
+                                k,
+                                torch.broadcast_to(
+                                    k_pe,
+                                    (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
+                                ),
+                            ],
+                            dim=-1,
+                        )
+
                     assert (
                         forward_batch.extend_prefix_lens.shape
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    k = k_prefix
-                    v = v_prefix
-
-                    o = flash_attn_varlen_func(
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        kv_indptr,
-                        max_q_len,
-                        max_kv_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                    )
-                    return o
+                    if _use_fp8_prefill_attn:
+                        return self.mla_fp8_prefill_attn(q, k, v, layer)
+                    else:
+                        return flash_attn_varlen_func(
+                            q,
+                            k,
+                            v,
+                            qo_indptr,
+                            kv_indptr,
+                            max_q_len,
+                            max_kv_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        )
 
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
@@ -1653,7 +1980,10 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
                 return o
-            elif forward_batch.forward_mode.is_draft_extend():
+            elif (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
@@ -2129,6 +2459,7 @@ class AiterMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
+                    topk=topk,
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len

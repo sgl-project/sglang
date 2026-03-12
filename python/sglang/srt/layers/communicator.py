@@ -840,18 +840,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
