@@ -29,7 +29,7 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 _is_hip = current_platform.is_hip()
-_use_aiter_vae = get_bool_env_var("SGLANG_USE_AITER_VAE") and _is_hip
+_use_aiter_vae = get_bool_env_var("SGLANG_USE_ROCM_VAE") and _is_hip
 
 
 def _replace_groupnorm_with_aiter(module: torch.nn.Module) -> int:
