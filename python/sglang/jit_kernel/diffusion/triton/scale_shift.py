@@ -411,3 +411,12 @@ if current_platform.is_npu():
     from .npu_fallback import fuse_scale_shift_native
 
     fuse_scale_shift_kernel = fuse_scale_shift_native
+
+if current_platform.is_mps():
+    from .mps_fallback import (
+        fuse_scale_shift_gate_select01_kernel_native,
+        fuse_scale_shift_kernel_native,
+    )
+
+    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+    fuse_scale_shift_gate_select01_kernel = fuse_scale_shift_gate_select01_kernel_native

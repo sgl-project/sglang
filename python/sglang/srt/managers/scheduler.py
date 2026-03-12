@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -30,7 +31,6 @@ import torch
 import torch.distributed
 import zmq
 from torch.cuda import Stream as CudaStream
-from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
@@ -202,6 +202,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     get_numa_node,
     get_zmq_socket,
+    is_mps,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -218,6 +219,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+if is_mps():
+    CudaStreamContext = nullcontext
+else:
+    from torch.cuda import StreamContext as CudaStreamContext
 
 logger = logging.getLogger(__name__)
 
@@ -786,7 +792,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.return_health_check_ct = 0
+        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1259,8 +1265,6 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-
-            self.maybe_send_health_check_signal()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -1316,8 +1320,6 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-
-            self.maybe_send_health_check_signal()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -1493,35 +1495,14 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req):
-                # Check if there are requests being processed
-                has_running_requests = (
-                    self.chunked_req is not None
-                    or self.dllm_manager.any_staging_reqs()
-                    or not self.running_batch.is_empty()
-                    or len(self.offload_tags) > 0
+            # Skip health check when server is busy — ongoing requests already carry health info.
+            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
+                for_health_check=True
+            ):
+                self.return_health_check_ipcs.append(
+                    getattr(recv_req, "http_worker_ipc", None)
                 )
-
-                # In PD disaggregation mode, also check if health check would be blocked
-                # in special queues (bootstrap/prealloc) due to external factors
-                will_block_in_pd_queue = False
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                    # If bootstrap queue has backlog, health check will also be blocked there
-                    will_block_in_pd_queue = (
-                        len(self.disagg_prefill_bootstrap_queue.queue) > 0
-                        or len(self.disagg_prefill_inflight_queue) > 0
-                    )
-                elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                    # If prealloc/transfer queue has backlog, health check will also be blocked there
-                    will_block_in_pd_queue = (
-                        len(self.disagg_decode_prealloc_queue.queue) > 0
-                        or len(self.disagg_decode_transfer_queue.queue) > 0
-                    )
-
-                if has_running_requests or will_block_in_pd_queue:
-                    self.return_health_check_ct += 1
-                    continue
+                continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1780,7 +1761,7 @@ class Scheduler(
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = len(req.origin_input_ids)
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
@@ -2078,13 +2059,20 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            # For prefill-only batch, we can avoid going through decoding step.
-            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+            if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+        # For prefill-only batch, filter out finished requests since they
+        # won't go through the decode step. This keeps running_batch accurate
+        # for load reporting (num_running_reqs via /get_load).
+        # Runs outside the last_batch block so stale requests are cleaned
+        # even when no new batches arrive (e.g. traffic stops).
+        if self.running_batch.is_prefill_only:
+            self.running_batch.filter_batch()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2104,8 +2092,11 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
+            # Run decode (skip for prefill-only batches)
+            if (
+                not self.running_batch.is_empty()
+                and not self.running_batch.is_prefill_only
+            ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2396,7 +2387,11 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
                 )
 
             msg_prefix = (
@@ -2421,6 +2416,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if batch.is_empty():
+            return batch
 
         # Update batch tensors
         batch.prepare_for_decode()
@@ -2621,14 +2619,18 @@ class Scheduler(
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
+        self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ct:
+        if self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_output(HealthCheckOutput())
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(
+                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+                )
+            )
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
@@ -2644,20 +2646,36 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def _is_idle_for_hicache_storage_op(self) -> bool:
-        """Stricter idle check for storage attach/detach.
+    def is_fully_idle(self, for_health_check=False) -> bool:
+        # Batch running status
+        idle = (
+            self.running_batch.is_empty()
+            and self.chunked_req is None
+            and not self.dllm_manager.any_staging_reqs()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        )
 
-        We require:
-        - no running batches (including overlap/pp/disagg paths) via `_is_no_request()`
-        - no queued requests in scheduler queues (waiting/grammar/disagg queues)
-        """
-        if not self._is_no_request():
-            return False
-        if len(self.waiting_queue) != 0:
-            return False
-        if len(self.grammar_manager.grammar_queue) != 0:
-            return False
-        return True
+        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
+        idle &= len(self.waiting_queue) == 0
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            idle &= (
+                len(self.disagg_decode_prealloc_queue.queue) == 0
+                and len(self.disagg_decode_transfer_queue.queue) == 0
+            )
+
+        if not for_health_check:
+            # Grammar queue and prefill inflight queue may not produce batch results
+            # instantly, but they still indicate the server is not fully idle.
+            idle &= len(self.grammar_manager.grammar_queue) == 0
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                idle &= len(self.disagg_prefill_inflight_queue) == 0
+
+        return idle
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -2667,7 +2685,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self._is_idle_for_hicache_storage_op():
+        if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2720,7 +2738,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self._is_idle_for_hicache_storage_op():
+        if not self.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2787,29 +2805,9 @@ class Scheduler(
             message=msg,
         )
 
-    def _is_no_request(self):
-        no_request = (
-            self.running_batch.is_empty()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (self.cur_batch is None or self.cur_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-        )
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            no_request &= (
-                len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                and len(self.disagg_prefill_inflight_queue) == 0
-            )
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            no_request &= (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
-                and len(self.disagg_decode_transfer_queue.queue) == 0
-            )
-        return no_request
-
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self._is_no_request():
+        if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
