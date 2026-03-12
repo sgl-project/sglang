@@ -183,9 +183,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     "hidden_states": torch.zeros(
                         (pp_proxy_bs, hidden_size), dtype=dtype
                     ),
-                    "residual": torch.zeros(
-                        (pp_proxy_bs, hidden_size), dtype=dtype
-                    ),
+                    "residual": torch.zeros((pp_proxy_bs, hidden_size), dtype=dtype),
                 }
             else:
                 pp_proxy_tensors = None
