@@ -1195,7 +1195,11 @@ class Scheduler(
             and batch
             and getattr(batch, "is_extend_in_batch", batch.forward_mode.is_extend())
             and self.last_batch
-            and getattr(self.last_batch, "is_extend_in_batch", self.last_batch.forward_mode.is_extend())
+            and getattr(
+                self.last_batch,
+                "is_extend_in_batch",
+                self.last_batch.forward_mode.is_extend(),
+            )
         )
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
