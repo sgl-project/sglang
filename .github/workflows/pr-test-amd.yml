@@ -1,7 +1,7 @@
 name: PR Test (AMD)
 # Dynamic run-name for /rerun-stage commands to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
+run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
   push:
@@ -24,8 +24,29 @@ on:
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
+      target_stage_select:
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-small-1-gpu-amd
+          - stage-b-test-small-1-gpu-amd-nondeterministic
+          - stage-b-test-small-1-gpu-amd-mi35x
+          - stage-b-test-large-1-gpu-amd
+          - stage-b-test-large-2-gpu-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
       target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
+        description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
         type: string
         default: ""
@@ -71,9 +92,11 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
 
 concurrency:
-  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
-  group: pr-test-amd-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # When called via workflow_call with run_all_tests=true, use a unique group per run to
+  # avoid collisions with direct push/PR triggers. We use run_all_tests (not github.event_name)
+  # to detect this, because github.event_name inherits from the caller in workflow_call.
+  group: pr-test-amd-${{ inputs.run_all_tests && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' }}
 
 jobs:
   call-gate:
@@ -139,16 +162,16 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -186,16 +209,16 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-2gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -228,9 +251,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -238,7 +261,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -268,16 +291,16 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'jit-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -307,9 +330,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -317,7 +340,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{matrix.runner}}
     steps:
@@ -347,9 +370,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-nondeterministic') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -357,7 +380,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -386,9 +409,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -425,9 +448,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -435,7 +458,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -465,9 +488,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -475,7 +498,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-2gpu-sglang]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -502,12 +525,20 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
     runs-on: ${{matrix.runner}}
     steps:
@@ -622,12 +653,20 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-2gpu-sglang]
         part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
     runs-on: ${{matrix.runner}}
     steps:
@@ -744,19 +783,19 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     env:
-      RUNNER_LABELS: linux-mi325-gpu-8
+      RUNNER_LABELS: linux-mi325-8gpu-sglang
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-8]
+        runner: [linux-mi325-8gpu-sglang]
         part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
@@ -792,9 +831,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -833,9 +872,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )

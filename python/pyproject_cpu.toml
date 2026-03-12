@@ -23,7 +23,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "decord; platform_machine == 'x86_64'",
   "einops",
   "fastapi",
   "gguf",
@@ -68,7 +67,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto>=0.4.1",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
 ]
@@ -96,6 +95,9 @@ dev = ["sglang[test]"]
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [

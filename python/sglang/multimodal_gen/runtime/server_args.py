@@ -21,6 +21,7 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -39,7 +40,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.utils import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+    expand_path_fields,
+)
 
 logger = init_logger(__name__)
 
@@ -270,6 +275,7 @@ class ServerArgs:
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
+    warmup_steps: int = 1
 
     disable_autocast: bool | None = None
 
@@ -293,6 +299,7 @@ class ServerArgs:
     scheduler_port: int = 5555
 
     output_path: str | None = "outputs/"
+    input_save_path: str | None = "inputs/uploads"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -332,7 +339,8 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def _adjust_path(self):
-        self.model_path = os.path.expanduser(self.model_path)
+        expand_path_fields(self)
+        self._adjust_save_paths()
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
@@ -346,6 +354,7 @@ class ServerArgs:
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        self.adjust_pipeline_config()
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -353,6 +362,13 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+
+    def _adjust_save_paths(self):
+        """Normalize empty-string save paths to None (disabled)."""
+        if self.output_path is not None and self.output_path.strip() == "":
+            self.output_path = None
+        if self.input_save_path is not None and self.input_save_path.strip() == "":
+            self.input_save_path = None
 
     def _adjust_quant_config(self):
         """validate and adjust"""
@@ -375,6 +391,26 @@ class ServerArgs:
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
                 transformer_weights_path=self.nunchaku_config.transformer_weights_path,
+            )
+
+    def adjust_pipeline_config(self):
+        # enable parallel folding when SP is enabled
+        if self.tp_size != 1 or self.sp_degree <= 1:
+            return
+
+        enabled = False
+        for text_encoder_config in self.pipeline_config.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                enabled = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
+        if enabled:
+            logger.info(
+                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                self.__class__.__name__,
+                self.tp_size,
+                self.sp_degree,
             )
 
     def _adjust_offload(self):
@@ -742,6 +778,12 @@ class ServerArgs:
             default=ServerArgs.warmup_resolutions,
             help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
         )
+        parser.add_argument(
+            "--warmup-steps",
+            type=int,
+            default=ServerArgs.warmup_steps,
+            help="The number of warmup steps to perform for each resolution.",
+        )
 
         parser.add_argument(
             "--dit-cpu-offload",
@@ -838,7 +880,13 @@ class ServerArgs:
             "--output-path",
             type=str,
             default=ServerArgs.output_path,
-            help="Directory path to save generated images/videos",
+            help='Directory path to save generated images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--input-save-path",
+            type=str,
+            default=ServerArgs.input_save_path,
+            help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
 
         # LoRA
@@ -881,10 +929,15 @@ class ServerArgs:
         return parser
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        host = self.host
+        if not host or host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"http://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"http://{host}:{self.port}"
 
     @property
     def scheduler_endpoint(self):

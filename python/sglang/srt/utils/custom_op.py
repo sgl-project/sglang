@@ -4,6 +4,7 @@ import inspect
 from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 
 import torch
+import torch.library
 
 F = TypeVar("F", bound=Callable)
 
@@ -189,3 +190,146 @@ class CustomOpWrapper:
                 )
 
         return fake_impl
+
+
+def register_custom_op_from_extern(
+    fn: Callable,
+    *,
+    op_name: Optional[str] = None,
+    mutates_args: Optional[List[str]] = None,
+    out_shape: Optional[Union[int, str]] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    fake_impl: Optional[Callable] = None,
+    computed_args: Optional[dict] = None,
+) -> Callable:
+    """Wrap an external library function as a custom op for torch.compile compatibility.
+
+    Use this to wrap functions from external libraries (e.g. flashinfer kernels) that
+    perform operations incompatible with torch.compile/dynamo tracing, such as JIT
+    compilation, file I/O, or dynamic module loading.
+
+    The wrapped function becomes an opaque node in the compiled graph. Dynamo will
+    not trace inside it, avoiding tracing failures. A fake implementation is used
+    for shape/dtype propagation during compilation.
+
+    The external function must have type annotations compatible with
+    ``torch.library.infer_schema`` (``torch.Tensor``, ``int``, ``float``, ``bool``,
+    ``Optional[torch.Tensor]``, etc.).
+
+    This function is idempotent: calling it multiple times with the same ``op_name``
+    (or ``fn.__name__``) safely skips re-registration.
+
+    Example usage::
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        trtllm_fp8_block_scale_moe = register_custom_op_from_extern(
+            trtllm_fp8_block_scale_moe,
+            out_shape="hidden_states",
+            out_dtype=torch.bfloat16,
+            computed_args={
+                "tune_max_num_tokens": lambda hidden_states, **kw: next_power_of_2(
+                    hidden_states.shape[0]
+                ),
+            },
+        )
+
+    :param fn: The external function to wrap.
+    :param op_name: The name of the custom operator.
+                    Defaults to ``fn.__name__``.
+    :param mutates_args: A list of argument names that are mutated in-place.
+                         Defaults to ``[]``.
+    :param out_shape: The position (int) or name (str) of the argument whose shape
+                      matches the output tensor. Used to auto-generate a fake
+                      implementation. Set to ``None`` for inplace-only operators.
+    :param out_dtype: Override the output dtype in the fake implementation.
+                      If ``None``, ``torch.empty_like`` is used (same dtype as the
+                      reference tensor). Useful when the output dtype differs from
+                      the input (e.g. fp8 input -> bf16 output).
+    :param fake_impl: A custom fake implementation for shape/dtype propagation.
+                      Only one of ``out_shape`` or ``fake_impl`` should be provided.
+    :param computed_args: A dict mapping argument names to callables. These arguments
+                          are excluded from the custom op schema and computed inside
+                          the op body at runtime. Each callable receives the other
+                          arguments as keyword args and returns the computed value.
+                          Use this for arguments that vary dynamically (e.g.
+                          ``tune_max_num_tokens``) to avoid torch.compile recompilation.
+    :return: The registered custom op callable (``torch.ops.sglang.<op_name>``).
+    """
+    name = op_name or fn.__name__
+    computed_args = computed_args or {}
+
+    assert not (
+        out_shape is not None and fake_impl is not None
+    ), "Only one of `out_shape` or `fake_impl` should be provided."
+
+    # If computed_args specified, create a wrapper with a reduced signature
+    # that computes the excluded args inside the op body.
+    if computed_args:
+        original_fn = fn
+        original_sig = inspect.signature(fn)
+
+        # Build new signature excluding computed args
+        new_params = [
+            p
+            for param_name, p in original_sig.parameters.items()
+            if param_name not in computed_args
+        ]
+        new_sig = original_sig.replace(parameters=new_params)
+
+        def wrapper(*args, **kwargs):
+            bound = new_sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            # Compute excluded args from the bound arguments
+            for arg_name, compute_fn in computed_args.items():
+                bound.arguments[arg_name] = compute_fn(**bound.arguments)
+            return original_fn(**bound.arguments)
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__qualname__ = fn.__qualname__
+        wrapper.__module__ = fn.__module__
+        wrapper.__signature__ = new_sig
+        # Build annotations without computed args, preserving return type
+        wrapper.__annotations__ = {
+            k: v
+            for k, v in getattr(fn, "__annotations__", {}).items()
+            if k not in computed_args
+        }
+        fn = wrapper
+
+    # Generate fake_impl from out_shape if needed
+    fake_sig = inspect.signature(fn)
+    if fake_impl is None and out_shape is not None:
+
+        def _fake_impl(*args, **kwargs):
+            bound = fake_sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            try:
+                ref = (
+                    bound.args[out_shape]
+                    if isinstance(out_shape, int)
+                    else bound.arguments[out_shape]
+                )
+            except (IndexError, KeyError):
+                raise RuntimeError(
+                    f"Cannot find output argument at position `{out_shape}` for "
+                    f"external function `{name}` with signature `{fake_sig}`."
+                )
+            if out_dtype is not None:
+                return torch.empty(ref.shape, dtype=out_dtype, device=ref.device)
+            return torch.empty_like(ref)
+
+        fake_impl = _fake_impl
+    elif fake_impl is None:
+        fake_impl = lambda *args, **kwargs: None
+
+    from sglang.srt.utils.common import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name=name,
+        op_func=fn,
+        mutates_args=mutates_args or [],
+        fake_impl=fake_impl,
+    )
+
+    return getattr(torch.ops.sglang, name)
