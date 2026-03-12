@@ -60,6 +60,7 @@ def bench_layernorm_scale_shift_gate_select01(
     )
 
     if provider == "split":
+
         def fn():
             normalized = norm_infer(
                 x.view(-1, x.shape[-1]),
@@ -78,7 +79,9 @@ def bench_layernorm_scale_shift_gate_select01(
                 gate1=gate1,
                 index=index,
             )
+
     else:
+
         def fn():
             return fuse_layernorm_scale_shift_gate_select01_kernel(
                 x,
@@ -120,6 +123,7 @@ def bench_residual_layernorm_scale_shift_gate_select01(
     residual_gate = torch.randn_like(x)
 
     if provider == "split":
+
         def fn():
             residual_out = residual + residual_gate * x
             normalized = norm_infer(
@@ -139,7 +143,9 @@ def bench_residual_layernorm_scale_shift_gate_select01(
                 gate1=gate1,
                 index=index,
             )
+
     else:
+
         def fn():
             return fuse_residual_layernorm_scale_shift_gate_select01_kernel(
                 x,

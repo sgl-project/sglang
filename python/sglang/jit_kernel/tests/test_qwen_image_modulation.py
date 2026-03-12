@@ -2,16 +2,18 @@ import pytest
 import torch
 import triton
 
+from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_gate_select01_kernel,
 )
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.utils import get_ci_test_range
 
 DEVICE = "cuda"
-DTYPES = get_ci_test_range([torch.float16, torch.bfloat16, torch.float32], [torch.float16, torch.bfloat16])
+DTYPES = get_ci_test_range(
+    [torch.float16, torch.bfloat16, torch.float32], [torch.float16, torch.bfloat16]
+)
 BATCH_SIZES = get_ci_test_range([1, 2, 4], [1, 2])
 SEQ_LENS = get_ci_test_range([6, 33, 128, 257], [6, 128])
 HIDDEN_SIZES = get_ci_test_range([512, 1024, 1536, 3072], [512, 3072])
@@ -114,7 +116,9 @@ def cuda_setup():
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-def test_fused_layernorm_scale_shift_gate_select01(dtype, batch_size, seq_len, hidden_size):
+def test_fused_layernorm_scale_shift_gate_select01(
+    dtype, batch_size, seq_len, hidden_size
+):
     x = torch.randn(batch_size, seq_len, hidden_size, device=DEVICE, dtype=dtype)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
     bias = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
