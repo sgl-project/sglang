@@ -9,20 +9,23 @@ from typing import Optional
 import torch
 
 from .causal_conv1d_triton import PAD_SLOT_ID
+from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
+from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
 
 try:
     from sgl_kernel import causal_conv1d_fwd
     from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
     torch.ops.sgl_kernel.causal_conv1d_update
-    _USE_TRITON = False
+    _HAS_SGL_KERNEL = True
 except (ImportError, AttributeError):
-    from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
-    from .causal_conv1d_triton import (
-        causal_conv1d_update as _causal_conv1d_update_triton,
-    )
+    _HAS_SGL_KERNEL = False
 
-    _USE_TRITON = True
+
+def _get_seq_lens_cpu(query_start_loc, x):
+    if query_start_loc is not None:
+        return (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
+    return [x.shape[-1]]
 
 
 def causal_conv1d_fn(
@@ -66,29 +69,35 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
-    if _USE_TRITON:
-        seq_lens_cpu = (
-            (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
-            if query_start_loc is not None
-            else [x.shape[-1]]
-        )
+    # Use Triton when: (1) sgl_kernel not available, or (2) input is
+    # non-contiguous and seq_lens_cpu is already pre-computed by caller.
+    # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
+    # copy that can cost >0.6 ms/layer on large prefill batches.
+    use_triton = not _HAS_SGL_KERNEL or (
+        x.stride(-1) != 1 and "seq_lens_cpu" in kwargs
+    )
+    if use_triton:
+        if "seq_lens_cpu" not in kwargs:
+            kwargs["seq_lens_cpu"] = _get_seq_lens_cpu(query_start_loc, x)
         return _causal_conv1d_fn_triton(
             x,
             weight,
             bias,
             conv_states=conv_states,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=seq_lens_cpu,
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             activation=activation,
             pad_slot_id=pad_slot_id,
             **kwargs,
         )
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
+
+    # CUDA path: ensure contiguous (seq_lens_cpu unavailable, avoid GPU-CPU sync)
     if x.stride(-1) != 1:
         x = x.contiguous()
+
+    if activation not in [None, "silu", "swish"]:
+        raise NotImplementedError("activation must be None, silu, or swish")
     bias = bias.contiguous() if bias is not None else None
 
     causal_conv1d_fwd(
@@ -137,7 +146,8 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
-    if _USE_TRITON:
+    use_triton = not _HAS_SGL_KERNEL
+    if use_triton:
         return _causal_conv1d_update_triton(
             x,
             conv_state,
