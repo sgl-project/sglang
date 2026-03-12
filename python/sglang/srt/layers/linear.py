@@ -37,6 +37,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -1463,7 +1464,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1486,7 +1487,10 @@ class RowParallelLinear(LinearBase):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+                fp_communications = \
+                    (not forward_batch is None and forward_batch.forward_mode.is_decode()) \
+                    or not get_global_server_args().quantize_tp_communications
+                output = tensor_model_parallel_all_reduce(output_parallel, fp_comm=fp_communications)
         else:
             output = output_parallel
 
