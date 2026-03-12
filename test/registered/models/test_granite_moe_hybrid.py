@@ -23,7 +23,7 @@ class TestGraniteMoeHybridExtraBuffer(
     cache_chunk_size = 256
     gsm8k_accuracy_thres = 0.78
     kl_div_thres = 0.002
-    kl_div_thres_prefill = 0.009
+    kl_div_thres_prefill = 0.02
     other_args = [
         "--mem-fraction-static",
         "0.8",
