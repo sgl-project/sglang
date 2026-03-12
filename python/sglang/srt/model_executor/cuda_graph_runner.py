@@ -180,8 +180,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if pp_size > 1:
                 pp_proxy_bs = max_bs // pp_proxy_scatter_factor
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((pp_proxy_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((pp_proxy_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros(
+                        (pp_proxy_bs, hidden_size), dtype=dtype
+                    ),
+                    "residual": torch.zeros(
+                        (pp_proxy_bs, hidden_size), dtype=dtype
+                    ),
                 }
             else:
                 pp_proxy_tensors = None
