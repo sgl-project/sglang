@@ -413,14 +413,10 @@ class LayerNorm(MultiPlatformOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
-            if self.use_bias:
-                return torch.ops.sgl_kernel.layernorm_cpu(
-                    x, self.weight.data, self.bias.data, self.variance_epsilon
-                )
-            else:
-                return torch.ops.sgl_kernel.layernorm_cpu(
-                    x, self.weight.data, None, self.variance_epsilon
-                )
+            bias_data = self.bias.data if self.use_bias else None
+            return torch.ops.sgl_kernel.layernorm_cpu(
+                x, self.weight.data, bias_data, self.variance_epsilon
+)
         else:
             return self.forward_native(x)
 
