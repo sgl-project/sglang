@@ -427,6 +427,14 @@ def run_one_case(
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
 ):
+    # Reset random seed before each case so repeated benchmark runs use
+    # identical input data (same expert routing pattern every time).
+    # Without this, random.shuffle in the data loader produces different
+    # inputs across repeats, causing up to 25% throughput variance for
+    # MoE models with expert-parallel dispatch.
+    random.seed(BenchArgs.seed)
+    np.random.seed(BenchArgs.seed)
+
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         response = requests.post(url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT)
