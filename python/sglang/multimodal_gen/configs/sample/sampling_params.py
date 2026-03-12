@@ -641,7 +641,7 @@ class SamplingParams:
         parser.add_argument(
             "--negative-prompt",
             type=str,
-            default=SamplingParams.negative_prompt,
+            default=None,
             help="Negative text prompt for generation",
         )
         parser.add_argument(
@@ -928,7 +928,11 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        return {
+            attr: getattr(args, attr)
+            for attr in attrs
+            if hasattr(args, attr) and getattr(args, attr) is not None
+        }
 
     def output_file_path(self):
         if self.output_path is None:
