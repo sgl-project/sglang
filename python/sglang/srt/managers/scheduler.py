@@ -137,6 +137,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -517,11 +518,6 @@ class Scheduler(
         self._mm_processor = None
         if self.model_config.is_multimodal and self.processor is not None:
             try:
-                from sglang.srt.managers.multimodal_processor import (
-                    get_mm_processor,
-                    import_processors,
-                )
-
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
