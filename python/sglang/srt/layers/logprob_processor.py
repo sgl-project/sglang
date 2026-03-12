@@ -428,10 +428,9 @@ class OutputLogprobProcessor(nn.Module):
     log_softmax computation, and extraction of top-k / token-id logprobs.
 
     Entry points:
-      - forward:                  logits -> preprocess -> temperature scale -> log_softmax
-                                  (used by Sampler before sampling, and for scoring)
-      - process_output_logprobs:  attach pre-computed logprob results to LogitsProcessorOutput
-                                  (used by Sampler after sampling)
+      - forward:                           logits -> preprocess -> temperature scale -> log_softmax
+      - extract_logprobs_results:          logprobs -> token logprobs + top-k + token-id logprobs
+      - extract_logprobs_results_for_prefill: logprobs -> top-k + token-id logprobs (scoring only)
     """
 
     def __init__(self, use_nan_detection: bool = False):
@@ -545,25 +544,7 @@ class OutputLogprobProcessor(nn.Module):
             logprobs = torch.log(probs)
         return None, probs, logprobs, original_logprobs
 
-    def process_output_logprobs(
-        self,
-        logits_output: LogitsProcessorOutput,
-        logprobs: torch.Tensor,
-        batch_next_token_ids: torch.Tensor,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[Optional[List[int]]],
-    ):
-        """Compute and attach logprob results to logits_output."""
-        result = self.from_logprobs(
-            logprobs, batch_next_token_ids, top_logprobs_nums, token_ids_logprobs
-        )
-        logits_output.next_token_logprobs = result.token_logprobs
-        logits_output.next_token_top_logprobs_val = result.top_logprobs_val
-        logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
-        logits_output.next_token_token_ids_logprobs_val = result.token_ids_logprobs_val
-        logits_output.next_token_token_ids_logprobs_idx = result.token_ids_logprobs_idx
-
-    def from_logprobs(
+    def extract_logprobs_results(
         self,
         logprobs: torch.Tensor,
         batch_next_token_ids: torch.Tensor,
@@ -600,7 +581,7 @@ class OutputLogprobProcessor(nn.Module):
             token_ids_logprobs_idx=next_token_token_ids_logprobs_idx,
         )
 
-    def extract_logprobs_for_scoring(
+    def extract_logprobs_results_for_prefill(
         self,
         logprobs: torch.Tensor,
         top_logprobs_nums: List[int],

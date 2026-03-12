@@ -117,17 +117,25 @@ class Sampler(nn.Module):
             )
             del probs
 
-        # Attach logprobs to logits_output (in-place modification)
+        # Attach logprobs to logits_output
         if return_logprob:
             output_logprobs = (
                 original_logprobs if original_logprobs is not None else logprobs
             )
-            self.output_logprob_processor.process_output_logprobs(
-                logits_output,
+            result = self.output_logprob_processor.extract_logprobs_results(
                 output_logprobs,
                 batch_next_token_ids,
                 top_logprobs_nums,
                 token_ids_logprobs,
+            )
+            logits_output.next_token_logprobs = result.token_logprobs
+            logits_output.next_token_top_logprobs_val = result.top_logprobs_val
+            logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
+            logits_output.next_token_token_ids_logprobs_val = (
+                result.token_ids_logprobs_val
+            )
+            logits_output.next_token_token_ids_logprobs_idx = (
+                result.token_ids_logprobs_idx
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -301,7 +309,7 @@ class Sampler(nn.Module):
             return_original_logprob=False,
             rl_on_policy=False,
         )
-        result = self.output_logprob_processor.extract_logprobs_for_scoring(
+        result = self.output_logprob_processor.extract_logprobs_results_for_prefill(
             logprobs,
             top_logprobs_nums,
             token_ids_logprobs,
