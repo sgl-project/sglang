@@ -256,7 +256,7 @@ class MambaPool:
                 for conv_shape in conv_state_shape
             ]
 
-            if _is_cpu and _cpu_has_amx_support:
+            if _is_cpu and _is_cpu_amx_available:
                 from sglang.srt.layers.amx_utils import _init_amx_conv_state
 
                 # CPU uses a different layout of conv_state for kernel optimization
