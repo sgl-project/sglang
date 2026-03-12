@@ -274,6 +274,12 @@ impl PDRouter {
         Ok(original)
     }
 
+    fn inject_dp_rank_to_json(json_val: &mut Value, rank: isize, rank_key: &str) {
+        if let Some(obj) = json_val.as_object_mut() {
+            obj.insert(rank_key.to_string(), Value::Number(rank.into()));
+        }
+    }
+
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -341,10 +347,46 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        let mut prefill_json_request = json_request.clone();
+                        let mut decode_json_request = json_request;
+
+                        let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
+                        if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
+                            let text_length: isize = match context.request_text.as_ref() {
+                                Some(text) => text.len().try_into().unwrap_or(0),
+                                None => 0,
+                            };
+                            let prefill_rank = dp_rank_policy
+                                .select_dp_rank(prefill.as_ref(), text_length)
+                                .await;
+                            let decode_rank = dp_rank_policy
+                                .select_dp_rank(decode.as_ref(), text_length)
+                                .await;
+                            if let (Some(p_rank), Some(d_rank)) = (prefill_rank, decode_rank) {
+                                debug!("prefill_rank is {}, decode_rank {}", p_rank, d_rank);
+                                Self::inject_dp_rank_to_json(
+                                    &mut prefill_json_request,
+                                    p_rank,
+                                    "routed_dp_rank",
+                                );
+                                Self::inject_dp_rank_to_json(
+                                    &mut decode_json_request,
+                                    d_rank,
+                                    "routed_dp_rank",
+                                );
+                                Self::inject_dp_rank_to_json(
+                                    &mut decode_json_request,
+                                    p_rank,
+                                    "disagg_prefill_dp_rank",
+                                );
+                            }
+                        }
+
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
-                                json_request,
+                                prefill_json_request,
+                                decode_json_request,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
@@ -530,10 +572,12 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        prefill_json_request: Value,
+        decode_json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -555,7 +599,7 @@ impl PDRouter {
             &self.client,
             prefill.url(),
             context.route,
-            &json_request,
+            &prefill_json_request,
             headers,
             false,
         );
@@ -563,7 +607,7 @@ impl PDRouter {
             &self.client,
             decode.url(),
             context.route,
-            &json_request,
+            &decode_json_request,
             headers,
             false,
         );

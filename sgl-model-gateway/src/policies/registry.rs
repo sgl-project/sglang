@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
@@ -36,6 +36,9 @@ pub struct PolicyRegistry {
     /// When None, the registry works independently without mesh synchronization
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
     mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
+
+    // DP-rank policy: Supports the selection of dp-rank outside the engine.
+    dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 }
 
 impl PolicyRegistry {
@@ -50,6 +53,7 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
+            dp_rank_policy: Arc::new(OnceLock::new()),
         }
     }
 
@@ -229,6 +233,16 @@ impl PolicyRegistry {
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.prefill_policy.set(policy);
+    }
+
+    pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
+        // OnceLock::set returns Err if already set, which we ignore since
+        // the policy should only be set once at startup
+        let _ = self.dp_rank_policy.set(policy);
+    }
+
+    pub fn get_dp_rank_policy(&self) -> Option<Arc<dyn DPRankLoadPolicy>> {
+        self.dp_rank_policy.get().map(Arc::clone)
     }
 
     /// Set the decode policy for PD mode (lock-free, set once at startup)

@@ -13,6 +13,7 @@ use crate::core::{HashRing, Worker};
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
+mod dp_min_token;
 mod factory;
 mod manual;
 mod power_of_two;
@@ -25,6 +26,7 @@ pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
+pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
@@ -91,6 +93,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+#[async_trait]
+pub trait DPRankLoadPolicy: Send + Sync + Debug {
+    async fn select_dp_rank(&self, worker: &dyn Worker, text_str: isize) -> Option<isize>;
 }
 
 /// Configuration for cache-aware policy

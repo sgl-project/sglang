@@ -1,4 +1,53 @@
-use smg::core::metrics_aggregator::{aggregate_metrics, MetricPack};
+use smg::core::metrics_manager::{aggregate_metrics, extract_gauge_metrics, MetricPack};
+
+#[test]
+fn test_extract_gauge_metrics() {
+    let pack1 = MetricPack {
+        labels: vec![("source".to_string(), "worker1".to_string())],
+        metrics_text: r#"
+# HELP sglang:num_used_tokens The number of used tokens
+# TYPE sglang:num_used_tokens gauge
+sglang:num_used_tokens{dp_rank="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 123859.0
+sglang:num_used_tokens{dp_rank="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1.0
+# HELP http_requests_total The total number of HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="post",code="200"} 1027
+http_requests_total{method="post",code="400"} 3
+"#
+        .to_string(),
+    };
+    let metrics_text = pack1.metrics_text;
+    let dp_rank_metrics = extract_gauge_metrics(metrics_text, "sglang_num_used_tokens");
+    for (dp_rank, value) in &dp_rank_metrics {
+        println!("dp_rank = {}: value = {}", dp_rank, value);
+    }
+    assert_eq!(dp_rank_metrics.len(), 2);
+    assert_eq!(dp_rank_metrics.get(&0), Some(&123859));
+}
+
+#[test]
+fn test_extract_gauge_metrics_without_dp_rank() {
+    let pack1 = MetricPack {
+        labels: vec![("source".to_string(), "worker1".to_string())],
+        metrics_text: r#"
+# HELP sglang:num_used_tokens The number of used tokens
+# TYPE sglang:num_used_tokens gauge
+sglang:num_used_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2.0
+# HELP http_requests_total The total number of HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="post",code="200"} 1027
+http_requests_total{method="post",code="400"} 3
+"#
+        .to_string(),
+    };
+    let metrics_text = pack1.metrics_text;
+    let dp_rank_metrics = extract_gauge_metrics(metrics_text, "sglang_num_used_tokens");
+    for (dp_rank, value) in &dp_rank_metrics {
+        println!("dp_rank = {}: value = {}", dp_rank, value);
+    }
+    assert_eq!(dp_rank_metrics.len(), 1);
+    assert_eq!(dp_rank_metrics.get(&0), Some(&2));
+}
 
 #[test]
 fn test_aggregate_simple() {
