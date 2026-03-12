@@ -408,6 +408,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.has_reusing_chunked_req = False
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -608,6 +609,10 @@ class PrefillAdder:
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
+        # Track if this batch has a reusing request with is_chunked > 0
+        # to prevent batching another chunked-reusing request (memory_pool assertion).
+        if req.req_pool_idx is not None and req.is_chunked > 0:
+            self.has_reusing_chunked_req = True
         self._update_prefill_budget(
             0,
             req.extend_input_len,
@@ -711,6 +716,10 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            # Only one chunked request allowed per batch when reusing req_pool_idx.
+            if self.new_chunked_req is not None or self.has_reusing_chunked_req:
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -723,7 +732,7 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self, req: Req, truncation_align_size: Optional[int]
     ):
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -805,6 +814,10 @@ class PrefillAdder:
                     ),
                 )
             else:
+                # Only one chunked request allowed per batch when reusing req_pool_idx.
+                if self.new_chunked_req is not None or self.has_reusing_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
