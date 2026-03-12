@@ -1350,6 +1350,133 @@ class FlashInferFP4MoE(FusedMoE):
         return result
 
 
+class FlashInferCuteDslMoE(FusedMoE):
+    """Dedicated CuteDSL MoE layer that bypasses the generic dispatch machinery.
+
+    Modeled after FlashInferFP4MoE: receives StandardTopKOutput (pre-computed
+    topk_ids/topk_weights) and calls CuteDslMoEWrapper.run() directly, skipping
+    dispatcher.dispatch() -> quant_method.apply() -> dispatcher.combine().
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cutedsl_wrapper = None
+        self._cutedsl_scales = None
+        self._cutedsl_input_scale = None
+
+    def _ensure_wrapper(self, device: str, output_dtype: torch.dtype) -> None:
+        """Lazily create CuteDslMoEWrapper on first forward call.
+
+        The wrapper is intentionally NOT created in __init__ because of an
+        interaction with FlashInfer autotuning. During server startup,
+        _flashinfer_autotune() runs a dummy forward pass to profile kernel
+        tactics. That dummy run is the first forward call, so _ensure_wrapper
+        is invoked there. The autotune pass uses torch.no_grad() (not
+        torch.inference_mode()) specifically so that the pre-allocated CUDA
+        graph buffers inside CuteDslMoEWrapper are created as normal tensors.
+        If inference_mode were used instead, those buffers would be tagged as
+        "inference tensors" and any later inplace writes during CUDA graph
+        capture (init_device_graphs) would raise:
+            RuntimeError: Inplace update to inference tensor outside
+            InferenceMode is not allowed.
+        The torch.no_grad() fix in model_runner._flashinfer_autotune() covers
+        both the v1 (FusedMoE + dispatcher) and v2 (this class) CuteDSL paths
+        equally, since both lazily allocate wrapper buffers on first forward.
+        """
+        if self._cutedsl_wrapper is not None:
+            return
+        from flashinfer import CuteDslMoEWrapper
+
+        server_args = get_global_server_args()
+        use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
+        max_num_tokens = max(
+            getattr(server_args, "cuda_graph_max_bs", None) or 512,
+            getattr(server_args, "chunked_prefill_size", None) or 8192,
+        )
+        self._cutedsl_wrapper = CuteDslMoEWrapper(
+            num_experts=self.num_experts,
+            top_k=(
+                self.top_k if self.top_k is not None else self.moe_runner_config.top_k
+            ),
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size_per_partition,
+            use_cuda_graph=use_cuda_graph,
+            max_num_tokens=max_num_tokens,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+            output_dtype=output_dtype,
+            device=device,
+        )
+
+    def _ensure_scales(self) -> None:
+        if self._cutedsl_scales is not None:
+            return
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _resolve_cutedsl_standard_scales,
+        )
+
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            _resolve_cutedsl_standard_scales(self)
+        )
+        self._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+        self._cutedsl_input_scale = used_input_scale
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            return moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        assert TopKOutputChecker.format_is_standard(topk_output)
+
+        self._ensure_wrapper(str(hidden_states.device), hidden_states.dtype)
+        self._ensure_scales()
+
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
+
+        w1_alpha, fc2_input_scale, w2_alpha = self._cutedsl_scales
+
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            self._cutedsl_input_scale,
+            16,
+            False,
+            False,
+        )
+
+        w1_weight_sf = getattr(self, "w13_blockscale_mma", self.w13_blockscale_swizzled)
+        w2_weight_sf = getattr(self, "w2_blockscale_mma", self.w2_blockscale_swizzled)
+
+        final_hidden_states = self._cutedsl_wrapper.run(
+            x=x_fp4,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            w1_weight=self.w13_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=self.w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+        )
+
+        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states
+
+
 @register_custom_op(out_shape="hidden_states")
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,

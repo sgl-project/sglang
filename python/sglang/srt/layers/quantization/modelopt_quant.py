@@ -1453,7 +1453,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         """Access the global enable_flashinfer_cutedsl_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutedsl()
+        return (
+            get_moe_runner_backend().is_flashinfer_cutedsl()
+            or get_moe_runner_backend().is_flashinfer_cutedsl_v2()
+        )
 
     def create_weights(
         self,

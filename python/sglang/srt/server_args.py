@@ -179,6 +179,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_v2",
     "cutlass",
 ]
 
@@ -2040,6 +2041,23 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_cutedsl_v2":
+            assert self.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL v2 MOE currently supports only: 'modelopt_fp4'."
+            assert self.moe_a2a_backend == "none", (
+                f"flashinfer_cutedsl_v2 only supports moe_a2a_backend='none' (got '{self.moe_a2a_backend}'). "
+                "For EP with A2A dispatch, use flashinfer_cutedsl instead."
+            )
+            assert self.ep_size == 1, (
+                f"flashinfer_cutedsl_v2 only supports ep_size=1 (got {self.ep_size}). "
+                "For EP > 1, use flashinfer_cutedsl with an A2A backend."
+            )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer CuteDSL v2 MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):

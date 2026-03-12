@@ -804,6 +804,185 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                 )
                 print(f"  PASSED: {pct_within * 100:.1f}% within tol (atol={atol:.4f})")
 
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    @unittest.skipIf(
+        CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
+        "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
+    )
+    def test_cutedsl_v1_v2_parity(self):
+        """Verify v1 (no cuda_graph) and v2 (cuda_graph) wrappers produce identical results.
+
+        Also checks both match the pure-PyTorch reference.  This is the primary
+        regression test for FlashInferCuteDslMoE (v2 backend).
+        """
+        test_cases = [
+            # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
+            (16, 128, 256, 8, 2),
+            (32, 256, 512, 8, 4),
+        ]
+
+        for (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+        ) in test_cases:
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=top_k,
+            ):
+                tensors = _create_cutedsl_wrapper_tensors(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                )
+
+                wrapper_args = dict(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )
+                run_kwargs = dict(
+                    x=tensors["x"],
+                    x_sf=tensors["x_sf"],
+                    token_selected_experts=tensors["token_selected_experts"],
+                    token_final_scales=tensors["token_final_scales"],
+                    w1_weight=tensors["w1_weight"],
+                    w1_weight_sf=tensors["w1_weight_sf"],
+                    w1_alpha=tensors["w1_alpha"],
+                    fc2_input_scale=tensors["fc2_input_scale"],
+                    w2_weight=tensors["w2_weight"],
+                    w2_weight_sf=tensors["w2_weight_sf"],
+                    w2_alpha=tensors["w2_alpha"],
+                )
+
+                wrapper_v1 = CuteDslMoEWrapper(**wrapper_args, use_cuda_graph=False)
+                wrapper_v2 = CuteDslMoEWrapper(
+                    **wrapper_args,
+                    use_cuda_graph=True,
+                    max_num_tokens=num_tokens,
+                )
+
+                with torch.no_grad():
+                    out_v1 = wrapper_v1.run(**run_kwargs)
+                    out_v2 = wrapper_v2.run(**run_kwargs)
+
+                torch.testing.assert_close(
+                    out_v1,
+                    out_v2,
+                    atol=1e-5,
+                    rtol=1e-5,
+                    msg="v1 vs v2 wrapper outputs diverge (should be bitwise-equal)",
+                )
+
+                ref_output = _compute_reference_moe_fp4(
+                    hidden_states=tensors["x_bf16"].float().cuda(),
+                    gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                    gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                    token_selected_experts=tensors["token_selected_experts"],
+                    token_final_scales=tensors["token_final_scales"],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    fc2_input_scale=tensors["fc2_input_scale"],
+                )
+
+                out_f32 = out_v2.float()
+                ref_f32 = ref_output.float()
+                output_scale = max(ref_f32.std().item(), 0.01)
+                atol = max(0.1, 3.0 * output_scale)
+                rtol = 0.85
+                abs_diff = torch.abs(out_f32 - ref_f32)
+                rel_diff = abs_diff / (torch.abs(ref_f32) + 1e-8)
+                within_tol = (abs_diff < atol) | (rel_diff < rtol)
+                pct_within = within_tol.float().mean().item()
+                self.assertGreaterEqual(
+                    pct_within,
+                    0.925,
+                    f"v2 vs reference: only {pct_within * 100:.2f}% within tol",
+                )
+                print(
+                    f"  v1==v2 PASS, v2 vs ref: {pct_within * 100:.1f}% within tol "
+                    f"(tokens={num_tokens}, hidden={hidden_size}, inter={intermediate_size}, top_k={top_k})"
+                )
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    @unittest.skipIf(
+        CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
+        "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
+    )
+    def test_cutedsl_v2_cuda_graph_smoke(self):
+        """Smoke test: CuteDslMoEWrapper with use_cuda_graph=True under torch.no_grad().
+
+        Verifies the lazy-buffer-allocation + CUDA-graph-capture pattern used by
+        FlashInferCuteDslMoE doesn't hit the inference_mode tensor restriction.
+        Runs two forward passes: the first triggers buffer allocation, the second
+        reuses them (as would happen during CUDA graph replay).
+        """
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k = (
+            16,
+            128,
+            256,
+            8,
+            2,
+        )
+
+        tensors = _create_cutedsl_wrapper_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        wrapper = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+        )
+
+        run_kwargs = dict(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        with torch.no_grad():
+            out1 = wrapper.run(**run_kwargs)
+            out2 = wrapper.run(**run_kwargs)
+
+        self.assertEqual(out1.shape, (num_tokens, hidden_size))
+        self.assertFalse(
+            torch.isnan(out1).any().item() or torch.isinf(out1).any().item(),
+            "First pass output contains NaN or Inf",
+        )
+        torch.testing.assert_close(
+            out1,
+            out2,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Second pass should reuse buffers and produce identical output",
+        )
+        print("  CUDA graph smoke test PASSED (two passes, no_grad, buffers reused)")
+
 
 if __name__ == "__main__":
     unittest.main()

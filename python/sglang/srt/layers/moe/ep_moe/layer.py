@@ -576,6 +576,17 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
             return FlashInferFusedMoE
 
+    if (
+        get_moe_runner_backend().is_flashinfer_cutedsl_v2()
+        and get_moe_a2a_backend().is_none()
+    ):
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                FlashInferCuteDslMoE,
+            )
+
+            return FlashInferCuteDslMoE
+
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
     return FusedMoE
