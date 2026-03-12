@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import List, Optional
 
 from sglang.srt.disaggregation.utils import get_ib_devices_for_gpu

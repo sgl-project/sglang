@@ -203,9 +203,7 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
-        ib_device = get_ib_devices_for_gpu(
-            self.kv_args.ib_device, self.kv_args.gpu_id
-        )
+        ib_device = get_ib_devices_for_gpu(self.kv_args.ib_device, self.kv_args.gpu_id)
         if ib_device:
             os.environ["MORI_RDMA_DEVICES"] = ib_device
 
