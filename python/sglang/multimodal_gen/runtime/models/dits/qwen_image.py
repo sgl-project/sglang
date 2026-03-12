@@ -803,36 +803,20 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if x.is_cuda and getattr(norm_module, "norm_type", None) == "layer":
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if not index.is_contiguous():
-                    index = index.contiguous()
-                if is_scale_residual:
-                    if not residual_x.is_contiguous():
-                        residual_x = residual_x.contiguous()
-                    if not gate_x.is_contiguous():
-                        gate_x = gate_x.contiguous()
-                    x, residual_out, gate_result = (
-                        fuse_residual_layernorm_scale_shift_gate_select01_kernel(
-                            x,
-                            residual=residual_x,
-                            residual_gate=gate_x,
-                            weight=getattr(norm_module.norm, "weight", None),
-                            bias=getattr(norm_module.norm, "bias", None),
-                            scale0=scale0.contiguous(),
-                            shift0=shift0.contiguous(),
-                            gate0=gate0.contiguous(),
-                            scale1=scale1.contiguous(),
-                            shift1=shift1.contiguous(),
-                            gate1=gate1.contiguous(),
-                            index=index,
-                            eps=norm_module.eps,
-                        )
-                    )
-                else:
-                    x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if not index.is_contiguous():
+                index = index.contiguous()
+            if is_scale_residual:
+                if not residual_x.is_contiguous():
+                    residual_x = residual_x.contiguous()
+                if not gate_x.is_contiguous():
+                    gate_x = gate_x.contiguous()
+                x, residual_out, gate_result = (
+                    fuse_residual_layernorm_scale_shift_gate_select01_kernel(
                         x,
+                        residual=residual_x,
+                        residual_gate=gate_x,
                         weight=getattr(norm_module.norm, "weight", None),
                         bias=getattr(norm_module.norm, "bias", None),
                         scale0=scale0.contiguous(),
@@ -844,26 +828,23 @@ class QwenImageTransformerBlock(nn.Module):
                         index=index,
                         eps=norm_module.eps,
                     )
-                if is_scale_residual:
-                    return x, residual_out, gate_result
-                return x, gate_result
-
-            mask = (index == 0).unsqueeze(-1)
-            shift_result = torch.where(mask, shift0.unsqueeze(1), shift1.unsqueeze(1))
-            scale_result = torch.where(mask, scale0.unsqueeze(1), scale1.unsqueeze(1))
-            gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-            if is_scale_residual:
-                modulated, residual_out = norm_module(
-                    residual=residual_x,
-                    x=x,
-                    gate=gate_x,
-                    shift=shift_result,
-                    scale=scale_result,
                 )
-                return modulated, residual_out, gate_result
-
-            modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-            return modulated, gate_result
+                return x, residual_out, gate_result
+            else:
+                x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
+                    x,
+                    weight=getattr(norm_module.norm, "weight", None),
+                    bias=getattr(norm_module.norm, "bias", None),
+                    scale0=scale0.contiguous(),
+                    shift0=shift0.contiguous(),
+                    gate0=gate0.contiguous(),
+                    scale1=scale1.contiguous(),
+                    shift1=shift1.contiguous(),
+                    gate1=gate1.contiguous(),
+                    index=index,
+                    eps=norm_module.eps,
+                )
+                return x, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
