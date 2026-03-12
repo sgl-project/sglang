@@ -92,21 +92,16 @@ namespace device {
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
 #if !defined(USE_ROCM)
+#if !defined(SGL_CUDA_ARCH)
+#error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
+#endif
 #if defined(__CUDA_ARCH__)
-#define SGL_TARGET_CUDA_ARCH __CUDA_ARCH__
-#if defined(SGL_CUDA_ARCH)
 static_assert(__CUDA_ARCH__ == SGL_CUDA_ARCH,
               "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
 #endif
-#elif defined(SGL_CUDA_ARCH)
-#define SGL_TARGET_CUDA_ARCH SGL_CUDA_ARCH
-#endif
-#endif
-
-#ifdef SGL_TARGET_CUDA_ARCH
-#define SGL_ARCH_HOPPER_OR_GREATER (SGL_TARGET_CUDA_ARCH >= 900)
-#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_TARGET_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#else
+#define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
+#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#else  // USE_ROCM
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
