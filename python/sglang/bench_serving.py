@@ -37,7 +37,10 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.datasets.mooncake import (
+    build_mooncake_session_requests,
+    get_mooncake_request_over_time,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1166,7 +1169,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[DatasetRow],
+    input_requests: List[Union[DatasetRow, Dict[str, Any]]],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1181,6 +1184,7 @@ async def benchmark(
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
+    mooncake_block_size=128,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
@@ -1192,8 +1196,11 @@ async def benchmark(
     # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
     # Multi-turn format: ["turn1", "turn2", ...] - list of strings
     # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
-    first_prompt = input_requests[0].prompt
-    is_multi_turn = (
+    first_request = input_requests[0]
+    first_prompt = (
+        first_request.prompt if isinstance(first_request, DatasetRow) else None
+    )
+    is_multi_turn = bool(
         isinstance(first_prompt, list)
         and len(first_prompt) > 0
         and isinstance(first_prompt[0], str)
@@ -1216,27 +1223,10 @@ async def benchmark(
 
     # Handle the data structure difference for the warmup request
     if args.dataset_name == "mooncake":
-        # For mooncake, input_requests is a list of dicts.
-        # We need to build a temporary DatasetRow for the warmup phase.
-        warmup_record = input_requests[0]
-
-        # Build prompt from hash_ids, just like in the async generator
-        hash_ids = warmup_record.get("hash_ids", [])
-        prompt_text = ""
-        for hash_id in hash_ids:
-            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
-        prompt_text += "Can you tell me a detailed story in 1000 words?"
-
-        output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
-
-        # Create a temporary DatasetRow object for warmup
-        test_request = DatasetRow(
-            prompt=prompt_text,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            image_data=None,  # Mooncake doesn't have image data
-        )
+        # Mooncake traces are expanded into concrete DatasetRow objects on demand.
+        test_request = build_mooncake_session_requests(
+            input_requests[0], tokenizer, num_rounds=1, block_size=mooncake_block_size
+        )[0]
     else:
         # For all other datasets, input_requests is a list of DatasetRow objects
         test_request = input_requests[0]
@@ -1312,16 +1302,23 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    generated_requests: List[DatasetRow] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
+    if args.dataset_name == "mooncake":
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+            input_requests,
+            tokenizer,
+            mooncake_slowdown_factor,
+            mooncake_num_rounds,
+            block_size=mooncake_block_size,
         )
         print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            "Starting Mooncake trace replay. "
+            f"Sessions: {len(input_requests)}, "
+            f"Rounds per session: {mooncake_num_rounds}. "
+            f"Block size: {mooncake_block_size}. "
+            f"Slowdown factor: {mooncake_slowdown_factor}"
         )
         pbar_total *= args.mooncake_num_rounds
     else:
@@ -1339,6 +1336,7 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
+        generated_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1424,7 +1422,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=None if is_multi_turn else generated_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1556,6 +1554,9 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            "mooncake_slowdown_factor": getattr(args, "mooncake_slowdown_factor", None),
+            "mooncake_num_rounds": getattr(args, "mooncake_num_rounds", None),
+            "mooncake_block_size": getattr(args, "mooncake_block_size", None),
             # Information
             "server_info": server_info,
             # Results
@@ -1690,6 +1691,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
+
+    if not hasattr(args, "mooncake_block_size"):
+        args.mooncake_block_size = 128
 
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
@@ -1881,6 +1885,7 @@ def run_benchmark(args_: argparse.Namespace):
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
+            mooncake_block_size=args.mooncake_block_size,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
         )
@@ -2321,6 +2326,12 @@ if __name__ == "__main__":
         default=1,
         help="Number of conversation rounds for each session in the mooncake dataset. "
         "A value > 1 will enable true multi-turn session benchmarking.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-block-size",
+        type=int,
+        default=128,
+        help="Number of repeated context filler tokens added for each hash id in the mooncake prompt builder.",
     )
     mooncake_group.add_argument(
         "--mooncake-workload",
