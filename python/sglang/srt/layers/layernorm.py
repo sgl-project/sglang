@@ -416,7 +416,7 @@ class LayerNorm(MultiPlatformOp):
             bias_data = self.bias.data if self.use_bias else None
             return torch.ops.sgl_kernel.layernorm_cpu(
                 x, self.weight.data, bias_data, self.variance_epsilon
-)
+            )
         else:
             return self.forward_native(x)
 
