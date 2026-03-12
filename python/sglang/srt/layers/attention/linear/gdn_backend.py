@@ -359,9 +359,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        intermediate_state_cache = mamba_cache_params.intermediate_ssm
         if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState) 
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
@@ -560,7 +560,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     last_recurrent_state = last_recurrent_state.to(
                         ssm_states.dtype, copy=False
                     )
-                ssm_states[cache_indices] = last_recurrent_state
+                # ssm_states[cache_indices] = last_recurrent_state
+                intermediate_state_cache[cache_indices, 0] = last_recurrent_state
 
             if h is not None:
                 self._track_mamba_state_extend(
@@ -590,12 +591,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
     
             if intermediate_state is not None:
                 # MTP intermediate_state
-                intermediate_state[cache_indices, 0] = recurrent_state[cache_indices] # update indexput slow
+                # intermediate_state[cache_indices, 0] = recurrent_state[cache_indices] # update indexput slow
                 ssm_state = intermediate_state.view(
                     -1, num_value_heads, head_k_dim, head_v_dim
                 )
             else:
-                ssm_state = recurrent_state
+                ssm_state = intermediate_state[:, 0]
 
             if self.graph_mode:
                 num_accepted_tokens = torch.ones(

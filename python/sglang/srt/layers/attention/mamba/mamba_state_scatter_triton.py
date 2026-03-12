@@ -490,6 +490,102 @@ def move_intermediate_cache_dynamic_h_block(ssm_states, intermediate_state_cache
 
     return intermediate_state_cache
 
+@triton.jit
+def move_cache_dynamic_last_kernel_h_block_v1(
+    cache_ptr,
+    valid_indices_ptr,
+    last_steps_ptr,
+    layer_stride,
+    size_stride,
+    draft_stride,
+    h_dim,
+    dim_v,
+    dim_k,
+    num_layers,
+    H_BLOCK_SIZE: tl.constexpr, 
+    BLOCK_V: tl.constexpr,  # dim_v 的块大小
+    BLOCK_K: tl.constexpr,  # dim_k 的块大小
+):
+    """
+    使用清晰的 3D 偏移计算方式。
+    """
+    valid_id = tl.program_id(0)
+
+    # 加载真实的索引值
+    valid_idx_val = tl.load(valid_indices_ptr + valid_id)
+    last_step_val = tl.load(last_steps_ptr + valid_id)
+    if last_step_val < 0:
+        return
+    h_offsets = tl.arange(0, H_BLOCK_SIZE) 
+    v_offsets = tl.arange(0, BLOCK_V)
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    # 循环处理 layer
+    for l in range(num_layers):
+        base_addr = cache_ptr + tl.cast(l, tl.int64) * layer_stride + tl.cast(valid_idx_val, tl.int64) * size_stride
+        src_addr = base_addr + tl.cast(last_step_val, tl.int64) * draft_stride
+        # --- 循环处理 h 维度 ---
+        for h_start in range(0, h_dim, H_BLOCK_SIZE):
+            # if l == 0:
+            #     tl.device_print("h_start", h_start)
+            h_real = h_start + h_offsets # [h_start, h_start+1, ...]
+            h_mask = h_real < h_dim # 1D mask
+            
+            v_mask = v_offsets < dim_v
+            k_mask = k_offsets < dim_k
+            
+            # --- 组合 3D 掩码 ---
+            mask = h_mask[:, None, None] & v_mask[None, :, None] & k_mask[None, None, :]
+            
+            # --- 计算线性偏移 (核心公式) ---
+            # linear_offset = h * dim_v * dim_k + v * dim_k + k
+            linear_offset = h_real[:, None, None] * dim_v * dim_k + \
+                          v_offsets[None, :, None] * dim_k + \
+                          k_offsets[None, None, :]
+            
+            src_block = tl.load(src_addr + linear_offset, mask=mask, other=0)
+            
+            # 写入地址 (目标: 0)
+            dst_addr = base_addr + 0 * draft_stride
+            tl.store(dst_addr + linear_offset, src_block, mask=mask)
+
+
+def move_intermediate_cache_dynamic_h_block_v1(intermediate_state_cache, valid_tensor, last_steps_tensor, h_block_size=2):
+    """
+    封装函数：支持 H 维度分块的版本。
+    """
+    L, S, D, H, V, K = intermediate_state_cache.shape
+
+    # 1. 获取 Stride
+    strides = intermediate_state_cache.stride()
+    layer_stride, size_stride, draft_stride = int(strides[0]), int(strides[1]), int(strides[2])
+    assert len(valid_tensor) == len(last_steps_tensor), "长度必须一致"
+
+    # 3. 配置 Grid
+    # Grid[0]: 每个 valid_idx 一个线程
+    grid = (len(valid_tensor), )
+    # print(f"{intermediate_state_cache.shape}, {valid_tensor=}, {last_steps_tensor=}")
+    # 4. 启动 Kernel
+    # 注意：这里我们不再需要 pid_h 和 pid_v 作为 program_id
+    # 所有的分块逻辑都在 Kernel 内部通过循环实现
+    move_cache_dynamic_last_kernel_h_block_v1[grid](
+        cache_ptr=intermediate_state_cache,
+        valid_indices_ptr=valid_tensor,
+        last_steps_ptr=last_steps_tensor,
+        layer_stride=layer_stride,
+        size_stride=size_stride,
+        draft_stride=draft_stride,
+        h_dim=H,
+        dim_v=V,
+        dim_k=K,
+        num_layers=L,
+        H_BLOCK_SIZE=h_block_size, # 每次处理 2 个 h
+        BLOCK_V=triton.next_power_of_2(V), # v 维度的块大小 (这里假设 V 不大，一次性处理)
+        BLOCK_K=triton.next_power_of_2(K), # k 维度的块大小
+    )
+
+    return intermediate_state_cache
+
 
 @triton.jit
 def _conv_state_rollback_kernel(

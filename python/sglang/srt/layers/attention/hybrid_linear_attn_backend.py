@@ -30,7 +30,7 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import move_intermediate_cache_dynamic_h_block, conv_state_rollback
+    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import move_intermediate_cache_dynamic_h_block, conv_state_rollback, move_intermediate_cache_dynamic_h_block_v1
 
 logger = logging.getLogger(__name__)
 
@@ -1039,7 +1039,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             # ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
             #     :, valid_state_indices, last_steps
             # ].to(ssm_states.dtype, copy=False)
-            move_intermediate_cache_dynamic_h_block(ssm_states, intermediate_state_cache, valid_state_indices, last_steps)
+            # move_intermediate_cache_dynamic_h_block(ssm_states, intermediate_state_cache, valid_state_indices, last_steps)
+            move_intermediate_cache_dynamic_h_block_v1(intermediate_state_cache, valid_state_indices, last_steps)
     
             draft_token_num = intermediate_state_cache.shape[2]
             if valid_state_indices.numel() > 0:
