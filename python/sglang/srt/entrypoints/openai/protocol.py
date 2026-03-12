@@ -605,8 +605,8 @@ class ChatCompletionRequest(BaseModel):
     # Pretokenized input: skip tokenization for first N messages
     pretokenized_token_ids: Optional[List[int]] = None
     pretokenized_num_message: Optional[int] = None
-    # AdditionalMessageTokenizer type (e.g. "default", "qwen3", "glm47")
-    additional_tokenizer: Optional[str] = None
+    # TITOTokenizer type (e.g. "default", "qwen3", "glm47")
+    tito_model: Optional[str] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None

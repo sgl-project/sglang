@@ -37,8 +37,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from miles.utils.chat_template_utils.additional_message_tokenizer import (
-    get_additional_message_tokenizer,
+from miles.utils.chat_template_utils.tito_tokenizer import (
+    get_tito_tokenizer,
 )
 from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
@@ -688,13 +688,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         chat_template_kwargs = request.chat_template_kwargs or {}
 
-        additional_tokenizer = get_additional_message_tokenizer(
+        tito_tokenizer = get_tito_tokenizer(
             self.tokenizer_manager.tokenizer,
-            tokenizer_type=request.additional_tokenizer or "default",
+            tokenizer_type=request.tito_model or "default",
             chat_template_kwargs=chat_template_kwargs,
         )
         new_messages = all_msg_dicts[N:]
-        incremental_ids = additional_tokenizer.tokenize_additional(
+        incremental_ids = tito_tokenizer.tokenize_additional(
             new_messages=new_messages,
             pretokenized_token_ids=request.pretokenized_token_ids,
             tools=tools,
