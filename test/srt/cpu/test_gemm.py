@@ -29,10 +29,22 @@ class Mod(nn.Module):
 
 class TestGemm(CustomTestCase):
 
-    @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
-    def test_bf16_gemm(self, M, N, K, has_bias):
+    @parametrize(
+        M=[1, 101],
+        N=[16, 32 * 13],
+        K=[32 * 16],
+        has_bias=[False, True],
+        dim=[2, 3, 4, 5],
+    )
+    def test_bf16_gemm(self, M, N, K, has_bias, dim):
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+        if dim == 3:
+            mat1 = mat1.unsqueeze(0).repeat(2, 1, 1)
+        if dim == 4:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).repeat(2, 2, 1, 1)
+        if dim == 5:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(2, 2, 2, 1, 1)
 
         ref = torch.matmul(mat1.float(), mat2.float().t())
         if has_bias:

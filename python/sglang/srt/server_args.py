@@ -1604,6 +1604,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_cpu() and cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
                 else:
                     self.attention_backend = "triton"
 
@@ -1613,6 +1615,7 @@ class ServerArgs:
                 "fa3",
                 "fa4",
                 "ascend",
+                "intel_amx",
                 "aiter",
             ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
