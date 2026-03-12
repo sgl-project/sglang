@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_scale_shift_gate_select01_kernel,
+    fused_modulate_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -53,6 +54,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
+
+import os
+
+_FUSE_LN_SCALE_SHIFT_SELECT01 = (
+    os.environ.get("_FUSE_LN_SCALE_SHIFT_SELECT01", "0") == "1"
+)
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -809,25 +816,48 @@ class QwenImageTransformerBlock(nn.Module):
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
             if _is_cuda:
-                if is_scale_residual:
-                    x = gate_x * x + residual_x
-                    residual_out = x
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if not index.is_contiguous():
-                    index = index.contiguous()
-                # TODO: fuse norm with above select01 kernel, workaround now
-                x = apply_layernorm_only(x, norm_module)
-                x, gate_result = fuse_scale_shift_gate_select01_kernel(
-                    x,
-                    scale0=scale0.contiguous(),
-                    shift0=shift0.contiguous(),
-                    gate0=gate0.contiguous(),
-                    scale1=scale1.contiguous(),
-                    shift1=shift1.contiguous(),
-                    gate1=gate1.contiguous(),
-                    index=index,
-                )
+                if _FUSE_LN_SCALE_SHIFT_SELECT01:
+                    # Use fused kernel for CUDA - combines residual, layernorm, and modulation
+                    # Get layernorm weight and bias from norm_module
+                    ln_weight = getattr(norm_module.norm, "weight", None)
+                    ln_bias = getattr(norm_module.norm, "bias", None)
+
+                    # Call fused kernel
+                    x, residual_out, gate_result = fused_modulate_kernel(
+                        x=x,
+                        residual=residual_x if is_scale_residual else None,
+                        gate_x=gate_x if is_scale_residual else None,
+                        ln_weight=ln_weight,
+                        ln_bias=ln_bias,
+                        shift0=shift0,
+                        scale0=scale0,
+                        gate0=gate0,
+                        shift1=shift1,
+                        scale1=scale1,
+                        gate1=gate1,
+                        index=index,
+                        eps=norm_module.eps,
+                    )
+                else:
+                    if is_scale_residual:
+                        x = gate_x * x + residual_x
+                        residual_out = x
+                    if not x.is_contiguous():
+                        x = x.contiguous()
+                    if not index.is_contiguous():
+                        index = index.contiguous()
+                    # TODO: fuse norm with above select01 kernel, workaround now
+                    x = apply_layernorm_only(x, norm_module)
+                    x, gate_result = fuse_scale_shift_gate_select01_kernel(
+                        x,
+                        scale0=scale0.contiguous(),
+                        shift0=shift0.contiguous(),
+                        gate0=gate0.contiguous(),
+                        scale1=scale1.contiguous(),
+                        shift1=shift1.contiguous(),
+                        gate1=gate1.contiguous(),
+                        index=index,
+                    )
                 if is_scale_residual:
                     return x, residual_out, gate_result
                 else:
