@@ -569,7 +569,7 @@ def _get_direction_from_op(op: P2POp):
 
 
 def _group_by(items, keyfunc):
-    ans = defaultdict(list)
+    answer = defaultdict(list)
     for item in items:
-        ans[keyfunc(item)].append(item)
-    return dict(ans)
+        answer[keyfunc(item)].append(item)
+    return dict(answer)

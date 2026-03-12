@@ -80,15 +80,15 @@ class MMMUVLMEval(Eval):
 
     @staticmethod
     def _build_mc_mapping(options: List[str]) -> Tuple[dict, List[str]]:
-        index2ans = {}
+        index2answer = {}
         all_choices = []
         ch = ord("A")
         for opt in options:
             letter = chr(ch)
-            index2ans[letter] = opt
+            index2answer[letter] = opt
             all_choices.append(letter)
             ch += 1
-        return index2ans, all_choices
+        return index2answer, all_choices
 
     def _prepare_mmmu_samples(self, k: int) -> List[dict]:
         # Subjects and domains copied from MMMU data_utils to categorize results
@@ -131,7 +131,7 @@ class MMMUVLMEval(Eval):
             answer = ex.get("answer")
             raw_options = ex.get("options")
             question_type = "open"
-            index2ans = None
+            index2answer = None
             all_choices = None
             options = None
             if raw_options:
@@ -142,7 +142,7 @@ class MMMUVLMEval(Eval):
                         else list(eval(raw_options))
                     )
                     if isinstance(options, list) and len(options) > 0:
-                        index2ans, all_choices = self._build_mc_mapping(options)
+                        index2answer, all_choices = self._build_mc_mapping(options)
                         question_type = "multiple-choice"
                 except Exception:
                     options = None
@@ -162,7 +162,7 @@ class MMMUVLMEval(Eval):
                     "image_data": data_uri,
                     "answer": answer,
                     "question_type": question_type,
-                    "index2ans": index2ans,
+                    "index2answer": index2answer,
                     "all_choices": all_choices,
                     "category": subject,
                 }
@@ -227,10 +227,10 @@ class MMMUVLMEval(Eval):
             if (
                 sample["question_type"] == "multiple-choice"
                 and sample["all_choices"]
-                and sample["index2ans"]
+                and sample["index2answer"]
             ):
                 pred = _parse_multi_choice_response(
-                    response_text, sample["all_choices"], sample["index2ans"]
+                    response_text, sample["all_choices"], sample["index2answer"]
                 )
                 score = 1.0 if (gold is not None and pred == gold) else 0.0
                 extracted_answer = pred
@@ -327,7 +327,7 @@ class MMMUVLMEval(Eval):
 
 
 def _parse_multi_choice_response(
-    response: str, all_choices: List[str], index2ans: dict
+    response: str, all_choices: List[str], index2answer: dict
 ) -> str:
     # loosely adapted from benchmark mmmu eval
     for char in [",", ".", "!", "?", ";", ":", "'"]:
@@ -345,8 +345,8 @@ def _parse_multi_choice_response(
                 candidates.append(choice)
     if not candidates and len(response.split()) > 5:
         # try match by option text
-        for idx, ans in index2ans.items():
-            if ans and ans.lower() in response.lower():
+        for idx, answer in index2answer.items():
+            if answer and answer.lower() in response.lower():
                 candidates.append(idx)
     if not candidates:
         # fallback to first choice
@@ -359,8 +359,8 @@ def _parse_multi_choice_response(
         pos = response.rfind(f"({can})")
         if pos == -1:
             pos = response.rfind(f" {can} ")
-        if pos == -1 and index2ans.get(can):
-            pos = response.lower().rfind(index2ans[can].lower())
+        if pos == -1 and index2answer.get(can):
+            pos = response.lower().rfind(index2answer[can].lower())
         starts.append(pos)
     return candidates[int(max(range(len(starts)), key=lambda i: starts[i]))]
 
@@ -443,8 +443,8 @@ def _parse_open_response(response: str) -> List[str]:
 def _eval_open(gold, preds: List[str]) -> bool:
     if isinstance(gold, list):
         norm_answers = []
-        for ans in gold:
-            norm_answers.extend(_normalize_str(ans))
+        for answer in gold:
+            norm_answers.extend(_normalize_str(answer))
     else:
         norm_answers = _normalize_str(gold)
     for p in preds:

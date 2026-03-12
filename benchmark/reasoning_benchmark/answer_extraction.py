@@ -229,21 +229,21 @@ def extract_answer(pred_str, exhaust=False):
             pattern = "-?\d*\.?\d+"
             answers = re.findall(pattern, pred_str.replace(",", ""))
             if len(answers) >= 1:
-                last_ans = answers[-1]
+                last_answer = answers[-1]
             else:
-                last_ans = ""
-            if last_ans:
-                pred.append(last_ans)
+                last_answer = ""
+            if last_answer:
+                pred.append(last_answer)
 
     # multiple line
     _pred = []
-    for each_ans in pred:
-        each_ans = each_ans.strip().split("\n")[0]
-        each_ans = each_ans.lstrip(":")
-        each_ans = each_ans.rstrip(".")
-        each_ans = each_ans.rstrip("/")
-        each_ans = strip_string(each_ans)
-        _pred.append(each_ans)
+    for each_answer in pred:
+        each_answer = each_answer.strip().split("\n")[0]
+        each_answer = each_answer.lstrip(":")
+        each_answer = each_answer.rstrip(".")
+        each_answer = each_answer.rstrip("/")
+        each_answer = strip_string(each_answer)
+        _pred.append(each_answer)
     if exhaust:
         return _pred
     else:
@@ -251,19 +251,19 @@ def extract_answer(pred_str, exhaust=False):
 
 
 def extract_math_answer(question, reasoning, task):
-    answer = []
-    for ans in extract_answer(reasoning, exhaust=True):
-        if "separated by commas" in question and all(ch not in ans for ch in "()[]"):
-            answer.extend([a.strip() for a in ans.split(",")])
-        elif regex.search(r"\\text\{\s*and\s*\}", ans):
-            answer.extend(
+    answers = []
+    for answer in extract_answer(reasoning, exhaust=True):
+        if "separated by commas" in question and all(ch not in answer for ch in "()[]"):
+            answers.extend([a.strip() for a in answer.split(",")])
+        elif regex.search(r"\\text\{\s*and\s*\}", answer):
+            answers.extend(
                 [
                     a.strip()
-                    for a in regex.sub(r"\\text\{\s*and\s*\}", "[SEP]", ans).split(
+                    for a in regex.sub(r"\\text\{\s*and\s*\}", "[SEP]", answer).split(
                         "[SEP]"
                     )
                 ]
             )
         else:
-            answer.append(ans.strip())
-    return answer
+            answers.append(answer.strip())
+    return answers
