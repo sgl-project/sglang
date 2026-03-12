@@ -75,9 +75,10 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cpu, is_cuda, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 
@@ -1092,6 +1093,20 @@ class GptOssForCausalLM(nn.Module):
                         param = params_dict[name]
                         if "sinks" in name:
                             start = get_attention_tp_rank() * param.numel()
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

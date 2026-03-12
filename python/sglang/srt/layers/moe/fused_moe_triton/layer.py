@@ -442,6 +442,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if loaded_weight.dim() == 2:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -516,6 +519,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if loaded_weight.dim() == 2:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
