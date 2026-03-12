@@ -234,14 +234,24 @@ class EagleVerifyInputV2Mixin:
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                batch.mamba_track_indices = torch.tensor(
-                    [
-                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                        for req in batch.reqs
-                    ],
-                    dtype=torch.int64,
-                    device=device,
+                # Fully on-GPU operation: stack all buffers and gather to avoid sync
+                ping_pong_buffers = torch.stack(
+                    [req.mamba_ping_pong_track_buffer for req in batch.reqs]
+                )  # (bs, 2)
+
+                # Fully async: use non_blocking to avoid CPU-GPU sync
+                # Create tensor on CPU first, then async copy to GPU
+                next_track_indices_cpu = torch.tensor(
+                    [req.mamba_next_track_idx for req in batch.reqs],
+                    dtype=torch.long,
                 )
+                next_track_indices = next_track_indices_cpu.to(
+                    device, non_blocking=True
+                )
+
+                batch.mamba_track_indices = torch.gather(
+                    ping_pong_buffers, dim=1, index=next_track_indices.unsqueeze(1)
+                ).squeeze(1)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
