@@ -307,7 +307,7 @@ class Sampler(nn.Module):
             return_logprob=True,
             is_all_greedy=True,
             return_original_logprob=False,
-            rl_on_policy=False,
+            match_rl_trainer=False,
         )
         result = self.output_logprob_processor.extract_logprobs_results_for_prefill(
             logprobs,

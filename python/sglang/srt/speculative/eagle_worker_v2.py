@@ -18,11 +18,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
