@@ -99,23 +99,23 @@ class Sampler(nn.Module):
 
         # Sample
         if sampling_info.is_all_greedy:
+            # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
         elif self.use_ascend_backend:
             batch_next_token_ids = self._forward_ascend_backend(
                 logits, sampling_info, simple_sampling_case
             )
+        elif match_rl_trainer:
+            batch_next_token_ids = self._sample_from_logprobs(
+                logprobs,
+                sampling_info,
+                positions,
+            )
         else:
-            if match_rl_trainer:
-                batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs,
-                    sampling_info,
-                    positions,
-                )
-            else:
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
-                )
-                del probs
+            batch_next_token_ids = self._sample_from_probs(
+                probs, sampling_info, positions, simple_sampling_case
+            )
+            del probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
