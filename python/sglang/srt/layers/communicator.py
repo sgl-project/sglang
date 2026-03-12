@@ -873,7 +873,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                fp_communications = \
+                    forward_batch.forward_mode.is_decode() or \
+                    not get_global_server_args().quantize_tp_communications
+                hidden_states = tensor_model_parallel_all_reduce
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
