@@ -439,6 +439,9 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     sock = socket.socket(family=na.family, type=socket.SOCK_STREAM)
     # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # TCP_NODELAY: Disable Nagle's algorithm to avoid ~40ms delayed ACK on response.
+    # https://brooker.co.za/blog/2024/05/09/nagle.html
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     try:
         sock.bind(na.to_bind_tuple())
