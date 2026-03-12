@@ -69,8 +69,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
 
 class TestNegativePromptMerge(unittest.TestCase):
-    """Regression tests for negative_prompt not being passed through CLI
-    when using diffusers backend (subclass default differs from base)."""
+    """Regression tests for negative_prompt not being passed through CLI"""
 
     def test_get_cli_args_filters_none(self):
         ns = argparse.Namespace(negative_prompt=None, prompt="hello")
