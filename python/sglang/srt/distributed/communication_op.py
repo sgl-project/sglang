@@ -8,9 +8,9 @@ import torch.distributed
 from .parallel_state import get_tp_group
 
 
-def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def tensor_model_parallel_all_reduce(input_: torch.Tensor, fp_comm=True) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    return get_tp_group().all_reduce(input_, fp_comm=fp_comm)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
