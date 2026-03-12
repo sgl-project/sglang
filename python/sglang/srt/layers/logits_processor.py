@@ -366,7 +366,7 @@ class LogitsProcessor(nn.Module):
             or self.do_tensor_parallel_all_gather_dp_attn
         )
 
-        logprobs_result, sampled_logits = self.input_logprob_processor(
+        logprobs_result, sampled_logits = self.input_logprob_processor.forward(
             pruned_states,
             sample_indices,
             input_logprob_indices,

@@ -87,14 +87,16 @@ class Sampler(nn.Module):
         match_rl_trainer = self.rl_on_policy_target is not None and simple_sampling_case
 
         # Preprocess logits and compute logprobs / probs
-        logits, probs, logprobs, original_logprobs = self.output_logprob_processor(
-            logits_output.next_token_logits,
-            sampling_info,
-            return_logprob,
-            sampling_info.is_all_greedy,
-            SGLANG_RETURN_ORIGINAL_LOGPROB,
-            match_rl_trainer,
-            skip_logprob_computation=self.use_ascend_backend,
+        logits, probs, logprobs, original_logprobs = (
+            self.output_logprob_processor.forward(
+                logits_output.next_token_logits,
+                sampling_info,
+                return_logprob,
+                sampling_info.is_all_greedy,
+                SGLANG_RETURN_ORIGINAL_LOGPROB,
+                match_rl_trainer,
+                skip_logprob_computation=self.use_ascend_backend,
+            )
         )
 
         # Sample
@@ -301,7 +303,7 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
-        _, _, logprobs, _ = self.output_logprob_processor(
+        _, _, logprobs, _ = self.output_logprob_processor.forward(
             logits_output.next_token_logits,
             sampling_info,
             return_logprob=True,

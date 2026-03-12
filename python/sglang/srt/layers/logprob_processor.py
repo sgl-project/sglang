@@ -6,7 +6,6 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import crash_on_warnings
@@ -439,7 +438,7 @@ def get_token_ids_logprobs_chunk(
 # ============================================================
 
 
-class OutputLogprobProcessor(nn.Module):
+class OutputLogprobProcessor:
     """Processes output (decode) logprobs: logits -> log_softmax -> utilities.
 
     Handles the full output logprob pipeline including preprocessing,
@@ -452,7 +451,6 @@ class OutputLogprobProcessor(nn.Module):
     """
 
     def __init__(self, use_nan_detection: bool = False):
-        super().__init__()
         self.use_nan_detection = use_nan_detection
 
     def preprocess_logits(
@@ -483,7 +481,7 @@ class OutputLogprobProcessor(nn.Module):
         return_logprob: bool,
         is_all_greedy: bool,
         return_original_logprob: bool,
-        match_rl_trainer: bool,
+        match_rl_trainer: bool = False,
         skip_logprob_computation: bool = False,
     ) -> Tuple[
         Optional[torch.Tensor],
@@ -638,7 +636,7 @@ class OutputLogprobProcessor(nn.Module):
 # ============================================================
 
 
-class InputLogprobProcessor(nn.Module):
+class InputLogprobProcessor:
     """Processes input (prefill) logprobs:
     (hidden_states, lm_head, get_logits_fn) -> chunk -> log_softmax -> utilities.
 
@@ -647,7 +645,6 @@ class InputLogprobProcessor(nn.Module):
     """
 
     def __init__(self, chunk_size: int = 4096):
-        super().__init__()
         self.chunk_size = chunk_size
 
     def forward(
