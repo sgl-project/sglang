@@ -160,7 +160,9 @@ class EmbeddingData:
 
     def get_embedding(self, is_concat=False):
         if is_concat:
-            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
+            return torch.concat(
+                [embedding.cuda() for embedding in self.embedding_list]
+            ).to("cpu", non_blocking=True)
         else:
             return self.embedding_list
 
@@ -434,22 +436,29 @@ class MMReceiverBase(ABC):
                         )
                     else:
                         raise e
+
+                # Skip mm_pool if not adaptive dispatch to encoder
+                enable_adaptive_dispatch_to_encoder = (
+                    server_args.enable_adaptive_dispatch_to_encoder
+                )
                 self.mm_processor = get_mm_processor(
                     hf_config,
                     server_args,
                     _processor,
                     transport_mode,
-                    skip_mm_pool=True,
+                    skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
     @abstractmethod
     def process_waiting_requests(self, recv_reqs):
         pass
 
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(
+        self, img_data, mm_processor, prompt, need_wait_for_image=True
+    ):
         req_id = None
         try:
-            if len(self.encode_urls) == 0:
+            if len(self.encode_urls) == 0 or not need_wait_for_image:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)

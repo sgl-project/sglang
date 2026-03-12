@@ -331,7 +331,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 False,  # is_sf_swizzled_layout
             )
             hs_fp4 = hs_fp4_bytes.reshape(x.shape[0], x.shape[1] // 2)
-            hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
+            hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+                *hs_sf_bytes.shape[:-1], -1
+            )
 
             correction_bias = (
                 None
