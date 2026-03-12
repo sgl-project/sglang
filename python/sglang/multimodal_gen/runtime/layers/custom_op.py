@@ -53,8 +53,17 @@ class CustomOp(nn.Module):
         # NOTE(woosuk): This is a placeholder for future extensions.
         return self.forward_native(*args, **kwargs)
 
+    def forward_musa(self, *args, **kwargs) -> Any:
+        # MUSA kernels follow the CUDA path by default.
+        return self.forward_cuda(*args, **kwargs)
+
     def forward_oot(self, *args, **kwargs) -> Any:
         # By default, we assume that OOT ops are compatible with the
+        # PyTorch-native implementation.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_npu(self, *args, **kwargs) -> Any:
+        # By default, we assume that NPU ops are compatible with the
         # PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 
@@ -67,6 +76,8 @@ class CustomOp(nn.Module):
             return self.forward_npu
         elif current_platform.is_xpu():
             return self.forward_xpu
+        elif current_platform.is_musa():
+            return self.forward_musa
         else:
             return self.forward_native
 

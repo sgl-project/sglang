@@ -114,6 +114,9 @@ class TestOpenAIServer(CustomTestCase):
     def run_completion_stream(
         self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
+        print(
+            f"run_completion_stream: {echo=}, {logprobs=}, {use_list_input=}, {parallel_sample_num=}, {token_input=}"
+        )
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
@@ -145,6 +148,7 @@ class TestOpenAIServer(CustomTestCase):
 
         is_firsts = {}
         for response in generator:
+            print(f"{response=}")
             usage = response.usage
             if usage is not None:
                 assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
@@ -1034,6 +1038,18 @@ class TestOpenAIV1Score(CustomTestCase):
                 msg=f"Score {i} probabilities should sum to 1",
             )
 
+        # Verify usage
+        self.assertIn("usage", response, "Response should have a 'usage' field")
+        self.assertGreater(response["usage"]["prompt_tokens"], 0)
+        self.assertEqual(
+            response["usage"]["prompt_tokens"], response["usage"]["total_tokens"]
+        )
+        self.assertEqual(
+            response["usage"]["completion_tokens"],
+            0,
+            "completion_tokens should be 0 for /v1/score",
+        )
+
     def test_score_token_input(self):
         """Test scoring with token IDs input"""
         query = "The capital of France is"
@@ -1083,6 +1099,18 @@ class TestOpenAIV1Score(CustomTestCase):
                 places=6,
                 msg=f"Score {i} probabilities should sum to 1",
             )
+
+        # Verify usage
+        self.assertIn("usage", response, "Response should have a 'usage' field")
+        self.assertGreater(response["usage"]["prompt_tokens"], 0)
+        self.assertEqual(
+            response["usage"]["prompt_tokens"], response["usage"]["total_tokens"]
+        )
+        self.assertEqual(
+            response["usage"]["completion_tokens"],
+            0,
+            "completion_tokens should be 0 for /v1/score",
+        )
 
     def test_score_error_handling(self):
         """Test error handling for invalid inputs"""

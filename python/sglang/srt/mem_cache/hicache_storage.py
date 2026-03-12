@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -50,8 +51,11 @@ class HiCacheStorageConfig:
     pp_rank: int
     pp_size: int
     is_mla_model: bool
+    enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    tp_lcm_size: Optional[int] = None
+    should_split_heads: bool = False
     extra_config: Optional[dict] = None
 
 
@@ -186,7 +190,7 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
+        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,

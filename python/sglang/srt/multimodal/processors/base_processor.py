@@ -182,6 +182,13 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
 
+        # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
+        # directly as _processor rather than a processor that wraps a tokenizer.
+        if hasattr(self._processor, "tokenizer"):
+            self._tokenizer = self._processor.tokenizer
+        else:
+            self._tokenizer = self._processor
+
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
@@ -203,6 +210,8 @@ class BaseMultimodalProcessor(ABC):
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
             "images_crop": Modality.IMAGE,
+            "has_local_crops": Modality.IMAGE,
+            "has_images": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
@@ -252,7 +261,7 @@ class BaseMultimodalProcessor(ABC):
         Use prompt and img_grid_thw to build input_ids
         """
         if not isinstance(prompt, list):
-            prompt = self._processor.tokenizer.encode(prompt)
+            prompt = self._tokenizer.encode(prompt)
 
         img_token_id = self.IM_TOKEN_ID
         spatial_merge_size = self.spatial_merge_size
@@ -337,11 +346,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "xpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
-            elif processor.__class__.__name__ not in {
-                "Qwen2_5_VLProcessor",
-                "Qwen3VLProcessor",
-            }:
+            else:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                    npu_apply_qwen_image_preprocess_patch,
+                )
+
+                npu_apply_qwen_image_preprocess_patch()
                 kwargs["device"] = "npu"
 
         result = processor.__call__(
@@ -378,8 +389,7 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
-        # Lazy import because decord is not available on some arm platforms.
-        from decord import VideoReader, cpu
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
         # Before processing inputs
         if not image_data or len(image_data) == 0:
@@ -388,9 +398,8 @@ class BaseMultimodalProcessor(ABC):
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
-                # Estimate frames for the video
-                vr = VideoReader(path, ctx=cpu(0))
-                num_frames = len(vr)
+                decoder = VideoDecoderWrapper(path)
+                num_frames = len(decoder)
             else:
                 # For images, each contributes one frame
                 num_frames = 1
@@ -636,7 +645,7 @@ class BaseMultimodalProcessor(ABC):
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._processor.tokenizer.decode(prompt)
+            prompt = self._tokenizer.decode(prompt)
         else:
             prompt = prompt
 
@@ -709,7 +718,7 @@ class BaseMultimodalProcessor(ABC):
         # Convert prompt into str
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt_str = self._processor.tokenizer.decode(prompt)
+            prompt_str = self._tokenizer.decode(prompt)
         else:
             assert isinstance(prompt, str)
             prompt_str = prompt
@@ -793,7 +802,7 @@ class BaseMultimodalProcessor(ABC):
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._processor.tokenizer.decode(prompt)
+            prompt = self._tokenizer.decode(prompt)
         else:
             prompt = prompt
 
@@ -988,7 +997,7 @@ class BaseMultimodalProcessor(ABC):
         all_loaded_data = base_output.organize_results()
         # Handle text-only case
         if not all_loaded_data:
-            input_ids = self._processor.tokenizer(
+            input_ids = self._tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1044,7 +1053,7 @@ class BaseMultimodalProcessor(ABC):
                 )
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
-            input_ids = self._processor.tokenizer(
+            input_ids = self._tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,

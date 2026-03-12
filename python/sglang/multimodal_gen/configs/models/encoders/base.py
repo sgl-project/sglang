@@ -81,6 +81,11 @@ class EncoderConfig(ModelConfig):
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
 
+    # Use the SP Group of the transformer as the TP Group of T5.
+    parallel_folding: bool = False
+    # "sp" or "ulysses" or "ring"
+    parallel_folding_mode: str = "sp"
+
 
 @dataclass
 class ImageEncoderConfig(EncoderConfig):

@@ -4,6 +4,8 @@ import unittest
 # TODO: use interface in cpu.py
 import torch
 
+from sglang.srt.layers.amx_utils import CPUQuantMethod
+
 kernel = torch.ops.sgl_kernel
 
 torch.manual_seed(1234)
@@ -22,6 +24,7 @@ from utils import (
     torch_naive_fused_moe,
     torch_naive_fused_moe_gptoss,
     torch_w8a8_per_column_fused_moe,
+    unpack_and_dequant_awq,
 )
 
 from sglang.test.test_utils import CustomTestCase
@@ -50,9 +53,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         topk_weights,
         topk_ids,
         inplace,
-        False,
-        False,
-        False,
+        CPUQuantMethod.UNQUANT,
         None,
         None,
         None,
@@ -112,14 +113,12 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int),
             False,  # inplace # See [Note] inplace should be False in fused_experts.
-            False,  # use_int8_w8a8
-            False,  # use_fp8_w8a16
-            False,  # use_mxfp4
+            CPUQuantMethod.UNQUANT,
             None,  # w1_scale
             None,  # w2_scale
+            None,  # w1_zp
+            None,  # w2_zp
             None,  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
             w1_b.to(torch.bfloat16),
             w2_b.to(torch.bfloat16),
             alpha,
@@ -173,9 +172,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             inplace,
-            True,
-            False,
-            False,
+            CPUQuantMethod.INT8_W8A8,
             w1_s,
             w2_s,
             None,
@@ -235,14 +232,12 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            False,
-            True,
-            False,
+            CPUQuantMethod.FP8_W8A16,
             w1s,
             w2s,
+            None,
+            None,
             [BLOCK_N, BLOCK_K],
-            None,
-            None,
             None,
             None,
             None,
@@ -288,9 +283,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            False,
-            False,
-            True,
+            CPUQuantMethod.MXFP4,
             w1s,
             w2s,
             None,
@@ -354,14 +347,12 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,  # inplace # See [Note] inplace should be False in fused_experts.
-            False,  # use_int8_w8a8
-            False,  # use_fp8_w8a16
-            True,  # use_mxfp4
+            CPUQuantMethod.MXFP4,  # use_mxfp4
             w1s,  # w1_scale
             w2s,  # w2_scale
+            None,  # w1_zp
+            None,  # w2_zp
             None,  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
             w1_b,
             w2_b,
             alpha,
@@ -370,6 +361,95 @@ class TestFusedExperts(CustomTestCase):
         )
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @parametrize(M=[1, 6], N=[512], K=[256], E=[8], topk=[4])
+    def test_int4_moe(self, M, N, K, E, topk, group_size=128):
+        dtype = torch.bfloat16
+
+        a = torch.rand(M, K, dtype=dtype) / math.sqrt(K)
+
+        awq_w13_weight = torch.randint(-127, 128, (E, K, 2 * N // 8)).to(torch.int)
+        awq_w13_zero = torch.randint(0, 10, (E, K // group_size, 2 * N // 8)).to(
+            torch.int
+        )
+        awq_w13_scales = torch.rand(E, int(K // group_size), 2 * N).to(torch.bfloat16)
+
+        awq_w2_weight = torch.randint(-127, 128, (E, N, K // 8)).to(torch.int)
+        awq_w2_zero = torch.randint(0, 10, (E, N // group_size, K // 8)).to(torch.int)
+        awq_w2_scales = torch.rand(E, int(N // group_size), K).to(torch.bfloat16)
+        bf16_w13_weight = []
+        bf16_w2_weight = []
+        for i in range(E):
+            bf16_w13_weight_i, _ = unpack_and_dequant_awq(
+                awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i], 4, 128
+            )
+            bf16_w2_weight_i, _ = unpack_and_dequant_awq(
+                awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i], 4, 128
+            )
+            bf16_w13_weight.append(bf16_w13_weight_i)
+            bf16_w2_weight.append(bf16_w2_weight_i)
+        bf16_w13_weight = torch.stack(bf16_w13_weight).detach()
+        bf16_w2_weight = torch.stack(bf16_w2_weight).detach()
+
+        score = torch.rand((M, E), dtype=dtype)
+
+        ref_out = torch_naive_fused_moe(
+            a, bf16_w13_weight, bf16_w2_weight, score, topk, False
+        )
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        awq_w13_weight_pack = []
+        awq_w13_zero_pack = []
+        awq_w13_scales_pack = []
+        awq_w2_weight_pack = []
+        awq_w2_zero_pack = []
+        awq_w2_scales_pack = []
+        for i in range(E):
+            packed_weight_13_i, packed_zero_13_i, packed_scales_13_i = (
+                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i]
+                )
+            )
+            awq_w13_weight_pack.append(packed_weight_13_i)
+            awq_w13_zero_pack.append(packed_zero_13_i)
+            awq_w13_scales_pack.append(packed_scales_13_i)
+            packed_weight_2_i, packed_zero_2_i, packed_scales_2_i = (
+                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i]
+                )
+            )
+            awq_w2_weight_pack.append(packed_weight_2_i)
+            awq_w2_zero_pack.append(packed_zero_2_i)
+            awq_w2_scales_pack.append(packed_scales_2_i)
+        awq_w13_weight_pack = torch.stack(awq_w13_weight_pack).detach()
+        awq_w13_zero_pack = torch.stack(awq_w13_zero_pack).detach()
+        awq_w13_scales_pack = torch.stack(awq_w13_scales_pack).detach()
+        awq_w2_weight_pack = torch.stack(awq_w2_weight_pack).detach()
+        awq_w2_zero_pack = torch.stack(awq_w2_zero_pack).detach()
+        awq_w2_scales_pack = torch.stack(awq_w2_scales_pack).detach()
+
+        out = kernel.fused_experts_cpu(
+            a,
+            awq_w13_weight_pack,
+            awq_w2_weight_pack,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            CPUQuantMethod.INT4_W4A8,
+            awq_w13_scales_pack,
+            awq_w2_scales_pack,
+            awq_w13_zero_pack,
+            awq_w2_zero_pack,
+            None,
+            None,
+            None,
+            None,
+            None,
+            True,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
