@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
-from einops import rearrange
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -287,7 +286,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output, _ = self.out_proj(core_attn_out)
         return output
 

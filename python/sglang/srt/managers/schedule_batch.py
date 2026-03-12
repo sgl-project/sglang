@@ -1121,6 +1121,14 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
+        # When using input_embeds, we cannot easily mix the original input embeddings
+        # with the newly generated output token IDs during re-prefill of retracted request.
+        # output_ids will have no use, but will lead to wrong size cache indexes.
+        # Therefore, we discard the generated output_ids and restart prefill and generation
+        # to ensure shape consistency in KV cache.
+        if self.input_embeds is not None:
+            self.output_ids = []
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1883,12 +1891,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
+        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
-            # Retracting loops ends and still not enough memory
-            raise ValueError(
-                "Out of memory even after retracting all other requests in the decode batch."
+            # Even the last remaining request cannot fit in memory.
+            # Instead of crashing the scheduler, gracefully abort it.
+            last_idx = sorted_indices.pop()
+            last_req = self.reqs[last_idx]
+            last_req.to_finish = FINISH_ABORT(
+                "Out of memory even after retracting all other requests "
+                "in the decode batch. Aborting the last request.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            reqs_to_abort.append(last_req)
+            self.release_req(last_idx, 0, server_args)
+            logger.warning(
+                "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1905,7 +1924,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]

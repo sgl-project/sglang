@@ -4,6 +4,7 @@ import torch
 import triton
 from vllm._custom_ops import scaled_int8_quant as vllm_scaled_int8_quant
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 
@@ -59,19 +60,19 @@ def benchmark(batch_size, provider):
     M, K = batch_size, 16384
     x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 1000
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "vllm op":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = run_bench(
             lambda: vllm_scaled_int8_quant(x, symmetric=True),
             quantiles=quantiles,
         )
     if provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = run_bench(
             lambda: per_token_quant_int8(x),
             quantiles=quantiles,
         )
     if provider == "torch.compile":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = run_bench(
             lambda: torch_int8_quant(x),
             quantiles=quantiles,
         )
