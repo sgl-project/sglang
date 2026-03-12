@@ -677,9 +677,17 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
+    # PR authors can always rerun failed CI on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
+    #
+    # SECURITY: For fork PRs, do NOT auto-grant can_rerun_ut. The /rerun-ut command
+    # executes code from the PR branch on self-hosted GPU runners. For fork PRs this
+    # would bypass the run-ci label gate (which requires maintainer review before
+    # untrusted code runs on our infrastructure). /rerun-failed-ci is safe because it
+    # only reruns workflows that already passed the gate.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != repo.owner.login
+
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -692,7 +700,13 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_ut"] = True
+        if not is_fork:
+            user_perms["can_rerun_ut"] = True
+        else:
+            print(
+                f"Fork PR detected — not auto-granting can_rerun_ut to author "
+                f"{user_login}. Requires CI_PERMISSIONS.json entry."
+            )
 
     if not user_perms:
         print(f"User {user_login} does not have any configured permissions. Exiting.")
