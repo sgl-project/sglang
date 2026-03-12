@@ -1974,8 +1974,12 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
-                    q_scale=layer.k_scale,
-                    kv_scale=layer.k_scale,
+                    q_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
+                    kv_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
@@ -2028,8 +2032,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=layer.k_scale,
-                        kv_scale=layer.k_scale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2059,8 +2067,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=layer.k_scale,
-                        kv_scale=layer.k_scale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2195,8 +2207,8 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=reduce_indptr,
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
-                q_scale=layer.k_scale,
-                kv_scale=layer.k_scale,
+                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
