@@ -792,7 +792,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.return_health_check_ct = 0
+        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1499,7 +1499,9 @@ class Scheduler(
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ct += 1
+                self.return_health_check_ipcs.append(
+                    getattr(recv_req, "http_worker_ipc", None)
+                )
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -2057,13 +2059,20 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            # For prefill-only batch, we can avoid going through decoding step.
-            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+            if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+        # For prefill-only batch, filter out finished requests since they
+        # won't go through the decode step. This keeps running_batch accurate
+        # for load reporting (num_running_reqs via /get_load).
+        # Runs outside the last_batch block so stale requests are cleaned
+        # even when no new batches arrive (e.g. traffic stops).
+        if self.running_batch.is_prefill_only:
+            self.running_batch.filter_batch()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2083,8 +2092,11 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
+            # Run decode (skip for prefill-only batches)
+            if (
+                not self.running_batch.is_empty()
+                and not self.running_batch.is_prefill_only
+            ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2375,7 +2387,11 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
                 )
 
             msg_prefix = (
@@ -2400,6 +2416,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if batch.is_empty():
+            return batch
 
         # Update batch tensors
         batch.prepare_for_decode()
@@ -2603,12 +2622,15 @@ class Scheduler(
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ct:
+        if self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_output(HealthCheckOutput())
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(
+                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+                )
+            )
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()

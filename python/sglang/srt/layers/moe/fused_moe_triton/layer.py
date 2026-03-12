@@ -95,7 +95,12 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
-    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake() or a2a_backend.is_mori():
+    elif (
+        a2a_backend.is_deepep()
+        or a2a_backend.is_mooncake()
+        or a2a_backend.is_mori()
+        or a2a_backend.is_nixl()
+    ):
         return MaybeTboDeepEPDispatcher(
             group=(
                 get_tp_group().device_group
