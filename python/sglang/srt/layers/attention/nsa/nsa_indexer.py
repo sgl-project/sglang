@@ -951,7 +951,7 @@ class Indexer(MultiPlatformOp):
             # communication and rerange bytes on the critical path.
             k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             k_fp8_dtype = k_fp8.dtype
-            k_fp8_width = k_fp8.shape[-1]
+            k_fp8_split_size = k_fp8.shape[-1]
             k_scale_bytes = k_scale.view(torch.uint8)
             packed = torch.cat(
                 [k_fp8.view(torch.uint8), k_scale_bytes],
@@ -964,7 +964,7 @@ class Indexer(MultiPlatformOp):
                 torch.cuda.current_stream(),
             )
             k_fp8, k_scale = torch.split(
-                packed, [k_fp8_width, k_scale_bytes.shape[-1]], dim=-1
+                packed, [k_fp8_split_size, k_scale_bytes.shape[-1]], dim=-1
             )
 
             out_loc = forward_batch.out_cache_loc
