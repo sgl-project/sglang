@@ -15,9 +15,8 @@
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Event
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -120,43 +119,36 @@ class BaseGrammarObject:
 INVALID_GRAMMAR_OBJ = BaseGrammarObject()
 
 
-@dataclass
-class CacheEntry:
-    value: BaseGrammarObject
-    event: Event
-
-
 class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], CacheEntry] = {}
+        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
 
-    def _not_supported(self, key_type: str, key_string: str) -> None:
+    def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+        return INVALID_GRAMMAR_OBJ
 
-    def dispatch_fallback(
-        self, key_type: str, key_string: str
-    ) -> Optional[BaseGrammarObject]:
+    def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
         This function should not be reached in any case.
         """
         raise ValueError(f"Invalid key_type: {key_type}={key_string}")
 
-    def dispatch_json(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("json", key_string)
 
-    def dispatch_regex(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("regex", key_string)
 
-    def dispatch_ebnf(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("ebnf", key_string)
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("structural_tag", key_string)
 
     def _init_value_dispatch(
         self, key: Tuple[str, str], require_reasoning: bool
-    ) -> Optional[BaseGrammarObject]:
+    ) -> BaseGrammarObject:
         s = time.perf_counter()
         key_type, key_string = key
         if key_type == "json":
@@ -167,10 +159,6 @@ class BaseGrammarBackend:
             grammar = self.dispatch_ebnf(key_string)
         elif key_type == "structural_tag":
             grammar = self.dispatch_structural_tag(key_string)
-        elif key_type == "structural_pattern":
-            grammar = self.dispatch_structural_pattern(key_string)
-        elif key_type == "structural_pattern_v2":
-            grammar = self.dispatch_structural_pattern_v2(key_string)
         else:
             grammar = self.dispatch_fallback(key_type, key_string)
 
@@ -180,7 +168,7 @@ class BaseGrammarBackend:
 
     def get_cached_or_future_value(
         self, key: Tuple[str, str], require_reasoning: bool
-    ) -> Optional[BaseGrammarObject]:
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
             copied_value = value.copy()
