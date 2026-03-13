@@ -60,7 +60,7 @@ class GrammarManager:
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                if req.grammar:
+                if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
@@ -115,6 +115,7 @@ class GrammarManager:
         ready_reqs = intersect(ready_reqs_all)
         failed_reqs = union(failed_reqs_all)
         """
+        assert self.grammar_backend
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
 
@@ -170,6 +171,7 @@ class GrammarManager:
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
                 continue
 
+            assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             if req.grammar is INVALID_GRAMMAR_OBJ:
@@ -181,6 +183,7 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
 
+            assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
             self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"

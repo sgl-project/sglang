@@ -614,7 +614,10 @@ class SchedulerMetricsMixin:
         if not self.enable_hierarchical_cache:
             return
 
-        host_pool = self.tree_cache.token_to_kv_pool_host
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            self.tree_cache, "full_kv_pool_host", None
+        )
+        assert host_pool is not None, "Host pool not found"
         self.stats.hicache_host_used_tokens = (
             host_pool.size - host_pool.available_size()
         )
