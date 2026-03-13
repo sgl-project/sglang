@@ -124,7 +124,7 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
-struct CustomAllReducePush : public CustomAllReduceBase {
+struct CustomAllReducePull : public CustomAllReduceBase {
   static constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);
   static constexpr auto one_shot_kernel = all_reduce_one_shot_kernel<DType, kNumGPU, kUsePDL>;
   static constexpr auto two_shot_kernel = all_reduce_two_shot_kernel<DType, kNumGPU, kUsePDL>;
@@ -192,7 +192,7 @@ struct CustomAllReducePush : public CustomAllReduceBase {
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 tvm::ffi::Tensor custom_all_reduce(CustomAllReduceRef obj, tvm::ffi::Tensor input, int shot) {
-  using Impl = CustomAllReducePush<DType, kNumGPU, kUsePDL>;
+  using Impl = CustomAllReducePull<DType, kNumGPU, kUsePDL>;
   return static_cast<Impl&>(*obj.get()).all_reduce(input, shot);
 }
 
