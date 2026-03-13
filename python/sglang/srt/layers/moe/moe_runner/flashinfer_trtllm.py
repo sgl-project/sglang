@@ -241,7 +241,9 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
     )
 
-    # Clean up weights that won't be used by TRT-LLM
+    # NOTE(zianglih): This postprocess is one-way: after TRT-LLM repack we drop
+    # the original w13/w2 tensors. /update_weights_from_disk will not work on
+    # this path today; supporting it requires a refactor.
     del (
         layer.w2_weight,
         layer.w2_weight_scale,

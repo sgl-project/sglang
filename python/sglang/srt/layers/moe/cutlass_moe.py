@@ -5,6 +5,10 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
+from sglang.srt.layers.quantization.fp4_utils import (
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_input_scale_enabled,
+)
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 _is_cuda = is_cuda()
@@ -345,6 +349,18 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
 
+def _apply_nvfp4_online_input_scale_inplace(
+    x: torch.Tensor,
+    a_gscale: torch.Tensor,
+    w_alphas: torch.Tensor,
+    w_weight_scale: torch.Tensor,
+) -> None:
+    """Apply online NVFP4 input scaling for one GEMM stage in-place."""
+    input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+    w_alphas.copy_((w_weight_scale * input_scale).expand_as(w_alphas))
+    a_gscale.copy_(input_scale_inv.expand_as(a_gscale))
+
+
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -359,6 +375,8 @@ def cutlass_moe_fp4(
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    w1_weight_scale: Optional[torch.Tensor] = None,
+    w2_weight_scale: Optional[torch.Tensor] = None,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -448,6 +466,14 @@ def cutlass_moe_fp4(
         params.blockscale_offsets,
     )
 
+    if nvfp4_online_input_scale_enabled():
+        assert (
+            w1_weight_scale is not None
+        ), "w1_weight_scale is required when SGLANG_NVFP4_ONLINE_INPUT_SCALE=1"
+        _apply_nvfp4_online_input_scale_inplace(
+            a, a1_gscale, w1_alphas, w1_weight_scale
+        )
+
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a,
         a1_gscale,
@@ -472,6 +498,14 @@ def cutlass_moe_fp4(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
     silu_and_mul(c1, intermediate)
+
+    if nvfp4_online_input_scale_enabled():
+        assert (
+            w2_weight_scale is not None
+        ), "w2_weight_scale is required when SGLANG_NVFP4_ONLINE_INPUT_SCALE=1"
+        _apply_nvfp4_online_input_scale_inplace(
+            intermediate, a2_gscale, w2_alphas, w2_weight_scale
+        )
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

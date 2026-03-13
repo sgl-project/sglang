@@ -2371,6 +2371,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        # If a HuggingFace model is loaded (e.g. via ModelOpt path), its forward signature is
+        # (input_ids, attention_mask, position_ids, ...). Calling it with SGLang-style positional
+        # args would accidentally pass `positions` as `attention_mask` (1D), causing HF masking
+        # to crash. Detect and call HF models with keyword args, then adapt outputs.
+        try:
+            import transformers  # type: ignore
+
+            if isinstance(self.model, transformers.PreTrainedModel):
+                input_ids = forward_batch.input_ids
+                position_ids = forward_batch.positions
+                if hasattr(input_ids, "ndim") and input_ids.ndim == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                if hasattr(position_ids, "ndim") and position_ids.ndim == 1:
+                    position_ids = position_ids.unsqueeze(0)
+                # Basic "all tokens valid" attention mask for this single packed sequence.
+                attention_mask = torch.ones(
+                    input_ids.shape, device=input_ids.device, dtype=torch.bool
+                )
+                out = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                next_token_logits = out.logits[:, -1, :]
+                return LogitsProcessorOutput(next_token_logits=next_token_logits)
+        except Exception:
+            pass
+
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -2407,6 +2437,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
+
+        # See note in forward_decode: HuggingFace models must be called with keyword args.
+        try:
+            import transformers  # type: ignore
+
+            if isinstance(self.model, transformers.PreTrainedModel):
+                input_ids = forward_batch.input_ids
+                position_ids = forward_batch.positions
+                if hasattr(input_ids, "ndim") and input_ids.ndim == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                if hasattr(position_ids, "ndim") and position_ids.ndim == 1:
+                    position_ids = position_ids.unsqueeze(0)
+                attention_mask = torch.ones(
+                    input_ids.shape, device=input_ids.device, dtype=torch.bool
+                )
+                out = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                next_token_logits = out.logits[:, -1, :]
+                return (LogitsProcessorOutput(next_token_logits=next_token_logits), can_run_graph)
+        except Exception:
+            pass
 
         return (
             self.model.forward(

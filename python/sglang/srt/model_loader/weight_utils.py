@@ -245,6 +245,13 @@ def get_quant_config(
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
+        # nvfp4 supports online quantization without config file (uses defaults)
+        if model_config.quantization == "nvfp4":
+            logger.info(
+                "No quantization config file found for nvfp4. "
+                "Using defaults (group_size=128, exclude_modules=[]) for online weight quantization."
+            )
+            return quant_cls.from_config({"packed_modules_mapping": packed_modules_mapping})
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(

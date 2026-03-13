@@ -56,6 +56,10 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
+from sglang.srt.layers.quantization.fp4_utils import (
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_input_scale_enabled,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -1143,6 +1147,23 @@ class FlashInferFP4MoE(FusedMoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _apply_nvfp4_online_input_scale_inplace(
+        self, hidden_states: torch.Tensor
+    ) -> None:
+        """Apply online NVFP4 input scaling in-place on cached tensors."""
+        input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(hidden_states)
+        w13_weight_scale_runtime = self.w13_weight_scale_2
+        if self.moe_runner_config.is_gated and w13_weight_scale_runtime.dim() > 1:
+            w13_weight_scale_runtime = w13_weight_scale_runtime[:, 0]
+
+        self.g1_alphas.data.copy_(
+            (w13_weight_scale_runtime * input_scale).expand_as(self.g1_alphas)
+        )
+        self.w13_input_scale_quant.copy_(
+            input_scale_inv.expand_as(self.w13_input_scale_quant)
+        )
+        self.g1_scale_c.data.copy_(self.w2_input_scale_quant * self.g1_alphas.data)
+
     # ---------------------------------------------------------------------
     # Helper: quantize hidden states to FP4 each forward pass
     # ---------------------------------------------------------------------
@@ -1211,6 +1232,8 @@ class FlashInferFP4MoE(FusedMoE):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
 
+        if nvfp4_online_input_scale_enabled():
+            self._apply_nvfp4_online_input_scale_inplace(hidden_states)
         hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
         routing_method_type = self.routing_method_type
         assert (

@@ -32,7 +32,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_input_scale_enabled,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -79,6 +83,46 @@ try:
         from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 except ImportError:
     fp4_quantize = None
+
+
+def _make_online_quant_weight_loader(layer: torch.nn.Module):
+    """Create a weight loader that redirects to _weight_fp_temp.
+    
+    For online NVFP4 quantization, weights are loaded into _weight_fp_temp
+    and then quantized in process_weights_after_loading. This loader redirects
+    the weight loading to the temporary buffer.
+    
+    Args:
+        layer: The layer module that owns both weight and _weight_fp_temp parameters.
+    
+    Returns:
+        A weight loader function that loads into _weight_fp_temp.
+    """
+    def weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, shard_id=None) -> None:
+        # Redirect loading to _weight_fp_temp
+        if hasattr(layer, "_weight_fp_temp"):
+            temp_param = layer._weight_fp_temp
+            if hasattr(temp_param, "weight_loader") and temp_param.weight_loader is not None:
+                # Pass shard_id if provided
+                if shard_id is not None:
+                    temp_param.weight_loader(temp_param, loaded_weight, shard_id)
+                else:
+                    temp_param.weight_loader(temp_param, loaded_weight)
+            else:
+                # Fallback: direct copy
+                temp_param.data.copy_(loaded_weight.to(temp_param.dtype))
+    
+    return weight_loader
+
+
+def nvfp4_online_weight_quant_enabled() -> bool:
+    """Whether to quantize NVFP4 weights online from full-precision checkpoints.
+
+    This is gated by the experimental env var SGLANG_NVFP4_ONLINE_WEIGHT_QUANT.
+    When enabled, NVFP4 weights are derived from fp16/bf16 checkpoints during
+    weight loading, and stored in the same NVFP4 layout expected by GEMM.
+    """
+    return get_bool_env_var("SGLANG_NVFP4_ONLINE_WEIGHT_QUANT")
 
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
@@ -1058,6 +1102,14 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "quantization config for your model's configuration."
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
+        # Allow overriding serialized-format assumption when doing online NVFP4
+        # weight quantization from full-precision checkpoints.
+        if is_checkpoint_nvfp4_serialized and nvfp4_online_weight_quant_enabled():
+            logger.info(
+                "SGLANG_NVFP4_ONLINE_WEIGHT_QUANT is enabled: treating NVFP4 "
+                "checkpoint as full-precision for online weight quantization."
+            )
+            is_checkpoint_nvfp4_serialized = False
 
         if group_size is None or exclude_modules is None:
             logger.warning(
@@ -1082,6 +1134,61 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             layer,
             prefix,
             Linear=ModelOptFp4LinearMethod,
+            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+        )
+
+
+class NvFp4Config(ModelOptFp4Config):
+    """Config class for NVFP4 with online weight quantization enabled by default.
+    
+    This config enables online weight quantization from full-precision checkpoints
+    without requiring the SGLANG_NVFP4_ONLINE_WEIGHT_QUANT environment variable.
+    """
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "nvfp4"
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "NvFp4Config":
+        # For nvfp4 online quantization, allow empty config with defaults
+        # Default values: group_size=16 (nvfp4 uses per-group quantization with group size 16),
+        # exclude_modules=[], kv_cache_quant_algo="auto"
+        if not config or (not config.get("quant_algo") and not config.get("quantization")):
+            # Empty or minimal config - use defaults for online quantization
+            logger.info(
+                "nvfp4 quantization method selected with no config file: "
+                "using defaults (group_size=16, exclude_modules=[]) for online weight quantization."
+            )
+            return cls(
+                is_checkpoint_nvfp4_serialized=False,
+                kv_cache_quant_algo="auto",
+                group_size=16,  # nvfp4 uses group_size=16 per specification
+                exclude_modules=[],
+                packed_modules_mapping=config.get("packed_modules_mapping"),
+            )
+        
+        # Call parent's from_config but force online quantization
+        # by always treating as non-serialized checkpoint
+        instance = super().from_config(config)
+        # Force online quantization by setting is_checkpoint_nvfp4_serialized to False
+        instance.is_checkpoint_nvfp4_serialized = False
+        logger.info(
+            "nvfp4 quantization method selected: enabling online weight quantization "
+            "from full-precision checkpoints."
+        )
+        return instance
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return self._get_quant_method(
+            layer,
+            prefix,
+            Linear=NvFp4LinearMethod,
             Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
         )
 
@@ -1115,12 +1222,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         del input_size, output_size
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
-            raise ValueError(
-                "NVFP4 quantization was selected, "
-                " dynamic quantization is not supported."
-            )
-
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -1133,65 +1234,261 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 "Unsupported model when in features size is " "not multiple of 16"
             )
 
-        weight_dtype = (
-            torch.float8_e4m3fn
-            if self.quant_config.is_checkpoint_nvfp4_serialized
-            else params_dtype
-        )
+        # When using traditional NVFP4-serialized checkpoints, we assume weights,
+        # scales, and per-tensor scales come from disk.
+        if self.quant_config.is_checkpoint_nvfp4_serialized:
+            weight_dtype = torch.float8_e4m3fn
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                # 2 fp4 data is packed in one uint8 in the input dimension
-                output_size_per_partition,
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    # 2 fp4 data is packed in one uint8 in the input dimension
+                    output_size_per_partition,
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
 
-        input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
+            input_scale = PerTensorScaleParameter(
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("input_scale", input_scale)
 
-        layer.register_parameter("input_scale", input_scale)
+            weight_scale_2 = PerTensorScaleParameter(
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale_2", weight_scale_2)
 
-        weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale_2", weight_scale_2)
+            weight_scale = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.quant_config.group_size,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+        else:
+            # Online NVFP4 weight quantization from full-precision checkpoints:
+            # Register weight in final packed NVFP4 shape [out, in//2] to maintain
+            # consistent parameter layout. Use a temporary buffer for full-precision
+            # checkpoint loading, then quantize into the registered packed weight.
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    # 2 fp4 values are packed in one uint8 in the input dimension
+                    output_size_per_partition,
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=_make_online_quant_weight_loader(layer),  # Redirects to _weight_fp_temp
+            )
+            layer.register_parameter("weight", weight)
 
-        weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // self.quant_config.group_size,
-                dtype=weight_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
+            # Register temporary full-precision buffer for checkpoint loading
+            # This will be quantized and copied to layer.weight in process_weights_after_loading
+            weight_fp_temp = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("_weight_fp_temp", weight_fp_temp)
 
-        layer.register_parameter("weight_scale", weight_scale)
+            # For option A, activation/weight scales are derived later. Initialize
+            # placeholders with 1D shape [num_partitions] to match serialized path convention.
+            # Use ones() to avoid garbage values from empty().
+            input_scale = PerTensorScaleParameter(
+                data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("input_scale", input_scale)
+
+            weight_scale_2 = PerTensorScaleParameter(
+                data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale_2", weight_scale_2)
+
+            # Store per-block scales in FP8 after we quantize; for now we just
+            # allocate a tensor with the logical shape in fp8 so the loader
+            # wiring remains consistent.
+            weight_scale = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.quant_config.group_size,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+            
+            # Register alpha and input_scale_inv as placeholder scalar Parameters
+            # to match serialized path structure. They will be properly initialized
+            # in process_weights_after_loading.
+            from torch.nn import Parameter
+            layer.register_parameter(
+                "alpha",
+                Parameter(torch.tensor(1.0, dtype=torch.float32), requires_grad=False)
+            )
+            layer.register_parameter(
+                "input_scale_inv",
+                Parameter(torch.tensor(1.0, dtype=torch.float32), requires_grad=False)
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        input_scale_2 = layer.input_scale.max().to(torch.float32)
-        weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+        # Two modes:
+        # 1) NVFP4-serialized checkpoints: use pre-quantized weights/scales.
+        # 2) Online NVFP4 weight quantization (Option A): derive NVFP4 weights
+        #    from full-precision checkpoints during loading.
+        # Use a module-level flag to only print diagnostics for the first layer
+        if not hasattr(ModelOptFp4LinearMethod, "_nvfp4_diag_printed"):
+            logger.info(f"[NVFP4] Online weight quant enabled: {nvfp4_online_weight_quant_enabled()}, Serialized: {self.quant_config.is_checkpoint_nvfp4_serialized}")
+            ModelOptFp4LinearMethod._nvfp4_diag_printed = True
+        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+            assert fp4_quantize is not None, "NVFP4 quantization kernel is not available"
+            if not nvfp4_online_weight_quant_enabled():
+                raise ValueError(
+                    "ModelOptFp4LinearMethod with non-serialized NVFP4 checkpoint "
+                    "requires SGLANG_NVFP4_ONLINE_WEIGHT_QUANT=1 to enable "
+                    "online weight quantization."
+                )
 
-        # Keep per-shard scales intact for hot reload; derive scalar params below.
-        copy_or_rebind_param(
-            layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
-        )
-        copy_or_rebind_param(
-            layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
-        )
+            # Load full-precision weights from temporary buffer
+            weight_fp = layer._weight_fp_temp.data.to(torch.float32)
+            
+            # Derive a global per-tensor weight scale using NVFP4 constants.
+            # We follow the same amax-based strategy as nvfp4_compute_input_scale_and_inv.
+            if weight_fp.numel() == 0:
+                global_encode_scale = weight_fp.new_tensor(1.0, dtype=torch.float32)
+            else:
+                global_amax = weight_fp.abs().max().to(torch.float32)
+                # Guard against division by zero to avoid inf
+                if global_amax.item() == 0.0:
+                    global_encode_scale = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                else:
+                    global_encode_scale = (448.0 * 6.0 / global_amax).to(torch.float32)
+                    global_encode_scale = torch.clamp(
+                        global_encode_scale, max=torch.finfo(torch.float32).max
+                    )
 
-        # Store original output size before any padding
-        layer.output_size_per_partition = layer.weight.shape[0]
+            # Quantize full-precision weights to NVFP4 layout.
+            q_weight, q_scale = fp4_quantize(weight_fp.to(layer._weight_fp_temp.dtype), global_encode_scale)
+            
+            # Verify packed weight shape matches expected layout
+            # (2 fp4 values are packed in one uint8 in the input dimension)
+            expected_packed_shape = (layer.output_size_per_partition, layer.input_size_per_partition // 2)
+            assert q_weight.shape == expected_packed_shape, (
+                f"Packed weight shape mismatch: got {q_weight.shape}, "
+                f"expected {expected_packed_shape}"
+            )
+
+            # For online weight quantization, we only derive weight-side scales during load.
+            # Activation scales (input_scale_2, input_scale_inv, alpha) are computed
+            # at runtime in apply() when activations are available.
+            # According to nvfp4 spec: ans = Aquant * Bquant * Ascale2 * Bscale2 / Aglobal_scale / Bglobal_scale
+            # weight_scale_2 represents the decode-side scale (1/global_encode_scale) used in GEMM
+            # NOT the encode-side scale used for quantization
+            weight_scale_2_scalar = (1.0 / global_encode_scale).to(torch.float32)
+            # Ensure it's a scalar (0-dim) tensor, not just a single-element tensor
+            if weight_scale_2_scalar.dim() > 0:
+                weight_scale_2_scalar = weight_scale_2_scalar.squeeze()
+
+            # Store weight_scale_2 as per-partition tensor with 1D shape [num_partitions]
+            # to match serialized path convention.
+            weight_scale_2_tensor = weight_scale_2_scalar.expand_as(layer.weight_scale_2)
+            copy_or_rebind_param(layer, "weight_scale_2", weight_scale_2_tensor)
+
+            # Initialize input_scale with default values (will be overwritten at runtime
+            # if online input scale is enabled)
+            default_input_scale = torch.ones_like(layer.input_scale, dtype=torch.float32)
+            copy_or_rebind_param(layer, "input_scale", default_input_scale)
+
+            # Create alpha and input_scale_inv exactly as serialized path does:
+            # - Both are scalar tensors (0-dim) of dtype float32
+            # - They are created via copy_or_rebind_param which registers them as Parameters
+            # - For online input scale: placeholders (will be updated in apply())
+            # - For offline input scale: defaults (used directly in apply())
+            if nvfp4_online_input_scale_enabled():
+                # Store weight scale for runtime alpha computation in apply()
+                # Ensure gemm_weight_scale is a scalar (0-dim) tensor
+                gemm_weight_scale_value = weight_scale_2_scalar.to(torch.float32)
+                if gemm_weight_scale_value.dim() > 0:
+                    gemm_weight_scale_value = gemm_weight_scale_value.squeeze()
+                copy_or_rebind_param(
+                    layer, "gemm_weight_scale", gemm_weight_scale_value
+                )
+                # Placeholder values for alpha and input_scale_inv; will be computed
+                # from activations in apply(). Create as scalars matching serialized path.
+                dummy_input_scale_2 = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                alpha_value = (dummy_input_scale_2 * weight_scale_2_scalar).to(torch.float32)
+                input_scale_inv_value = (1 / dummy_input_scale_2).to(torch.float32)
+                # Ensure they are scalar tensors (0-dim) to match serialized path
+                if alpha_value.dim() > 0:
+                    alpha_value = alpha_value.squeeze()
+                if input_scale_inv_value.dim() > 0:
+                    input_scale_inv_value = input_scale_inv_value.squeeze()
+                copy_or_rebind_param(layer, "alpha", alpha_value)
+                copy_or_rebind_param(layer, "input_scale_inv", input_scale_inv_value)
+            else:
+                # If online input scale is disabled, we need default values for alpha and
+                # input_scale_inv. Since we don't have checkpoint activation scales in
+                # online weight quant mode, use 1.0 as defaults (these will be used in
+                # apply() when online input scale is disabled).
+                default_input_scale_2 = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                alpha_value = (default_input_scale_2 * weight_scale_2_scalar).to(torch.float32)
+                input_scale_inv_value = (1 / default_input_scale_2).to(torch.float32)
+                # Ensure they are scalar tensors (0-dim) to match serialized path
+                if alpha_value.dim() > 0:
+                    alpha_value = alpha_value.squeeze()
+                if input_scale_inv_value.dim() > 0:
+                    input_scale_inv_value = input_scale_inv_value.squeeze()
+                copy_or_rebind_param(layer, "alpha", alpha_value)
+                copy_or_rebind_param(layer, "input_scale_inv", input_scale_inv_value)
+
+            # Copy quantized weights/scales into registered parameters (already in correct shape)
+            copy_or_rebind_param(layer, "weight", q_weight.to(torch.uint8))
+            copy_or_rebind_param(layer, "weight_scale", q_scale)
+            
+            # Clean up temporary full-precision buffer
+            delattr(layer, "_weight_fp_temp")
+
+            # Store original output size before any padding
+            layer.output_size_per_partition = layer.weight.shape[0]
+        else:
+            
+            input_scale_2 = layer.input_scale.max().to(torch.float32)
+            weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+
+            # Keep per-shard scales intact for hot reload; derive scalar params below.
+            copy_or_rebind_param(
+                layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
+            )
+            copy_or_rebind_param(
+                layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
+            )
+
+            if nvfp4_online_input_scale_enabled():
+                copy_or_rebind_param(
+                    layer, "gemm_weight_scale", weight_scale_2.to(torch.float32)
+                )
+
+            # Store original output size before any padding
+            layer.output_size_per_partition = layer.weight.shape[0]
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -1287,6 +1584,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
 
+        if nvfp4_online_input_scale_enabled():
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            layer.alpha.copy_(
+                (layer.gemm_weight_scale * input_scale).expand_as(layer.alpha)
+            )
+            layer.input_scale_inv.copy_(
+                input_scale_inv.expand_as(layer.input_scale_inv)
+            )
+
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
@@ -1321,6 +1627,242 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+class NvFp4LinearMethod(ModelOptFp4LinearMethod):
+    """Linear method for NVFP4 with online weight quantization enabled by default.
+    
+    This method enables online weight quantization without requiring the
+    SGLANG_NVFP4_ONLINE_WEIGHT_QUANT environment variable.
+    """
+
+    def __init__(self, quant_config: NvFp4Config):
+        super().__init__(quant_config)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Override to enable online quantization without env var check
+        # Two modes:
+        # 1) NVFP4-serialized checkpoints: use pre-quantized weights/scales.
+        # 2) Online NVFP4 weight quantization: derive NVFP4 weights
+        #    from full-precision checkpoints during loading.
+        # Use a module-level flag to only print diagnostics for the first layer
+        if not hasattr(NvFp4LinearMethod, "_nvfp4_diag_printed"):
+            logger.info(
+                f"[NVFP4] Online weight quant enabled (nvfp4 method), "
+                f"Serialized: {self.quant_config.is_checkpoint_nvfp4_serialized}"
+            )
+            NvFp4LinearMethod._nvfp4_diag_printed = True
+        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+            assert fp4_quantize is not None, "NVFP4 quantization kernel is not available"
+            # For nvfp4 method, online quantization is always enabled
+            # (no env var check needed)
+            
+            # Log that we're using online quantization path
+            if not hasattr(NvFp4LinearMethod, "_online_quant_logged"):
+                logger.info(
+                    "[NVFP4] ✓ Online weight quantization path ACTIVE - "
+                    "quantizing weights from full-precision checkpoint"
+                )
+                NvFp4LinearMethod._online_quant_logged = True
+
+            # Load full-precision weights from temporary buffer
+            weight_fp = layer._weight_fp_temp.data.to(torch.float32)
+            
+            # Derive a global per-tensor weight scale using NVFP4 constants.
+            # We follow the same amax-based strategy as nvfp4_compute_input_scale_and_inv.
+            if weight_fp.numel() == 0:
+                global_encode_scale = weight_fp.new_tensor(1.0, dtype=torch.float32)
+            else:
+                global_amax = weight_fp.abs().max().to(torch.float32)
+                # Guard against division by zero to avoid inf
+                if global_amax.item() == 0.0:
+                    global_encode_scale = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                else:
+                    global_encode_scale = (448.0 * 6.0 / global_amax).to(torch.float32)
+                    global_encode_scale = torch.clamp(
+                        global_encode_scale, max=torch.finfo(torch.float32).max
+                    )
+            
+            # Log scale computation for first layer
+            if not hasattr(NvFp4LinearMethod, "_scale_logged"):
+                logger.info(
+                    f"[NVFP4] Weight quantization scales - "
+                    f"global_amax: {global_amax.item():.6f}, "
+                    f"global_encode_scale: {global_encode_scale.item():.6f}, "
+                    f"weight_scale_2 (1/encode): {(1.0 / global_encode_scale).item():.6f}"
+                )
+                NvFp4LinearMethod._scale_logged = True
+
+            # Quantize full-precision weights to NVFP4 layout.
+            q_weight, q_scale = fp4_quantize(weight_fp.to(layer._weight_fp_temp.dtype), global_encode_scale)
+            
+            # Log quantization results for first layer
+            if not hasattr(NvFp4LinearMethod, "_quant_logged"):
+                logger.info(
+                    f"[NVFP4] Quantization complete - "
+                    f"q_weight shape: {q_weight.shape}, "
+                    f"q_scale shape: {q_scale.shape}, "
+                    f"weight_fp shape: {weight_fp.shape}"
+                )
+                NvFp4LinearMethod._quant_logged = True
+            
+            # Verify packed weight shape matches expected layout
+            # (2 fp4 values are packed in one uint8 in the input dimension)
+            expected_packed_shape = (layer.output_size_per_partition, layer.input_size_per_partition // 2)
+            assert q_weight.shape == expected_packed_shape, (
+                f"Packed weight shape mismatch: got {q_weight.shape}, "
+                f"expected {expected_packed_shape}"
+            )
+
+            # For online weight quantization, we only derive weight-side scales during load.
+            # Activation scales (input_scale_2, input_scale_inv, alpha) are computed
+            # at runtime in apply() when activations are available.
+            # According to nvfp4 spec: ans = Aquant * Bquant * Ascale2 * Bscale2 / Aglobal_scale / Bglobal_scale
+            # weight_scale_2 represents the decode-side scale (1/global_encode_scale) used in GEMM
+            # NOT the encode-side scale used for quantization
+            weight_scale_2_scalar = (1.0 / global_encode_scale).to(torch.float32)
+            # Ensure it's a scalar (0-dim) tensor, not just a single-element tensor
+            if weight_scale_2_scalar.dim() > 0:
+                weight_scale_2_scalar = weight_scale_2_scalar.squeeze()
+
+            # Store weight_scale_2 as per-partition tensor with 1D shape [num_partitions]
+            # to match serialized path convention.
+            weight_scale_2_tensor = weight_scale_2_scalar.expand_as(layer.weight_scale_2)
+            copy_or_rebind_param(layer, "weight_scale_2", weight_scale_2_tensor)
+
+            # Initialize input_scale with default values (will be overwritten at runtime
+            # if online input scale is enabled)
+            default_input_scale = torch.ones_like(layer.input_scale, dtype=torch.float32)
+            copy_or_rebind_param(layer, "input_scale", default_input_scale)
+
+            # Create alpha and input_scale_inv exactly as serialized path does:
+            # - Both are scalar tensors (0-dim) of dtype float32
+            # - They are created via copy_or_rebind_param which registers them as Parameters
+            # - For online input scale: placeholders (will be updated in apply())
+            # - For offline input scale: defaults (used directly in apply())
+            if nvfp4_online_input_scale_enabled():
+                # Store weight scale for runtime alpha computation in apply()
+                # Ensure gemm_weight_scale is a scalar (0-dim) tensor
+                gemm_weight_scale_value = weight_scale_2_scalar.to(torch.float32)
+                if gemm_weight_scale_value.dim() > 0:
+                    gemm_weight_scale_value = gemm_weight_scale_value.squeeze()
+                copy_or_rebind_param(
+                    layer, "gemm_weight_scale", gemm_weight_scale_value
+                )
+                # Placeholder values for alpha and input_scale_inv; will be computed
+                # from activations in apply(). Create as scalars matching serialized path.
+                dummy_input_scale_2 = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                alpha_value = (dummy_input_scale_2 * weight_scale_2_scalar).to(torch.float32)
+                input_scale_inv_value = (1 / dummy_input_scale_2).to(torch.float32)
+                # Ensure they are scalar tensors (0-dim) to match serialized path
+                if alpha_value.dim() > 0:
+                    alpha_value = alpha_value.squeeze()
+                if input_scale_inv_value.dim() > 0:
+                    input_scale_inv_value = input_scale_inv_value.squeeze()
+                copy_or_rebind_param(layer, "alpha", alpha_value)
+                copy_or_rebind_param(layer, "input_scale_inv", input_scale_inv_value)
+            else:
+                # If online input scale is disabled, we need default values for alpha and
+                # input_scale_inv. Since we don't have checkpoint activation scales in
+                # online weight quant mode, use 1.0 as defaults (these will be used in
+                # apply() when online input scale is disabled).
+                default_input_scale_2 = torch.tensor(1.0, dtype=torch.float32, device=weight_fp.device)
+                alpha_value = (default_input_scale_2 * weight_scale_2_scalar).to(torch.float32)
+                input_scale_inv_value = (1 / default_input_scale_2).to(torch.float32)
+                # Ensure they are scalar tensors (0-dim) to match serialized path
+                if alpha_value.dim() > 0:
+                    alpha_value = alpha_value.squeeze()
+                if input_scale_inv_value.dim() > 0:
+                    input_scale_inv_value = input_scale_inv_value.squeeze()
+                copy_or_rebind_param(layer, "alpha", alpha_value)
+                copy_or_rebind_param(layer, "input_scale_inv", input_scale_inv_value)
+
+            # Copy quantized weights/scales into registered parameters
+            # According to nvfp4 specification, quantization uses group_size=16
+            # fp4_quantize returns q_scale with shape (rounded_m, rounded_n // 4) where
+            # rounded_n ≈ n // 16 (with padding), which matches group_size=16
+            # q_scale is already in fp8(e4m3fn) format and swizzled/interleaved
+            # Use q_scale directly like the parent class does - the padding code will handle shape adjustments
+            copy_or_rebind_param(layer, "weight", q_weight.to(torch.uint8))
+            copy_or_rebind_param(layer, "weight_scale", q_scale)
+            
+            # Clean up temporary full-precision buffer
+            delattr(layer, "_weight_fp_temp")
+            
+            # Pad weights and scales for CUTLASS alignment (same logic as parent class)
+            if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+                # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
+                from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+                # Pad weight N dimension to 128
+                weight, _ = pad_nvfp4_weight(
+                    layer.weight.data, n_alignment=128, k_alignment=0
+                )
+                # Pad scale N dimension to match weight
+                scale = layer.weight_scale
+                if scale.shape[0] != weight.shape[0]:
+                    pad_n = weight.shape[0] - scale.shape[0]
+                    scale = torch.nn.functional.pad(scale, (0, 0, 0, pad_n))
+
+                # Pad K dimension: scale K dimension must be multiple of 4
+                scale_k = scale.shape[1]  # K/group_size (where group_size=16 for nvfp4)
+                weights_padding_cols = 0
+                if scale_k % 4 != 0:
+                    padded_scale_k = round_up_to_multiple(scale_k, 4)
+                    pad_scale_k = padded_scale_k - scale_k
+                    # Pad scale K dimension
+                    scale = torch.nn.functional.pad(scale, (0, pad_scale_k, 0, 0))
+                    # Pad weight K/2 dimension correspondingly
+                    # Each scale group corresponds to group_size elements in the original weight
+                    # Weight is packed (2 fp4 per uint8), so weight.shape[1] = n // 2
+                    # Padding scale_k by pad_scale_k means adding pad_scale_k groups
+                    # Each group has group_size elements, so pad_weight_k = pad_scale_k * group_size // 2
+                    # For group_size=16: pad_weight_k = pad_scale_k * 16 // 2 = pad_scale_k * 8
+                    pad_weight_k = pad_scale_k * group_size // 2
+                    weight = torch.nn.functional.pad(weight, (0, pad_weight_k, 0, 0))
+                    # Store K padding for activation padding in apply()
+                    weights_padding_cols = pad_weight_k
+
+                # Shuffle for TRTLLM layout
+                epilogue_tile_m = 128
+                shuffled_scale_shape = scale.shape
+                weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
+                scale = (
+                    shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
+                    .reshape(shuffled_scale_shape)
+                    .view(torch.float8_e4m3fn)
+                )
+
+                copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
+                copy_or_rebind_param(layer, "weight", weight)
+                layer.weights_padding_cols = weights_padding_cols
+            else:
+                # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
+                weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
+                layer.weights_padding_cols = weights_padding_cols
+                copy_or_rebind_param(layer, "weight", weight)
+
+                # q_scale from fp4_quantize is already swizzled/interleaved according to docstring
+                # We just need to pad it to match the padded weight dimensions
+                # q_scale has shape (rounded_m, rounded_n // 4) where rounded_n ≈ n // 16
+                scales = layer.weight_scale  # Already swizzled from fp4_quantize
+                m_scale, k_scale = scales.shape
+                
+                # Pad M dimension to match padded weight N dimension
+                m_padded = weight.shape[0]
+                k_padded = round_up_to_multiple(k_scale, 4)
+                
+                if m_scale != m_padded or k_scale != k_padded:
+                    # Pad scales to match padded weight dimensions
+                    padded_scales = torch.zeros((m_padded, k_padded), dtype=scales.dtype, device=scales.device)
+                    padded_scales[:m_scale, :k_scale] = scales
+                    scales = padded_scales
+                
+                # Use q_scale directly as weight_scale_interleaved since it's already swizzled
+                copy_or_rebind_param(layer, "weight_scale_interleaved", scales)
+        else:
+            # Serialized checkpoint path - use parent implementation
+            super().process_weights_after_loading(layer)
 
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
@@ -1581,6 +2123,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "input_global_scale": (
                     layer.w13_input_scale_quant
                     if MOE_NVFP4_DISPATCH
+                    or nvfp4_online_input_scale_enabled()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else None
                 )
@@ -1728,6 +2271,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
+        w1_weight_scale, w2_weight_scale = None, None
+        if nvfp4_online_input_scale_enabled():
+            # Keep loader-owned weight-scale params untouched; use a selected runtime view.
+            w1_weight_scale = layer.w13_weight_scale_2
+            if layer.moe_runner_config.is_gated and w1_weight_scale.dim() > 1:
+                w1_weight_scale = w1_weight_scale[:, 0]
+            w2_weight_scale = layer.w2_weight_scale_2
+
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
@@ -1768,6 +2319,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            if nvfp4_online_input_scale_enabled():
+                assert w1_weight_scale is not None
+                if x_sf is None:
+                    # No pre-quantized activations from dispatcher: compute from current batch.
+                    input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+                    layer.w13_input_scale_quant.copy_(
+                        input_scale_inv.expand_as(layer.w13_input_scale_quant)
+                    )
+                else:
+                    # Pre-quantized path: dispatcher already wrote current-batch scale.
+                    input_scale_inv = layer.w13_input_scale_quant
+                    input_scale = 1.0 / input_scale_inv
+                layer.g1_alphas.copy_(
+                    (w1_weight_scale * input_scale).expand_as(layer.g1_alphas)
+                )
 
             output_dtype = torch.bfloat16
 
@@ -1837,6 +2403,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            w1_weight_scale=w1_weight_scale,
+            w2_weight_scale=w2_weight_scale,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

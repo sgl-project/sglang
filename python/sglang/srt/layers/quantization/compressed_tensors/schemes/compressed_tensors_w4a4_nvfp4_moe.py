@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backen
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.fp4_utils import nvfp4_online_input_scale_enabled
 from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
@@ -418,6 +419,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 topk_ids=topk_ids,
                 params=layer.cutlass_moe_params,
                 apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
+                w1_weight_scale=(
+                    layer.w13_weight_scale_2
+                    if nvfp4_online_input_scale_enabled()
+                    else None
+                ),
+                w2_weight_scale=(
+                    layer.w2_weight_scale_2
+                    if nvfp4_online_input_scale_enabled()
+                    else None
+                ),
             ).to(x.dtype)
 
         return StandardCombineInput(hidden_states=output)

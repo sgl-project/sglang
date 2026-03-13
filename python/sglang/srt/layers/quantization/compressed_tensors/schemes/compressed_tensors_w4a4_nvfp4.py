@@ -15,7 +15,11 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_input_scale_enabled,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -139,6 +143,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]
+
+        if nvfp4_online_input_scale_enabled():
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            layer.alpha.copy_(input_scale / layer.weight_global_scale)
+            layer.input_global_scale.copy_(
+                input_scale_inv.expand_as(layer.input_global_scale)
+            )
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
