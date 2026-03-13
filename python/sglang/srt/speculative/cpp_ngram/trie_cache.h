@@ -38,20 +38,19 @@ class TrieCache {
 
   void insert(const int32_t* tokens, size_t len);
 
-  Result buildRecency(const int32_t* context, size_t len, int32_t last_token,
-                  size_t draft_token_num, const Param& param) const;
+  Result buildRecency(
+      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
-  Result buildFrequency(const int32_t* context, size_t len, int32_t last_token,
-                   size_t draft_token_num, const Param& param) const;
+  Result buildFrequency(
+      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
   void squeeze(size_t count);
 
   void reset();
 
  private:
-  std::vector<std::pair<TrieNode*, int32_t>> match(
-      const int32_t* context, size_t len,
-      size_t min_window, size_t max_window) const;
+  std::vector<std::pair<TrieNode*, int32_t>>
+  match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const;
 
   TrieNode* getNode() {
     auto node = node_pool_[--free_node_count_];
