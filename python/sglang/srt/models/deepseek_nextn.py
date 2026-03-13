@@ -224,7 +224,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         quant_config = (
             None
-            if _is_npu and not get_global_server_args().speculative_draft_model_quantization
+            if _is_npu
+            and not get_global_server_args().speculative_draft_model_quantization
             else quant_config
         )
         self.quant_config = quant_config
