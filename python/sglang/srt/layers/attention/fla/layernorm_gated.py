@@ -21,7 +21,6 @@ from sglang.srt.utils import (
     device_context,
     is_cpu,
     is_npu,
-    is_cuda,
     is_xpu,
     next_power_of_2,
 )
