@@ -295,6 +295,7 @@ class Engine(EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        skip_cache_write: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -329,6 +330,7 @@ class Engine(EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            skip_cache_write=skip_cache_write,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -385,6 +387,7 @@ class Engine(EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        skip_cache_write: bool = False,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -419,6 +422,7 @@ class Engine(EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            skip_cache_write=skip_cache_write,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

@@ -206,6 +206,9 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Whether to skip storing KV cache to storage backend for this request
+    skip_cache_write: bool = False
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -718,6 +721,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Whether to skip storing KV cache to storage backend for this request
+    skip_cache_write: bool = False
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

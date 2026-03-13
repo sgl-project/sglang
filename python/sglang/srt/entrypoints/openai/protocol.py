@@ -314,6 +314,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Whether to skip storing KV cache to storage backend for this request
+    skip_cache_write: bool = False
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -631,6 +633,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Whether to skip storing KV cache to storage backend for this request
+    skip_cache_write: bool = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

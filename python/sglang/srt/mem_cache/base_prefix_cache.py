@@ -60,6 +60,8 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    # Whether to skip storing KV cache to storage backend
+    skip_cache_write: bool = False
 
 
 @dataclasses.dataclass

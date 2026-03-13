@@ -786,6 +786,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            skip_cache_write=grpc_req.skip_cache_write if grpc_req.HasField("skip_cache_write") else False,
         )
 
     @staticmethod
