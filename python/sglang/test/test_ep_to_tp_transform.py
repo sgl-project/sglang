@@ -489,6 +489,77 @@ class TestEpToTpTransform(unittest.TestCase):
         del model, model2
         torch.cuda.empty_cache()
 
+    def test_ep_to_tp_fused_shared_experts(self):
+        """EP→TP transform must correctly handle fused shared experts.
+
+        When shared experts are fused into FusedMoE, the weight tensors have
+        extra rows for shared experts: [num_routed_local + num_shared, ...].
+        The transform must shard the shared expert portion locally (no collective)
+        while redistributing the routed portion via all_to_all.
+
+        This exercises the `if num_shared > 0` branches in ep_to_tp_transform:
+        - is_w13 + shared: split fused [gate|up], shard each half, re-fuse
+        - w2 + shared: simple shard slice
+        """
+        from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+        from sglang.srt.server_args import get_global_server_args
+
+        config = _make_tiny_config(n_routed_experts=16)
+        weights = _generate_checkpoint_weights(config)
+
+        server_args = get_global_server_args()
+        old_flag = server_args.disable_shared_experts_fusion
+
+        # Force-enable shared expert fusion, bypassing the n_routed_experts==256 check
+        def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
+            self_model.num_fused_shared_experts = self_model.config.n_shared_experts
+
+        try:
+            server_args.disable_shared_experts_fusion = False
+
+            with patch.object(
+                DeepseekV3ForCausalLM,
+                "determine_num_fused_shared_experts",
+                _force_fuse,
+            ):
+                # Load normally (TP)
+                tp_snapshot = _create_model_and_load(config, weights, ep_load=False)
+
+                # Load as EP, then transform to TP
+                ep_snapshot = _create_model_and_load(config, weights, ep_load=True)
+
+                # Verify shared experts are actually fused by checking weight dim 0
+                # With fusion: num_local_experts = n_routed + n_shared = 16 + 1 = 17
+                n_shared = config.n_shared_experts  # 1
+                found_fused = False
+                for key in tp_snapshot:
+                    if "w13_weight" in key and "scale" not in key and "bias" not in key:
+                        self.assertEqual(
+                            tp_snapshot[key].shape[0],
+                            config.n_routed_experts + n_shared,
+                            f"Shared experts not fused for {key}: "
+                            f"expected dim 0 = {config.n_routed_experts + n_shared}, "
+                            f"got {tp_snapshot[key].shape[0]}",
+                        )
+                        found_fused = True
+                        break
+                self.assertTrue(found_fused, "No w13_weight found in snapshot")
+
+                # Compare EP-loaded vs TP-loaded weights
+                self.assertEqual(
+                    set(tp_snapshot.keys()),
+                    set(ep_snapshot.keys()),
+                    "Mismatch in parameter names",
+                )
+                for key in sorted(tp_snapshot.keys()):
+                    torch.testing.assert_close(
+                        ep_snapshot[key],
+                        tp_snapshot[key],
+                        msg=f"Mismatch on rank {self.rank} for {key}",
+                    )
+        finally:
+            server_args.disable_shared_experts_fusion = old_flag
+
 
 if __name__ == "__main__":
     unittest.main()
