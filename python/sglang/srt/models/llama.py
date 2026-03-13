@@ -52,11 +52,12 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, is_musa, is_npu, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -131,6 +132,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -175,6 +177,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            reduce_results=reduce_results,
         )
 
         self.rotary_emb = get_rope(
@@ -267,6 +270,8 @@ class LlamaDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
+
+        self.reduce_results = not _is_musa
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -280,6 +285,7 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
+            reduce_results=self.reduce_results,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -287,6 +293,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=self.reduce_results,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -305,7 +312,14 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if _is_musa:
+                hidden_states, residual = (
+                    self.input_layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual, None
+                    )
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -313,7 +327,16 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _is_musa:
+            hidden_states, residual = (
+                self.post_attention_layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual, None
+                )
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -397,7 +420,12 @@ class LlamaModel(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            if _is_musa:
+                hidden_states, _ = self.norm.forward_with_allreduce_fusion(
+                    hidden_states, residual, None
+                )
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -41,6 +42,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -341,7 +343,7 @@ class RMSNorm(MultiPlatformOp):
                 if (
                     _use_aiter
                     and get_global_server_args().enable_aiter_allreduce_fusion
-                ):
+                ) or _is_musa:
                     x = tensor_model_parallel_all_reduce(x)
                     return self.forward(x, residual, None)
 
