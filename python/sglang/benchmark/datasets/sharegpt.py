@@ -57,7 +57,7 @@ def sample_sharegpt_requests(
     ]
 
     # Shuffle the dataset.
-    random.shuffle(dataset)
+    # random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[DatasetRow] = []
