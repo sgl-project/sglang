@@ -141,7 +141,7 @@ class TestNgramCacheProb(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.cache = _make_cache("Prob")
+        cls.cache = _make_cache("PROB")
         cls.cache.batch_put(SEED_SEQUENCES)
         cls.cache.synchronize()
         ids, masks = cls.cache.batch_get(QUERY_SEQUENCES)
@@ -339,7 +339,7 @@ class TestMaskValidity(CustomTestCase):
             self._check_mask(masks[i].tolist())
 
     def test_prob_mask_invariants(self):
-        cache = _make_cache("Prob")
+        cache = _make_cache("PROB")
         cache.batch_put(SEED_SEQUENCES)
         cache.synchronize()
         _, masks = cache.batch_get(QUERY_SEQUENCES)
@@ -353,7 +353,7 @@ class TestFrequencyBoosting(CustomTestCase):
 
     def test_repeated_insert_promotes_token(self):
         cache = _make_cache(
-            "Prob",
+            "PROB",
             draft_token_num=2,
             max_bfs_breadth=1,
             min_bfs_breadth=1,
