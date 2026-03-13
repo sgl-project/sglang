@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include "ngram.h"
+#include "sam_cache.h"
 #include "trie_cache.h"
 
 PYBIND11_MODULE(ngram_cache_cpp, m) {
@@ -16,6 +17,14 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
       .def("batchMatch", &NgramTrie::batchMatch, "")
       .def("reset", &NgramTrie::reset, "")
       .def("synchronize", &NgramTrie::synchronize, "");
+
+  using NgramSAM = Ngram<SAMCache>;
+  py::class_<NgramSAM>(m, "NgramSAM")
+      .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
+      .def("asyncInsert", &NgramSAM::asyncInsert, "")
+      .def("batchMatch", &NgramSAM::batchMatch, "")
+      .def("reset", &NgramSAM::reset, "")
+      .def("synchronize", &NgramSAM::synchronize, "");
 
   py::class_<Param>(m, "Param")
       .def(py::init<>())

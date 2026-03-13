@@ -15,6 +15,7 @@ ngram_cache_cpp = load(
     sources=[
         f"{_abs_path}/ngram_cache_binding.cpp",
         f"{_abs_path}/ngram.cpp",
+        f"{_abs_path}/sam_cache.cpp",
         f"{_abs_path}/trie_cache.cpp",
         f"{_abs_path}/result.cpp",
     ],
@@ -32,6 +33,7 @@ class NgramCache:
         max_bfs_breadth=8,
         draft_token_num=8,
         match_type="BFS",
+        cache_type="trie",
         capacity=1000000,
     ):
         param = ngram_cache_cpp.Param()
@@ -42,7 +44,14 @@ class NgramCache:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.match_type = match_type
-        self.cache = ngram_cache_cpp.NgramTrie(capacity, param)
+        if cache_type == "trie":
+            self.cache = ngram_cache_cpp.NgramTrie(capacity, param)
+        elif cache_type == "sam":
+            self.cache = ngram_cache_cpp.NgramSAM(capacity, param)
+        else:
+            raise ValueError(
+                f"Unknown cache_type={cache_type!r}. Expected 'trie' or 'sam'."
+            )
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num

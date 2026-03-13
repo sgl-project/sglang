@@ -44,6 +44,7 @@ class NGRAMWorker:
         self.max_match_window_size: int = (
             server_args.speculative_ngram_max_match_window_size
         )
+        self.cache_type: str = server_args.speculative_ngram_cache_type
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -56,6 +57,7 @@ class NGRAMWorker:
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
+            cache_type=server_args.speculative_ngram_cache_type,
             capacity=server_args.speculative_ngram_capacity,
             branch_length=server_args.speculative_ngram_branch_length,
             draft_token_num=server_args.speculative_num_draft_tokens,

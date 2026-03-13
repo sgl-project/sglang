@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 
+#include "sam_cache.h"
 #include "trie_cache.h"
 
 namespace ngram {
@@ -137,5 +138,6 @@ Result Ngram<Cache>::batchMatch(const std::vector<std::vector<int32_t>>& tokens)
 }
 
 template class Ngram<TrieCache>;
+template class Ngram<SAMCache>;
 
 }  // namespace ngram
