@@ -41,6 +41,18 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:
+            print(
+                "\n"
+                "==============================================================================\n"
+                "WARNING: This copy of sgl-model-gateway is DEPRECATED and no longer maintained.\n"
+                "The actively maintained version has moved to:\n"
+                "  https://github.com/lightseekorg/smg\n"
+                "\n"
+                "Please migrate to the standalone repository for the latest features,\n"
+                "bug fixes, and security updates.\n"
+                "==============================================================================\n",
+                file=sys.stderr,
+            )
             if Router is None:
                 raise RuntimeError("Rust Router is not installed")
             router_args._validate_router_args()
