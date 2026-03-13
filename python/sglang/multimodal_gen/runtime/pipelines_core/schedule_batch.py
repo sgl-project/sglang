@@ -11,6 +11,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
+import logging
 import os
 import pprint
 from copy import deepcopy
@@ -21,11 +22,11 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.server_args import (
-    ServerArgs,
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
+    init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
 
@@ -288,20 +289,22 @@ class Req:
         else:
             target_width = -1
 
-        # sanitize prompts for info-level logging
-        sanitized_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
-        sanitized_neg_prompt = _sanitize_for_logging(
-            self.negative_prompt, key_hint="negative_prompt"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            display_prompt = self.prompt
+            display_neg_prompt = self.negative_prompt
+        else:
+            display_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
+            display_neg_prompt = _sanitize_for_logging(
+                self.negative_prompt, key_hint="negative_prompt"
+            )
 
-        # Log sampling parameters
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
                          fps: {self.fps}
-                      prompt: {sanitized_prompt}
-                  neg_prompt: {sanitized_neg_prompt}
+                      prompt: {display_prompt}
+                  neg_prompt: {display_neg_prompt}
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
@@ -313,7 +316,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        logger.debug(debug_str)
+        logger.info(debug_str)
 
 
 @dataclass
