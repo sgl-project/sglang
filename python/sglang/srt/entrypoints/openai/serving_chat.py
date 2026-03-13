@@ -248,6 +248,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs
             else None
         )
+        if self.is_gpt_oss and reasoning_effort == "none":
+            raise ValueError(
+                f"Harmony does not support reasoning effort {reasoning_effort}"
+            )
+
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
