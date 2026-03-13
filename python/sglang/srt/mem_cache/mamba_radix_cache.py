@@ -42,6 +42,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.marconi_admission_cache import MarconiAdmissionTree
+from sglang.srt.mem_cache.marconi_config import (
+    get_marconi_branch_align_interval,
+)
+from sglang.srt.mem_cache.marconi_utils import (
+    get_attn_flops,
+    get_kv_cache_size_bytes,
+    get_mamba1_flops,
+    get_mlp_flops,
+    normalize,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -49,7 +60,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -59,9 +70,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+MARCONI_EVICTION_MAX_CANDIDATES = max(
+    1, get_int_env_var("SGLANG_MARCONI_EVICTION_MAX_CANDIDATES", 512)
+)
+
 
 class TreeNode:
-
     counter = 0
     last_access_time_counter_float = float64(1.0)
 
@@ -71,6 +85,7 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
+        self.prefix_len = 0
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -83,6 +98,7 @@ class TreeNode:
 
         self.hit_count = 0
         self.host_ref_counter = 0
+        self.pin_until = 0.0
         # store the host indices of KV cache
         self.host_value = None
         # store hash values of each pages
@@ -401,6 +417,26 @@ class MambaRadixCache(BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.marconi_config = params.marconi_config
+        self.marconi_model_stats = None
+        self.marconi_enabled = bool(
+            self.marconi_config is not None and self.marconi_config.enable
+        )
+        if self.marconi_enabled:
+            self.marconi_model_stats = self.marconi_config.model_stats
+            if self.marconi_model_stats is None:
+                raise ValueError(
+                    "Marconi is enabled but model stats are missing; "
+                    "cannot compute eviction utilities."
+                )
+        if self.marconi_enabled:
+            self.marconi_eff_weight = self.marconi_config.eff_weight
+            self.marconi_eviction_latency_weights = (1.0, 1.0, 1.0)
+            self.marconi_eviction_max_candidates = MARCONI_EVICTION_MAX_CANDIDATES
+            self.marconi_attn_only_reuse = False
+        self.marconi_admission_tree = (
+            self._make_marconi_admission_tree() if self.marconi_enabled else None
+        )
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -432,10 +468,96 @@ class MambaRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return True
 
+    def _node_has_full_mamba_state(self, node: TreeNode) -> bool:
+        return node.mamba_value is not None
+
+    def _make_marconi_admission_tree(self) -> MarconiAdmissionTree:
+        return MarconiAdmissionTree()
+
+    def _get_marconi_live_stats(self) -> dict:
+        hit_rate = (
+            self.marconi_live_hit_count / self.marconi_live_match_count
+            if self.marconi_live_match_count > 0
+            else 0.0
+        )
+        token_hit_rate = (
+            self.marconi_live_token_hit / self.marconi_live_token_total
+            if self.marconi_live_token_total > 0
+            else 0.0
+        )
+        admission_branch_rate = (
+            self.marconi_admission_branch_count / self.marconi_admission_match_count
+            if getattr(self, "marconi_admission_match_count", 0) > 0
+            else 0.0
+        )
+        admission_tree = self.marconi_admission_tree
+        admission_nodes = admission_tree.num_nodes if admission_tree is not None else 0
+        admission_tokens = (
+            admission_tree.num_tokens if admission_tree is not None else 0
+        )
+        full_tokens, mamba_states = self.total_size()
+        return {
+            "enabled": self.marconi_enabled,
+            "matches": self.marconi_live_match_count,
+            "hits": self.marconi_live_hit_count,
+            "hit_rate": hit_rate,
+            "token_total": self.marconi_live_token_total,
+            "token_hit": self.marconi_live_token_hit,
+            "token_hit_rate": token_hit_rate,
+            "attn_only_reuse_count": self.marconi_live_attn_only_reuse_count,
+            "branch_checkpoint_inserts": self.marconi_live_branch_checkpoint_count,
+            "rehydrate_count": self.marconi_live_rehydrate_count,
+            "track_entry_inserts": self.marconi_live_track_entry_insert_count,
+            "admission_matches": getattr(self, "marconi_admission_match_count", 0),
+            "admission_branches": getattr(self, "marconi_admission_branch_count", 0),
+            "admission_branch_rate": admission_branch_rate,
+            "admission_tree_nodes": admission_nodes,
+            "admission_tree_tokens": admission_tokens,
+            "evict_full_tokens": self.marconi_live_evict_full,
+            "evict_mamba_states": self.marconi_live_evict_mamba,
+            "cached_full_tokens": full_tokens,
+            "cached_mamba_states": mamba_states,
+        }
+
+    def _log_marconi_live_stats(self, *, force: bool = False) -> None:
+        if not self.marconi_enabled:
+            return
+        if not force and not logger.isEnabledFor(logging.DEBUG):
+            return
+        if not force and (
+            self.marconi_live_match_count == 0
+            or self.marconi_live_match_count % self.marconi_live_log_interval != 0
+        ):
+            return
+        stats = self._get_marconi_live_stats()
+        logger.debug(
+            "Marconi live stats: matches=%d hit_rate=%.4f token_hit_rate=%.4f "
+            "admission_branch_rate=%.4f branch_checkpoint_inserts=%d "
+            "rehydrate_count=%d track_entry_inserts=%d evict_full=%d evict_mamba=%d "
+            "cached_full=%d cached_mamba=%d",
+            stats["matches"],
+            stats["hit_rate"],
+            stats["token_hit_rate"],
+            stats["admission_branch_rate"],
+            stats["branch_checkpoint_inserts"],
+            stats["rehydrate_count"],
+            stats["track_entry_inserts"],
+            stats["evict_full_tokens"],
+            stats["evict_mamba_states"],
+            stats["cached_full_tokens"],
+            stats["cached_mamba_states"],
+        )
+
+    def get_runtime_stats(self) -> Optional[dict[str, object]]:
+        if not self.marconi_enabled:
+            return None
+        return {"marconi": self._get_marconi_live_stats()}
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
+        self.root_node.prefix_len = 0
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -445,6 +567,73 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        self.marconi_cached_kv_mask = None
+        if self.marconi_enabled:
+            kv_capacity = getattr(self.token_to_kv_pool_allocator, "size", None)
+            if kv_capacity is not None and kv_capacity > 0:
+                self.marconi_cached_kv_mask = torch.zeros(
+                    kv_capacity + 1, dtype=torch.bool, device="cpu"
+                )
+        self.marconi_live_match_count = 0
+        self.marconi_live_hit_count = 0
+        self.marconi_live_token_total = 0
+        self.marconi_live_token_hit = 0
+        self.marconi_live_evict_full = 0
+        self.marconi_live_evict_mamba = 0
+        self.marconi_live_branch_checkpoint_count = 0
+        self.marconi_live_rehydrate_count = 0
+        self.marconi_live_track_entry_insert_count = 0
+        self.marconi_live_attn_only_reuse_count = 0
+        self.marconi_live_log_interval = 50
+        if self.marconi_enabled:
+            self.marconi_admission_match_count = 0
+            self.marconi_admission_branch_count = 0
+            self.marconi_num_reqs_before_eviction = None
+            self.marconi_admission_tree = self._make_marconi_admission_tree()
+
+    def _marconi_filter_free_indices(
+        self, indices: torch.Tensor, where: str
+    ) -> Optional[torch.Tensor]:
+        if not self.marconi_enabled:
+            return indices
+        if indices is None or indices.numel() == 0:
+            return None
+        if self.marconi_cached_kv_mask is None:
+            return indices
+        idx_cpu = indices.detach().to(device="cpu", dtype=torch.int64, copy=False)
+        if (
+            idx_cpu.numel() > 0
+            and idx_cpu.max().item() >= self.marconi_cached_kv_mask.numel()
+        ):
+            return indices
+        mask = self.marconi_cached_kv_mask[idx_cpu]
+        if mask.numel() == 0:
+            return None
+        keep = ~mask
+        if not keep.any():
+            return None
+        free_idx = idx_cpu[keep]
+        return free_idx.to(dtype=indices.dtype, device=indices.device)
+
+    def _marconi_kv_mask_add(self, indices: torch.Tensor) -> None:
+        if (
+            self.marconi_cached_kv_mask is None
+            or indices is None
+            or indices.numel() == 0
+        ):
+            return
+        idx_cpu = indices.detach().to(device="cpu", dtype=torch.int64, copy=False)
+        self.marconi_cached_kv_mask[idx_cpu] = True
+
+    def _marconi_kv_mask_remove(self, indices: torch.Tensor) -> None:
+        if (
+            self.marconi_cached_kv_mask is None
+            or indices is None
+            or indices.numel() == 0
+        ):
+            return
+        idx_cpu = indices.detach().to(device="cpu", dtype=torch.int64, copy=False)
+        self.marconi_cached_kv_mask[idx_cpu] = False
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -469,8 +658,47 @@ class MambaRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        value, best_last_node, last_node, mamba_branching_seqlen, best_value_len = (
+            self._match_prefix_helper(key)
+        )
+        return self._match_post_processor(
+            params,
+            value,
+            best_last_node,
+            last_node,
+            mamba_branching_seqlen,
+            best_value_len,
+        )
+
+    def _marconi_align_cache_len(self, cache_len: int) -> int:
+        if cache_len <= 0:
+            return 0
+        if self.page_size > 1:
+            return cache_len // self.page_size * self.page_size
+        return cache_len
+
+    def _marconi_align_branch_len(self, cache_len: int) -> Optional[int]:
+        if cache_len <= 0:
+            return None
+        align_interval = get_marconi_branch_align_interval(self.page_size)
+        if align_interval <= 1:
+            return cache_len
+        aligned = cache_len // align_interval * align_interval
+        return aligned if aligned > 0 else None
+
+    def _marconi_branch_seqlen(
+        self,
+        cache_len: int,
+        cached_prefix_len: int,
+        existing_branch: Optional[int],
+    ) -> Optional[int]:
+        branch_len = None
+        if cache_len > 0 and cache_len >= cached_prefix_len:
+            branch_len = self._marconi_align_branch_len(cache_len)
+        if existing_branch is not None:
+            if branch_len is None or existing_branch < branch_len:
+                branch_len = existing_branch
+        return branch_len
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -483,13 +711,21 @@ class MambaRadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            branchoff_mamba_value=params.branchoff_mamba_value,
+            branch_checkpoint_len=params.branch_checkpoint_len,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
+        kv_cache_protected_len = getattr(
+            req, "kv_cache_protected_len", req.cache_protected_len
+        )
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -498,22 +734,53 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
             return
-
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        if (
+            self.marconi_enabled
+            and self.marconi_admission_tree is not None
+            and kv_committed_len > 0
+            and not getattr(req, "marconi_admission_seeded", False)
+        ):
+            input_len = min(len(req.origin_input_ids), kv_committed_len)
+            if input_len > 0:
+                self.marconi_admission_tree.insert(
+                    req.origin_input_ids[:input_len], req.extra_key
+                )
+                req.marconi_admission_seeded = True
+
+        track_entries = None
+        primary_entry = None
+        secondary_entries = None
+        if self.marconi_enabled:
+            track_entries = getattr(req, "mamba_track_entries", None)
+            if track_entries:
+                entries = sorted(track_entries, key=lambda x: x[0])
+                primary_entry = entries[-1]
+                secondary_entries = entries[:-1]
+        primary_mamba_forked = None
 
         if is_insert:
-            cache_len = (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
+            if primary_entry is not None:
+                cache_len = primary_entry[0]
+            else:
+                cache_len = (
+                    req.mamba_last_track_seqlen
+                    if self.enable_mamba_extra_buffer
+                    else len(token_ids)
+                )
             if cache_len is None:
                 cache_len = 0
+            if cache_len > len(token_ids):
+                cache_len = len(token_ids)
+            if cache_len <= 0:
+                is_insert = False
+
+        if is_insert:
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
+                cache_end_idx = max(cache_len, kv_cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
@@ -534,20 +801,49 @@ class MambaRadixCache(BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
-                mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
+                if primary_entry is not None:
+                    primary_len, primary_idx = primary_entry
+                    mamba_value_src = torch.tensor(
+                        [primary_idx],
+                        dtype=torch.int64,
+                        device=page_aligned_kv_indices.device,
                     )
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[
-                        mamba_ping_pong_track_buffer_to_keep
-                    ]
-                    .unsqueeze(-1)
-                    .clone()
-                )
+                    mamba_ping_pong_track_buffer_to_keep = None
+                    if req.mamba_ping_pong_track_buffer is not None:
+                        buffer_list = req.mamba_ping_pong_track_buffer.tolist()
+                        if primary_idx in buffer_list:
+                            mamba_ping_pong_track_buffer_to_keep = buffer_list.index(
+                                primary_idx
+                            )
+                else:
+                    mamba_ping_pong_track_buffer_to_keep = (
+                        self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
+                        )
+                    )
+                    mamba_value_src = (
+                        req.mamba_ping_pong_track_buffer[
+                            mamba_ping_pong_track_buffer_to_keep
+                        ]
+                        .unsqueeze(-1)
+                        .clone()
+                    )
             else:
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                mamba_value_src = req.mamba_pool_idx.unsqueeze(-1).clone()
+                mamba_ping_pong_track_buffer_to_keep = None
+
+            mamba_value = mamba_value_src
+            if self.marconi_enabled:
+                primary_mamba_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                    mamba_value_src
+                )
+                if primary_mamba_forked is None:
+                    self.evict_mamba(1)
+                    primary_mamba_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                        mamba_value_src
+                    )
+                    assert primary_mamba_forked is not None, "Can not alloc mamba cache"
+                mamba_value = primary_mamba_forked
                 mamba_ping_pong_track_buffer_to_keep = None
 
             result = self.insert(
@@ -558,18 +854,120 @@ class MambaRadixCache(BasePrefixCache):
                 )
             )
             new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+            if mamba_exist and primary_mamba_forked is not None:
+                self.req_to_token_pool.mamba_pool.free(primary_mamba_forked)
 
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
-            )
+            inserted_start = getattr(req, "kv_cache_inserted_start", None)
+            inserted_end = getattr(req, "kv_cache_inserted_end", None)
+            dup_ranges = []
+            if (
+                inserted_start is not None
+                and inserted_end is not None
+                and inserted_start < inserted_end
+            ):
+                pre_end = min(new_prefix_len, inserted_start)
+                if kv_cache_protected_len < pre_end:
+                    dup_ranges.append(
+                        (
+                            kv_cache_protected_len,
+                            pre_end,
+                            "cache_finished_req:dup_prefix_pre",
+                        )
+                    )
+                post_start = max(kv_cache_protected_len, inserted_end)
+                if post_start < new_prefix_len:
+                    dup_ranges.append(
+                        (
+                            post_start,
+                            new_prefix_len,
+                            "cache_finished_req:dup_prefix_post",
+                        )
+                    )
+            elif kv_cache_protected_len < new_prefix_len:
+                dup_ranges.append(
+                    (
+                        kv_cache_protected_len,
+                        new_prefix_len,
+                        "cache_finished_req:dup_prefix",
+                    )
+                )
+
+            for start, end, where in dup_ranges:
+                dup_slice = kv_indices[start:end]
+                if self.marconi_enabled:
+                    safe = self._marconi_filter_free_indices(dup_slice, where)
+                    if safe is not None:
+                        self.token_to_kv_pool_allocator.free(safe)
+                else:
+                    self.token_to_kv_pool_allocator.free(dup_slice)
+
+            if secondary_entries:
+                for cache_len, mamba_idx in secondary_entries:
+                    cache_len = min(cache_len, len(token_ids))
+                    if cache_len <= 0:
+                        continue
+                    kv_indices_sub = kv_indices[:cache_len]
+                    if self.page_size != 1:
+                        page_aligned_len = (
+                            len(kv_indices_sub) // self.page_size * self.page_size
+                        )
+                        if page_aligned_len <= 0:
+                            continue
+                        kv_indices_sub = kv_indices_sub[:page_aligned_len].to(
+                            dtype=torch.int64, copy=True
+                        )
+                        token_ids_sub = token_ids[:page_aligned_len]
+                        cache_len = page_aligned_len
+                    else:
+                        kv_indices_sub = kv_indices_sub.to(dtype=torch.int64, copy=True)
+                        token_ids_sub = token_ids[:cache_len]
+
+                    mamba_value = torch.tensor(
+                        [mamba_idx], dtype=torch.int64, device=kv_indices_sub.device
+                    )
+                    secondary_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                        mamba_value
+                    )
+                    if secondary_forked is None:
+                        self.evict_mamba(1)
+                        secondary_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                            mamba_value
+                        )
+                        if secondary_forked is None:
+                            continue
+                    result = self.insert(
+                        InsertParams(
+                            key=RadixKey(token_ids_sub, req.extra_key),
+                            value=kv_indices_sub,
+                            mamba_value=secondary_forked,
+                            branch_checkpoint_len=cache_len,
+                        )
+                    )
+                    mamba_exist = result.mamba_exist
+                    if mamba_exist:
+                        self.req_to_token_pool.mamba_pool.free(secondary_forked)
+
+            if track_entries:
+                req.mamba_track_entries = None
+            if self.marconi_enabled:
+                req.kv_cache_protected_len = max(kv_cache_protected_len, new_prefix_len)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free(kv_indices[kv_cache_protected_len:])
             mamba_exist = True
 
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
 
-        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
+        # Finished requests should not keep ping-pong buffers; keeping one slot
+        # can leave mamba pages allocated but not tracked in the cache.
+        if self.enable_mamba_extra_buffer:
+            mamba_ping_pong_track_buffer_to_keep = None
+
+        free_mamba_cache = (
+            True
+            if self.enable_mamba_extra_buffer
+            else (mamba_exist or primary_mamba_forked is not None)
+        )
 
         if free_mamba_cache:
             self.req_to_token_pool.free_mamba_cache(
@@ -581,6 +979,9 @@ class MambaRadixCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
+        kv_cache_protected_len = getattr(
+            req, "kv_cache_protected_len", req.cache_protected_len
+        )
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -597,12 +998,24 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None:
+        if self.disable or cache_len is None or cache_len <= 0:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+
+        track_entries = getattr(req, "mamba_track_entries", None)
+        if self.marconi_enabled and track_entries:
+            self._marconi_cache_track_entries(
+                req,
+                track_entries,
+                kv_cache_protected_len,
+                kv_indices_orig,
+                token_ids,
+            )
+            req.mamba_track_entries = None
+            return
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
@@ -636,7 +1049,36 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
+        branch_checkpoint_len = None
+        if req.mamba_branching_seqlen is not None:
+            if page_aligned_len == req.mamba_branching_seqlen:
+                branch_checkpoint_len = req.mamba_branching_seqlen
+            else:
+                branch_align_interval = get_marconi_branch_align_interval(
+                    self.page_size
+                )
+                if (
+                    page_aligned_len < req.mamba_branching_seqlen
+                    and req.mamba_branching_seqlen
+                    <= page_aligned_len + branch_align_interval
+                ):
+                    branch_checkpoint_len = page_aligned_len
+        branch_checkpoint = branch_checkpoint_len is not None
+        needs_branch_checkpoint = req.mamba_branching_seqlen is not None
+        if self.marconi_enabled and needs_branch_checkpoint and not branch_checkpoint:
+            return _skip_cache_unfinished_req(req)
+        if self.marconi_enabled and branch_checkpoint_len is not None:
+            self.marconi_live_branch_checkpoint_count += 1
+            # Only cache up to the branch checkpoint when Marconi is enabled.
+            # KV entries beyond the checkpoint are not reusable without a matching
+            # SSM state and should remain request-local.
+            if branch_checkpoint_len < page_aligned_len:
+                page_aligned_token_ids = page_aligned_token_ids[:branch_checkpoint_len]
+                page_aligned_kv_indices = page_aligned_kv_indices[
+                    :branch_checkpoint_len
+                ]
+                page_aligned_len = branch_checkpoint_len
+        # Radix tree mamba value is forked from request-local state.
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 
         # if alloc mamba cache failed, do evict and alloc again
@@ -651,12 +1093,24 @@ class MambaRadixCache(BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_forked,
+                branchoff_mamba_value=(
+                    mamba_value_forked if branch_checkpoint else None
+                ),
+                branch_checkpoint_len=branch_checkpoint_len,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
-        )
+        if self.marconi_enabled:
+            if getattr(req, "kv_cache_inserted_start", None) is None:
+                req.kv_cache_inserted_start = new_prefix_len
+                req.kv_cache_inserted_end = page_aligned_len
+            else:
+                if req.kv_cache_inserted_end is None:
+                    req.kv_cache_inserted_end = page_aligned_len
+                else:
+                    req.kv_cache_inserted_end = max(
+                        req.kv_cache_inserted_end, page_aligned_len
+                    )
         # there is a mamba cache in radix cache, release it
         if mamba_exist:
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
@@ -673,17 +1127,43 @@ class MambaRadixCache(BasePrefixCache):
         if not mamba_exist:
             assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
 
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        if not self.marconi_enabled:
+            assert (
+                req.cache_protected_len <= len(new_indices) + self.page_size - 1
+            ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            assert new_prefix_len <= len(
+                new_indices
+            ), f"{new_prefix_len=}, {len(new_indices)=}"
+        elif new_prefix_len > len(new_indices):
+            logger.warning(
+                "Marconi KV prefix exceeds mamba prefix: rid=%s "
+                "new_prefix_len=%d mamba_prefix_len=%d",
+                req.rid,
+                new_prefix_len,
+                len(new_indices),
+            )
+
+        new_cache_protected_len = len(new_indices)
+        free_end = min(new_prefix_len, new_cache_protected_len)
+        dup_slice = None
+        if kv_cache_protected_len < free_end:
+            # Clone before we overwrite req_to_token_pool so we free request-local KV.
+            dup_slice = kv_indices_orig[kv_cache_protected_len:free_end].clone()
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(kv_cache_protected_len, len(new_indices))),
+            new_indices[kv_cache_protected_len:],
         )
+
+        if dup_slice is not None:
+            if self.marconi_enabled:
+                safe = self._marconi_filter_free_indices(
+                    dup_slice, "cache_unfinished_req:dup_prefix"
+                )
+                if safe is not None:
+                    self.token_to_kv_pool_allocator.free(safe)
+            else:
+                self.token_to_kv_pool_allocator.free(dup_slice)
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -694,8 +1174,215 @@ class MambaRadixCache(BasePrefixCache):
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
         req.cache_protected_len = len(new_indices)
+        if self.marconi_enabled:
+            req.kv_cache_protected_len = max(kv_cache_protected_len, len(new_indices))
+        else:
+            req.kv_cache_protected_len = req.cache_protected_len
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+
+    def _marconi_cache_rehydrate(self, req: Req, kv_cache_protected_len: int) -> None:
+        self.marconi_live_rehydrate_count += 1
+        saved_prefix = req.marconi_saved_prefix_indices
+        saved_fill_ids = req.marconi_saved_fill_ids
+        if saved_prefix is None or saved_fill_ids is None:
+            req.finish_marconi_rehydrate()
+            return
+
+        rehydrate_len = req.marconi_rehydrate_len or len(saved_fill_ids)
+        rehydrate_len = min(rehydrate_len, len(saved_fill_ids), len(saved_prefix))
+        if rehydrate_len <= 0:
+            req.finish_marconi_rehydrate()
+            return
+
+        token_ids = saved_fill_ids[:rehydrate_len]
+        kv_indices = saved_prefix[:rehydrate_len]
+
+        track_entries = req.marconi_track_entries or []
+        if track_entries:
+            cache_len, mamba_idx = max(track_entries, key=lambda x: x[0])
+            cache_len = min(cache_len, rehydrate_len)
+        else:
+            cache_len = rehydrate_len
+            mamba_idx = (
+                int(req.mamba_pool_idx.item())
+                if req.mamba_pool_idx is not None
+                else None
+            )
+        if mamba_idx is None:
+            req.finish_marconi_rehydrate()
+            return
+
+        mamba_value = torch.tensor(
+            [mamba_idx], dtype=torch.int64, device=kv_indices.device
+        )
+        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if mamba_value_forked is None:
+            self.evict_mamba(1)
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+
+        result = self.insert(
+            InsertParams(
+                key=RadixKey(token_ids[:cache_len], req.extra_key),
+                value=kv_indices[:cache_len],
+                mamba_value=mamba_value_forked,
+                branch_checkpoint_len=cache_len,
+            )
+        )
+        mamba_exist = result.mamba_exist
+        if mamba_exist:
+            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+
+        req.marconi_track_entries = None
+        req.finish_marconi_rehydrate()
+
+    def _marconi_cache_track_entries(
+        self,
+        req: Req,
+        track_entries: List[Tuple[int, int]],
+        kv_cache_protected_len: int,
+        kv_indices_orig: torch.Tensor,
+        token_ids: List[int],
+    ) -> None:
+        entries = sorted(track_entries, key=lambda x: x[0])
+        self.marconi_live_track_entry_insert_count += len(entries)
+        primary_len, primary_idx = entries[-1]
+        cache_len = min(primary_len, len(token_ids))
+        if cache_len <= 0:
+            return
+
+        kv_indices = kv_indices_orig[:cache_len]
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        if page_aligned_len <= 0:
+            return
+
+        page_aligned_token_ids = token_ids[:page_aligned_len]
+
+        mamba_value = torch.tensor(
+            [primary_idx], dtype=torch.int64, device=page_aligned_kv_indices.device
+        )
+        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if mamba_value_forked is None:
+            self.evict_mamba(1)
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+
+        result = self.insert(
+            InsertParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                value=page_aligned_kv_indices,
+                mamba_value=mamba_value_forked,
+                branch_checkpoint_len=page_aligned_len,
+            )
+        )
+        new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+        if self.marconi_enabled:
+            if getattr(req, "kv_cache_inserted_start", None) is None:
+                req.kv_cache_inserted_start = new_prefix_len
+                req.kv_cache_inserted_end = page_aligned_len
+            else:
+                if req.kv_cache_inserted_end is None:
+                    req.kv_cache_inserted_end = page_aligned_len
+                else:
+                    req.kv_cache_inserted_end = max(
+                        req.kv_cache_inserted_end, page_aligned_len
+                    )
+        if mamba_exist:
+            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+        )
+        new_indices, new_last_node = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
+        new_cache_protected_len = len(new_indices)
+        free_end = min(new_prefix_len, new_cache_protected_len)
+        dup_slice = None
+        if kv_cache_protected_len < free_end:
+            dup_slice = kv_indices_orig[kv_cache_protected_len:free_end].clone()
+
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(kv_cache_protected_len, len(new_indices))),
+            new_indices[kv_cache_protected_len:],
+        )
+
+        if dup_slice is not None:
+            safe = self._marconi_filter_free_indices(
+                dup_slice, "cache_unfinished_req:dup_prefix"
+            )
+            if safe is not None:
+                self.token_to_kv_pool_allocator.free(safe)
+
+        self.dec_lock_ref(req.last_node)
+        self.inc_lock_ref(new_last_node)
+
+        req.prefix_indices = torch.cat(
+            [new_indices, kv_indices_orig[len(new_indices) :]]
+        )
+        req.cache_protected_len = len(new_indices)
+        req.kv_cache_protected_len = max(kv_cache_protected_len, len(new_indices))
+        req.mamba_last_track_seqlen = None
+        req.last_node = new_last_node
+
+        # Insert secondary track entries.
+        for cache_len, mamba_idx in entries[:-1]:
+            cache_len = min(cache_len, len(token_ids))
+            if cache_len <= 0:
+                continue
+            kv_indices = kv_indices_orig[:cache_len]
+            if self.page_size != 1:
+                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+                if page_aligned_len <= 0:
+                    continue
+                kv_indices = kv_indices[:page_aligned_len].to(
+                    dtype=torch.int64, copy=True
+                )
+                token_ids_sub = token_ids[:page_aligned_len]
+                cache_len = page_aligned_len
+            else:
+                kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                token_ids_sub = token_ids[:cache_len]
+
+            mamba_value = torch.tensor(
+                [mamba_idx], dtype=torch.int64, device=kv_indices.device
+            )
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+            if mamba_value_forked is None:
+                self.evict_mamba(1)
+                mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                    mamba_value
+                )
+                if mamba_value_forked is None:
+                    continue
+            result = self.insert(
+                InsertParams(
+                    key=RadixKey(token_ids_sub, req.extra_key),
+                    value=kv_indices,
+                    mamba_value=mamba_value_forked,
+                    branch_checkpoint_len=cache_len,
+                )
+            )
+            mamba_exist = result.mamba_exist
+            if mamba_exist:
+                self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -705,6 +1392,175 @@ class MambaRadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    def _marconi_node_mamba_layers(self, node: TreeNode) -> int:
+        stats = self.marconi_model_stats
+        if stats is None or node.mamba_value is None:
+            return 0
+        return stats.num_mamba_layers
+
+    def _marconi_collect_leaf_nodes_full_scan(self) -> List[TreeNode]:
+        nodes = []
+        for node in self._collect_leaves():
+            if node == self.root_node:
+                continue
+            if node.full_lock_ref == 0 and node.mamba_lock_ref == 0:
+                nodes.append(node)
+        return nodes
+
+    def _marconi_collect_leaf_nodes(self) -> List[TreeNode]:
+        max_candidates = self.marconi_eviction_max_candidates
+        nodes = []
+        node = self.full_lru_list.get_leaf_lru_no_lock()
+        while self.full_lru_list.in_list(node) and len(nodes) < max_candidates:
+            if node.mamba_lock_ref == 0:
+                nodes.append(node)
+            node = self.full_lru_list.get_prev_leaf_no_lock(node)
+        if nodes:
+            return nodes
+        return self._marconi_collect_leaf_nodes_full_scan()
+
+    def _marconi_collect_leaf_and_single_child_nodes_full_scan(self) -> List[TreeNode]:
+        nodes = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node != self.root_node and len(node.children) <= 1:
+                if node.mamba_value is not None and node.mamba_lock_ref == 0:
+                    # For leaf nodes (no children), evicting them frees both KV and Mamba,
+                    # so we need both full_lock_ref == 0 and mamba_lock_ref == 0.
+                    # For internal nodes (one child), we only tombstone the Mamba state,
+                    # so only mamba_lock_ref == 0 is required.
+                    if len(node.children) == 0 and node.full_lock_ref > 0:
+                        continue
+                    nodes.append(node)
+            stack.extend(node.children.values())
+        return nodes
+
+    def _marconi_collect_leaf_and_single_child_nodes(self) -> List[TreeNode]:
+        max_candidates = self.marconi_eviction_max_candidates
+        nodes = []
+        node = self.mamba_lru_list.get_lru_no_lock()
+        while self.mamba_lru_list.in_list(node) and len(nodes) < max_candidates:
+            if (
+                node != self.root_node
+                and len(node.children) <= 1
+                and node.mamba_value is not None
+            ):
+                # For leaf nodes (no children), evicting them frees both KV and Mamba,
+                # so we need both full_lock_ref == 0 and mamba_lock_ref == 0.
+                # For internal nodes (one child), we only tombstone the Mamba state,
+                # so only mamba_lock_ref == 0 is required.
+                if len(node.children) > 0 or node.full_lock_ref == 0:
+                    nodes.append(node)
+            node = self.mamba_lru_list.get_prev_no_lock(node)
+        if nodes:
+            return nodes
+        return self._marconi_collect_leaf_and_single_child_nodes_full_scan()
+
+    def _marconi_compute_utilities(self, nodes: List[TreeNode]) -> List[float]:
+        stats = self.marconi_model_stats
+        if stats is None:
+            return []
+        current_ts = get_last_access_time()
+        timestamps = [node.last_access_time for node in nodes]
+        recency_scores = []
+        for ts in timestamps:
+            delta = current_ts - ts
+            recency_scores.append(1.0 / delta if delta > 0 else 0.0)
+        recency_scores = normalize(recency_scores)
+
+        efficiency_scores = []
+        mamba_weight, attn_weight, mlp_weight = self.marconi_eviction_latency_weights
+        for node in nodes:
+            seqlen_total = node.prefix_len
+            seqlen_child = len(node.key)
+            seqlen_parent = max(seqlen_total - seqlen_child, 0)
+
+            mamba_layers = self._marconi_node_mamba_layers(node)
+            flops_savings_mamba = mamba_layers * get_mamba1_flops(
+                seqlen_child, stats.model_dim, stats.ssm_state_size
+            )
+            flops_savings_attn = stats.num_attn_layers * (
+                get_attn_flops(seqlen_total, stats.model_dim)
+                - get_attn_flops(seqlen_parent, stats.model_dim)
+            )
+            flops_savings_mlp = stats.num_mlp_layers * (
+                get_mlp_flops(seqlen_total, stats.model_dim)
+                - get_mlp_flops(seqlen_parent, stats.model_dim)
+            )
+            total_flops_savings = (
+                mamba_weight * flops_savings_mamba
+                + attn_weight * flops_savings_attn
+                + mlp_weight * flops_savings_mlp
+            )
+            total_memory = mamba_layers * stats.mamba_state_size_bytes
+            total_memory += stats.num_attn_layers * get_kv_cache_size_bytes(
+                seqlen_total, stats.model_dim, stats.kv_cache_dtype_size
+            )
+            if total_memory > 0:
+                efficiency_scores.append(total_flops_savings / total_memory)
+            else:
+                efficiency_scores.append(0.0)
+        efficiency_scores = normalize(efficiency_scores)
+
+        return [
+            self.marconi_eff_weight * eff + recency
+            for eff, recency in zip(efficiency_scores, recency_scores)
+        ]
+
+    def _marconi_select_node(self, nodes: List[TreeNode]) -> Optional[TreeNode]:
+        utilities = self._marconi_compute_utilities(nodes)
+        if not utilities:
+            return None
+        min_idx = utilities.index(min(utilities))
+        return nodes[min_idx]
+
+    def _marconi_evict_full(self, full_num_tokens: int) -> None:
+        full_num_evicted = 0
+        while full_num_evicted < full_num_tokens:
+            candidates = self._marconi_collect_leaf_nodes()
+            if not candidates:
+                break
+            node = self._marconi_select_node(candidates)
+            if node is None:
+                break
+            full_evicted_delta, _, _, _ = self._evict_leaf_node(node, False)
+            full_num_evicted += full_evicted_delta
+        if full_num_evicted > 0:
+            self.marconi_live_evict_full += full_num_evicted
+            logger.info(
+                "Marconi eviction(full): evicted=%d total_full=%d total_mamba=%d",
+                full_num_evicted,
+                self.marconi_live_evict_full,
+                self.marconi_live_evict_mamba,
+            )
+
+    def _marconi_evict_mamba(self, mamba_num: int) -> None:
+        mamba_num_evicted = 0
+        while mamba_num_evicted < mamba_num:
+            candidates = self._marconi_collect_leaf_and_single_child_nodes()
+            if not candidates:
+                break
+            node = self._marconi_select_node(candidates)
+            if node is None:
+                break
+            if len(node.children) == 0:
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(node, True)
+                mamba_num_evicted += mamba_evicted_delta
+            else:
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                mamba_num_evicted += len(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self._tombstone_internal_node(node)
+        if mamba_num_evicted > 0:
+            self.marconi_live_evict_mamba += mamba_num_evicted
+            logger.info(
+                "Marconi eviction(mamba): evicted=%d total_full=%d total_mamba=%d",
+                mamba_num_evicted,
+                self.marconi_live_evict_full,
+                self.marconi_live_evict_mamba,
+            )
+
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
     ) -> Tuple[int, int, TreeNode, TreeNode]:
@@ -712,8 +1568,12 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
+        assert (
+            x.mamba_value is not None
+        ), f"leaf node mamba value must not be None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
+        if self.marconi_enabled:
+            self._marconi_kv_mask_remove(x.value)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
         self.req_to_token_pool.mamba_pool.free(x.mamba_value)
@@ -755,6 +1615,10 @@ class MambaRadixCache(BasePrefixCache):
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
+        if self.marconi_enabled:
+            before = self.marconi_live_evict_mamba
+            self._marconi_evict_mamba(mamba_num)
+            return self.marconi_live_evict_mamba - before
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -790,6 +1654,10 @@ class MambaRadixCache(BasePrefixCache):
         """Evict full KV cache. Returns the number of tokens evicted."""
         if self.disable or full_num_tokens <= 0:
             return 0
+        if self.marconi_enabled:
+            before = self.marconi_live_evict_full
+            self._marconi_evict_full(full_num_tokens)
+            return self.marconi_live_evict_full - before
 
         full_num_evicted = 0
         # get the least recently used leaf node that is not locked
@@ -848,10 +1716,7 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable:
             return None
 
-        if node.mamba_value is not None:
-            assert (
-                node.mamba_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
+        if node.mamba_value is not None and node.mamba_lock_ref > 0:
             if node.mamba_lock_ref == 1:
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
@@ -873,9 +1738,9 @@ class MambaRadixCache(BasePrefixCache):
         self.full_lru_list.sanity_check(self)
         self.mamba_lru_list.sanity_check(self)
 
-    def evictable_size(self) -> Tuple[int, int]:
+    def evictable_size(self) -> int:
         # Note: use full_evictable_size() and mamba_evictable_size() instead.
-        raise NotImplementedError
+        return self.full_evictable_size_
 
     def full_evictable_size(self) -> int:
         return self.full_evictable_size_
@@ -930,7 +1795,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
+    ) -> Tuple[List[torch.Tensor], TreeNode, TreeNode, Optional[int], int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
@@ -943,32 +1808,47 @@ class MambaRadixCache(BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
+        mamba_branching_seqlen: Optional[int] = None
+        matched_len = 0
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None:
+            if self._node_has_full_mamba_state(node):
                 best_value_len = len(value)
                 best_last_node = node
 
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
+                if len(key) > prefix_len:
+                    mamba_branching_seqlen = matched_len + prefix_len
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
+                matched_len += prefix_len
                 break
             else:
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
+                matched_len += prefix_len
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
+
+        if (
+            mamba_branching_seqlen is None
+            and matched_len > 0
+            and not self._node_has_full_mamba_state(node)
+            and len(node.children) > 0
+        ):
+            # Reuse of a purely-input prefix would require a checkpoint here.
+            mamba_branching_seqlen = matched_len
         # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None:
+        if self._node_has_full_mamba_state(node):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
+        return value, best_last_node, node, mamba_branching_seqlen, best_value_len
 
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
@@ -983,77 +1863,161 @@ class MambaRadixCache(BasePrefixCache):
         self,
         params: MatchPrefixParams,
         value: List[torch.Tensor],
+        best_last_node: TreeNode,
         last_node: TreeNode,
+        mamba_branching_seqlen: Optional[int],
         best_value_len: int,
     ) -> MatchResult:
         """Post-process the matched result."""
         cow_mamba = params.cow_mamba
         req = params.req
+        key = params.key
+
+        if value:
+            value_full = torch.cat(value)
+        else:
+            value_full = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        mamba_len = 0
+        if best_value_len > 0:
+            mamba_len = int(sum(len(v) for v in value[:best_value_len]))
+
+        if len(value) > best_value_len and mamba_branching_seqlen is None:
+            mamba_branching_seqlen = int(value_full.numel())
+        if mamba_branching_seqlen is not None:
+            mamba_branching_seqlen = self._marconi_align_branch_len(
+                mamba_branching_seqlen
+            )
+
+        use_attn_only = (
+            self.marconi_enabled
+            and self.marconi_attn_only_reuse
+            and value_full.numel() > mamba_len
+        )
+        last_node_for_return = last_node if use_attn_only else best_last_node
 
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
-        node_update = last_node
-        self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-
-        # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = get_last_access_time()
-        while node_update:
+        node_update = last_node_for_return
+        if self.marconi_enabled:
+            if node_update != self.root_node:
+                self.full_lru_list.reset_node_mru(node_update)
+            if best_last_node != self.root_node and self._node_has_full_mamba_state(
+                best_last_node
+            ):
+                self.mamba_lru_list.reset_node_mru(best_last_node)
+            cur_time = get_last_access_time()
             node_update.last_access_time = cur_time
-            cur_time -= (
-                0.00001  # assuming less than 100000 nodes in a branch of the tree
-            )
-            node_update = node_update.parent
-
-        # Calculate the branching point. It is defined as the last aligned position that
-        # does not have a mamba value.
-        if len(value) > best_value_len:
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
-            mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
-            mamba_branching_seqlen = (
-                mamba_cache_chunk_aligned_seqlen
-                if mamba_cache_chunk_aligned_seqlen > 0
-                else None
-            )
+            if best_last_node is not node_update:
+                best_last_node.last_access_time = cur_time
+            node_update.hit_count += 1
         else:
+            self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+            self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+
+            # This last_access_time is for sanity check, can be deleted after validation in production
+            cur_time = get_last_access_time()
+            while node_update:
+                node_update.last_access_time = cur_time
+                cur_time -= (
+                    0.00001  # assuming less than 100000 nodes in a branch of the tree
+                )
+                node_update = node_update.parent
+
+        if use_attn_only and req is not None:
+            self.marconi_live_attn_only_reuse_count += 1
+            req.marconi_rehydrate_len = int(value_full.numel())
+            req.marconi_rehydrate_from = mamba_len
+            req.marconi_rehydrate_pending = True
+            req.marconi_rehydrate_last_node = best_last_node
+            req.marconi_track_entries = None
+            # Avoid branching for rehydrate; we'll roll-forward explicitly.
             mamba_branching_seqlen = None
 
-        # Copy mamba state to req local space if cow is true
-        if cow_mamba and last_node.mamba_value is not None:
+        # Copy mamba state to req local space if cow is true and state is full.
+        if (
+            cow_mamba
+            and req is not None
+            and self._node_has_full_mamba_state(best_last_node)
+        ):
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
+                # Try to alloc again after evicting an unpinned mamba state.
                 if dst_index is None:
-                    self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    self.inc_lock_ref(best_last_node)
+                    self.evict_mamba(1)
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
+                    self.dec_lock_ref(best_last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
+                src_index = best_last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
             else:
-                src_index = last_node.mamba_value
+                src_index = best_last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
-        value = value[:best_value_len]
-        if value:
-            value = torch.cat(value)
-        else:
-            value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        value = value_full if use_attn_only else value_full[:mamba_len]
+
+        if self.marconi_enabled:
+            matched_len = int(value.numel())
+            total_len = len(key.token_ids)
+            self.marconi_live_match_count += 1
+            self.marconi_live_token_total += total_len
+            self.marconi_live_token_hit += matched_len
+            if matched_len > 0:
+                self.marconi_live_hit_count += 1
+            self._log_marconi_live_stats()
+
+            if (
+                self.marconi_admission_tree is not None
+                and matched_len > 0
+                and key is not None
+            ):
+                self.marconi_admission_tree.record_cache_hit(
+                    key.token_ids, matched_len, key.extra_key
+                )
+
+        if (
+            self.marconi_enabled
+            and req is not None
+            and self.marconi_admission_tree is not None
+        ):
+            if not getattr(req, "marconi_admission_seeded", False):
+                input_len = min(len(req.origin_input_ids), len(key.token_ids))
+                if input_len > 0:
+                    self.marconi_admission_tree.insert(
+                        list(req.origin_input_ids[:input_len]), key.extra_key
+                    )
+                    req.marconi_admission_seeded = True
+            admission_len, branchoff_required = (
+                self.marconi_admission_tree.match_prefix(key.token_ids, key.extra_key)
+            )
+            self.marconi_admission_match_count += 1
+            if branchoff_required:
+                self.marconi_admission_branch_count += 1
+            cached_prefix_len = len(value)
+            cache_len = admission_len if branchoff_required else 0
+            req.marconi_cache_len = cache_len if cache_len > 0 else None
+            mamba_branching_seqlen = self._marconi_branch_seqlen(
+                cache_len, cached_prefix_len, mamba_branching_seqlen
+            )
 
         return MatchResult(
             device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
+            last_device_node=last_node_for_return,
+            last_host_node=last_node_for_return,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
-    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+    def _split_node(
+        self,
+        key: RadixKey,
+        child: TreeNode,
+        split_len: int,
+        branchoff_mamba_value: Optional[torch.Tensor] = None,
+    ) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
@@ -1063,6 +2027,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.prefix_len = new_node.parent.prefix_len + len(new_node.value)
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -1073,12 +2038,17 @@ class MambaRadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
+        child.prefix_len = new_node.prefix_len + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
         self.full_lru_list.insert_mru(new_node)
         self.full_lru_list.insert_mru(child)
+        if branchoff_mamba_value is not None:
+            new_node.mamba_value = branchoff_mamba_value
+            self.mamba_lru_list.insert_mru(new_node)
+            self.mamba_evictable_size_ += len(branchoff_mamba_value)
         if child.mamba_value is not None:
             self.mamba_lru_list.insert_mru(child)
         return new_node
@@ -1089,7 +2059,8 @@ class MambaRadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
-        chunked: bool = False,
+        branchoff_mamba_value=None,
+        branch_checkpoint_len: Optional[int] = None,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
@@ -1100,11 +2071,23 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            mamba_value_exist = node.mamba_value is not None
+            if not mamba_value_exist:
+                node.mamba_value = mamba_value
+                # Existing node is already in full_lru_list; add to mamba LRU.
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+                node.last_access_time = get_last_access_time()
+            else:
+                self.mamba_lru_list.reset_node_mru(node)
+                node.last_access_time = get_last_access_time()
+            return 0, mamba_value_exist
 
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
+        branch_state_attached = False
+        mamba_value_attached = False
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1117,36 +2100,90 @@ class MambaRadixCache(BasePrefixCache):
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
+                if branchoff_mamba_value is not None:
+                    mamba_value_attached = True
+                new_node = self._split_node(
+                    node.key,
+                    node,
+                    prefix_len,
+                    branchoff_mamba_value,
+                )
+                branchoff_mamba_value = None
                 node = new_node
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        mamba_value_exist = False
+            if (
+                branch_checkpoint_len is not None
+                and not branch_state_attached
+                and total_prefix_length == branch_checkpoint_len
+                and node.mamba_value is None
+            ):
+                node.mamba_value = (
+                    branchoff_mamba_value
+                    if branchoff_mamba_value is not None
+                    else mamba_value
+                )
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(node.mamba_value)
+                node.last_access_time = get_last_access_time()
+                branch_state_attached = True
+                mamba_value_attached = True
+
+        if (
+            branch_checkpoint_len is not None
+            and not branch_state_attached
+            and total_prefix_length == branch_checkpoint_len
+            and node.mamba_value is None
+        ):
+            node.mamba_value = (
+                branchoff_mamba_value
+                if branchoff_mamba_value is not None
+                else mamba_value
+            )
+            self.mamba_lru_list.insert_mru(node)
+            self.mamba_evictable_size_ += len(node.mamba_value)
+            node.last_access_time = get_last_access_time()
+            branch_state_attached = True
+            mamba_value_attached = True
+
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
-            new_node.value = value.clone()
-            new_node.mamba_value = mamba_value
+            new_node.value = value
+            new_node.prefix_len = node.prefix_len + len(value)
             self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
-            self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
+            if self.marconi_enabled:
+                self._marconi_kv_mask_add(new_node.value)
+            # If we already attached a mamba state at the branch checkpoint, do not
+            # attach (and double-count) the same state at the new leaf.
+            if not mamba_value_attached:
+                new_node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(new_node)
+                self.mamba_evictable_size_ += len(mamba_value)
+            else:
+                new_node.mamba_value = None
+            return total_prefix_length, False
+
+        # len(key) == 0
+        mamba_value_exist = node.mamba_value is not None and not mamba_value_attached
+        if not mamba_value_exist:
+            if not mamba_value_attached:
+                node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+            else:
+                self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
-        else:  # mamba value already exists
-            mamba_value_exist = True
-            self.full_lru_list.reset_node_mru(node)
+        else:
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
+        self.full_lru_list.reset_node_mru(node)
         return total_prefix_length, mamba_value_exist
 
     def _iteratively_delete_tombstone_leaf(
@@ -1164,6 +2201,8 @@ class MambaRadixCache(BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
+            if self.marconi_enabled:
+                self._marconi_kv_mask_remove(node.parent.value)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)

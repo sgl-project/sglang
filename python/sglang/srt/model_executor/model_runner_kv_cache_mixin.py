@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.marconi_config import DEFAULT_MAMBA_TRACK_BUFFER_SIZE
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
@@ -399,6 +400,7 @@ class ModelRunnerKVCacheMixin:
                         cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                        mamba_track_buffer_size=DEFAULT_MAMBA_TRACK_BUFFER_SIZE,
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
@@ -423,6 +425,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    mamba_track_buffer_size=DEFAULT_MAMBA_TRACK_BUFFER_SIZE,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                 )

@@ -173,6 +173,10 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.marconi_config import (
+    MarconiConfig,
+    MarconiModelStats,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -211,7 +215,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_float4_e2m1fn_x2, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -679,6 +683,177 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        marconi_config = None
+        if server_args.enable_marconi:
+            if not self.is_hybrid_ssm:
+                logger.warning(
+                    "Marconi is enabled but the model is not using Mamba radix cache."
+                )
+            else:
+                marconi_model_stats = None
+                cache_params = None
+                hf_config = (
+                    self.model_config.hf_text_config or self.model_config.hf_config
+                )
+                try:
+                    cache_params = getattr(hf_config, "mamba2_cache_params", None)
+                except Exception:
+                    cache_params = None
+
+                kv_cache_dtype = getattr(
+                    self.tp_worker.model_runner, "kv_cache_dtype", None
+                )
+                if kv_cache_dtype is not None:
+                    kv_cache_dtype_size = torch._utils._element_size(kv_cache_dtype)
+                    if is_float4_e2m1fn_x2(kv_cache_dtype):
+                        kv_cache_dtype_size = max(1, kv_cache_dtype_size // 2)
+                else:
+                    kv_cache_dtype_size = 2
+
+                mamba_state_size_bytes = None
+                mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+                if mamba_pool is not None and getattr(
+                    mamba_pool, "num_mamba_layers", None
+                ):
+                    try:
+                        total_bytes = mamba_pool.mamba_cache.mem_usage_bytes()
+                        slots = max(1, getattr(mamba_pool, "size", 0) + 1)
+                        mamba_state_size_bytes = int(
+                            total_bytes / (slots * max(mamba_pool.num_mamba_layers, 1))
+                        )
+                    except Exception:
+                        mamba_state_size_bytes = None
+
+                if cache_params is not None:
+                    num_mamba_layers = len(cache_params.layers)
+                    if mamba_state_size_bytes is None:
+                        mamba_state_size_bytes = int(
+                            cache_params.mamba_cache_per_req // max(num_mamba_layers, 1)
+                        )
+                    shape = cache_params.shape
+                    ssm_state_size = getattr(shape, "state_size", None) or getattr(
+                        shape, "head_dim", None
+                    )
+                    model_dim = (
+                        getattr(hf_config, "hidden_size", None)
+                        or getattr(hf_config, "d_model", None)
+                        or getattr(hf_config, "n_embd", None)
+                    )
+                    if (
+                        model_dim is None
+                        and hasattr(shape, "num_heads")
+                        and hasattr(shape, "head_dim")
+                    ):
+                        model_dim = shape.num_heads * shape.head_dim
+                    num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+                    if hasattr(hf_config, "full_attention_layer_ids"):
+                        num_attn_layers = len(list(hf_config.full_attention_layer_ids))
+                    elif getattr(hf_config, "layers_block_type", None):
+                        num_attn_layers = sum(
+                            1
+                            for layer_type in hf_config.layers_block_type
+                            if layer_type == "attention"
+                        )
+                    elif num_hidden_layers is not None:
+                        num_attn_layers = max(0, num_hidden_layers - num_mamba_layers)
+                    else:
+                        num_attn_layers = 0
+                    num_mlp_layers = num_hidden_layers or (
+                        num_mamba_layers + num_attn_layers
+                    )
+                    if (
+                        model_dim is not None
+                        and ssm_state_size is not None
+                        and mamba_state_size_bytes is not None
+                    ):
+                        marconi_model_stats = MarconiModelStats(
+                            model_dim=model_dim,
+                            ssm_state_size=ssm_state_size,
+                            num_mamba_layers=num_mamba_layers,
+                            num_attn_layers=num_attn_layers,
+                            num_mlp_layers=num_mlp_layers,
+                            kv_cache_dtype_size=kv_cache_dtype_size,
+                            mamba_state_size_bytes=mamba_state_size_bytes,
+                        )
+                if marconi_model_stats is None:
+                    hybrid_pattern = getattr(hf_config, "hybrid_override_pattern", None)
+                    if hybrid_pattern:
+                        num_mamba_layers = hybrid_pattern.count("M")
+                        num_attn_layers = hybrid_pattern.count("*")
+                        num_hidden_layers = getattr(
+                            hf_config, "num_hidden_layers", None
+                        )
+                        num_mlp_layers = num_hidden_layers or (
+                            num_mamba_layers + num_attn_layers
+                        )
+                        ssm_state_size = getattr(
+                            hf_config, "ssm_state_size", None
+                        ) or getattr(hf_config, "mamba_state_dim", None)
+                        model_dim = (
+                            getattr(hf_config, "hidden_size", None)
+                            or getattr(hf_config, "d_model", None)
+                            or getattr(hf_config, "n_embd", None)
+                        )
+                        if (
+                            model_dim is not None
+                            and ssm_state_size is not None
+                            and mamba_state_size_bytes is not None
+                        ):
+                            marconi_model_stats = MarconiModelStats(
+                                model_dim=model_dim,
+                                ssm_state_size=ssm_state_size,
+                                num_mamba_layers=num_mamba_layers,
+                                num_attn_layers=num_attn_layers,
+                                num_mlp_layers=num_mlp_layers,
+                                kv_cache_dtype_size=kv_cache_dtype_size,
+                                mamba_state_size_bytes=mamba_state_size_bytes,
+                            )
+                if marconi_model_stats is None:
+                    layers_block_type = getattr(hf_config, "layers_block_type", None)
+                    if layers_block_type:
+                        num_attn_layers = sum(
+                            1
+                            for layer_type in layers_block_type
+                            if layer_type == "attention"
+                        )
+                        num_mamba_layers = len(layers_block_type) - num_attn_layers
+                        num_hidden_layers = getattr(
+                            hf_config, "num_hidden_layers", None
+                        ) or len(layers_block_type)
+                        num_mlp_layers = num_hidden_layers
+                        ssm_state_size = (
+                            getattr(hf_config, "linear_key_head_dim", None)
+                            or getattr(hf_config, "ssm_state_size", None)
+                            or getattr(hf_config, "mamba_state_dim", None)
+                        )
+                        model_dim = (
+                            getattr(hf_config, "hidden_size", None)
+                            or getattr(hf_config, "d_model", None)
+                            or getattr(hf_config, "n_embd", None)
+                        )
+                        if (
+                            model_dim is not None
+                            and ssm_state_size is not None
+                            and mamba_state_size_bytes is not None
+                        ):
+                            marconi_model_stats = MarconiModelStats(
+                                model_dim=model_dim,
+                                ssm_state_size=ssm_state_size,
+                                num_mamba_layers=num_mamba_layers,
+                                num_attn_layers=num_attn_layers,
+                                num_mlp_layers=num_mlp_layers,
+                                kv_cache_dtype_size=kv_cache_dtype_size,
+                                mamba_state_size_bytes=mamba_state_size_bytes,
+                            )
+                if marconi_model_stats is None:
+                    logger.warning(
+                        "Marconi is enabled but model stats could not be derived."
+                    )
+                marconi_config = MarconiConfig.enabled(
+                    model_stats=marconi_model_stats,
+                    eff_weight=server_args.marconi_eff_weight,
+                )
+
         # Create cache
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
@@ -694,11 +869,13 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            marconi_config=marconi_config,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            attention_chunk_size=getattr(self, "attention_chunk_size", None),
         )
 
         if (
@@ -1796,7 +1973,10 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            if not getattr(req, "_prefill_matched_this_round", False):
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            req._prefill_matched_this_round = False
+
             last_host_node = (
                 req.last_host_backup_node
                 if req.last_host_backup_node is not None
@@ -2205,6 +2385,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            marconi_branch_prefill=self.server_args.enable_marconi,
         )
 
         if self.chunked_req is not None:
@@ -2213,6 +2394,8 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+
+        # No marconi-specific prefill reordering.
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -2258,7 +2441,10 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            if not getattr(req, "_prefill_matched_this_round", False):
+                req.init_next_round_input(self.tree_cache)
+            req._prefill_matched_this_round = False
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2287,6 +2473,9 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+        for req in self.waiting_queue:
+            if getattr(req, "_prefill_matched_this_round", False):
+                req._prefill_matched_this_round = False
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2852,6 +3041,11 @@ class Scheduler(
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        if self.tree_cache is not None:
+            runtime_stats = self.tree_cache.get_runtime_stats()
+            if runtime_stats is not None:
+                ret.update(runtime_stats)
 
         # This field is not serializable.
         ret.pop("model_config", None)

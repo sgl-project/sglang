@@ -143,6 +143,7 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             dllm_config=self.dllm_config,
+            marconi_branch_prefill=self.server_args.enable_marconi,
         )
 
     def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:

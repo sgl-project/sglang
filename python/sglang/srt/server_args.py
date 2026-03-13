@@ -31,6 +31,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.marconi_config import (
+    DEFAULT_MARCONI_EFF_WEIGHT,
+    get_marconi_branch_align_interval,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -353,6 +357,8 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_marconi: bool = False
+    marconi_eff_weight: Optional[float] = None
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -793,6 +799,9 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+
+        # Handle Marconi mode defaults.
+        self._handle_marconi_mode()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2882,6 +2891,12 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+    def _handle_marconi_mode(self):
+        if not self.enable_marconi:
+            return
+        if self.marconi_eff_weight is None:
+            self.marconi_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3059,6 +3074,14 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+
+        if self.enable_marconi:
+            if self.disable_radix_cache:
+                logger.warning("Marconi is disabled because radix cache is disabled.")
+                self.enable_marconi = False
+            if self.marconi_eff_weight is not None and self.marconi_eff_weight < 0.0:
+                raise ValueError("marconi_eff_weight must be non-negative.")
+            get_marconi_branch_align_interval(self.page_size)
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -3698,6 +3721,17 @@ class ServerArgs:
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
         )
         parser.add_argument(
+            "--enable-marconi",
+            action="store_true",
+            help="Enable Marconi eviction for hybrid radix cache.",
+        )
+        parser.add_argument(
+            "--marconi-eff-weight",
+            type=float,
+            default=ServerArgs.marconi_eff_weight,
+            help="Weight for FLOP efficiency in Marconi eviction utility.",
+        )
+        parser.add_argument(
             "--enable-prefill-delayer",
             action="store_true",
             help="Enable prefill delayer for DP attention to reduce idle time.",
@@ -3728,7 +3762,6 @@ class ServerArgs:
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
         )
-
         # Runtime options
         parser.add_argument(
             "--device",

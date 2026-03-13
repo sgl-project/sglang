@@ -7,6 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.marconi_config import MarconiConfig
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
@@ -27,12 +28,16 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
 
+    marconi_config: Optional["MarconiConfig"] = None
+
     pp_rank: int = 0
     pp_size: int = 1
 
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+
+    attention_chunk_size: Optional[int] = None
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
