@@ -735,7 +735,14 @@ class FusedMoE(torch.nn.Module):
 
     def _get_ep_to_tp_shard_dim(self, param_name: str) -> int | None:
         """Return the dimension holding intermediate_size for a given parameter,
-        or None if the parameter has no intermediate dimension to shard (e.g. per-tensor scales)."""
+        or None if the parameter has no intermediate dimension to shard (e.g. per-tensor scales).
+
+        Shape abbreviations used in comments below:
+            E  = num_local_experts (number of experts on this rank)
+            I  = moe_intermediate_size (expert FFN intermediate width)
+            H  = hidden_size (model hidden dimension)
+            bn = block rows, bk = block cols (quantization block sizes)
+        """
         is_triton = self.use_triton_kernels
 
         if "w13_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
@@ -746,16 +753,19 @@ class FusedMoE(torch.nn.Module):
             return 1 if is_triton else 2
         elif "w13_weight_bias" in param_name:
             return 1  # [E, 2*I]
-        elif "w13_weight_scale_inv" in param_name or "w13_weight_scale1" in param_name:
+        elif "weight_scale_2" in param_name or "input_scale" in param_name:
+            # Per-tensor scales (FP4 _scale_2, input_scale): no intermediate dim, just gather
+            return None
+        elif "w13_weight_scale" in param_name:
             # Block scale: [E, 2*ceil(I/bn), ceil(H/bk)] — shard dim 1
-            # Column scale: [E, 2*I] — shard dim 1
+            # Also covers w13_weight_scale_inv, w13_weight_scale1
             return 1
-        elif "w2_weight_scale_inv" in param_name or "w2_weight_scale1" in param_name:
+        elif "w2_weight_scale" in param_name:
             # Block scale: [E, ceil(H/bn), ceil(I/bk)] — shard dim 2
-            # Column scale: [E, I] — shard dim 1 (but this is rare for w2)
+            # Also covers w2_weight_scale_inv, w2_weight_scale1
             return 2
-        elif "weight_scale" in param_name or "input_scale" in param_name:
-            # Per-tensor scales: [E, 2] or [E] — no intermediate dim, just gather
+        elif "weight_scale" in param_name:
+            # Remaining per-tensor scales: [E, 2] or [E] — no intermediate dim, just gather
             return None
         else:
             return None
