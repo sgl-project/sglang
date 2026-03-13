@@ -121,7 +121,7 @@ jobs:
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec -w /home/sdp/sglang/ "$cid" \
-            bash -c "LD_LIBRARY_PATH=/home/sdp/miniforge3/envs/py3.10/lib:$LD_LIBRARY_PATH && cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
+            bash -c "LD_LIBRARY_PATH=/home/sdp/miniforge3/envs/py3.10/lib:$LD_LIBRARY_PATH && PATH=/home/sdp/miniforge3/envs/py3.10/bin:$PATH && cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
 
       - name: Cleanup container
         if: always()
