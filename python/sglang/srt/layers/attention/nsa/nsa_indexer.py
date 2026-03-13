@@ -328,14 +328,6 @@ class Indexer(MultiPlatformOp):
             query = rotate_activation(query)
             key = rotate_activation(key)
 
-        # allgather+rerrange
-        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
         return query, key
 
     def _get_k_bf16(
@@ -951,6 +943,41 @@ class Indexer(MultiPlatformOp):
         Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
+
+        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+            assert act_quant is not None
+
+            # For CP prefill, gather packed fp8+scale instead of bf16 keys to reduce
+            # communication and rerange bytes on the critical path.
+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+            k_fp8_dtype = k_fp8.dtype
+            k_fp8_width = k_fp8.shape[-1]
+            k_scale_bytes = k_scale.view(torch.uint8)
+            packed = torch.cat(
+                [k_fp8.view(torch.uint8), k_scale_bytes],
+                dim=-1,
+            )
+            packed = cp_all_gather_rerange_output(
+                packed.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            k_fp8, k_scale = torch.split(
+                packed, [k_fp8_width, k_scale_bytes.shape[-1]], dim=-1
+            )
+
+            out_loc = forward_batch.out_cache_loc
+            if not out_loc.is_contiguous():
+                out_loc = out_loc.contiguous()
+
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=out_loc,
+                index_k=k_fp8.contiguous().view(k_fp8_dtype),
+                index_k_scale=k_scale.contiguous().view(torch.float32),
+            )
+            return
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
