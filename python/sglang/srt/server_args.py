@@ -35,7 +35,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device,
@@ -51,6 +50,8 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -58,7 +59,6 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    is_valid_ipv6_address,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -67,6 +67,7 @@ from sglang.srt.utils.common import (
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.network import NetworkAddress
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -189,6 +191,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
     "mooncake",
+    "nixl",
     "mori",
     "ascend_fuseep",
     "flashinfer",
@@ -506,7 +509,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -528,7 +531,7 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
-    elastic_ep_backend: Literal[None, "mooncake"] = None
+    elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
@@ -1045,8 +1048,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -2097,6 +2100,8 @@ class ServerArgs:
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "flashinfer" if is_flashinfer_available() else "triton"
         else:
@@ -2112,6 +2117,8 @@ class ServerArgs:
                     return "aiter"
                 else:
                     return "triton"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "triton"
 
@@ -2454,12 +2461,19 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2476,6 +2490,7 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
+                "mxfp8",
                 "modelopt_fp8",
                 "compressed-tensors",
                 None,
@@ -2483,6 +2498,16 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
@@ -2532,6 +2557,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "nixl":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
@@ -2596,9 +2627,10 @@ class ServerArgs:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
                     self.eplb_algorithm = "elasticity_aware"
-                assert (
-                    self.eplb_algorithm == "elasticity_aware"
-                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+                assert self.eplb_algorithm in [
+                    "elasticity_aware",
+                    "elasticity_aware_hierarchical",
+                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
@@ -2691,7 +2723,8 @@ class ServerArgs:
         if self.speculative_moe_runner_backend is None:
             self.speculative_moe_runner_backend = (
                 "auto"
-                if self.moe_runner_backend == "flashinfer_trtllm"
+                if self.moe_runner_backend
+                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
                 else self.moe_runner_backend
             )
         else:
@@ -4625,8 +4658,8 @@ class ServerArgs:
             "--elastic-ep-backend",
             type=str,
             default=ServerArgs.elastic_ep_backend,
-            choices=["none", "mooncake"],
-            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
         )
         parser.add_argument(
             "--enable-elastic-expert-backup",
@@ -5556,10 +5589,7 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        if is_valid_ipv6_address(host):
-            return f"{scheme}://[{host}]:{self.port}"
-        else:
-            return f"{scheme}://{host}:{self.port}"
+        return NetworkAddress(host, self.port).to_url(scheme)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
@@ -6160,23 +6190,16 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-                port_num, host = configure_ipv6(server_args.dist_init_addr)
-                dist_init_addr = (host, str(port_num))
+                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             else:
-                dist_init_addr = server_args.dist_init_addr.split(":")
+                na = NetworkAddress.parse(server_args.dist_init_addr)
 
-            assert (
-                len(dist_init_addr) == 2
-            ), "please provide --dist-init-addr as host:port of head node"
-
-            dist_init_host, dist_init_port = dist_init_addr
-            dist_init_port = int(dist_init_port)
+            dist_init_host = na.host
+            dist_init_port = na.port
             port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
-            metrics_ipc_name = port_base + 3
+            metrics_port = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -6191,7 +6214,7 @@ class PortArgs:
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    wait_port_available(metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -6203,12 +6226,16 @@ class PortArgs:
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
-                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
+                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                scheduler_input_ipc_name=NetworkAddress(
+                    dist_init_host, scheduler_input_port
+                ).to_tcp(),
+                detokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, detokenizer_port
+                ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
+                metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 

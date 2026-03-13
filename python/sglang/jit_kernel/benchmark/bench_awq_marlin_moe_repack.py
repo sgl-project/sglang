@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import torch
 import triton
@@ -9,7 +7,7 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
 try:
@@ -19,10 +17,7 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 NUM_BITS = 4
 GROUP_SIZE = 128
