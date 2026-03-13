@@ -24,21 +24,41 @@ def get_thinking_kwargs(args):
         else:
             # Qwen3
             thinking_param = "enable_thinking"
-        return {
-            "chat_template_kwargs": {thinking_param: True},
-        }
+        return {thinking_param: True}
     return {}
 
 
-def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
-    # Get thinking kwargs based on user's choice
-    thinking_kwargs = get_thinking_kwargs(args)
+def parse_json_object(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
 
-    # Build extra_body with thinking kwargs and top_k if specified
-    extra_body = thinking_kwargs.copy() if thinking_kwargs else {}
-    top_k = getattr(args, "top_k", None)
-    if top_k is not None:
-        extra_body["top_k"] = top_k
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+
+    return parsed
+
+
+def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    if isinstance(chat_template_kwargs, str):
+        chat_template_kwargs = parse_json_object(chat_template_kwargs)
+    elif chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    elif not isinstance(chat_template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be a dict or a JSON object string")
+
+    chat_template_kwargs = {**get_thinking_kwargs(args), **chat_template_kwargs}
+
+    extra_body = {}
+    if chat_template_kwargs:
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
+
+    for param_name in ("top_k", "min_p"):
+        value = getattr(args, param_name, None)
+        if value is not None:
+            extra_body[param_name] = value
 
     sampler = ChatCompletionSampler(
         model=args.model,
@@ -253,6 +273,15 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=None, help="Min-p sampling parameter"
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=parse_json_object,
+        default=None,
+        help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(

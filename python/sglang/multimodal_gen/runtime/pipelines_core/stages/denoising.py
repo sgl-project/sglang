@@ -23,7 +23,6 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
-    WanI2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
@@ -344,9 +343,9 @@ class DenoisingStage(PipelineStage):
             torch.full(
                 (batch_size,),
                 guidance_val,
-                dtype=torch.float32,
+                dtype=target_dtype,
                 device=device,
-            ).to(target_dtype)
+            )
             * 1000.0
         )
 
@@ -756,6 +755,9 @@ class DenoisingStage(PipelineStage):
         ):
             self.save_sta_search_results(batch)
 
+        # Capture references before potential deletion on MPS
+        dits = list(filter(None, [self.transformer, self.transformer_2]))
+
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
         if torch.backends.mps.is_available() and not is_warmup:
@@ -773,7 +775,7 @@ class DenoisingStage(PipelineStage):
             )
 
         # reset offload managers with prefetching first layer for next forward
-        for dit in filter(None, [self.transformer, self.transformer_2]):
+        for dit in dits:
             if isinstance(dit, OffloadableDiTMixin):
                 # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
                 # TODO: should be make this an option?
@@ -794,13 +796,9 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, where the image latents is provided as condition, the image_latent (input image) should be
-        # replicated on all SP ranks, not sharded, as it provides global context.
-        # For Wan2_2_TI2V_5B_Config, it has very special settings
-        if (
-            isinstance(server_args.pipeline_config, WanI2V480PConfig)
-            and batch.image_latent is not None
-        ):
+        # image_latent must be sharded consistently with latents when it is
+        # concatenated along the sequence dimension in the denoising loop.
+        if batch.image_latent is not None:
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )

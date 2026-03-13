@@ -12,7 +12,6 @@
 # limitations under the License.
 
 from math import sqrt
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -27,9 +26,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils.common import sample_video_frames
-
-if TYPE_CHECKING:
-    from decord import VideoReader
 
 DEFAULT_NUM_TILES = 12
 NUM_VIDEO_TILES = 1
@@ -99,13 +95,16 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {self.PLACEHOLDER}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
 
     @staticmethod
-    def parse_video(video: "VideoReader") -> tuple[np.ndarray, list[float]]:
+    def parse_video(video) -> tuple[np.ndarray, list[float]]:
         frames = sample_video_frames(
             video, desired_fps=DESIRED_FPS, max_frames=MAX_FRAMES
         )
-        video_array = video.get_batch(frames).asnumpy()
-        # doing the `1000 /` and then `/ 1000` is to match vllm's timestamping *exactly*, for reference.
-        frame_duration_ms = int(1000 / video.get_avg_fps())
+        video_array = video.get_frames_at(frames)
+        avg_fps = video.avg_fps
+        if avg_fps > 0:
+            frame_duration_ms = int(1000 / avg_fps)
+        else:
+            frame_duration_ms = 0
         timestamps = [i * frame_duration_ms / 1000.0 for i in frames]
         return video_array, timestamps
 

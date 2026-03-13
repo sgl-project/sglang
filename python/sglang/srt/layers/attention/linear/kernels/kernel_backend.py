@@ -44,11 +44,13 @@ class LinearAttnKernelBase(ABC):
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,

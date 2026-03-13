@@ -22,7 +22,6 @@ dependencies = [
   "av",
   "build",
   "compressed-tensors",
-  "decord2",
   "datasets",
   "einops",
   "fastapi",
@@ -62,7 +61,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto>=0.4.1",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
 ]
@@ -72,7 +71,7 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
     "PyYAML==6.0.1",
     "cloudpickle",
-    "diffusers==0.36.0",
+    "diffusers==0.37.0",
     "imageio==2.36.0",
     "imageio-ffmpeg==0.5.1",
     "moviepy>=2.0.0",
