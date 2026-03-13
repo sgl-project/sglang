@@ -1,12 +1,12 @@
 #include "ngram.h"
 
-#include "trie_cache.h"
-
 #include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include "trie_cache.h"
 
 namespace ngram {
 
@@ -14,53 +14,45 @@ template <typename Cache>
 Ngram<Cache>::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.branch_length > 1)) {
     throw std::runtime_error(
-        "param_.branch_length must be greater than 1, current value: " +
-        std::to_string(param_.branch_length));
+        "param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
   }
   if (!(param_.min_match_window_size > 0)) {
     throw std::runtime_error(
-        "min_match_window_size must be greater than 0, current value: " +
-        std::to_string(param_.min_match_window_size));
+        "min_match_window_size must be greater than 0, current value: " + std::to_string(param_.min_match_window_size));
   }
   if (!(param_.min_match_window_size <= param_.max_match_window_size)) {
     throw std::runtime_error(
         "min_match_window_size must be less than or equal to "
         "max_match_window_size, current min_match_window_size: " +
         std::to_string(param_.min_match_window_size) +
-        ", max_match_window_size: " +
-        std::to_string(param_.max_match_window_size));
+        ", max_match_window_size: " + std::to_string(param_.max_match_window_size));
   }
   if (!(param_.max_match_window_size < param_.branch_length)) {
     throw std::runtime_error(
         "max_match_window_size must be less than branch_length, current "
         "max_match_window_size: " +
-        std::to_string(param_.max_match_window_size) +
-        ", branch_length: " + std::to_string(param_.branch_length));
+        std::to_string(param_.max_match_window_size) + ", branch_length: " + std::to_string(param_.branch_length));
   }
   if (!(param_.min_bfs_breadth > 0)) {
     throw std::runtime_error(
-        "min_bfs_breadth must be greater than 0, current value: " +
-        std::to_string(param_.min_bfs_breadth));
+        "min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
   }
   if (!(param_.min_bfs_breadth <= param_.max_bfs_breadth)) {
     throw std::runtime_error(
         "min_bfs_breadth must be less than or equal to max_bfs_breadth, "
         "current min_bfs_breadth: " +
-        std::to_string(param_.min_bfs_breadth) +
-        ", max_bfs_breadth: " + std::to_string(param_.max_bfs_breadth));
+        std::to_string(param_.min_bfs_breadth) + ", max_bfs_breadth: " + std::to_string(param_.max_bfs_breadth));
   }
   if (!(param_.draft_token_num > 0)) {
     throw std::runtime_error(
-        "draft_token_num must be greater than 0, current value: " +
-        std::to_string(param_.draft_token_num));
+        "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
         throw std::runtime_error(
             "batch_draft_token_num config value " + std::to_string(config) +
-            " must be less than or equal to draft_token_num: " +
-            std::to_string(param_.draft_token_num));
+            " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
       }
     }
   }
@@ -68,17 +60,13 @@ Ngram<Cache>::Ngram(size_t capacity, const Param& param) : param_(param) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config >= param_.min_match_window_size)) {
         throw std::runtime_error(
-            "batch_min_match_window_size config value " +
-            std::to_string(config) +
-            " must be greater than or equal to min_match_window_size: " +
-            std::to_string(param_.min_match_window_size));
+            "batch_min_match_window_size config value " + std::to_string(config) +
+            " must be greater than or equal to min_match_window_size: " + std::to_string(param_.min_match_window_size));
       }
       if (!(config <= param_.max_match_window_size)) {
         throw std::runtime_error(
-            "batch_min_match_window_size config value " +
-            std::to_string(config) +
-            " must be less than or equal to max_match_window_size: " +
-            std::to_string(param_.max_match_window_size));
+            "batch_min_match_window_size config value " + std::to_string(config) +
+            " must be less than or equal to max_match_window_size: " + std::to_string(param_.max_match_window_size));
       }
     }
   }
@@ -125,31 +113,24 @@ void Ngram<Cache>::insertWorker() {
 }
 
 template <typename Cache>
-Result Ngram<Cache>::batchMatch(
-    const std::vector<std::vector<int32_t>>& tokens) const {
+Result Ngram<Cache>::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (Cache::*)(const int32_t*, size_t, int32_t, size_t,
-                                     const Param&) const;
+  using BuildFn = Result (Cache::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
   BuildFn build_fn;
   if (param_.match_type == "BFS") {
     build_fn = &Cache::buildRecency;
   } else if (param_.match_type == "PROB") {
     build_fn = &Cache::buildFrequency;
   } else {
-    throw std::runtime_error(
-        "Unknown match_type: '" + param_.match_type +
-        "'. Must be 'BFS' or 'PROB'.");
+    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
   Result merged;
   for (const auto& suffix : tokens) {
     auto draft_token_num = param_.get_draft_token_num(tokens.size());
-    auto res = (cache_.get()->*build_fn)(suffix.data(), suffix.size(),
-                                          suffix.back(), draft_token_num,
-                                          param_);
-    merged.token.insert(merged.token.end(), res.token.begin(),
-                        res.token.end());
+    auto res = (cache_.get()->*build_fn)(suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_);
+    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }
   return merged;

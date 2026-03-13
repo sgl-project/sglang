@@ -6,8 +6,7 @@
 
 namespace ngram {
 
-Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree,
-                  int root) {
+Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
   Result info;
   std::vector<int32_t> prevs;
   info.token.reserve(draft_token_num);

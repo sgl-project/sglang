@@ -17,7 +17,6 @@ struct Node {
   std::unordered_map<int32_t, int32_t> next;
 };
 
-Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree,
-                  int root);
+Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root);
 
 }  // namespace ngram

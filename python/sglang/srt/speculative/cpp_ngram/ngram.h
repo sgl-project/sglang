@@ -40,7 +40,9 @@ class Ngram {
     }
   }
 
-  const Param& param() const { return param_; }
+  const Param& param() const {
+    return param_;
+  }
 
  private:
   void insertWorker();

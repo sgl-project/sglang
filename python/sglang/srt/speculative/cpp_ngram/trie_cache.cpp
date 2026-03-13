@@ -69,8 +69,7 @@ void TrieCache::squeeze(size_t count) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
         "available to release: " +
-        std::to_string(node_pool_.size() - free_node_count_) +
-        ", required to release: " + std::to_string(count));
+        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
   }
   while (count--) {
     auto last = global_lru_.back();
@@ -101,13 +100,11 @@ void TrieCache::reset() {
   root_ = getNode();
 }
 
-std::vector<std::pair<TrieNode*, int32_t>> TrieCache::match(
-    const int32_t* context, size_t len,
-    size_t min_window, size_t max_window) const {
+std::vector<std::pair<TrieNode*, int32_t>>
+TrieCache::match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const {
   std::vector<std::pair<TrieNode*, int32_t>> result;
   result.reserve(max_window - min_window);
-  for (int32_t match_window_size = std::min(len, max_window);
-       match_window_size >= static_cast<int32_t>(min_window);
+  for (int32_t match_window_size = std::min(len, max_window); match_window_size >= static_cast<int32_t>(min_window);
        --match_window_size) {
     auto start = context + len - match_window_size;
     auto end = start + match_window_size;
@@ -128,15 +125,12 @@ std::vector<std::pair<TrieNode*, int32_t>> TrieCache::match(
   return result;
 }
 
-Result TrieCache::buildRecency(const int32_t* context, size_t len,
-                           int32_t last_token, size_t draft_token_num,
-                           const Param& param) const {
-  auto anchors = match(context, len, param.min_match_window_size,
-                       param.max_match_window_size);
+Result TrieCache::buildRecency(
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
 
-  double bfs_breadth_scale =
-      double(param.max_bfs_breadth - param.min_bfs_breadth) /
-      (param.max_match_window_size - param.min_match_window_size + 1);
+  double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) /
+                             (param.max_match_window_size - param.min_match_window_size + 1);
 
   std::vector<Node> tree(draft_token_num + 1);
   int root = 0;
@@ -144,10 +138,7 @@ Result TrieCache::buildRecency(const int32_t* context, size_t len,
 
   for (auto [node, depth] : anchors) {
     std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
-    queue.push({root,
-                (param.max_match_window_size - depth) * bfs_breadth_scale +
-                    param.min_bfs_breadth,
-                node});
+    queue.push({root, (param.max_match_window_size - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
     while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
       auto front = queue.front();
       queue.pop();
@@ -158,18 +149,14 @@ Result TrieCache::buildRecency(const int32_t* context, size_t len,
 
       auto breadth = std::max(1, int32_t(cur_breadth));
       for (int i = 0;
-           i < breadth && iter != std::get<2>(front)->lru.end() &&
-           cursor <= static_cast<int>(draft_token_num);
+           i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= static_cast<int>(draft_token_num);
            ++i, ++iter) {
         auto token = (*iter)->token;
         auto pos = -1;
-        if (auto tit = tree[parent].next.find(token);
-            tit != tree[parent].next.end()) {
+        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
           pos = tit->second;
         } else {
-          pos = tree[parent]
-                    .next.insert(std::make_pair(token, cursor++))
-                    .first->second;
+          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
         }
         queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
       }
@@ -179,11 +166,9 @@ Result TrieCache::buildRecency(const int32_t* context, size_t len,
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result TrieCache::buildFrequency(const int32_t* context, size_t len,
-                            int32_t last_token, size_t draft_token_num,
-                            const Param& param) const {
-  auto anchors = match(context, len, param.min_match_window_size,
-                       param.max_match_window_size);
+Result TrieCache::buildFrequency(
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
 
   struct CompareByLastDouble {
     bool operator()(
@@ -193,9 +178,10 @@ Result TrieCache::buildFrequency(const int32_t* context, size_t len,
     }
   };
 
-  std::priority_queue<std::tuple<double, const TrieNode*, double>,
-                      std::vector<std::tuple<double, const TrieNode*, double>>,
-                      CompareByLastDouble>
+  std::priority_queue<
+      std::tuple<double, const TrieNode*, double>,
+      std::vector<std::tuple<double, const TrieNode*, double>>,
+      CompareByLastDouble>
       heap;
 
   std::vector<Node> tree(draft_token_num + 1);
@@ -204,8 +190,7 @@ Result TrieCache::buildFrequency(const int32_t* context, size_t len,
   int cursor = 1;
   int top_k = param.max_bfs_breadth;
 
-  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node,
-                                    double prob) -> void {
+  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
     double sum_freq = 0.0;
     int count = 0;
     std::list<std::pair<TrieNode*, int32_t>> topk_children;
