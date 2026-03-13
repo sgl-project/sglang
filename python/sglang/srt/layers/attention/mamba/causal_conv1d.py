@@ -92,12 +92,11 @@ def causal_conv1d_fn(
             **kwargs,
         )
 
+    if activation not in [None, "silu", "swish"]:
+        raise NotImplementedError("activation must be None, silu, or swish")
     # CUDA path: ensure contiguous (seq_lens_cpu unavailable, avoid GPU-CPU sync)
     if x.stride(-1) != 1:
         x = x.contiguous()
-
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
     bias = bias.contiguous() if bias is not None else None
 
     causal_conv1d_fwd(
