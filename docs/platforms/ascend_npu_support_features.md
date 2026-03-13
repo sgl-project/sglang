@@ -319,7 +319,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-custom-`<br/>`all-reduce`                    | `True`   | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
