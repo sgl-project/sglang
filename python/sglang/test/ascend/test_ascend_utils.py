@@ -155,6 +155,9 @@ QWEN3_VL_235B_A22B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 )
 
 QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B")
+QWEN3_30B_MODELSLIM_INT4_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
+)
 
 # Embedding model weights path
 BGE_LARGE_EN_V1_5_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "bge-large-en-v1.5")
