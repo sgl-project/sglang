@@ -139,9 +139,19 @@ def normalize_base_url(host: str, port: int) -> str:
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
+        self._body = None
+
+    def _read_body(self):
+        if self._body is None:
+            self._body = self.resp.read()
+        return self._body
 
     def json(self):
-        return json.loads(self.resp.read())
+        return json.loads(self._read_body())
+
+    @property
+    def text(self):
+        return self._read_body().decode("utf-8", errors="replace")
 
     @property
     def status_code(self):
