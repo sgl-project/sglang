@@ -73,9 +73,7 @@ def causal_conv1d_fn(
     # non-contiguous and seq_lens_cpu is already pre-computed by caller.
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
     # copy that can cost >0.6 ms/layer on large prefill batches.
-    use_triton = not _HAS_SGL_KERNEL or (
-        x.stride(-1) != 1 and "seq_lens_cpu" in kwargs
-    )
+    use_triton = not _HAS_SGL_KERNEL or (x.stride(-1) != 1 and "seq_lens_cpu" in kwargs)
     if use_triton:
         if "seq_lens_cpu" not in kwargs:
             kwargs["seq_lens_cpu"] = _get_seq_lens_cpu(query_start_loc, x)
