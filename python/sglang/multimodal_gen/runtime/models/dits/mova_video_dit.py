@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    fused_rmsnorm_rope,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -169,17 +170,33 @@ class SelfAttention(nn.Module):
         k, _ = self.k(x)
         v, _ = self.v(x)
 
-        # RMSNorm over sharded hidden dimension.
         if self.tp_size > 1:
+            # TP > 1: use separate RMSNorm + RoPE (fused kernel doesn't support TP)
             q = tensor_parallel_rms_norm(q, self.norm_q)
             k = tensor_parallel_rms_norm(k, self.norm_k)
+            q = rope_apply_head_dim(q, freqs, self.head_dim)
+            k = rope_apply_head_dim(k, freqs, self.head_dim)
         else:
-            q = self.norm_q(q)
-            k = self.norm_k(k)
+            # TP == 1: use fused kernel (wrapper handles CUDA vs non-CUDA)
+            cos = freqs.real.squeeze(1).float().contiguous()  # [S, head_dim//2]
+            sin = freqs.imag.squeeze(1).float().contiguous()  # [S, head_dim//2]
 
-        # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
+            q = fused_rmsnorm_rope(
+                q,
+                self.norm_q.weight,
+                cos,
+                sin,
+                self.head_dim,
+                self.norm_q.variance_epsilon,
+            )
+            k = fused_rmsnorm_rope(
+                k,
+                self.norm_k.weight,
+                cos,
+                sin,
+                self.head_dim,
+                self.norm_k.variance_epsilon,
+            )
 
         # USPAttention expects [B, S_local, H, D] format
         q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
