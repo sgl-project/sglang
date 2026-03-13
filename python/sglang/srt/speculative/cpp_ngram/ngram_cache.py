@@ -15,6 +15,8 @@ ngram_cache_cpp = load(
     sources=[
         f"{_abs_path}/ngram_cache_binding.cpp",
         f"{_abs_path}/ngram.cpp",
+        f"{_abs_path}/trie_cache.cpp",
+        f"{_abs_path}/result.cpp",
     ],
     extra_cflags=["-O3", "-std=c++20"],
 )
