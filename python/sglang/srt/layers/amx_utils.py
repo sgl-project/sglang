@@ -48,6 +48,7 @@ def dtype_is_supported(weight):
     return weight.dtype in [
         torch.float16,
         torch.bfloat16,
+        torch.uint8,
         torch.int8,
         torch.float8_e4m3fn,
     ]

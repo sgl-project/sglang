@@ -740,6 +740,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale = Parameter(
                     packed_w2_weight_scale, requires_grad=False
                 )
+                if hasattr(layer, "w13_weight_bias"):
+                    layer.w13_weight_bias = Parameter(
+                        layer.w13_weight_bias.float(), requires_grad=False
+                    )
+                if hasattr(layer, "w2_weight_bias"):
+                    layer.w2_weight_bias = Parameter(
+                        layer.w2_weight_bias.float(), requires_grad=False
+                    )
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
