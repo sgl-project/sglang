@@ -126,16 +126,6 @@
 
 \vspace{-2pt}
 
-% ---------- 个人简介 ----------
-\section{个人简介}
-
-生物医学工程博士候选人（布法罗大学，GPA\,4.0/4.0），研究方向为医学影像算法与临床转化（光声/超声、多模态成像、影像组学）。
-已发表第一/共同作者 SCI 论文 \textbf{11 篇}，代表期刊包括 \textit{npj Imaging}、\textit{IEEE TMI}、\textit{IEEE TUFFC}、\textit{Photoacoustics}、\textit{BOE}、\textit{Med-X}，Google Scholar 总引用约 \textbf{100}。
-长期主导 NIH 资助的多中心研究（最大队列 N\,>\,400），覆盖研究设计、IRB 伦理申报、临床数据管理、统计分析与论文发表全流程。
-具备与放射科/外科/肿瘤科/内分泌科医生协作经验，能够支持 CT 临床科研选题、数据分析与英文论文产出，推动学术合作和KOL关系建设。
-
-\vspace{-2pt}
-
 % ---------- 教育背景 ----------
 \section{教育背景}
 
@@ -166,9 +156,10 @@
   \textbf{机器学习工程师实习 · Seno Medical（医疗成像设备公司）}\hfill 纽约 \\
   \textit{临床数据集构建 · AI辅助医学影像评估 · 合规部署} \hfill \textit{2024年5月 -- 8月}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item 与临床团队协作，构建2000+条医学影像 QA 数据集并制定标注规范；完成 LLaMA（LoRA）微调与检索增强（RAG）系统开发
-    \item 设计符合 PHI 法规的本地化安全部署方案（FastAPI\,+\,Docker），供医院网络内部使用
-    \item 将技术成果整理为临床团队可读的评估报告，给出模型性能、局限与改进建议
+    \item 与临床团队协作，构建 2000+ 条医学影像 QA 数据集并制定标注规范，完成 LLaMA（LoRA）微调与检索增强（RAG）系统开发，用于医生端问答与报告辅助。
+    \item 设计端到端评估框架（标签体系、自动化指标与误差分析脚本），将 hallucination 率从约 30\% 降低至 15\%，并将 Recall@5 提升至约 90\%，形成可复现的评估流程。
+    \item 搭建模块化 RAG 后端：完成文本切分与摄取任务、基于 FAISS 的向量库、检索与重排序层以及推理服务编排，支持后续模型快速迭代与对比实验。
+    \item 设计符合 PHI 法规的本地化安全部署方案（FastAPI\,+\,Docker），并为临床团队输出部署文档与模型评估报告，便于在医院内部网络长期运行与维护。
   \end{itemize}
 
   \vspace{3pt}
@@ -178,8 +169,10 @@
   \textbf{研究科学家 · Roswell Park 综合癌症中心}\hfill 纽约州布法罗 \\
   \textit{医学影像算法研发 · 临床数据分析} \hfill \textit{2023年5月 -- 8月}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item 参与肿瘤相关多模态医学影像研究，负责图像预处理、特征分析与算法评估
-    \item 与临床医生协作开展数据整理与结果验证，形成可用于论文发表的研究结论
+    \item 参与肿瘤相关多模态医学影像研究，负责图像预处理、特征工程与模型评估，保障数据质量与实验可重复性。
+    \item 与放射科、肿瘤科医生协作开展数据整理与结果验证，将复杂算法结果转化为临床可解释的影像与统计指标，支撑论文撰写与会议展示。
+    \item 搭建影像+结构化报告的数据流水线（去标识化、模式规范化、自动质控），为后续生成式建模与预测模型提供标准化数据资产。
+    \item 在 AWS 环境中完成模型训练与调参，建立实验追踪脚本与对比基线，缩短不同模型方案之间的迭代周期。
   \end{itemize}
 
   \vspace{3pt}
@@ -189,8 +182,11 @@
   \textbf{联合创始人 · HydroSense Tech LLC（高精度传感器公司）}\hfill 北京 / 新加坡 \\
   \textit{传感器硬件研发 · 嵌入式ML · IoT数据平台} \hfill \textit{2015年 -- 至今（兼职）}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item 主导传感器硬件设计与机器学习算法开发，产品销售额突破百万美元，覆盖5+国家市政及工业客户
-    \item 持有多项传感器算法与硬件发明专利（信号处理、漂移补偿、EMI抑制等，2017--2023）
+    \item 联合创立物联网高精度传感创业公司，负责核心算法与系统架构设计，推动产品从试点走向规模化应用，年营收达到百万美元级别，落地于 5+ 国家市政与工业场景。
+    \item 设计传感器信号链（前端放大、采样同步、数字滤波），在显著温度与电磁干扰条件下实现稳定测量，为后续 AI 校准与远程监控打下基础。
+    \item 构建基于 Python / MLflow 的 AI 驱动校准与预测框架，以回归与神经网络模型建模非线性与温度依赖，将现场漂移降低约 30\%，并实现设备健康状态长期追踪。
+    \item 搭建支持 OTA 的远程监控与自诊断系统（C++ 固件 + 网关服务），实现 5000+ 设备的集中配置管理与异常预警，减少现场维护频次与成本。
+    \item 持有多项传感器算法与硬件发明专利（信号处理、漂移补偿、EMI 抑制等，2017--2023），将研究成果沉淀为可保护的知识产权。
   \end{itemize}
 
 \end{itemize}
@@ -308,22 +304,6 @@
 
 \vspace{-2pt}
 
-% ---------- Professional Summary ----------
-\section{Professional Summary}
-
-PhD candidate in Biomedical Engineering (University at Buffalo, GPA\,4.0/4.0), specializing in medical
-photoacoustic/ultrasound imaging and AI-assisted diagnostics. Published \textbf{11 first/co-author papers}
-in \textit{npj Imaging}, \textit{IEEE Transactions on Medical Imaging}, \textit{IEEE TUFFC},
-\textit{Photoacoustics}, \textit{Biomedical Optics Express}, and \textit{Med-X}, with $\sim$\textbf{100 total citations}.
-Led NIH-funded multi-center clinical studies (up to N\,$>$\,400) across the full research cycle:
-protocol design, IRB submission, multi-site data management, image processing, and SCI manuscript preparation.
-Extensive experience collaborating with radiologists, surgeons, oncologists, and endocrinologists to drive
-publishable clinical imaging research outcomes. Core expertise in medical image AI, radiomics, and
-longitudinal predictive modeling — directly transferable to CT perfusion analysis, low-dose CT denoising,
-and CT-based disease prediction research in support of Siemens Healthineers clinical programs.
-
-\vspace{-2pt}
-
 % ---------- Education ----------
 \section{Education}
 
@@ -345,9 +325,10 @@ and CT-based disease prediction research in support of Siemens Healthineers clin
   \textbf{Applied ML Engineer Intern -- Seno Medical (Medical Imaging Device Company)}\hfill New York \\
   \textit{Clinical Dataset Development, AI-Assisted Medical Imaging, PHI-Compliant Deployment} \hfill \textit{May 2024 -- Aug 2024}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item Collaborated with clinicians to curate 2,000+ medical imaging QA datasets with annotation guidelines; fine-tuned LLaMA (LoRA) and built a RAG system, cutting hallucination by 50\% and raising Recall@5 to 90\%
-    \item Engineered PHI-compliant on-premises AI deployment (FastAPI\,+\,Docker) for hospital-network environments
-    \item Summarized technical findings into clinical-facing evaluation reports with model performance, limitations, and recommendations for downstream clinical workflow integration
+    \item Collaborated with clinicians to build a 2k+ medical imaging QA dataset with clear annotation guidelines, and fine-tuned a LLaMA-based model (LoRA) as the core of a retrieval-augmented QA system.
+    \item Designed an end-to-end evaluation harness with label schema (factuality, coverage, style), automatic metrics, and Python error-analysis scripts, reducing hallucination from \textasciitilde30\% to 15\% and increasing Recall@5 to 90\%.
+    \item Implemented a modular RAG backend with text chunking/ingestion jobs, a FAISS-based vector store, retriever/re-ranker layer, and LLM orchestration, enabling reproducible experiments across model and retrieval variants.
+    \item Engineered PHI-compliant on-prem AI deployment with FastAPI and Docker for hospital-network environments, and produced clinician-facing reports summarizing model behavior, limitations, and integration recommendations.
   \end{itemize}
 
   \vspace{3pt}
@@ -357,8 +338,10 @@ and CT-based disease prediction research in support of Siemens Healthineers clin
   \textbf{Research Scientist -- Roswell Park Comprehensive Cancer Center}\hfill Buffalo, NY \\
   \textit{Medical Imaging Algorithm Development, Clinical Data Analysis} \hfill \textit{May 2023 -- Aug 2023}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item Conducted oncology-focused multimodal medical imaging research, including image preprocessing, feature analysis, and model evaluation
-    \item Collaborated with clinicians on data curation and outcome validation, generating publication-ready research evidence
+    \item Designed a multimodal data pipeline aligning imaging with structured text reports, including de-identification, schema normalization, and automated QC, to produce clean datasets for downstream modeling.
+    \item Built dataset generation jobs (filtering, sampling, augmentation, metadata tagging) to construct balanced image--report datasets for conditional generation and predictive modeling.
+    \item Implemented a domain-specific latent diffusion model (Stable Diffusion--style, DDIM/DPMS sampling) on AWS for conditional image-to-text report generation and synthetic data augmentation.
+    \item Automated GPU training and experiment tracking with standardized configs, logging, and comparison scripts, enabling fast iteration and reproducible baselines across model variants.
   \end{itemize}
 
   \vspace{3pt}
@@ -368,8 +351,11 @@ and CT-based disease prediction research in support of Siemens Healthineers clin
   \textbf{Co-founder \& Core Engineer -- HydroSense Tech LLC}\hfill Beijing / Singapore \\
   \textit{IoT Sensing, Embedded ML, Signal Processing} \hfill \textit{2015 -- Present (part-time)}
   \begin{itemize}[leftmargin=0.2in, topsep=1pt]
-    \item Co-founded precision sensing startup; led hardware/software development driving multi-million dollar revenue across municipal and industrial customers in 5+ countries
-    \item Co-inventor on multiple patents covering sensor algorithms and hardware innovations (2017--2023)
+    \item Co-founded a precision sensing startup and led full-stack development (optics, embedded firmware, data intelligence), scaling deployments from pilots to multi-million-dollar annual revenue across municipal and industrial customers in 5+ countries.
+    \item Designed the end-to-end sensor signal pipeline, including photodiode amplification, sampling synchronization, and fixed-point digital filtering, achieving sub-percent repeatability under temperature and EMI drift.
+    \item Built an AI-driven calibration and prediction framework (Python/MLflow) using regression and neural compensation models to capture nonlinearities and temperature dependence, reducing field drift by \textasciitilde30\% while tracking long-term device health.
+    \item Developed a self-diagnostic telemetry and remote-monitoring system (C++ firmware + Python services) with OTA updates and anomaly alerts, enabling proactive maintenance and significantly reducing on-site service visits for a 5000+ device fleet.
+    \item \textbf{Patents:} Co-inventor on multiple granted patents covering rainfall sensing hardware, adaptive signal processing, and intelligent embedded calibration algorithms (2017--2023).
   \end{itemize}
 
 \end{itemize}

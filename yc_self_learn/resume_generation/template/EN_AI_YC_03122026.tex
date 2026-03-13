@@ -1,0 +1,252 @@
+% !TEX program = xelatex
+% ===========================================================
+% Yanda Cheng -- AI / LLM Resume (English Only)
+% Compile with: XeLaTeX
+% ===========================================================
+
+\documentclass[letterpaper,10pt]{article}
+
+% ---------- Packages ----------
+\usepackage{iftex}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=3pt, left=1.5em}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage{tabularx}
+
+% ---------- Engine compatibility ----------
+\ifPDFTeX
+\fi
+\ifXeTeX
+  \usepackage{fontspec}
+  \usepackage{xeCJK}
+\fi
+\ifLuaTeX
+  \usepackage{fontspec}
+  \usepackage{luatexja}
+  \usepackage{luatexja-fontspec}
+\fi
+
+% ---------- Fonts ----------
+\ifXeTeX
+  \IfFontExistsTF{Microsoft YaHei}{
+    \setCJKmainfont[Scale=1.12]{Microsoft YaHei}
+    \setCJKsansfont[Scale=1.12]{Microsoft YaHei}
+  }{
+    \setCJKmainfont[Scale=1.12]{Noto Sans CJK SC}
+    \setCJKsansfont[Scale=1.12]{Noto Sans CJK SC}
+  }
+\fi
+\ifLuaTeX
+  \IfFontExistsTF{Microsoft YaHei}{
+    \setmainjfont{Microsoft YaHei}
+  }{
+    \setmainjfont{Noto Sans CJK SC}
+  }
+\fi
+\linespread{1.03}\selectfont
+
+% ---------- Page Style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- Margins ----------
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-0.9in}
+\addtolength{\textheight}{1.15in}
+
+% ---------- Section Formatting ----------
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{5pt plus 1pt minus 1pt}{3pt}
+
+% ---------- Custom Commands ----------
+\newcommand{\resumeItem}[1]{\item\small{#1}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & \small#2 \\
+    \textit{\small#3} & \textit{\small#4} \\
+  \end{tabular*}\vspace{-2pt}
+}
+
+\newcommand{\projheading}[2]{
+  \vspace{1pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & \textit{\small#2} \\
+  \end{tabular*}\vspace{2pt}
+}
+
+\newcommand{\resumeSubHeadingList}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+\newcommand{\projItemListStart}{\begin{itemize}[leftmargin=0.2in, topsep=3pt]}
+\newcommand{\projItemListEnd}{\end{itemize}\vspace{2pt}}
+
+% =================================================================
+\begin{document}
+% =================================================================
+
+% ######################## ENGLISH VERSION ONLY #########################
+
+% ---------- Header ----------
+\begin{center}
+  {\huge \textbf{Yanda Cheng}}
+\end{center}
+\vspace{4pt}
+\noindent\small
++1-859-338-3379 \quad$|$\quad
+\href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \quad$|$\quad
+\href{https://yanda-cheng.com}{https://yanda-cheng.com} \quad$|$\quad
+\href{https://www.linkedin.com/in/yanda-cheng-4888a216b}{LinkedIn} \quad$|$\quad
+\href{https://scholar.google.com/citations?user=XkNfimMAAAAJ&hl=en}{Google Scholar}
+
+\vspace{-4pt}
+
+% ---------- Education ----------
+\section{Education}
+
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=2pt, topsep=2pt]
+  \item \textbf{PhD} in Biomedical Engineering \hfill \textit{University at Buffalo (SUNY), Buffalo, NY} \hfill GPA: 4.0/4.0 \hfill 2021--2026 (Expected)
+  \item \textbf{MEng} in Biomedical Engineering \hfill \textit{Cornell University (Ivy League), Ithaca, NY} \hfill 2020--2021
+  \item \textbf{BS} in Electrical \& Computer Engineering \hfill \textit{University of Kentucky, Lexington, KY} \hfill 2015--2020
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Work Experience ----------
+\section{Work Experience}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  \vspace{-3pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{SGLang (LLM/VLM Serving Framework)} & Mountain View, CA (remote) \\
+    \textit{Open-Source Contributor} & \textit{Aug 2025 -- Feb 2026} \\
+  \end{tabular*}\vspace{2pt}
+  \begin{itemize}[leftmargin=0.2in, topsep=3pt]
+    \item Added \textbf{Sequence Parallelism (SP)} support for \textbf{GLM-Image} in SGLang diffusion pipeline (\textbf{\#18077}): enabled multi-GPU sharded execution for DiT-style diffusion, established reproducible latency/VRAM baselines, and validated behavior across SP/TP settings to unblock high-resolution generation.
+    \item Fixed high-concurrency file-descriptor leaks in HTTP utils (\textbf{\#12047}) by ensuring urllib responses are always closed on success and error paths, preventing OSError (too many open files); stress-tested with 5,000 requests (100 threads) achieving 0 percent failures and p99 under 30 ms with stable FD count.
+    \item Unblocked out-of-the-box diffusion launches by fixing missing dependencies in \texttt{sglang[diffusion]} (\textbf{\#17900}; related \textbf{\#17671}): added \textbf{accelerate} and \textbf{ftfy} to extras, enabling \texttt{device\_map="cuda/auto"} model loading for Wan2.1 and FLUX-class models in clean-room installs.
+    \item Built and shared \textbf{Qwen} performance benchmarks focusing on \textbf{p99 latency} across multiple \textbf{SP/TP} configurations, providing actionable baselines for parallelism trade-offs and regression detection.
+  \end{itemize}
+
+  \vspace{3pt}
+  \vspace{-3pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{HydroSense Tech} & Beijing / Singapore \\
+    \textit{Co-founder \& Core Engineer} & \textit{2015 -- Present (part-time)} \\
+  \end{tabular*}\vspace{2pt}
+  \begin{itemize}[leftmargin=0.2in, topsep=3pt]
+    \item Co-founded an IoT precision-sensing startup and led the cloud/backend stack for ML-enabled devices, scaling from pilot sites to \textbf{multi-million-dollar annual revenue} across municipal and industrial customers in 5+ countries.
+    \item Designed and operated cloud servers and APIs that ingest time-series data from 5000+ deployed sensors, coordinate edge gateways and customer-facing dashboards, and enforce authentication, rate limiting, and per-customer isolation.
+    \item Built the central data warehouse and analytics layer (SQL/columnar storage + Python jobs) for long-horizon device telemetry, enabling ad-hoc queries, customer reports, and model retraining pipelines over billions of sensor records.
+    \item Implemented post-training evaluation and monitoring pipelines for on-device ML models, including backtests on historical data, drift detection, and automatic promotion/rollback of model versions via configuration-driven server APIs.
+    \item \textbf{Patents:} Co-inventor on 3 granted patents covering rainfall sensing hardware and ML-based drift compensation / EMI mitigation algorithms (2017--2023).
+  \end{itemize}
+  
+  \vspace{3pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{Seno Medical} & New York, NY \\
+    \textit{Applied ML Engineer Intern} & \textit{May 2024 -- Aug 2024} \\
+  \end{tabular*}\vspace{2pt}
+  \begin{itemize}[leftmargin=0.2in, topsep=3pt]
+    \item Collaborated with clinicians to curate 2,000+ medical imaging QA datasets with annotation guidelines; fine-tuned LLaMA (LoRA) and built a RAG system, cutting hallucination by 50 percent and raising Recall at 5 to 90 percent.
+    \item Designed an end-to-end evaluation harness with label schema (factuality, coverage, style), automatic metrics, and Python error-analysis scripts; reduced hallucination rate from 30 percent to 15 percent and increased Recall at 5 to 90 percent.
+    \item Implemented a modular RAG backend: chunking and ingestion jobs, FAISS-based vector store, retriever/re-ranker layer, and LLM orchestration, served via FastAPI and containerized with Docker for PHI-compliant on-prem deployment.
+    \item Set up Git-based workflows and observability (structured logs, latency/error-rate dashboards); shipped reproducible Docker images and deployment runbooks for downstream clinical teams.
+  \end{itemize}
+
+  \vspace{3pt}
+  \vspace{-3pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{Roswell Park Comprehensive Cancer Center} & Buffalo, NY \\
+    \textit{Research Scientist} & \textit{May 2023 -- Aug 2023} \\
+  \end{tabular*}\vspace{2pt}
+  \begin{itemize}[leftmargin=0.2in, topsep=3pt]
+    \item Designed a multi-modal data pipeline aligning imaging with structured text reports (de-identification, schema normalization, automated QC) to produce clean image--text pairs for generative modeling.
+    \item Built dataset generation jobs (filtering, sampling, augmentation, metadata tagging) to create balanced image--report datasets for conditional generation and downstream training.
+    \item Implemented a domain-specific latent diffusion model (Stable Diffusion--style, DDIM/DPMS sampling), trained on AWS, for conditional image-to-text report generation and synthetic data augmentation.
+    \item Automated GPU training and experiment tracking with standardized configs, logging, and comparison scripts, enabling fast iteration over model variants and dataset settings on the AWS stack.
+  \end{itemize}
+
+  \vspace{3pt}
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Research Projects ----------
+\section{Selected Research Projects}
+
+\begin{itemize}[leftmargin=0in, label={}]
+
+  \projheading{Predictive modeling of chronic foot ulcer outcomes using longitudinal photoacoustic imaging}{npj Imaging, 2026}
+  \projItemListStart
+    \item Designed longitudinal follow-up protocol for over 400 diabetic foot ulcer patients; coordinated \textbf{IRB approval}, multi-center patient enrollment, and data collection with endocrinology, vascular surgery, and wound care teams.
+    \item Combined radiomics features with LASSO/Random Forest models achieving AUC over 0.85 for quantitative ulcer healing prediction, directly supporting clinical decision-making.
+    \item \textit{Applicable to:} longitudinal outcome prediction across medical imaging modalities, risk stratification in clinical cohorts, and time-series modeling in CV/ML pipelines.
+  \projItemListEnd
+
+  \projheading{OneTouch automated photoacoustic and ultrasound imaging of breast in standing pose}{IEEE Trans.\ Medical Imaging, 2025, cited 8 times}
+  \projItemListStart
+    \item Co-developed a multi-modal clinical imaging platform integrating AI-assisted diagnosis for early breast cancer screening; coordinated with radiologists and surgeons on clinical protocol design and image interpretation validation.
+    \item \textit{Applicable to:} multi-modal medical imaging, computer vision for cancer screening, and deployment of AI tools in radiology workflows.
+  \projItemListEnd
+
+  \projheading{Dual-scan photoacoustic tomography for the imaging of vascular structure on foot}{IEEE Trans.\ UFFC, 2023, cited 21 times}
+  \projItemListStart
+    \item Developed quantitative 3D vascular imaging protocol for peripheral arterial disease (PAD) assessment; established clinical imaging standards in collaboration with a vascular surgery team.
+    \item \textit{Applicable to:} quantitative vascular imaging, angiography analysis, and 3D vessel segmentation in medical imaging and CV applications.
+  \projItemListEnd
+
+\end{itemize}
+
+\vspace{-2pt}
+
+% ---------- Publications ----------
+\section{Selected Publications (First / Co-Author, Peer-Reviewed)}
+
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Predictive modeling of chronic foot ulcer outcomes using longitudinal photoacoustic imaging. \textit{npj Imaging} 4(1), 12, \textbf{2026}.
+  \item \small \textbf{Cheng Y.}, Huang C., Bing R.W., et al. Dysphagia assessment based on photoacoustic imaging: a pilot ex vivo and in vivo study in infant swine. \textit{Med-X} 3(1), 1--9, \textbf{2025}.
+  \item \small \textbf{Cheng Y.}, Zheng W., et al. Unsupervised denoising of photoacoustic images based on the Noise2Noise network. \textit{Biomed.\ Optics Express} 15(8), 4390--4405, \textbf{2024}.\quad(14 citations)
+  \item \small \textbf{Cheng Y.}, Huang C., et al. Dual-scan photoacoustic tomography for the imaging of vascular structure on foot. \textit{IEEE Trans.\ UFFC} 70, \textbf{2023}.\quad(21 citations)
+  \item \small Huang C., \textbf{Cheng Y.}, et al. Enhanced clinical photoacoustic vascular imaging through skin localization and adaptive weighting. \textit{Photoacoustics} 42, 100690, \textbf{2025}. [4 citations]
+  \item \small Zhang H., ..., \textbf{Cheng Y.}, et al. OneTouch automated PA/US breast imaging in standing pose. \textit{IEEE Trans.\ Medical Imaging}, \textbf{2025}. (8 citations)
+  \item \small Liu X., \textbf{Cheng Y.}, et al. Simultaneous tissue blood flow and oxygenation with a wearable fiber-free optical sensor. \textit{J.\ Biomed.\ Optics} 26(1), 012705, \textbf{2021}.\quad\textbf{[38 citations]}
+\end{itemize}
+\vspace{2pt}
+\noindent\small\textbf{Total: about 100 citations (Google Scholar); 11 SCI papers; Venues: npj Imaging, IEEE TMI, IEEE TUFFC, Photoacoustics, BOE, Med-X, JBO}
+
+\vspace{-2pt}
+
+% ---------- Technical Skills ----------
+\section{Technical Skills}
+\noindent
+\small
+\textbf{Medical Imaging:} Image reconstruction, denoising (DL/classical), registration, segmentation, 3D visualization; CT, PA, US, multiphoton microscopy \\
+\textbf{AI / Machine Learning / LLMs:} CNN, UNet, Transformer, LSTM, Radiomics, LASSO, SVM, Random Forest, deep learning denoising; large language models, RAG systems, prompt engineering, multimodal models \\
+\textbf{Clinical Data Analysis:} Longitudinal analysis, Kaplan-Meier survival analysis, ROC/AUC, regression, statistical testing (Python\,/\,R\,/\,SPSS) \\
+\textbf{Research Workflow:} IRB/ethics protocol submission, multi-site data management, SCI manuscript preparation \& submission, academic presentation \\
+\textbf{Programming:} Python, C/C++, MATLAB, R, SQL; PyTorch, scikit-learn, OpenCV, Pandas, Docker \\
+\textbf{Languages:} Mandarin Chinese (native), English (fluent -- academic writing, cross-national team collaboration)
+
+\vspace{-2pt}
+
+% ---------- Awards ----------
+\section{Awards \& Honors}
+\begin{itemize}[leftmargin=0.2in, itemsep=1pt]
+  \item \small \textbf{\$3,000 Startup Seed Grant}, University at Buffalo Entrepreneurship Award -- PA-based Breast Cancer Detection (2023)
+  \item \small Key Contributor, NIH-Funded Research Project (PI: Prof.\ Jun Xia, University at Buffalo; ongoing)
+  \item \small Outstanding Teaching Assistant -- BME 503 Image Processing \& BME 302 Medical Devices, University at Buffalo
+\end{itemize}
+
+\end{document}
+
