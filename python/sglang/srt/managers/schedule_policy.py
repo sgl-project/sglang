@@ -731,9 +731,7 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(
-        self, req: Req, truncation_align_size: Optional[int]
-    ):
+    def add_one_req(self, req: Req, truncation_align_size: Optional[int]):
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,

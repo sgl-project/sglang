@@ -10,7 +10,6 @@ Usage:
 """
 
 import asyncio
-import subprocess
 import time
 import unittest
 from typing import Any, Optional
