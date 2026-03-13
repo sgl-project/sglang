@@ -201,6 +201,7 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        hf_quant_config["hf_config"] = model_config.hf_config
 
         # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
         hf_quant_config["requantization_method"] = model_config.quantization
@@ -243,7 +244,10 @@ def get_quant_config(
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
-            return quant_cls(online_scheme=model_config.quantization)
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))

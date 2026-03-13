@@ -183,7 +183,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB  # TODO update
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
         self._test_peak_memory(
             threshold=17, test_start=False, add_peak_memory_before_load=True
         )
@@ -196,21 +196,29 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 class TestFP8ToMXFP4Dense(TestOnlineQuantizationMemoryLoad):
     model = "Qwen/Qwen3-8B-FP8"
 
-    def test_peak_memory(self):
-        # Original Qwen/Qwen3-8B-FP8 model: TODO update GiB (TP=1, peak_memory_before_load)
-        self._test_peak_memory(threshold=7)  # TP=1 TODO update
-
     def test_gsm8k(self):
         # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
-        self._test_gsm8k(accuracy_threshold=0.88)
+        self._test_gsm8k(accuracy_threshold=0.87)
 
 
 class TestFP8ToMXFP4DenseTP1(TestFP8ToMXFP4Dense):
     tp = 1
 
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=6.5, test_start=False, add_peak_memory_before_load=True
+        )
+
 
 class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
     tp = 2
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-8B-FP8 model: 4.663 GiB (TP=2, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=3.5, test_start=False, add_peak_memory_before_load=True
+        )
 
 
 class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
@@ -218,8 +226,10 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
     tp = 1
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: TODO update GiB (TP=1, peak_memory_before_load)
-        self._test_peak_memory(threshold=21)  # TP=1 TODO update
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: 29.103 GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=18.5, test_start=False, add_peak_memory_before_load=True
+        )
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948

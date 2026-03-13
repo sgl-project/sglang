@@ -30,6 +30,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
@@ -42,6 +44,7 @@ class QuarkConfig(QuantizationConfig):
     def __init__(
         self,
         quant_config: dict[str, Any] | None = None,
+        hf_config: "PretrainedConfig | None" = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
@@ -56,7 +59,9 @@ class QuarkConfig(QuantizationConfig):
         if online_scheme is not None:
             assert not is_prequantized
             if online_scheme == "quark_mxfp4":
-                quant_config = self._create_online_mxfp4_config()
+                quant_config = self._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
             else:
                 raise ValueError(f"Unsupported online_scheme: {online_scheme}")
 
@@ -151,10 +156,14 @@ class QuarkConfig(QuantizationConfig):
                 and config["requantization_method"] == "quark_mxfp4"
                 and config["activation_scheme"] == "dynamic"
             ):
-                quant_config = QuarkConfig._create_online_mxfp4_config()
+                hf_config = config["hf_config"]
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
                 dequantization_config = Fp8Config.from_config(config)
                 quark_config = cls(
                     quant_config=quant_config,
+                    hf_config=hf_config,
                     is_prequantized=False,
                     dequantization_config=dequantization_config,
                 )
@@ -236,24 +245,33 @@ class QuarkConfig(QuantizationConfig):
         return []
 
     @staticmethod
-    def _create_online_mxfp4_config() -> dict[str, Any]:
+    def _create_online_mxfp4_config(model_type: str) -> dict[str, Any]:
         """
         Create a synthetic quant_config for online MXFP4 quantization.
         """
+        # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
+        # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
+        exclude = [
+            "re:.*gate$",
+            "re:.*router",
+            "re:.*lm_head",
+            "re:.*embed_tokens",
+        ]
+
+        # DeepSeek V3.2-specific exclusions for accuracy,
+        # adapted from https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json#L39-L41
+        if model_type == "deepseek_v3":
+            exclude.extend(
+                [
+                    "re:.*model.layers.61.*",
+                    "re:.*self_attn.*",
+                    "re:.*mlp.gate$",
+                ]
+            )
+
         return {
             "packed_modules_mapping": {},
-            # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
-            # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
-            "exclude": [
-                "re:.*gate",
-                "re:.*router",
-                "re:.*lm_head",
-                "re:.*embed_tokens",
-                # TODO: verify if we keep these here.
-                "re:.*model.layers.61.*",  # DeepSeek 3.2
-                "re:.*self_attn.*",  # DeepSeek 3.2
-                "re:.*mlp.gate$",  # DeepSeek 3.2
-            ],
+            "exclude": exclude,
             "global_quant_config": {
                 "weight": {
                     "dtype": "fp4",
