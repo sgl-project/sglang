@@ -1488,8 +1488,9 @@ class RowParallelLinear(LinearBase):
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
                 fp_communications = \
-                    (not forward_batch is None and forward_batch.forward_mode.is_decode()) \
-                    or not get_global_server_args().quantize_tp_communications
+                    (forward_batch.forward_mode.is_decode() \
+                    or not get_global_server_args().quantize_tp_communications) \
+                    if forward_batch is not None else True
                 output = tensor_model_parallel_all_reduce(output_parallel, fp_comm=fp_communications)
         else:
             output = output_parallel
