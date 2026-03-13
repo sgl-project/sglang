@@ -421,10 +421,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 forward_batch,
             )
 
-        if (input_ids is None) ^ (input_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+        if input_ids is None:
+            raise ValueError("input_ids must be provided when input_embeds is not.")
 
         if input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
