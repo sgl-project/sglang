@@ -42,7 +42,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from diffusion_skill_env import (
-    configure_runtime_env,
     ensure_dir,
     get_assets_dir,
     get_output_dir,
@@ -464,7 +463,6 @@ def main():
     )
 
     args = parser.parse_args()
-    configure_runtime_env(required_gpus=1)
 
     if args.show_injection_example:
         patch_fn = inject_kernels_example()
