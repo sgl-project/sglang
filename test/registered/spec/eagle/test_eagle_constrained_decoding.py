@@ -3,8 +3,8 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -18,7 +18,7 @@ register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
 
 
 class TestEagleConstrainedDecoding(
-    CustomTestCase, TestRegexConstrainedMixin, TestJSONConstrainedMixin
+    CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
     max_running_requests = 64
     attention_backend = "triton"
