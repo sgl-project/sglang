@@ -60,7 +60,7 @@ def get_encoding():
 
 def get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[Literal["high", "medium", "low"]] = None,
+    reasoning_effort: Optional[Literal["none", "high", "medium", "low"]] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,
@@ -69,6 +69,8 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
+        if reasoning_effort == "none":
+            raise ValueError("Harmony does not support reasoning_effort='none'")
         sys_msg_content = sys_msg_content.with_reasoning_effort(
             REASONING_EFFORT[reasoning_effort]
         )
