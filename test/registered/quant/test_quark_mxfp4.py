@@ -171,7 +171,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB  # TODO update
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
         self._test_peak_memory(
             threshold=17, test_start=False, add_peak_memory_before_load=True
         )
