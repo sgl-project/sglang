@@ -2261,6 +2261,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
+                has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
