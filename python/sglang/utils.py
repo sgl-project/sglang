@@ -16,7 +16,7 @@ import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
+from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -139,19 +139,17 @@ def normalize_base_url(host: str, port: int) -> str:
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
-        self._body = None
 
-    def _read_body(self):
-        if self._body is None:
-            self._body = self.resp.read()
-        return self._body
+    @cached_property
+    def _body(self):
+        return self.resp.read()
 
     def json(self):
-        return json.loads(self._read_body())
+        return json.loads(self._body)
 
     @property
     def text(self):
-        return self._read_body().decode("utf-8", errors="replace")
+        return self._body.decode("utf-8", errors="replace")
 
     @property
     def status_code(self):
