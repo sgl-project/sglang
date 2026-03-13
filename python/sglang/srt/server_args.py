@@ -1680,6 +1680,7 @@ class ServerArgs:
                     self.ep_size == 1
                     and is_triton_kernels_available()
                     and self.quantization is None
+                    and not (is_cpu() and cpu_has_amx_support())
                 ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(

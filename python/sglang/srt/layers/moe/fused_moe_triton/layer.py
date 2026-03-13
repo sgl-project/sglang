@@ -224,7 +224,11 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_triton_kernels = (
+            get_moe_runner_backend().is_triton_kernels()
+            if not (_is_cpu and _is_cpu_amx_available)
+            else False
+        )
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
