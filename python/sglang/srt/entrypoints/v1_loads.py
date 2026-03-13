@@ -166,10 +166,22 @@ async def get_loads(
         d["num_total_reqs"] = d["num_running_reqs"] + d["num_waiting_reqs"]
         loads.append(d)
 
+    # Get prompt_tokens_total from Prometheus metrics
+    prompt_tokens_total = 0
+    if tokenizer_manager.enable_metrics:
+        prompt_tokens_total = int(
+            tokenizer_manager.metrics_collector.prompt_tokens_total.labels(
+                **tokenizer_manager.metrics_collector.labels
+            )._value.get()
+        )
+
+    aggregate = _compute_aggregate(loads)
+    aggregate["prompt_tokens_total"] = prompt_tokens_total
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": __version__,
         "dp_rank_count": len(loads),
         "loads": loads,
-        "aggregate": _compute_aggregate(loads),
+        "aggregate": aggregate,
     }
