@@ -54,12 +54,14 @@ def main():
         (512, 128256, torch.bfloat16),
     ]
 
-    print(f"{'bs':>5}  {'vocab':>7}  {'dtype':>8}  {'original (us)':>14}  "
-          f"{'fused (us)':>11}  {'inplace (us)':>13}  {'speedup':>8}  {'speedup_ip':>11}")
+    print(
+        f"{'bs':>5}  {'vocab':>7}  {'dtype':>8}  {'original (us)':>14}  "
+        f"{'fused (us)':>11}  {'inplace (us)':>13}  {'speedup':>8}  {'speedup_ip':>11}"
+    )
     print("-" * 100)
 
     for bs, vocab, dtype in configs:
-        temps = (torch.rand(bs, 1, dtype=torch.float32, device="cuda") * 1.5 + 0.1)
+        temps = torch.rand(bs, 1, dtype=torch.float32, device="cuda") * 1.5 + 0.1
 
         # --- Original ---
         logits_orig = torch.randn(bs, vocab, dtype=dtype, device="cuda")

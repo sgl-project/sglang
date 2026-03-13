@@ -37,9 +37,7 @@ class TestFusedTemperatureSoftmax(CustomTestCase):
         """Assert outputs are close and both are valid probability distributions."""
         self.assertEqual(fused.shape, ref.shape)
         # Valid probabilities: non-negative, sum to ~1
-        self.assertTrue(
-            (fused >= 0).all(), f"Negative probabilities in fused output"
-        )
+        self.assertTrue((fused >= 0).all(), f"Negative probabilities in fused output")
         row_sums = fused.sum(dim=-1)
         torch.testing.assert_close(
             row_sums,

@@ -31,7 +31,7 @@ if is_cuda():
 _use_fused_sampling = False
 if is_cuda():
     try:
-        from sglang.srt.layers.fused_sampling import fused_temperature_softmax
+        from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
 
         _use_fused_sampling = True
     except ImportError:
@@ -162,13 +162,13 @@ class Sampler(nn.Module):
             else:
                 # Standard path: do softmax and sample from probs.
                 if _use_fused_sampling:
-                    probs = fused_temperature_softmax(
+                    fused_temperature_softmax_inplace(
                         logits, sampling_info.temperatures
                     )
                 else:
                     logits.div_(sampling_info.temperatures)
                     logits[:] = torch.softmax(logits, dim=-1)
-                    probs = logits
+                probs = logits
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case

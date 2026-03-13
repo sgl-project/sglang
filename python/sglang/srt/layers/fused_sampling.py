@@ -8,7 +8,22 @@ import torch
 import triton
 import triton.language as tl
 
+_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_SIZE": 1024}, num_warps=4),
+    triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
+    triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
+    triton.Config({"BLOCK_SIZE": 2048}, num_warps=16),
+    triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
+    triton.Config({"BLOCK_SIZE": 4096}, num_warps=16),
+    triton.Config({"BLOCK_SIZE": 8192}, num_warps=16),
+    triton.Config({"BLOCK_SIZE": 8192}, num_warps=32),
+    triton.Config({"BLOCK_SIZE": 16384}, num_warps=16),
+    triton.Config({"BLOCK_SIZE": 16384}, num_warps=32),
+    triton.Config({"BLOCK_SIZE": 32768}, num_warps=32),
+]
 
+
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["vocab_size"])
 @triton.jit
 def _fused_temperature_softmax_kernel(
     logits_ptr,
@@ -27,10 +42,7 @@ def _fused_temperature_softmax_kernel(
     logits_row = logits_ptr + row_idx * logits_stride
     output_row = output_ptr + row_idx * output_stride
 
-    # Pass 1: online softmax -- find max and accumulate sum(exp) in one sweep.
-    # Using the numerically stable online algorithm:
-    #   m_new  = max(m_old, block_max)
-    #   d_new  = d_old * exp(m_old - m_new) + sum(exp(x - m_new))
+    # Pass 1: online softmax — find max and accumulate sum(exp) in one sweep.
     running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
     running_sum = tl.full([], value=0.0, dtype=tl.float32)
 
@@ -87,8 +99,6 @@ def fused_temperature_softmax(
     )
     temperatures_flat = temperatures.view(-1)
 
-    BLOCK_SIZE = min(triton.next_power_of_2(vocab_size), 4096)
-
     grid = (batch_size,)
     _fused_temperature_softmax_kernel[grid](
         logits,
@@ -97,11 +107,11 @@ def fused_temperature_softmax(
         vocab_size,
         logits.stride(0),
         output.stride(0),
-        BLOCK_SIZE=BLOCK_SIZE,
     )
     return output
 
 
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["vocab_size"])
 @triton.jit
 def _fused_temperature_softmax_inplace_kernel(
     logits_ptr,
@@ -169,13 +179,10 @@ def fused_temperature_softmax_inplace(
 
     temperatures_flat = temperatures.view(-1)
 
-    BLOCK_SIZE = min(triton.next_power_of_2(vocab_size), 4096)
-
     grid = (batch_size,)
     _fused_temperature_softmax_inplace_kernel[grid](
         logits,
         temperatures_flat,
         vocab_size,
         logits.stride(0),
-        BLOCK_SIZE=BLOCK_SIZE,
     )
