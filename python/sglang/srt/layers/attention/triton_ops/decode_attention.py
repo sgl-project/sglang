@@ -41,6 +41,400 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+# =====================================================================
+# Unified single-pass decode attention (no split-KV, no stage2 reduce)
+# Adapted from vLLM's kernel_unified_attention_2d for SGLang's KV cache
+# Toggle: set env SGLANG_UNIFIED_DECODE_ATTN=1 to enable
+# =====================================================================
+
+import os as _os
+
+_USE_UNIFIED_DECODE = _os.environ.get("SGLANG_UNIFIED_DECODE_ATTN", "1") == "1"
+
+
+@triton.jit
+def _unified_grouped_decode_kernel(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    O,
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    v_scale,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_obs,
+    stride_oh,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start
+
+    if cur_batch_seq_len <= 0:
+        return
+
+    # Load Q: [BLOCK_H, BLOCK_DMODEL]
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < Lk
+        off_qpe = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        )
+        qpe = tl.load(
+            Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+        )
+
+    # Online softmax accumulators
+    m_i = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    for start_n in range(0, cur_batch_seq_len, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < cur_batch_seq_len
+
+        kv_loc = tl.load(
+            kv_indices + cur_batch_kv_start + offs_n,
+            mask=kv_mask,
+            other=0,
+        )
+
+        # Load K: [BLOCK_DMODEL, BLOCK_N] transposed
+        offs_buf_k = (
+            kv_loc[None, :] * stride_buf_kbs
+            + cur_kv_head * stride_buf_kh
+            + offs_d[:, None]
+        )
+        k = tl.load(
+            K_Buffer + offs_buf_k,
+            mask=(kv_mask[None, :]) & (mask_d[:, None]),
+            other=0.0,
+        )
+
+        # S = Q @ K: [BLOCK_H, BLOCK_N]
+        qk = tl.dot(q, k.to(q.dtype))
+
+        if BLOCK_DPE > 0:
+            offs_buf_kpe = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(
+                K_Buffer + offs_buf_kpe,
+                mask=(kv_mask[None, :]) & (mask_dpe[:, None]),
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe.to(qpe.dtype))
+
+        qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        qk = tl.where(mask_h[:, None] & kv_mask[None, :], qk, float("-inf"))
+
+        # Online softmax
+        m_j = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_j)
+        m_new = tl.where(m_new > float("-inf"), m_new, 0.0)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_j = tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        # Load V: [BLOCK_N, BLOCK_DV]
+        offs_buf_v = (
+            kv_loc[:, None] * stride_buf_vbs
+            + cur_kv_head * stride_buf_vh
+            + offs_dv[None, :]
+        )
+        v = tl.load(
+            V_Buffer + offs_buf_v,
+            mask=(kv_mask[:, None]) & (mask_dv[None, :]),
+            other=0.0,
+        )
+        acc += tl.dot(p.to(v.dtype), v)
+        l_i = l_i * alpha + l_j
+        m_i = m_new
+
+    acc = acc / l_i[:, None] * v_scale
+
+    offs_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_dv[None, :]
+    tl.store(
+        O + offs_o,
+        acc,
+        mask=(mask_h[:, None]) & (mask_dv[None, :]),
+    )
+
+
+@triton.jit
+def _unified_normal_decode_kernel(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    O,
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    v_scale,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_obs,
+    stride_oh,
+    kv_group_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_kv_head = cur_head // kv_group_num
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start
+
+    if cur_batch_seq_len <= 0:
+        return
+
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+    q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    for start_n in range(0, cur_batch_seq_len, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < cur_batch_seq_len
+        kv_loc = tl.load(
+            kv_indices + cur_batch_kv_start + offs_n,
+            mask=kv_mask,
+            other=0,
+        )
+        offs_buf_k = (
+            kv_loc[:, None] * stride_buf_kbs
+            + cur_kv_head * stride_buf_kh
+            + offs_d[None, :]
+        )
+        k = tl.load(
+            K_Buffer + offs_buf_k,
+            mask=(kv_mask[:, None]) & (mask_d[None, :]),
+            other=0.0,
+        )
+        qk = tl.sum(q[None, :] * k, 1)
+        qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        qk = tl.where(kv_mask, qk, float("-inf"))
+
+        m_j = tl.max(qk, 0)
+        m_new = tl.maximum(m_i, m_j)
+        m_new = tl.where(m_new > float("-inf"), m_new, 0.0)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new)
+        l_j = tl.sum(p, 0)
+        acc *= alpha
+
+        offs_buf_v = (
+            kv_loc[:, None] * stride_buf_vbs
+            + cur_kv_head * stride_buf_vh
+            + offs_dv[None, :]
+        )
+        v = tl.load(
+            V_Buffer + offs_buf_v,
+            mask=(kv_mask[:, None]) & (mask_dv[None, :]),
+            other=0.0,
+        )
+        acc += tl.sum(p[:, None] * v, 0)
+        l_i = l_i * alpha + l_j
+        m_i = m_new
+
+    acc = acc / l_i * v_scale
+    offs_o = cur_batch * stride_obs + cur_head * stride_oh + offs_dv
+    tl.store(O + offs_o, acc, mask=mask_dv)
+
+
+def decode_attention_fwd_unified_grouped(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    kv_indptr,
+    kv_indices,
+    sm_scale_withk,
+    v_scale,
+    logit_cap=0.0,
+):
+    """Unified single-pass decode for GQA/MQA (kv_group_num > 1)."""
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+    batch, head_num = q.shape[0], q.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    BLOCK_N = 32
+    if _is_hip and Lk >= 576:
+        BLOCK_N = 16
+
+    if Lk == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    elif Lk == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
+    else:
+        BLOCK_DMODEL = triton.next_power_of_2(Lk)
+        BLOCK_DPE = 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    BLOCK_H = 16
+    grid = (batch, triton.cdiv(head_num, min(BLOCK_H, kv_group_num)))
+
+    extra_kargs = {}
+    num_stages = 2
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+
+    _unified_grouped_decode_kernel[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        o,
+        sm_scale_withk,
+        kv_indptr,
+        kv_indices,
+        v_scale,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK_N,
+        BLOCK_H=BLOCK_H,
+        logit_cap=logit_cap,
+        Lk=Lk,
+        Lv=Lv,
+        num_warps=4,
+        num_stages=num_stages,
+        **extra_kargs,
+    )
+
+
+def decode_attention_fwd_unified_normal(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    kv_indptr,
+    kv_indices,
+    sm_scale_withk,
+    v_scale,
+    logit_cap=0.0,
+):
+    """Unified single-pass decode for MHA (kv_group_num == 1)."""
+    BLOCK_N = 64
+    if _is_hip:
+        BLOCK_N = 32
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+    batch, head_num = q.shape[0], q.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    grid = (batch, head_num)
+
+    num_warps = 4
+    if _is_hip:
+        num_warps = 2
+
+    _unified_normal_decode_kernel[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        o,
+        sm_scale_withk,
+        kv_indptr,
+        kv_indices,
+        v_scale,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kv_group_num=kv_group_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK_N,
+        logit_cap=logit_cap,
+        Lk=Lk,
+        Lv=Lv,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -746,6 +1140,44 @@ def decode_attention_fwd(
     assert q.shape[0] <= attn_logits.shape[0]
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
+
+    # Unified single-pass path: no split-KV, no stage2 reduce
+    # Enable with: SGLANG_UNIFIED_DECODE_ATTN=1
+    # Falls back to original two-stage when sinks or xai_temperature are used
+    if not hasattr(decode_attention_fwd, "_logged"):
+        with open("/tmp/unified_attn_active.log", "w") as _f:
+            if _USE_UNIFIED_DECODE:
+                _f.write("UNIFIED decode attention is ACTIVE (single-pass)")
+            else:
+                _f.write("UNIFIED decode attention is DISABLED (two-stage split-KV)")
+        decode_attention_fwd._logged = True
+
+    if _USE_UNIFIED_DECODE and sinks is None and xai_temperature_len <= 0:
+        if kv_group_num == 1:
+            decode_attention_fwd_unified_normal(
+                q,
+                k_buffer,
+                v_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                sm_scale * k_scale,
+                v_scale,
+                logit_cap=logit_cap,
+            )
+        else:
+            decode_attention_fwd_unified_grouped(
+                q,
+                k_buffer,
+                v_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                sm_scale * k_scale,
+                v_scale,
+                logit_cap=logit_cap,
+            )
+        return
 
     if kv_group_num == 1:
         # MHA
