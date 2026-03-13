@@ -620,7 +620,10 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        if not _is_npu or forward_batch.forward_mode.is_extend():
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -890,6 +893,14 @@ class Qwen3MoeModel(Qwen2MoeModel):
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: Qwen3MoeConfig,
@@ -1032,10 +1043,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
