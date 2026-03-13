@@ -8,6 +8,9 @@ from sglang.benchmark.backends.base_client import (
 from sglang.benchmark.backends.gserver_client import GServerBackendClient
 from sglang.benchmark.backends.oai_chat_client import OpenAIChatBackendClient
 from sglang.benchmark.backends.oai_client import OpenAIBackendClient
+from sglang.benchmark.backends.oai_embedding_client import (
+    OpenAIEmbeddingBackendClient,
+)
 from sglang.benchmark.backends.profile_client import ProfileBackendClient
 from sglang.benchmark.backends.sglang_client import SGLangBackendClient
 from sglang.benchmark.backends.trt_client import TRTBackendClient
@@ -18,6 +21,7 @@ BACKEND_MAPPING: Dict[str, Type[BaseBackendClient]] = {
     "sglang-native": SGLangBackendClient,
     "sglang-oai": OpenAIBackendClient,
     "sglang-oai-chat": OpenAIChatBackendClient,
+    "sglang-embedding": OpenAIEmbeddingBackendClient,
     "vllm": OpenAIBackendClient,
     "vllm-chat": OpenAIChatBackendClient,
     "lmdeploy": OpenAIBackendClient,

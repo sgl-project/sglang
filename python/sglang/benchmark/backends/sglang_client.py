@@ -40,9 +40,13 @@ class SGLangBackendClient(BaseBackendClient):
                 "lora_path": request_func_input.lora_name,
                 "return_logprob": self.args.return_logprob,
                 "return_routed_experts": self.args.return_routed_experts,
-                "logprob_start_len": -1,
+                "logprob_start_len": self.args.logprob_start_len,
                 **request_func_input.extra_request_body,
             }
+            if self.args.top_logprobs_num > 0:
+                payload["top_logprobs_num"] = self.args.top_logprobs_num
+            if self.args.token_ids_logprob is not None:
+                payload["token_ids_logprob"] = self.args.token_ids_logprob
 
             # Add image data if available (list of image urls/base64)
             if request_func_input.image_data:

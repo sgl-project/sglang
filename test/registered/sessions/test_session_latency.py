@@ -25,7 +25,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -318,19 +317,25 @@ def _print_summary(all_results: Dict[str, List[ModeResult]]):
 
 
 class TestSessionLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "openai/gpt-oss-20b"
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # NOTE: Overlap scheduling commits KV cache one step ahead,
+        # so the last decode token is cached (unlike non-overlap).
+        # Disable overlap to keep session cache behavior consistent.
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--attention-backend",
-                "flashinfer",
+                "--disable-overlap-schedule",
                 "--enable-streaming-session",
+                "--mem-fraction-static",
+                "0.70",
+                "--disable-piecewise-cuda-graph",
+                "--page-size",
+                "4",
             ],
         )
         cls.tokenizer = get_tokenizer(cls.model)

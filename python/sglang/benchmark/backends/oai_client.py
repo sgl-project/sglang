@@ -51,6 +51,9 @@ class OpenAIBackendClient(BaseBackendClient):
             if "ignore_eos" not in request_func_input.extra_request_body:
                 payload["ignore_eos"] = not self.args.disable_ignore_eos
 
+            if self.args.return_logprob and self.args.top_logprobs_num > 0:
+                payload["logprobs"] = self.args.top_logprobs_num
+
             # Merge in extra parameters - these will override defaults if present
             payload.update(request_func_input.extra_request_body)
 

@@ -22,10 +22,41 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+_is_hip = current_platform.is_hip()
+_use_aiter_vae = get_bool_env_var("SGLANG_USE_ROCM_VAE") and _is_hip
+
+
+def _replace_groupnorm_with_aiter(module: torch.nn.Module) -> int:
+    """Recursively replace nn.GroupNorm with AITer GroupNorm in a module tree.
+
+    Returns the number of replaced modules.
+    """
+    from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
+
+    count = 0
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.GroupNorm) and child.affine:
+            aiter_gn = AiterGroupNorm(
+                num_groups=child.num_groups,
+                num_channels=child.num_channels,
+                eps=child.eps,
+                affine=True,
+                device=child.weight.device,
+                dtype=child.weight.dtype,
+            )
+            aiter_gn.weight = child.weight
+            aiter_gn.bias = child.bias
+            setattr(module, name, aiter_gn)
+            count += 1
+        else:
+            count += _replace_groupnorm_with_aiter(child)
+    return count
 
 
 def _ensure_tensor_decode_output(decode_output):
@@ -60,6 +91,7 @@ class DecodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
+        self._aiter_gn_applied = False
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -118,10 +150,9 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
-        # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -154,6 +185,25 @@ class DecodingStage(PipelineStage):
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
+    def _apply_aiter_groupnorm(self):
+        """Replace nn.GroupNorm with AITer GroupNorm (called once after VAE load)."""
+        if self._aiter_gn_applied:
+            return
+        self._aiter_gn_applied = True
+        try:
+            count = _replace_groupnorm_with_aiter(self.vae)
+            if count > 0:
+                logger.info(
+                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
+                    count,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to apply AITer GroupNorm to VAE. "
+                "Model may be in an inconsistent state.",
+                exc_info=True,
+            )
+
     def load_model(self):
         # load vae if not already loaded (used for memory constrained devices)
         pipeline = self.pipeline() if self.pipeline else None
@@ -165,6 +215,8 @@ class DecodingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module("vae", self.vae)
             self.server_args.model_loaded["vae"] = True
+        if _use_aiter_vae:
+            self._apply_aiter_groupnorm()
 
     def offload_model(self):
         # Offload models if needed
