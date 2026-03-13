@@ -25,6 +25,8 @@ from sgl_kernel.elementwise import (
     copy_to_gpu_no_ce,
     downcast_fp8,
     fused_add_rmsnorm,
+    fused_add_rmsnorm_quant,
+    fused_rmsnorm_quant,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
