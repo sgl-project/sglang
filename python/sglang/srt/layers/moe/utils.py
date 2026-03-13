@@ -10,7 +10,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -23,6 +22,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
@@ -45,6 +45,9 @@ class MoeA2ABackend(Enum):
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
+    def is_nixl(self):
+        return self == MoeA2ABackend.NIXL
+
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER
 
@@ -62,6 +65,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -82,6 +86,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer_trtllm_routed(self):
+        return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
@@ -189,10 +196,6 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        log_info_on_rank0(
-            logger,
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
-        )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 

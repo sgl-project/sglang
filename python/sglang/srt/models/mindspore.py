@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -26,6 +26,19 @@ if _is_npu:
     from mindspore import Tensor, mint, mutable
 
 logger = logging.getLogger(__name__)
+
+
+def _get_arch_from_config(config):
+    mindspore_models = import_model_classes("sgl_mindspore.models")
+    architectures = getattr(config, "architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if not architectures:
+        raise ValueError("No model architectures are specified")
+    for arch in architectures:
+        if arch in mindspore_models:
+            return mindspore_models[arch]
+    raise ValueError(f"Unsupported arch {architectures}")
 
 
 def tensor_torch2ms(x: torch.Tensor):
@@ -178,28 +191,20 @@ class MindSporeForCausalLM(torch.nn.Module):
         arch = self.get_arch(self.config)
         self.model = arch(config=config, quant_config=quant_config)
 
-        self.casual_mask = LowerTriangularMask(
+        self.causal_mask = LowerTriangularMask(
             self.config.param_dtype, self.config.max_position_embeddings
         )
         self.key_cache = []
         self.value_cache = []
 
+    @property
+    def hot_token_id(self):
+        if hasattr(self.model, "hot_token_id"):
+            return tensor_ms2torch(self.model.hot_token_id)
+        return None
+
     def get_arch(self, config):
-        # Get all implemented models
-        mindspore_models = import_model_classes("sgl_mindspore.models")
-
-        # Get arch from config
-        architectures = config.architectures
-        if isinstance(architectures, str):
-            architectures = [architectures]
-        if not architectures:
-            logger.warning("No model architectures are specified")
-
-        for arch in architectures:
-            if arch in mindspore_models:
-                return mindspore_models[arch]
-        if arch is None:
-            raise ValueError(f"Unsupported arch {architectures}")
+        return _get_arch_from_config(config)
 
     @property
     def use_mla(self):
@@ -220,7 +225,7 @@ class MindSporeForCausalLM(torch.nn.Module):
                 else:
                     cache = forward_batch.token_to_kv_pool.get_value_buffer(i)
                 cache_ms = tensor_torch2ms(cache)
-                if cache_ms.ndim == 3:
+                if self.use_mla and cache_ms.ndim == 3:
                     cache_ms = mint.unsqueeze(cache_ms, 2)
                 cache_list.append(cache_ms)
 
@@ -237,30 +242,44 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         return mutable(self.key_cache), mutable(self.value_cache)
 
+    def _is_prefill(self, forward_batch: ForwardBatch):
+        # Different processing for the mindspore attention operator
+        # Without any prefix cache => Use FlashAttentionScore
+        # With cache => Use PagedAttention, no matter the query length is 1 or not
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+        if forward_batch.extend_prefix_lens is not None:
+            is_prefill = (
+                is_prefill and forward_batch.extend_prefix_lens.sum().item() == 0
+            )
+        return is_prefill
+
     def prepare_inputs(self, input_ids, positions, forward_batch):
         if self.use_mla:
             key_cache = self.get_kvcache(forward_batch)
         else:
             key_cache, value_cache = self.get_kvcache(forward_batch)
 
-        # Different processing for the mindspore attention operator
-        # Without any prefix cache => Use FlashAttentionScore
-        # With cache => Use PagedAttention, no matter the query length is 1 or not
-        is_prefill = forward_batch.forward_mode.is_extend()
-        is_prefill = is_prefill and forward_batch.extend_prefix_lens.sum().item() == 0
-
+        is_prefill = self._is_prefill(forward_batch)
         batch_valid_length = forward_batch.seq_lens.cpu().numpy()
-
+        if forward_batch.forward_mode.is_target_verify():
+            batch_valid_length += forward_batch.spec_info.num_tokens_per_req
         if forward_batch.extend_seq_lens is not None:
             q_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
         else:
             q_seq_lens = np.ones([forward_batch.batch_size], dtype=np.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                q_seq_lens = q_seq_lens * forward_batch.spec_info.num_tokens_per_req
 
         page_size = forward_batch.token_to_kv_pool.page_size
         block_tables = tensor_torch2ms(
             (
                 forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : forward_batch.seq_lens.max()
+                    forward_batch.req_pool_indices, : batch_valid_length.max()
                 ][:, ::page_size]
                 // page_size
             )
@@ -273,7 +292,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         model_inputs["position_ids"] = tensor_torch2ms(positions)
         model_inputs["q_seq_lens"] = ms.Tensor(q_seq_lens, dtype=ms.int32)
-        model_inputs["attention_mask"] = self.casual_mask.gen_attention_mask(
+        model_inputs["attention_mask"] = self.causal_mask.gen_attention_mask(
             is_prefill, model_inputs["position_ids"], q_seq_lens, batch_valid_length
         ).contiguous()
         model_inputs["out_cache_loc"] = tensor_torch2ms(forward_batch.out_cache_loc).to(
@@ -284,6 +303,8 @@ class MindSporeForCausalLM(torch.nn.Module):
         if not self.use_mla:
             model_inputs["value_cache"] = value_cache
         model_inputs["block_tables"] = block_tables
+        # for speculative decode
+        model_inputs["forward_mode"] = forward_batch.forward_mode
         return model_inputs
 
     def forward(
@@ -297,11 +318,46 @@ class MindSporeForCausalLM(torch.nn.Module):
         # prepare model inputs
         model_inputs = self.model.prepare_inputs(forward_batch, model_inputs)
 
-        logits = self.model(**model_inputs)
+        # Used by speculative decoding (EAGLE)
+        if self.model.capture_aux_hidden_states:
+            logits, hidden_states = self.model(**model_inputs)
+        else:
+            logits = self.model(**model_inputs)
+            hidden_states = None
 
-        # TODO: npu tensor ms2torch error to be fix, remain issues of torch_npu to get tensor from dlpack
-        logits_result = LogitsProcessorOutput(next_token_logits=tensor_ms2torch(logits))
+        logits_result = LogitsProcessorOutput(
+            next_token_logits=tensor_ms2torch(logits),
+            hidden_states=tensor_ms2torch(hidden_states),
+        )
         return logits_result
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        try:
+            arch_cls = _get_arch_from_config(config)
+            method = getattr(arch_cls, "get_model_config_for_expert_location", None)
+            if method is None:
+                return None
+            return method(config)
+        except Exception:
+            return None
+
+    # The following methods are used for speculative decoding
+    def get_embed_and_head(self):
+        embed, head = self.model.get_embed_and_head()
+        return tensor_ms2torch(embed), tensor_ms2torch(head)
+
+    def set_embed_and_head(self, embed, head):
+        self.model.set_embed_and_head(tensor_torch2ms(embed), tensor_torch2ms(head))
+
+    def get_embed(self):
+        return tensor_ms2torch(self.model.get_embed())
+
+    def set_embed(self, embed):
+        self.model.set_embed(tensor_torch2ms(embed))
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.model.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = [MindSporeForCausalLM]

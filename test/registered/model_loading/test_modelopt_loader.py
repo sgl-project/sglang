@@ -15,6 +15,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,7 +63,7 @@ class TestModelOptModelLoader(CustomTestCase):
 
         self.model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         self.load_config = LoadConfig()
-        self.device_config = DeviceConfig(device="cuda")
+        self.device_config = DeviceConfig(device=get_device())
 
         # Create a basic model config with unified quantization flag
         self.model_config = ModelConfig(
@@ -558,6 +559,65 @@ class TestModelOptLoaderIntegration(CustomTestCase):
         # Verify that modelopt_quant was properly parsed
         self.assertEqual(server_args.modelopt_quant, "fp8")
         self.assertEqual(server_args.model_path, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+
+class TestParseQuantHfConfig(CustomTestCase):
+    """Tests for _parse_quant_hf_config and _parse_modelopt_quant_config.
+
+    Regression tests for the fix where quant_method='modelopt' ignoring quant_algo.
+    """
+
+    # (quant_config_input, expected_quant_method)
+    _MODELOPT_CASES = [
+        ({"quant_method": "modelopt", "quant_algo": "FP8"}, "modelopt_fp8"),
+        ({"quant_method": "modelopt", "quant_algo": "FP4"}, "modelopt_fp4"),
+        ({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "modelopt_fp4"),
+        ({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}, "w4afp8"),
+        ({"quant_algo": "FP8"}, "modelopt_fp8"),
+        ({"quant_algo": "FP4"}, "modelopt_fp4"),
+        ({"quant_algo": "MIXED_PRECISION"}, "w4afp8"),
+        ({"quant_method": "modelopt"}, "modelopt"),
+    ]
+
+    def setUp(self):
+        """Set up a real ModelConfig using TinyLlama (already used elsewhere)."""
+        self.mock_tp_rank = patch(
+            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            return_value=0,
+        )
+        self.mock_tp_rank.start()
+
+        self.mock_mp_is_initialized = patch(
+            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            return_value=True,
+        )
+        self.mock_mp_is_initialized.start()
+
+        self.model_config = ModelConfig(
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        )
+
+    def tearDown(self):
+        self.mock_tp_rank.stop()
+        self.mock_mp_is_initialized.stop()
+
+    def test_modelopt_quant_parsing(self):
+        """Modelopt quant configs must resolve to the correct quant_method."""
+        for quant_cfg_input, expected in self._MODELOPT_CASES:
+            with self.subTest(quant_cfg=quant_cfg_input):
+                self.model_config.hf_config.quantization_config = dict(quant_cfg_input)
+                result = self.model_config._parse_quant_hf_config()
+                self.assertEqual(result["quant_method"], expected)
+
+    def test_non_modelopt_quant_method_unchanged(self):
+        """Non-modelopt quant_method (e.g. 'gptq') must NOT enter the modelopt path."""
+        self.model_config.hf_config.quantization_config = {
+            "quant_method": "gptq",
+            "bits": 4,
+        }
+        result = self.model_config._parse_quant_hf_config()
+        self.assertEqual(result["quant_method"], "gptq")
+        self.assertNotIn("quant_algo", result)
 
 
 if __name__ == "__main__":

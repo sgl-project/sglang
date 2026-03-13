@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """SGLang LLaDA2MoeModelLM model."""
+
 import logging
 from typing import Iterable, Optional, Tuple, Union
 
@@ -76,11 +77,18 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    is_npu,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -188,6 +196,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
+
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+        if _is_npu:
+            self.norm_topk_prob = False
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -512,6 +525,10 @@ class LLaDA2MoeAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+        can_fuse_set_kv = (
+            self.head_dim == self.rotary_emb.rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -522,7 +539,7 @@ class LLaDA2MoeAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if can_fuse_set_kv
                 else None
             ),
         )
@@ -531,7 +548,7 @@ class LLaDA2MoeAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not can_fuse_set_kv,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output

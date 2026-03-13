@@ -8,10 +8,10 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
+from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
@@ -30,9 +30,9 @@ register_cuda_ci(est_time=350, suite="stage-b-test-large-2-gpu")
 
 class TestDPAttentionDP2TP2(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -75,9 +75,9 @@ class TestDPAttentionDP2TP2(
 
 class TestDPRetract(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -115,9 +115,9 @@ class TestDPRetract(
 
 class TestDPAttentionDP2TP2DeepseekV3MTP(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -187,8 +187,6 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        # TODO(FlamingoPg): Use Kimi-VL-A3B-Instruct temporarily
-        # cauz Qwen3-VL use mrope which has bug in DP attention mode
         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_url = DEFAULT_IMAGE_URL

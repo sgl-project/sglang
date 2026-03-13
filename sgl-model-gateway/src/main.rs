@@ -11,7 +11,6 @@ use smg::{
         TraceConfig,
     },
     core::ConnectionMode,
-    mesh::service::MeshServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -20,6 +19,7 @@ use smg::{
     service_discovery::ServiceDiscoveryConfig,
     version,
 };
+use smg_mesh::service::MeshServerConfig;
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -259,6 +259,10 @@ struct CliArgs {
     /// Set the logging level
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"], help_heading = "Logging")]
     log_level: String,
+
+    /// Enable structured JSON log output instead of plain text
+    #[arg(long, default_value_t = false, help_heading = "Logging")]
+    json_log: bool,
 
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics
@@ -1119,6 +1123,7 @@ impl CliArgs {
             max_payload_size: self.max_payload_size,
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
+            json_log: self.json_log,
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
@@ -1147,6 +1152,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
+
+    eprintln!("\n{}", "=".repeat(78));
+    eprintln!(
+        "WARNING: This copy of sgl-model-gateway is DEPRECATED and no longer maintained."
+    );
+    eprintln!("The actively maintained version has moved to:");
+    eprintln!("  https://github.com/lightseekorg/smg");
+    eprintln!();
+    eprintln!("Please migrate to the standalone repository for the latest features,");
+    eprintln!("bug fixes, and security updates.");
+    eprintln!("{}\n", "=".repeat(78));
 
     let prefill_urls = parse_prefill_args();
 

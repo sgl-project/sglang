@@ -623,9 +623,9 @@ class DeepseekV2WeightLoaderMixin:
             nextn_conf: NextN configuration
 
         Returns:
-            List of (name, tensor) pairs with quantized weights
+            Original weights iterator if no quantization needed,
+            otherwise list of (name, tensor) pairs with quantized weights
         """
-        weights_dict = dict(weights)
         weight_block_size = [128, 128]
         partial_names = []
 
@@ -655,16 +655,20 @@ class DeepseekV2WeightLoaderMixin:
                                 f"model.layers.{layer_id}.self_attn.{stem}"
                             )
 
-        if partial_names:
-            for partial_name in tqdm.tqdm(
-                partial_names, desc="quant weights to fp8 ue8m0"
-            ):
-                original_weight = weights_dict[f"{partial_name}.weight"]
-                out_w, out_s = quant_weight_ue8m0(
-                    original_weight, weight_block_size=weight_block_size
-                )
-                weights_dict[f"{partial_name}.weight"] = out_w
-                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+        # Early return if no quantization needed - avoid materializing all weights into memory
+        if not partial_names:
+            return weights
+
+        # Only materialize weights dict when quantization is actually needed
+        weights_dict = dict(weights)
+
+        for partial_name in tqdm.tqdm(partial_names, desc="quant weights to fp8 ue8m0"):
+            original_weight = weights_dict[f"{partial_name}.weight"]
+            out_w, out_s = quant_weight_ue8m0(
+                original_weight, weight_block_size=weight_block_size
+            )
+            weights_dict[f"{partial_name}.weight"] = out_w
+            weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
         if isinstance(
             nextn_conf, NextNEnabledConfig
