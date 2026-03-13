@@ -518,6 +518,28 @@ class LogitsProcessor(nn.Module):
             pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
+            if aux_hidden_states is not None:
+                aux_pruned_states_list = []
+                pt = 0
+                for extend_logprob_start_len, extend_len in zip(
+                    logits_metadata.extend_logprob_start_lens_cpu,
+                    logits_metadata.extend_seq_lens_cpu,
+                ):
+                    if extend_len == extend_logprob_start_len:
+                        start_len = extend_logprob_start_len - 1
+                    else:
+                        start_len = extend_logprob_start_len
+                    aux_pruned_states_list.append(
+                        [
+                            hidden[pt + start_len : pt + extend_len]
+                            for hidden in aux_hidden_states
+                        ]
+                    )
+                    pt += extend_len
+                aux_pruned_states = [
+                    torch.cat([batch[i] for batch in aux_pruned_states_list], dim=0)
+                    for i in range(len(aux_hidden_states))
+                ]
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )
