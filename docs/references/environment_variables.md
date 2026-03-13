@@ -76,6 +76,8 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
 | `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
+| `SGLANG_MORI_NEXTN_FP8_DISP` | Use FP8 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
+| `SGLANG_MORI_NEXTN_FP4_DISP` | Use MXFP4 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
@@ -126,7 +128,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_ENABLE_FLASHINFER_FP8_GEMM` (deprecated) | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=flashinfer_trtllm` (SM100/SM103) or `--fp8-gemm-backend=flashinfer_cutlass` (SM120/SM121 and newer) instead. | `false` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` (deprecated) | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=cutlass` instead. | `false` |
-| `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weights downcasting | `false` |
+| `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weight dtype downcasting during loading (e.g., fp32 → fp16). By default, SGLang rejects this kind of downcasting when using quantization. | `false` |
+| `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1.,qkv_proj`. | `""` |
 
 
 ## Distributed Computing
