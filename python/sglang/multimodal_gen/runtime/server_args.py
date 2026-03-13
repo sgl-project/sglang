@@ -916,7 +916,11 @@ class ServerArgs:
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
-            help="The logging level of all loggers.",
+            help=(
+                "The logging level of all loggers. "
+                "Also controls torch.compile internal log handling: "
+                "info silences compile noise on console; non-info redirects compile stdout/stderr to file."
+            ),
         )
         parser.add_argument(
             "--backend",

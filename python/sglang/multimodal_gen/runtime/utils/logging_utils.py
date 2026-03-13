@@ -10,7 +10,9 @@ import datetime
 import logging
 import os
 import sys
+import threading
 import time
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -279,6 +281,164 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
 
 logger = init_logger(__name__)
+
+
+_TORCH_COMPILE_LOG_FILE_PATH: str | None = None
+_TORCH_COMPILE_LOG_FD: int | None = None
+_TORCH_COMPILE_WRITTEN_MODULE_HEADERS: set[str] = set()
+_TORCH_COMPILE_REDIRECT_LOCK = threading.RLock()
+
+
+def _resolve_log_level_name(log_level: str | None = None) -> str:
+    if log_level is not None:
+        return str(log_level).strip().lower()
+    root = logging.getLogger()
+    return logging.getLevelName(root.getEffectiveLevel()).lower()
+
+
+def _get_process_rank() -> int:
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except ValueError:
+        return 0
+
+
+def _get_torch_compile_log_path() -> str:
+    global _TORCH_COMPILE_LOG_FILE_PATH
+    if _TORCH_COMPILE_LOG_FILE_PATH is not None:
+        return _TORCH_COMPILE_LOG_FILE_PATH
+
+    log_dir = os.environ.get(
+        "SGLANG_TORCH_COMPILE_LOG_DIR",
+        os.path.join(os.getcwd(), "outputs", "torch_compile_logs"),
+    )
+    os.makedirs(log_dir, exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    rank = _get_process_rank()
+    _TORCH_COMPILE_LOG_FILE_PATH = os.path.join(
+        log_dir,
+        f"torch_compile_{ts}_pid{os.getpid()}_rank{rank}.log",
+    )
+    return _TORCH_COMPILE_LOG_FILE_PATH
+
+
+def _get_torch_compile_log_fd() -> int:
+    global _TORCH_COMPILE_LOG_FD
+    if _TORCH_COMPILE_LOG_FD is None:
+        _TORCH_COMPILE_LOG_FD = os.open(
+            _get_torch_compile_log_path(),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+    return _TORCH_COMPILE_LOG_FD
+
+
+def _write_torch_compile_session_header_once(module_name: str | None) -> None:
+    if not get_is_main_process():
+        return
+
+    key = module_name or "unknown_module"
+    if key in _TORCH_COMPILE_WRITTEN_MODULE_HEADERS:
+        return
+
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = (
+        f"\n===== torch.compile session: module={key}, pid={os.getpid()},"
+        f" rank={_get_process_rank()}, at={ts} =====\n"
+    )
+    os.write(_get_torch_compile_log_fd(), line.encode("utf-8", errors="replace"))
+    _TORCH_COMPILE_WRITTEN_MODULE_HEADERS.add(key)
+
+
+@contextmanager
+def _redirect_stdout_stderr_to_fd(target_fd: int):
+    try:
+        stdout_fd = sys.stdout.fileno()
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        # Some runtime wrappers may provide non-fd streams.
+        # Fall back to no-op to avoid blocking the denoising loop.
+        yield
+        return
+
+    stdout_dup = os.dup(stdout_fd)
+    stderr_dup = os.dup(stderr_fd)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(target_fd, stdout_fd)
+        os.dup2(target_fd, stderr_fd)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.dup2(stdout_dup, stdout_fd)
+        os.dup2(stderr_dup, stderr_fd)
+        os.close(stdout_dup)
+        os.close(stderr_dup)
+
+
+@contextmanager
+def torch_compile_log_context(
+    module_name: str | None = None, log_level: str | None = None
+):
+    """
+    Unified torch.compile logging control.
+
+    Policy:
+    - log-level == info: silence compile internal noise from stdout/stderr and
+      additionally suppress noisy python loggers/warnings.
+    - log-level != info: redirect compile stdout/stderr to file on main process;
+      non-main processes are silenced to avoid duplicated logs.
+    """
+    level_name = _resolve_log_level_name(log_level)
+    is_info_mode = level_name == "info"
+
+    if is_info_mode:
+        target_fd = os.open(os.devnull, os.O_WRONLY)
+        should_close_target_fd = True
+    else:
+        if get_is_main_process():
+            _write_torch_compile_session_header_once(module_name)
+            target_fd = _get_torch_compile_log_fd()
+            should_close_target_fd = False
+        else:
+            target_fd = os.open(os.devnull, os.O_WRONLY)
+            should_close_target_fd = True
+
+    loggers_to_suppress = [
+        "torch",
+        "torch._dynamo",
+        "torch._inductor",
+        "torch.fx.experimental.symbolic_shapes",
+        "triton",
+        "triton.runtime",
+        "triton.compiler",
+    ]
+    original_levels = None
+
+    with _TORCH_COMPILE_REDIRECT_LOCK:
+        try:
+            with _redirect_stdout_stderr_to_fd(target_fd):
+                if is_info_mode:
+                    original_levels = suppress_loggers(
+                        loggers_to_suppress, logging.ERROR
+                    )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        yield
+                else:
+                    yield
+        finally:
+            if original_levels is not None:
+                for logger_name, level in original_levels.items():
+                    logging.getLogger(logger_name).setLevel(level)
+            if should_close_target_fd:
+                os.close(target_fd)
 
 
 def _trace_calls(log_path, root_dir, frame, event, arg=None):
