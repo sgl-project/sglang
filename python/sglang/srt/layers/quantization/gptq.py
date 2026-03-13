@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -62,13 +62,14 @@ if TYPE_CHECKING:
     )
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
-_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -194,7 +195,9 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half] if not _is_npu else [torch.half, torch.bfloat16]
+        return (
+            [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+        )
 
     @classmethod
     # Need to figure it out
@@ -246,6 +249,8 @@ class GPTQConfig(QuantizationConfig):
             return None
 
         if isinstance(layer, FusedMoE):
+            if _is_cpu:
+                return GPTQMarlinMoEMethod(self)
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
         else:
             return get_linear_quant_method(
