@@ -41,7 +41,7 @@ class QuarkConfig(QuantizationConfig):
 
     def __init__(
         self,
-        quant_config: dict[str, Any],
+        quant_config: dict[str, Any] | None = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
