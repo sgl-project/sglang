@@ -1,11 +1,17 @@
 """
 RequestLoggingFilter — reference IOFilter implementation.
 
+.. note::
+   **Sample / placeholder only.**  This filter is a simple, benign example
+   whose sole purpose is to demonstrate the value of the IOFilter framework
+   (hook points, blocking vs. non-blocking dispatch, context propagation).
+   It is *not* intended as production-ready observability code and should be
+   treated as a starting point — replace or extend it with whatever fits your
+   deployment (structured logging, OpenTelemetry spans, Prometheus histograms,
+   etc.).
+
 Logs the model name on ingress and end-to-end latency on egress for every
-non-streaming request.  This is intentionally minimal: it serves as a
-starting point for custom observability integrations (structured logging,
-OpenTelemetry spans, Prometheus histograms, etc.) rather than as a
-production-complete solution.
+non-streaming request.
 
 Non-blocking: logging is scheduled as a background task and never delays
 the response to the caller.
