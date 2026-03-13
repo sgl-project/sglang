@@ -77,7 +77,7 @@ class QuarkConfig(QuantizationConfig):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
     @property
-    def quantized_layers(self) -> Tuple[list[str], int]:
+    def quantized_layers(self) -> tuple[list[str], int]:
         # Extract unique layer types (last part after ".")
         layer_types = sorted(
             set(name.split(".")[-1] for name in self._quantized_layers)
@@ -487,7 +487,12 @@ class QuarkConfig(QuantizationConfig):
         input_config = layer_quant_config.get("input_tensors")
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFp4MoE(weight_config, input_config)
+            return QuarkW4A4MXFp4MoE(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
+            )
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:

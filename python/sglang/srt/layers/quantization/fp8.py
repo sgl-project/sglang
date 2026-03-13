@@ -815,8 +815,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         use_mxfp8: bool,
         is_checkpoint_fp8_serialized: bool,
         params_dtype: torch.dtype,
-        with_bias: bool = False,
         extra_weight_attrs: dict,
+        with_bias: bool,
     ):
         """
         Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
@@ -899,7 +899,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # BIAS (optional, e.g. GPT-OSS)
-        if self.with_bias:
+        if with_bias:
             w13_up_dim = (
                 2 * intermediate_size_per_partition
                 if layer.moe_runner_config.is_gated
@@ -1033,6 +1033,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
         Fp8MoEMethod.create_fp8_moe_weight_(
@@ -1045,6 +1046,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_mxfp8=self.use_mxfp8,
             is_checkpoint_fp8_serialized=self.quant_config.is_checkpoint_fp8_serialized,
             params_dtype=params_dtype,
+            with_bias=with_bias,
             extra_weight_attrs=extra_weight_attrs,
         )
 
