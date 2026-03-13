@@ -169,7 +169,9 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         )
 
         kv_indices = torch.empty(
-            cum_kv_seq_len[-1], dtype=torch.int32, device=self.device
+            paged_kernel_lens_sum + self.draft_token_num * bs,
+            dtype=torch.int32,
+            device=self.device,
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -181,7 +183,28 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
+
+        # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * bs
+        )
+        custom_mask = self.custom_mask
+        if custom_mask.numel() < mask_numel:
+            custom_mask = torch.cat(
+                [
+                    custom_mask,
+                    torch.full(
+                        (mask_numel - custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=self.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+        return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
     def _fill_requests(
         self,
