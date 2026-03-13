@@ -141,96 +141,9 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
     def test_mamba_radix_cache_1(self):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
         )
-        # kv cache
-        size = 128
-        dtype = torch.bfloat16
-        head_num = 2
-        head_dim = 256
-        num_layers = 48
-        global_interval = 4
-        max_num_reqs = 10
-        mamba_cache_size = 20
-        max_context_len = 128
-        device = get_device()
-        full_attention_layer_ids = [
-            i for i in range(global_interval - 1, num_layers, global_interval)
-        ]
-
-        # mamba
-        mamba_layers = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids
-        ]
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
-            shape = Mamba2StateShape.create(
-                tp_world_size=1,
-                intermediate_size=4096,
-                n_groups=16,
-                num_heads=32,
-                head_dim=128,
-                state_size=128,
-                conv_kernel=4,
-            )
-            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
-
-        req_to_token_pool = HybridReqToTokenPool(
-            size=max_num_reqs,
-            mamba_size=mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=False,
-            cache_params=mamba2_cache_params,
-            enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=3,
-        )
-        # setup kv pool
-        pool = HybridLinearKVPool(
-            size=size,
-            dtype=dtype,
-            page_size=1,
-            head_num=head_num,
-            head_dim=head_dim,
-            full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
-            device=device,
-            enable_memory_saver=False,
-            mamba_pool=req_to_token_pool.mamba_pool,
-        )
-
-        # setup token to kv pool allocator
-        allocator = TokenToKVPoolAllocator(
-            size=size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
-        )
-        params = CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-            disable=False,
-        )
-        # setup radix cache
-        tree = MambaRadixCache(params=params)
-
-        def make_dummy_req():
-            sampling_params = SamplingParams(
-                temperature=0,
-                max_new_tokens=1,
-            )
-            req = Req(
-                rid=0,
-                origin_input_text="",
-                origin_input_ids=[],
-                sampling_params=sampling_params,
-            )
-            req_to_token_pool.alloc([req])
-            return req
-
         mamba_pool = req_to_token_pool.mamba_pool
         # test
         print(
@@ -384,6 +297,164 @@ class TestMamba(unittest.TestCase):
 
         print(tree.available_and_evictable_str())
         print(available_and_evictable_str(tree))
+        tree.sanity_check()
+
+    def _setup_tree_and_allocator(self):
+        """Helper to create a MambaRadixCache with allocator for testing."""
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
+        size = 128
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 256
+        num_layers = 48
+        global_interval = 4
+        max_num_reqs = 10
+        mamba_cache_size = 20
+        max_context_len = 128
+        device = get_device()
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+        )
+        tree = MambaRadixCache(params=params)
+
+        def make_dummy_req():
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+            req = Req(
+                rid=0,
+                origin_input_text="",
+                origin_input_ids=[],
+                sampling_params=sampling_params,
+            )
+            req_to_token_pool.alloc([req])
+            return req
+
+        return tree, allocator, req_to_token_pool, make_dummy_req
+
+    def test_insert_prev_prefix_len(self):
+        """Test that prev_prefix_len correctly controls which KV indices are freed
+        during insert, covering: full free, partial free across multi-node, and no free.
+        """
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+
+        initial_avail = allocator.available_size()
+
+        # Step 1: Insert [1,2,3] to create first node
+        req1 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=allocator.alloc(3),
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        assert allocator.available_size() == initial_avail - 3
+
+        # Step 2: Insert [1,2,3,4,5,6,7] with prev_prefix_len=0 (free all matched)
+        # Creates tree: [1,2,3] -> [4,5,6,7]
+        req2 = make_dummy_req()
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4, 5, 6, 7]),
+                value=allocator.alloc(7),
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                prev_prefix_len=0,
+            )
+        )
+        assert result.prefix_len == 3
+        # alloc 7, freed 3 (dup prefix [0..2]), stored 4 in new node => net -4
+        assert allocator.available_size() == initial_avail - 3 - 4
+        avail_after_step2 = allocator.available_size()
+
+        # Step 3: Insert [1,2,3,4,5,6,7,8] with prev_prefix_len=2
+        # Matched prefix = 7 (across two nodes: [1,2,3] len=3, [4,5,6,7] len=4)
+        # Protected [0..1], freed [2..6] = 5 slots, new [7] = 1 slot stored
+        req3 = make_dummy_req()
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8]),
+                value=allocator.alloc(8),
+                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                prev_prefix_len=2,
+            )
+        )
+        assert result.prefix_len == 7
+        # alloc 8, freed 5, stored 1 => net -3
+        assert allocator.available_size() == avail_after_step2 - 3
+        avail_after_step3 = allocator.available_size()
+
+        # Step 4: Insert [1,2,3,4,5,6,7,8,9] with prev_prefix_len=8 (covers all matched)
+        # Matched prefix = 8, prev_prefix_len=8 => nothing freed
+        req4 = make_dummy_req()
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+                value=allocator.alloc(9),
+                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                prev_prefix_len=8,
+            )
+        )
+        assert result.prefix_len == 8
+        # alloc 9, freed 0, stored 1 => net -9
+        assert allocator.available_size() == avail_after_step3 - 9
+
         tree.sanity_check()
 
 

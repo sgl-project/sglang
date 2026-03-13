@@ -7,6 +7,8 @@ description: Step-by-step guide for adding a new JIT CUDA kernel to SGLang Diffu
 
 > **Origin**: This skill is adapted from the [HuggingFace kernels cuda-kernels skill](https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels), rewritten to follow SGLang's JIT compilation system and internal abstractions.
 >
+> **Run environment first**: before compiling, benchmarking, or profiling any kernel from this guide, use `scripts/diffusion_skill_env.py` (or the setup block in `diffusion-benchmark-and-profile.md`) to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and pick an idle GPU.
+>
 > **Extended references** (in this directory's `references/` and `scripts/`):
 > - [references/kernel-templates.md](references/kernel-templates.md) — copy-paste ready templates for element-wise, row-reduction (RMSNorm), fused AdaLN
 > - [references/troubleshooting.md](references/troubleshooting.md) — build errors, perf issues, integration pitfalls
