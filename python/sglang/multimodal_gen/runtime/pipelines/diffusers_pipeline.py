@@ -288,7 +288,7 @@ class DiffusersExecutionStage(PipelineStage):
         if batch.generator is not None:
             kwargs["generator"] = batch.generator
         elif batch.seed is not None:
-            device = self._get_pipeline_device()
+            device = self._get_generator_device(batch)
             kwargs["generator"] = torch.Generator(device=device).manual_seed(batch.seed)
 
         # Image input for img2img or inpainting
@@ -307,15 +307,15 @@ class DiffusersExecutionStage(PipelineStage):
 
         return kwargs
 
-    def _get_pipeline_device(self) -> str:
-        """Get the device the pipeline is running on."""
-        for attr in ["unet", "transformer", "vae"]:
-            component = getattr(self.diffusers_pipe, attr, None)
-            if component is not None:
-                try:
-                    return str(next(component.parameters()).device)
-                except StopIteration:
-                    pass
+    def _get_generator_device(self, batch: Req) -> str:
+        """Resolve RNG device consistently with the non-diffusers path.
+
+        Diffusers CPU offload can temporarily park modules on CPU, but that
+        should not silently switch a CUDA request to CPU RNG, otherwise the
+        same seed produces different outputs depending on runtime placement.
+        """
+        if batch.generator_device == "cpu":
+            return "cpu"
         return current_platform.device_type
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
