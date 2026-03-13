@@ -121,7 +121,7 @@ jobs:
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec -w /home/sdp/sglang/ "$cid" \
-            bash -c "source/root/miniforge3/etc/profile.d/conda.sh && conda activate py3.10 && cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
+            bash -c "source /home/sdp/miniforge3/etc/profile.d/conda.sh && conda activate py3.10 && cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
       - name: Cleanup container
         if: always()
         run: |
