@@ -50,6 +50,7 @@ void bmm_fp8(
         auto n = B.size(2);
 
         auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
+        const c10::cuda::OptionalCUDAGuard device_guard(A.device());
         auto stream = at::cuda::getCurrentCUDAStream();
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(

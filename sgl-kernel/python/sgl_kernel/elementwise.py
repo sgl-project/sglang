@@ -79,7 +79,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -98,7 +98,7 @@ def rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper or later architectures.
 
     Returns
     -------
@@ -129,7 +129,7 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -152,7 +152,7 @@ def fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
     """
     # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
@@ -171,7 +171,7 @@ def gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> torch.Tensor:
     r"""Gemma-style root mean square normalization.
 
@@ -190,7 +190,7 @@ def gemma_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
 
     Returns
     -------
@@ -214,7 +214,7 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
@@ -237,7 +237,7 @@ def gemma_fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
     """
     # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
@@ -263,7 +263,11 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
 
 
-def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def silu_and_mul(
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_arch_support_pdl(),
+) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -274,11 +278,15 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.silu_and_mul.default(out, input, enable_pdl)
     return out
 
 
-def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def gelu_tanh_and_mul(
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_arch_support_pdl(),
+) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -289,11 +297,15 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input, enable_pdl)
     return out
 
 
-def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def gelu_and_mul(
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_arch_support_pdl(),
+) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -304,7 +316,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_and_mul.default(out, input, enable_pdl)
     return out
 
 
