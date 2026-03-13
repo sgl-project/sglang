@@ -131,6 +131,14 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        if ignored_layers_str := envs.SGLANG_FP8_IGNORED_LAYERS.get():
+            self.ignored_layers.extend(
+                [
+                    layer.strip()
+                    for layer in ignored_layers_str.split(",")
+                    if layer.strip()
+                ]
+            )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
