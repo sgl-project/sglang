@@ -42,7 +42,7 @@ class NgramCache:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.match_type = match_type
-        self.cache = ngram_cache_cpp.Ngram(capacity, param)
+        self.cache = ngram_cache_cpp.NgramTrie(capacity, param)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num

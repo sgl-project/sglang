@@ -10,7 +10,7 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
   m.doc() = "";
 
   using NgramTrie = Ngram<TrieCache>;
-  py::class_<NgramTrie>(m, "Ngram")
+  py::class_<NgramTrie>(m, "NgramTrie")
       .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
       .def("asyncInsert", &NgramTrie::asyncInsert, "")
       .def("batchMatch", &NgramTrie::batchMatch, "")
