@@ -1100,12 +1100,12 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
-
+            # NOTE: content should not be None but empty string to make sure retokenize consistancy.
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else None,
+                    content=text if text else "",
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
