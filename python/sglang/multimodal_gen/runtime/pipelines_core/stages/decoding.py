@@ -154,6 +154,7 @@ class DecodingStage(PipelineStage):
         return image
 
     def load_model(self):
+        # load vae if not already loaded (used for memory constrained devices)
         pipeline = self.pipeline() if self.pipeline else None
         if not self.server_args.model_loaded["vae"]:
             loader = VAELoader()
