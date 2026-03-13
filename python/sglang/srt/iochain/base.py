@@ -38,9 +38,9 @@ class IOContext:
     """
 
     request_id: str
-    raw_request: Any        # OpenAI-protocol request object
-    adapted_request: Any    # Internal GenerateReqInput (after tokenisation)
-    response: Any = None    # Non-streaming response; None on ingress / for streaming
+    raw_request: Any  # OpenAI-protocol request object
+    adapted_request: Any  # Internal GenerateReqInput (after tokenisation)
+    response: Any = None  # Non-streaming response; None on ingress / for streaming
     metadata: dict = field(default_factory=dict)
     start_time: float = field(default_factory=time.monotonic)
 
