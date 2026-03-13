@@ -171,8 +171,7 @@ def _unified_grouped_decode_kernel(
         # Online softmax
         m_j = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_j)
-        m_new = tl.where(m_new > float("-inf"), m_new, 0.0)
-        alpha = tl.exp(m_i - m_new)
+        alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
         p = tl.exp(qk - m_new[:, None])
         l_j = tl.sum(p, 1)
         acc = acc * alpha[:, None]
@@ -192,7 +191,7 @@ def _unified_grouped_decode_kernel(
         l_i = l_i * alpha + l_j
         m_i = m_new
 
-    acc = acc / l_i[:, None] * v_scale
+    acc = tl.where(l_i[:, None] > 0, acc / l_i[:, None] * v_scale, 0.0)
 
     offs_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_dv[None, :]
     tl.store(
@@ -278,8 +277,7 @@ def _unified_normal_decode_kernel(
 
         m_j = tl.max(qk, 0)
         m_new = tl.maximum(m_i, m_j)
-        m_new = tl.where(m_new > float("-inf"), m_new, 0.0)
-        alpha = tl.exp(m_i - m_new)
+        alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
         p = tl.exp(qk - m_new)
         l_j = tl.sum(p, 0)
         acc *= alpha
@@ -298,7 +296,7 @@ def _unified_normal_decode_kernel(
         l_i = l_i * alpha + l_j
         m_i = m_new
 
-    acc = acc / l_i * v_scale
+    acc = tl.where(l_i > 0, acc / l_i * v_scale, 0.0)
     offs_o = cur_batch * stride_obs + cur_head * stride_oh + offs_dv
     tl.store(O + offs_o, acc, mask=mask_dv)
 
