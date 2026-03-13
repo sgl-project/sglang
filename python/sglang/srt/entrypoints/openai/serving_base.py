@@ -93,15 +93,21 @@ class OpenAIServingBase(ABC):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
+            # IOChain ingress hook — no-op by default; override via IOChainMixin
+            await self._before_inference(request, adapted_request)
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                # IOChain egress hook — no-op by default; override via IOChainMixin
+                await self._after_inference(request, adapted_request, response)
+                return response
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
@@ -200,6 +206,36 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    async def _before_inference(
+        self,
+        request: OpenAIServingRequest,
+        adapted_request: Any,
+    ) -> None:
+        """
+        Hook called after tokenisation, immediately before inference dispatch.
+
+        No-op by default. Override (or mix in IOChainMixin) to inspect or act
+        on the incoming request without modifying any other serving logic.
+
+        For blocking checks (e.g. content policy), raise an exception here —
+        it will be caught by handle_request and returned as an error response.
+        """
+
+    async def _after_inference(
+        self,
+        request: OpenAIServingRequest,
+        adapted_request: Any,
+        response: Any,
+    ) -> None:
+        """
+        Hook called after a non-streaming response is fully built.
+
+        No-op by default. Override (or mix in IOChainMixin) to inspect or
+        record the outgoing response. Exceptions are propagated to the caller.
+
+        Note: not called for streaming responses (planned for a future release).
+        """
 
     def create_error_response(
         self,
