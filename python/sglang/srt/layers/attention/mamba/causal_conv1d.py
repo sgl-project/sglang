@@ -91,7 +91,6 @@ def causal_conv1d_fn(
             pad_slot_id=pad_slot_id,
             **kwargs,
         )
-
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
     # CUDA path: ensure contiguous (seq_lens_cpu unavailable, avoid GPU-CPU sync)
