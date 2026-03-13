@@ -57,10 +57,9 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
 
 
-_DUAL_STREAM_FORWARD = os.environ.get("_DUAL_STREAM_FORWARD", "0") == "1"
+_DUAL_STREAM_FORWARD = os.environ.get("QWEN_IMAGE_DUAL_STREAM_FORWARD", "0") == "1"
 
 _alt_stream = None
-
 
 def _get_or_create_alt_stream(device_module, priority=0):
     global _alt_stream
@@ -1003,14 +1002,24 @@ class QwenImageTransformerBlock(nn.Module):
     def forward_after_attn_dual_stream(
         self,
         attn_output: torch.Tensor,
-        img_modulated2: torch.Tensor,
+        img_mod2: torch.Tensor,
+        modulate_index: torch.Tensor,
+        img_gate1: torch.Tensor,
         hidden_states: torch.Tensor,
-        img_gate2: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         txt_mod2: torch.Tensor,
         txt_gate1: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_attn_output, txt_attn_output = attn_output
+        # Process image stream - norm2 + MLP
+        img_modulated2, hidden_states, img_gate2 = self._modulate(
+            img_attn_output,
+            img_mod2,
+            self.img_norm2,
+            modulate_index,
+            gate_x=img_gate1,
+            residual_x=hidden_states,
+        )
         high_priority_stream = _get_or_create_alt_stream(
             self.device_module, priority=-1
         )
@@ -1120,6 +1129,19 @@ class QwenImageTransformerBlock(nn.Module):
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
+
+        if _DUAL_STREAM_FORWARD:
+            return self.forward_after_attn_dual_stream(
+                attn_output,
+                img_mod2,
+                modulate_index,
+                img_gate1,
+                hidden_states,
+                encoder_hidden_states,
+                txt_mod2,
+                txt_gate1,
+            )
+
         # Process image stream - norm2 + MLP
         img_modulated2, hidden_states, img_gate2 = self._modulate(
             img_attn_output,
@@ -1129,18 +1151,7 @@ class QwenImageTransformerBlock(nn.Module):
             gate_x=img_gate1,
             residual_x=hidden_states,
         )
-
-        if _DUAL_STREAM_FORWARD:
-            return self.forward_after_attn_dual_stream(
-                attn_output,
-                img_modulated2,
-                hidden_states,
-                img_gate2,
-                encoder_hidden_states,
-                txt_mod2,
-                txt_gate1,
-            )
-
+        
         img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
