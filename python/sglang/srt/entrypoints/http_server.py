@@ -1394,14 +1394,6 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 ##### OpenAI-compatible API endpoints #####
 
 
-@app.get("/v1/iochain/stats")
-async def iochain_stats():
-    """Return token usage accumulated by the built-in IOChain TokenCounterFilter."""
-    from sglang.srt.iochain import get_token_counter
-
-    return get_token_counter().get_stats()
-
-
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
