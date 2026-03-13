@@ -11,7 +11,7 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
-If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
+If you use a pre-quantized model, **do not add `--quantization` to enable online quantization at the same time**.
 For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [NVIDIA ModelOpt](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
@@ -94,7 +94,6 @@ Take note, if your model is **per-channel quantized (INT8 or FP8) with per-token
 ```bash
 python3 -m sglang.launch_server \
     --model-path neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic \
-    --quantization w8a8_fp8 \
     --port 30000 --host 0.0.0.0
 ```
 
@@ -263,9 +262,9 @@ SGLang supports two modes for ModelOpt.
     * **Cons:** Requires an extra preparation step.
 
 * **Online Quantization (quant and serve):**
-    * **Usage:** Load a standard BF16/FP16 model and add a flag. The engine applies quantization *on startup*.
+    * **Usage:** Load a standard BF16/FP16 model use a flag `--quantization xyz`. The engine applies quantization *on startup*.
     * **Pros:** Convenient (no new checkpoint needed).
-    * **Cons:** **High startup time**, increases VRAM usage during initialization (risk of OOM).
+    * **Cons:** **High startup time**, potential increase VRAM usage during initialization (risk of OOM).
 
 The following sections guide you through using the Offline path: loading pre-quantized models or creating your own checkpoints.
 
@@ -274,20 +273,18 @@ The following sections guide you through using the Offline path: loading pre-qua
 If a model is already quantized (e.g., from Hugging Face), you can load it directly.
 
 * **FP8 Models:**
-    Use `--quantization modelopt_fp8`.
+
     ```bash
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.1-8B-Instruct-FP8 \
-        --quantization modelopt_fp8 \
         --port 30000
     ```
 
 * **FP4 Models:**
-    Use `--quantization modelopt_fp4`.
+
     ```bash
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
-        --quantization modelopt_fp4 \
         --port 30000
     ```
 
@@ -391,7 +388,6 @@ After quantization and export, you can deploy the model with SGLang:
 # Deploy the exported quantized model
 python -m sglang.launch_server \
     --model-path ./quantized_tinyllama_fp8 \
-    --quantization modelopt \
     --port 30000 --host 0.0.0.0
 ```
 
@@ -483,7 +479,6 @@ To enable online quantization, you can simply specify `--quantization` in the co
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --quantization fp8 \
     --port 30000 --host 0.0.0.0
 ```
 
@@ -517,6 +512,18 @@ python3 -m sglang.launch_server \
 SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
 
 Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
+### `quark_mxfp4` online quantization method
+
+SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
+
+Example:
+
+```bash
+sglang serve --model-path Qwen/Qwen3-30B-A3B \
+    --tensor-parallel-size 1 \
+    --quantization quark_mxfp4
+```
 
 ## Reference
 

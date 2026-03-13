@@ -92,24 +92,38 @@ LOAD_FORMAT_CHOICES = [
     "private",
 ]
 
-# NOTE: this list should contain only methods that support online quantization,
-# i.e. loading a higher precision checkpoint and quantizing it at load time.
-# Other quantization methods that load a pre-serialized checkpoint should NOT be added to this list.
-ONLINE_QUANTIZATION_CHOICES = [
+# TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
+# Some of the choices here do NOT support online quantization.
+QUANTIZATION_CHOICES = [
+    "awq",
+    "fp8",  # MOE + linear online quantization.
+    "mxfp8",  # MOE + linear online quantization.
+    "gptq",
+    "marlin",
+    "gptq_marlin",
+    "awq_marlin",
+    "bitsandbytes",
+    "gguf",
     # Modelopt has some online quantization support through ModelOptModelLoader.
+    "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
-    "modelopt",
-    "fp8",  # MOE + linear.
-    "mxfp8",  # MOE + linear.
-    "w8a8_fp8",  # linear + MOE (only half support => should likely be deprecated in favor of fp8, see https://github.com/sgl-project/sglang/issues/4524)
+    "petit_nvfp4",
+    "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
+    "qoq",
+    "w4afp8",
     "mxfp4",  # MOE-only.
-    "quark_mxfp4",  # MOE + linear.
+    "auto-round",
+    "compressed-tensors",  # for Ktransformers
+    "modelslim",  # for NPU
     "quark_int4fp8_moe",
+    "quark_mxfp4",  # Online MOE + linear quantization.
 ]
 
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*ONLINE_QUANTIZATION_CHOICES, "unquant"]
+
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -220,7 +234,7 @@ def add_load_format_choices(choices):
 
 
 def add_quantization_method_choices(choices):
-    ONLINE_QUANTIZATION_CHOICES.extend(choices)
+    QUANTIZATION_CHOICES.extend(choices)
 
 
 def add_attention_backend_choices(choices):
@@ -3481,7 +3495,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=ONLINE_QUANTIZATION_CHOICES,
+            choices=QUANTIZATION_CHOICES,
             help="The quantization method.",
         )
         parser.add_argument(
