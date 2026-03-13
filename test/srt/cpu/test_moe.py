@@ -93,9 +93,9 @@ class TestFusedExperts(CustomTestCase):
 
         a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
         w1 = torch.randn((e, 2 * n, k), device="cpu", dtype=dtype) / 10
-        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=dtype) / 10
+        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=torch.float) / 10
         w2 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
-        w2_b = torch.randn((e, k), device="cpu", dtype=dtype) / 10
+        w2_b = torch.randn((e, k), device="cpu", dtype=torch.float) / 10
         score = torch.randn((m, e), device="cpu", dtype=dtype)
         score = torch.softmax(score, dim=-1, dtype=torch.float32)
         topk_weight, topk_ids = torch.topk(score, topk)
@@ -119,8 +119,8 @@ class TestFusedExperts(CustomTestCase):
             None,  # w1_zp
             None,  # w2_zp
             None,  # block_size
-            w1_b.to(torch.bfloat16),
-            w2_b.to(torch.bfloat16),
+            w1_b,
+            w2_b,
             alpha,
             limit,
             True,  # is_vnni

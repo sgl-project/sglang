@@ -131,29 +131,20 @@ inline void add_mul_stub(
   }
 }
 
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_bias_stub(float* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
+// input = input + input2
+inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ input2, int64_t size) {
   using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
+  constexpr int kVecSize = fVec::size();
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0;
-    x1 = x1 + y1;
-    x0.store(input + d);
-    x1.store(input + d + fVec::size());
+    fVec x_fvec = fVec::loadu(input + d);
+    fVec y_fvec = fVec::loadu(input2 + d);
+    x_fvec = x_fvec + y_fvec;
+    x_fvec.store(input + d);
   }
   for (; d < size; ++d) {
-    input[d] = input[d] + float(input2[d]);
+    input[d] = input[d] + input2[d];
   }
 }
 
@@ -631,8 +622,8 @@ void fused_experts_kernel_impl(
     const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ packed_w1,
     const scalar_t* __restrict__ packed_w2,
-    const scalar_t* __restrict__ w1_bias,
-    const scalar_t* __restrict__ w2_bias,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ expert_ids,
@@ -681,8 +672,8 @@ void fused_experts_kernel_impl(
       int32_t expert_id = expert_ids[mb];
       const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
       const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
-      const scalar_t* __restrict__ B0_bias = w1_bias + expert_id * 2 * N + nb_upper * BLOCK_N;
-      const scalar_t* __restrict__ B1_bias = w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N;
+      const float* __restrict__ B0_bias = w1_bias + expert_id * 2 * N + nb_upper * BLOCK_N;
+      const float* __restrict__ B1_bias = w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -807,7 +798,7 @@ void fused_experts_kernel_impl(
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
+      const float* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
 
       // 2.a gemm: C = A @ B
       if (use_brgemm) {
@@ -1394,7 +1385,6 @@ at::Tensor fused_experts_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
-
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache1,
@@ -1404,8 +1394,8 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<scalar_t>(),
           packed_w2.data_ptr<scalar_t>(),
-          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
-          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+          with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
           topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
