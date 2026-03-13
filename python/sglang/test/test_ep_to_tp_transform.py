@@ -62,7 +62,9 @@ def _make_tiny_config(n_routed_experts: int = 16) -> PretrainedConfig:
     config.n_group = 8
     config.routed_scaling_factor = 2.5
     config.tie_word_embeddings = False
-    config.rope_scaling = None
+    # Transformers >=5.0 maps rope_scaling → rope_parameters via attribute_map.
+    # Provide rope_parameters directly so both old and new transformers work.
+    config.rope_parameters = {"rope_type": "default", "rope_theta": 10000}
     config.pad_token_id = None
     return config
 
@@ -296,6 +298,195 @@ class TestEpToTpTransform(unittest.TestCase):
             )
 
         del model
+        torch.cuda.empty_cache()
+
+    def test_ep_to_tp_shard_dim_fp4_params(self):
+        """_get_ep_to_tp_shard_dim must return correct dims for FP4 block scale params.
+
+        Regression test: w13_weight_scale and w2_weight_scale (without _inv/_1
+        suffix) were previously falling through to the per-tensor catch-all
+        (returning None instead of a shard dim), causing the EP→TP transform to
+        all_gather instead of shard. This left block scales at full size, failing
+        the modelopt post-processing assertion:
+            AssertionError: Expected w2_weight_scale.dim(2) == 16, got 128
+        """
+        config = _make_tiny_config(n_routed_experts=16)
+
+        with torch.device("cuda"):
+            from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+
+            model = DeepseekV3ForCausalLM(config, quant_config=None)
+
+        # Find any MoE layer to test _get_ep_to_tp_shard_dim
+        moe = None
+        for layer in model.model.layers:
+            if hasattr(layer.mlp, "experts") and isinstance(
+                layer.mlp.experts, FusedMoE
+            ):
+                moe = layer.mlp.experts
+                break
+        self.assertIsNotNone(moe, "No FusedMoE layer found in model")
+
+        # FP4 block scales — these MUST return a shard dim (not None)
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale"), 1)
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale"), 2)
+
+        # FP8 block scale variants — also must return a shard dim
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale_inv"), 1)
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale_inv"), 2)
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale1"), 1)
+        self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale1"), 2)
+
+        # FP4 per-tensor scales — must return None (no intermediate dim to shard)
+        self.assertIsNone(moe._get_ep_to_tp_shard_dim("w13_weight_scale_2"))
+        self.assertIsNone(moe._get_ep_to_tp_shard_dim("w2_weight_scale_2"))
+        self.assertIsNone(moe._get_ep_to_tp_shard_dim("w13_input_scale"))
+        self.assertIsNone(moe._get_ep_to_tp_shard_dim("w2_input_scale"))
+
+        # Weights (no scale/bias) — must return a shard dim
+        self.assertIsNotNone(moe._get_ep_to_tp_shard_dim("w13_weight"))
+        self.assertIsNotNone(moe._get_ep_to_tp_shard_dim("w2_weight"))
+
+        del model
+        torch.cuda.empty_cache()
+
+    def test_ep_to_tp_block_scale_shapes(self):
+        """EP→TP transform must correctly shard block-scale-shaped params.
+
+        Simulates FP4 block scale params by manually attaching them to a
+        FusedMoE layer with EP_LOAD state, then verifies the transform
+        produces the expected TP-sharded shapes.
+        """
+        config = _make_tiny_config(n_routed_experts=16)
+        weights = _generate_checkpoint_weights(config)
+
+        tp_size = self.world_size
+        tp_rank = self.rank
+        E = config.n_routed_experts  # 16 total routed experts
+        I = config.moe_intermediate_size  # 256
+        H = config.hidden_size  # 512
+        block_size = 16  # NVFP4 group_size
+
+        # Load model with EP_LOAD to set up internal state
+        with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
+            with torch.device("cuda"):
+                from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+
+                model = DeepseekV3ForCausalLM(config, quant_config=None)
+
+            def weight_iter():
+                for name, tensor in weights:
+                    yield name, tensor.clone()
+
+            model.load_weights(weight_iter())
+
+        # After transform, MoE layers should have normal TP shapes.
+        # Verify that if block scale params existed, they would have been
+        # sharded correctly by checking the restored field values.
+        for layer in model.model.layers:
+            if not hasattr(layer.mlp, "experts") or not isinstance(
+                layer.mlp.experts, FusedMoE
+            ):
+                continue
+            moe = layer.mlp.experts
+
+            # EP→TP should have restored these to normal TP values
+            self.assertEqual(moe.moe_tp_size, tp_size)
+            self.assertEqual(moe.moe_ep_size, 1)
+
+            # The intermediate_size_per_partition should be I / tp_size
+            self.assertEqual(
+                moe.intermediate_size_per_partition,
+                I // tp_size,
+            )
+
+        # Now verify the actual transform logic on block-scale-shaped tensors
+        # by constructing a fresh model with EP_LOAD and manually adding
+        # block scale params before calling ep_to_tp_transform.
+        with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
+            with torch.device("cuda"):
+                model2 = DeepseekV3ForCausalLM(config, quant_config=None)
+
+        # Find a MoE layer (still in EP_LOAD state before load_weights)
+        moe = None
+        for layer in model2.model.layers:
+            if hasattr(layer.mlp, "experts") and isinstance(
+                layer.mlp.experts, FusedMoE
+            ):
+                moe = layer.mlp.experts
+                break
+        self.assertIsNotNone(moe)
+        self.assertTrue(moe._ep_load_for_tp)
+
+        num_shared = moe.num_fused_shared_experts
+        E_local = moe.num_local_experts - num_shared  # experts on this rank
+        E_total = moe.num_experts - num_shared
+        I_blocks = I // block_size  # ceil(I / block_size) for our exact divisor
+        H_blocks = H // block_size
+
+        # Register mock FP4 block scale params on the MoE layer
+        # w13_weight_scale: [E_local + shared, 2*ceil(I/bn), ceil(H/bk)]
+        w13_scale = torch.nn.Parameter(
+            torch.randn(
+                E_local + num_shared, 2 * I_blocks, H_blocks,
+                device="cuda",
+            ).to(torch.float8_e4m3fn)
+        )
+        moe.register_parameter("w13_weight_scale", w13_scale)
+
+        # w2_weight_scale: [E_local + shared, ceil(H/bn), ceil(I/bk)]
+        w2_scale = torch.nn.Parameter(
+            torch.randn(
+                E_local + num_shared, H_blocks, I_blocks,
+                device="cuda",
+            ).to(torch.float8_e4m3fn)
+        )
+        moe.register_parameter("w2_weight_scale", w2_scale)
+
+        # Allocate _ep_to_tp_buf for each param (mimicking _ep_to_tp_transform_all_layers)
+        for name, param in moe.named_parameters():
+            shard_dim = moe._get_ep_to_tp_shard_dim(name)
+            if not hasattr(param, "_ep_to_tp_buf") and name in (
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ):
+                target_shape = list(param.data.shape)
+                target_shape[0] = E_total + num_shared
+                target_shape[shard_dim] = target_shape[shard_dim] // tp_size
+                param._ep_to_tp_buf = torch.empty(
+                    target_shape, dtype=param.data.dtype, device=param.data.device
+                )
+
+        # Also need _ep_to_tp_buf on existing weight params for transform to work
+        for name, param in moe.named_parameters():
+            if hasattr(param, "_ep_to_tp_buf"):
+                continue
+            shard_dim = moe._get_ep_to_tp_shard_dim(name)
+            target_shape = list(param.data.shape)
+            target_shape[0] = E_total + num_shared
+            if shard_dim is not None:
+                target_shape[shard_dim] = target_shape[shard_dim] // tp_size
+            param._ep_to_tp_buf = torch.empty(
+                target_shape, dtype=param.data.dtype, device=param.data.device
+            )
+
+        moe.ep_to_tp_transform()
+
+        # Verify block scale shapes after transform
+        w13_result = dict(moe.named_parameters())["w13_weight_scale"]
+        w2_result = dict(moe.named_parameters())["w2_weight_scale"]
+
+        # w13_weight_scale: [E_total + shared, 2*ceil(I/bn)/tp, ceil(H/bk)]
+        self.assertEqual(w13_result.shape[0], E_total + num_shared)
+        self.assertEqual(w13_result.shape[1], 2 * I_blocks // tp_size)
+        self.assertEqual(w13_result.shape[2], H_blocks)
+
+        # w2_weight_scale: [E_total + shared, ceil(H/bn), ceil(I/bk)/tp]
+        self.assertEqual(w2_result.shape[0], E_total + num_shared)
+        self.assertEqual(w2_result.shape[1], H_blocks)
+        self.assertEqual(w2_result.shape[2], I_blocks // tp_size)
+
+        del model, model2
         torch.cuda.empty_cache()
 
 
