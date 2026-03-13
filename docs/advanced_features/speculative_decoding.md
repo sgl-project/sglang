@@ -392,7 +392,7 @@ Enable it with:
 | `--speculative-ngram-max-match-window-size` | Maximum matching window size. | `12` |
 | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
-| `--speculative-ngram-match-type` | Match type: `"BFS"` or `"PROB"`. | `"BFS"` |
+| `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
 | `--speculative-ngram-branch-length` | How many recent tokens to insert into the cache. | `18` |
 | `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
 
@@ -468,7 +468,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 | `--speculative-ngram-max-match-window-size` | `int` | `12` | Maximum ngram matching window |
 | `--speculative-ngram-min-bfs-breadth` | `int` | `1` | Minimum BFS breadth |
 | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
-| `--speculative-ngram-match-type` | `str` | `"BFS"` | Match type: `"BFS"` or `"PROB"` |
+| `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
 | `--speculative-ngram-branch-length` | `int` | `18` | Recent tokens to insert into cache |
 | `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
 
