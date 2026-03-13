@@ -2283,9 +2283,10 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
-
+            
+        can_run_set = set(can_run_list)
         self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
+            x for x in self.waiting_queue if x not in can_run_set
         ]
         if adder.preempt_list:
             for req in adder.preempt_list:
