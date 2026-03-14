@@ -8,6 +8,8 @@ description: Step-by-step guide for adding a new Triton kernel to SGLang Diffusi
 This guide walks through adding a Triton kernel to `python/sglang/jit_kernel/diffusion/triton/`.
 We use a fused elementwise operation as the running example: `y = x * (1 + scale) + shift` (AdaLN modulation).
 
+Before compiling, benchmarking, or profiling any Triton kernel from this guide, use `scripts/diffusion_skill_env.py` (or the setup block in `diffusion-benchmark-and-profile.md`) to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and choose an idle GPU.
+
 ---
 
 ## Directory Layout

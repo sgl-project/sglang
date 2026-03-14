@@ -116,6 +116,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            is_nextn=moe_runner_config.is_nextn,
         )
     elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
@@ -194,6 +195,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        is_nextn: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -269,6 +271,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            is_nextn=is_nextn,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

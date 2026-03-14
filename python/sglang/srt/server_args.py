@@ -105,6 +105,7 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
@@ -1546,7 +1547,8 @@ class ServerArgs:
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                     and (
-                        self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                        self.quantization
+                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
                     )
                 ):
@@ -1819,15 +1821,19 @@ class ServerArgs:
                 "modelopt",
                 "modelopt_fp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
             ]:
                 assert model_config.hf_config.mlp_hidden_act == "relu2"
                 if model_config.quantization == "modelopt":
-                    self.quantization = (
-                        "modelopt_fp4"
-                        if model_config.hf_config.quantization_config["quant_algo"]
-                        == "NVFP4"
-                        else "modelopt_fp8"
-                    )
+                    quant_algo = model_config.hf_config.quantization_config[
+                        "quant_algo"
+                    ]
+                    if quant_algo == "MIXED_PRECISION":
+                        self.quantization = "modelopt_mixed"
+                    else:
+                        self.quantization = (
+                            "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
+                        )
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
@@ -2479,8 +2485,9 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2492,9 +2499,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."

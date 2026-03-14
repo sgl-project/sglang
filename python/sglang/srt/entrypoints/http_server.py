@@ -1617,12 +1617,22 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
 
 ##### Ollama-compatible API endpoints #####
 
+_ollama_root_route = os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE")
+if _ollama_root_route is not None:
 
-@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-async def ollama_root():
-    """Ollama-compatible root endpoint for health check."""
-    return "Ollama is running"
+    @app.get(_ollama_root_route)
+    @app.head(_ollama_root_route)
+    async def ollama_root():
+        """Ollama-compatible root endpoint."""
+        return "Ollama is running"
+
+else:
+
+    @app.get("/")
+    @app.head("/")
+    async def sglang_root():
+        """Default root endpoint."""
+        return "SGLang is running"
 
 
 @app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
