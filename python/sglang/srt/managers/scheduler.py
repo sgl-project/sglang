@@ -2088,7 +2088,7 @@ class Scheduler(
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
-        if new_batch is not None:
+        if new_batch is not None and len(new_batch.reqs) != 0:
             # Run prefill first if possible
             ret = new_batch
         else:
