@@ -172,7 +172,9 @@ class QwenImageResample(nn.Module):
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        if feat_idx is None:
+            feat_idx = []
         b, c, t, h, w = x.size()
         if self.mode == "upsample3d":
             if feat_cache is not None:
@@ -272,8 +274,10 @@ class QwenImageResidualBlock(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=None):
         # Apply shortcut connection
+        if feat_idx is None:
+            feat_idx = []
         h = self.conv_shortcut(x)
 
         # First normalization and activation
