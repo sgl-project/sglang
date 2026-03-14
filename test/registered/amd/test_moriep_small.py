@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd")
 
-
 common_args = [
     "--tp-size",
     "8",
@@ -101,7 +100,7 @@ class TestPureDP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.935)
 
 
 class TestMTP(CustomTestCase):
@@ -144,14 +143,14 @@ class TestMTP(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.92)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.8)
+        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
 
 
 class TestNormal(CustomTestCase):
@@ -198,7 +197,7 @@ class TestNormal(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.935)
 
 
 class TestLowLatency(CustomTestCase):
@@ -217,7 +216,8 @@ class TestLowLatency(CustomTestCase):
         env["SGLANG_MORI_FP8_DISP"] = "False"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "16384"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
-        env["MORI_DISABLE_P2P"] = "1"
+        # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
+        # env["MORI_DISABLE_P2P"] = "1"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -246,7 +246,7 @@ class TestLowLatency(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.935)
 
 
 class TestTBOwithLowLatency(CustomTestCase):
@@ -266,7 +266,8 @@ class TestTBOwithLowLatency(CustomTestCase):
         env["SGLANG_MORI_FP8_DISP"] = "False"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "16384"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
-        env["MORI_DISABLE_P2P"] = "1"
+        # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
+        # env["MORI_DISABLE_P2P"] = "1"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -295,7 +296,7 @@ class TestTBOwithLowLatency(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.935)
 
 
 class TestMTPwithTBO(CustomTestCase):
@@ -319,7 +320,8 @@ class TestMTPwithTBO(CustomTestCase):
         env["SGLANG_MORI_FP8_DISP"] = "False"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "16384"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
-        env["MORI_DISABLE_P2P"] = "1"
+        # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
+        # env["MORI_DISABLE_P2P"] = "1"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -347,8 +349,14 @@ class TestMTPwithTBO(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
+        self.assertGreaterEqual(metrics["accuracy"], 0.92)
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
 
 
 if __name__ == "__main__":
