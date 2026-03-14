@@ -15,7 +15,7 @@ inline void register_custom_all_reduce() {
   namespace refl = tvm::ffi::reflection;
   using Class = host::distributed::CustomAllReduceBase;
   refl::ObjectDef<Class>()
-      .def(refl::init<uint32_t, uint32_t, uint32_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<uint32_t, uint32_t, uint32_t, uint32_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("share_storage", &Class::share_storage)
       .def("share_graph_inputs", &Class::share_graph_inputs)
       .def("post_init", &Class::post_init)
@@ -23,6 +23,5 @@ inline void register_custom_all_reduce() {
       .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)
       .def("free_ipc_handles", &Class::free_ipc_handles)
       .def("free_storage", &Class::free_storage)
-      .def("reset_graph", &Class::reset_graph)
-      .def("configure", &Class::configure);
+      .def("configure_pull", &Class::configure_pull);
 }

@@ -78,7 +78,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   CustomAllReduceBase(
       uint32_t rank,
       uint32_t num_gpu,
-      uint32_t max_num_cta,
+      uint32_t max_num_cta_pull,
+      uint32_t max_num_cta_push,
       int64_t pull_buffer_size,
       int64_t push_buffer_size,
       int64_t graph_buffer_count)
@@ -87,16 +88,17 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         m_graph_buffer_count(graph_buffer_count),
         m_rank(rank),
         m_num_gpu(num_gpu),
-        m_max_num_cta(max_num_cta),
-        m_num_cta(0),
-        m_cta_size(0) {
+        m_max_num_cta_pull(max_num_cta_pull),
+        m_max_num_cta_push(max_num_cta_push),
+        // default config for pull kernel, can be updated by `configure()`
+        m_num_cta(max_num_cta_pull),
+        m_cta_size(256) {
     RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
     RuntimeCheck(rank < num_gpu, "Invalid rank: ", rank);
     const int64_t kU32Max = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
     const int64_t push_buffer_size_all = push_all_ranks_bytes();
     RuntimeCheck(pull_buffer_size <= kU32Max, "Buffer size is too large: ", pull_buffer_size);
     RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
-    this->configure(max_num_cta, 256);  // set default config
   }
 
   ExternHandle share_storage() {
@@ -140,7 +142,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
 
     // set signal buffer to zero
     const auto pull_signal = get_pull_signal(m_storage);
-    RuntimeDeviceCheck(cudaMemset(pull_signal, 0, signal_bytes()));
+    RuntimeDeviceCheck(cudaMemset(pull_signal, 0, pull_signal_bytes()));
 
     // update the pull controller and data pointer
     RuntimeCheck(!m_pull_ctrl.has_value(), "Controller is already initialized");
@@ -155,7 +157,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     // update the push controller and data pointer
     RuntimeCheck(!m_push_ctrl.has_value(), "Controller is already initialized");
     const auto push_signal = get_push_signal(m_storage);
-    RuntimeDeviceCheck(cudaMemset(push_signal, 0, signal_bytes()));
+    RuntimeDeviceCheck(cudaMemset(push_signal, 0, push_signal_bytes()));
     m_push_ctrl.emplace(push_signal);
     const auto push_buffer = get_push_buffer(m_storage);
     RuntimeDeviceCheck(cudaMemset(push_buffer, 0, push_all_ranks_bytes()));
@@ -221,15 +223,10 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     m_storage = nullptr;
   }
 
-  void reset_graph() {
-    m_graph_capture_inputs.clear();
-    m_cum_registered_count = 0;
-  }
-
-  tvm::ffi::Tuple<uint32_t, uint32_t> configure(uint32_t num_cta, uint32_t cta_size) {
+  tvm::ffi::Tuple<uint32_t, uint32_t> configure_pull(uint32_t num_cta, uint32_t cta_size) {
     using host::RuntimeCheck;
     const auto min_cta_size = m_num_gpu * device::kWarpThreads;
-    RuntimeCheck(num_cta > 0 && num_cta <= m_max_num_cta, "Invalid number of CTAs: ", num_cta);
+    RuntimeCheck(num_cta > 0 && num_cta <= m_max_num_cta_pull, "Invalid number of CTAs: ", num_cta);
     RuntimeCheck(cta_size >= min_cta_size, "Block size must be at least ", min_cta_size);
     const auto old_num_cta = m_num_cta;
     const auto old_block_size = m_cta_size;
@@ -254,8 +251,11 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   int64_t registered_count() const {
     return static_cast<int64_t>(m_graph_capture_inputs.size());
   }
-  int64_t signal_bytes() const {
-    return sizeof(device::distributed::Semaphore) * m_max_num_cta;
+  int64_t pull_signal_bytes() const {
+    return sizeof(device::distributed::Semaphore) * m_max_num_cta_pull;
+  }
+  int64_t push_signal_bytes() const {
+    return sizeof(device::distributed::Semaphore) * m_max_num_cta_push;
   }
   int64_t params_bytes() const {
     return sizeof(AllReduceData) * (1 + m_graph_buffer_count);  // 1 for default
@@ -264,7 +264,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     return PushController::kNumStages * m_num_gpu * m_push_buffer_bytes;
   }
   int64_t storage_bytes() const {
-    // | SignalArray (push + pull) | GraphBuffers (params) | pull buffer | push buffer |
+    // | SignalArray (pull + push) | GraphBuffers (pull params) | Buffers (pull + push) |
     return _get_offset_impl(5);
   }
   void* get_pull_signal(void* ptr) const {
@@ -284,8 +284,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
   int64_t _get_offset_impl(int64_t which) const {
     const int64_t offset_map[5] = {
-        /*[0]=*/signal_bytes(),
-        /*[1]=*/signal_bytes(),
+        /*[0]=*/pull_signal_bytes(),
+        /*[1]=*/push_signal_bytes(),
         /*[2]=*/params_bytes(),
         /*[3]=*/m_pull_buffer_bytes,
         /*[4]=*/push_all_ranks_bytes(),
@@ -299,9 +299,12 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   const int64_t m_graph_buffer_count;
   const uint32_t m_rank;
   const uint32_t m_num_gpu;
-  const uint32_t m_max_num_cta;
+  const uint32_t m_max_num_cta_pull;
+  const uint32_t m_max_num_cta_push;
+  // these 2 config should only affect pull kernel
   uint32_t m_num_cta;
   uint32_t m_cta_size;
+  // other states
   bool m_is_graph_capturing = false;
   int64_t m_cum_registered_count = 0;
   std::optional<PullController> m_pull_ctrl;

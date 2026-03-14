@@ -203,7 +203,7 @@ struct CustomAllReducePush : public CustomAllReduceBase {
     const auto input_ptr = input.data_ptr();
     const auto num_items_int64 = input.numel();
     const auto num_items = static_cast<uint32_t>(num_items_int64);
-    const auto num_blocks = m_max_num_cta;  // must be constant to ensure correctness
+    const auto num_blocks = m_max_num_cta_push;  // must be constant to ensure correctness
     const auto num_threads = [&] {
       for (const auto t : {128u, 256u, 512u}) {
         if (t * num_blocks * 2 * kVecSize >= num_items) return t;

@@ -37,6 +37,7 @@ class CustomAllReduceV2:
         max_push_size: Optional[int] = None,
     ) -> None:
         _init_config()
+        self.disabled = True
         full_nvlink = can_use_custom_all_reduce_with_nvlink(
             group=group,
             device=device,
@@ -47,7 +48,6 @@ class CustomAllReduceV2:
             return
 
         self.group = group
-        self.disabled = True
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
         self.override_shot(None)
@@ -60,10 +60,10 @@ class CustomAllReduceV2:
         self.max_push_size = max_push_size
         self.override_algo: Optional[AllReduceAlgo] = None
         self.obj = get_custom_all_reduce_cls()(
-            self.rank,
-            self.world_size,
-            self.max_pull_size,
-            self.max_push_size,
+            rank=self.rank,
+            world_size=self.world_size,
+            pull_buffer_bytes=self.max_pull_size,
+            push_buffer_bytes=self.max_push_size,
             graph_input_count=131072,
         )
         self._post_init_obj()
@@ -168,8 +168,8 @@ def _init_config():
             4: ModeConfig(2 * MB, 2 * MB),
             5: ModeConfig(2 * MB, 2 * MB),
             6: ModeConfig(1 * MB, 1 * MB),
-            7: ModeConfig(7 * 128 * KB, 7 * 128 * KB),
-            8: ModeConfig(6 * 128 * KB, 6 * 128 * KB),
+            7: ModeConfig(896 * KB, 896 * KB),
+            8: ModeConfig(720 * KB, 720 * KB),
         }
     else:
         THRESHOLD_2_SHOT_MAP = {
