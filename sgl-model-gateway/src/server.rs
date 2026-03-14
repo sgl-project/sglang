@@ -53,6 +53,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
+        anthropic::{AnthropicCountTokensRequest, AnthropicMessagesRequest},
         conversations,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
@@ -256,6 +257,55 @@ async fn v1_classify(
     state
         .router
         .route_classify(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let routing: AnthropicMessagesRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("Invalid request body: {}", e)
+                    }
+                })),
+            )
+                .into_response()
+        }
+    };
+    crate::routers::anthropic::router::proxy(&state.context, &headers, &routing, body).await
+}
+
+async fn v1_anthropic_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let routing: AnthropicCountTokensRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("Invalid request body: {}", e)
+                    }
+                })),
+            )
+                .into_response()
+        }
+    };
+    crate::routers::anthropic::router::proxy_count_tokens(&state.context, &headers, &routing, body)
         .await
 }
 
@@ -561,6 +611,11 @@ pub fn build_app(
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
+        .route("/v1/messages", post(v1_anthropic_messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(v1_anthropic_count_tokens),
+        )
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
