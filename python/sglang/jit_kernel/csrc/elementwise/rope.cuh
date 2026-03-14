@@ -20,7 +20,8 @@ struct FusedRopeParams {
   const void* __restrict__ positions;
   int64_t q_stride_bytes;
   int64_t k_stride_bytes;
-  int64_t head_stride_bytes;
+  int64_t q_head_stride_bytes;
+  int64_t k_head_stride_bytes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   uint32_t num_tokens;
@@ -60,7 +61,7 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
 
   const auto &[
     q, k, cos_sin_cache_ptr, positions, // pointers
-    q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
+    q_stride_bytes, k_stride_bytes, q_head_stride_bytes, k_head_stride_bytes,  // strides
     num_qo_heads, num_kv_heads, num_tokens // dimensions
   ] = params;
 
@@ -85,9 +86,10 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
     const int64_t head_id = idx % num_q_and_k_heads;
     const auto pos = static_cast<const IdType*>(positions)[token_id];
     const auto load_q = head_id < num_qo_heads;
+    const auto head_stride = load_q ? q_head_stride_bytes : k_head_stride_bytes;
     const auto input_ = load_q ? pointer::offset(q, token_id * q_stride_bytes)  //
                                : pointer::offset(k, token_id * k_stride_bytes);
-    const auto input = pointer::offset(input_, head_id * head_stride_bytes);
+    const auto input = pointer::offset(input_, head_id * head_stride);
     const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
     const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
     if constexpr (kIsNeox) {
@@ -148,7 +150,7 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
   const auto &[
     q, k, cos_sin_cache_ptr, positions, // pointers
-    q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
+    q_stride_bytes, k_stride_bytes, q_head_stride_bytes, k_head_stride_bytes,  // strides
     num_qo_heads, num_kv_heads, num_tokens // dimensions
   ] = base_params;
 
@@ -166,8 +168,9 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   auto idx = start_worker_id;
 
   PDLWaitPrimary<kUsePDL>();
-  // in this case, head_dim = rope_dim must be true
-  __builtin_assume(head_stride_bytes == kRopeDim * sizeof(DType));
+  // in the fused path, head_dim = rope_dim must be true for both q and k
+  __builtin_assume(q_head_stride_bytes == kRopeDim * sizeof(DType));
+  __builtin_assume(k_head_stride_bytes == kRopeDim * sizeof(DType));
 
   for (; idx < num_works; idx += num_workers) {
     const int64_t token_id = idx / num_q_and_k_heads;
@@ -175,9 +178,10 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
     const auto pos = static_cast<const IdType*>(positions)[token_id];
     const auto loc = static_cast<const IdType*>(out_loc)[token_id];
     const auto load_q = head_id < num_qo_heads;
+    const auto head_stride = load_q ? q_head_stride_bytes : k_head_stride_bytes;
     const auto input_ = load_q ? pointer::offset(q, token_id * q_stride_bytes)  //
                                : pointer::offset(k, token_id * k_stride_bytes);
-    const auto input = pointer::offset(input_, head_id * head_stride_bytes);
+    const auto input = pointer::offset(input_, head_id * head_stride);
     const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
     const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
     if constexpr (kIsNeox) {
@@ -205,7 +209,7 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
       const auto input_y_out = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
       store_as<InputStorage>(input_y_out, input_vec_y, lane_id);
       if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * k_head_stride_bytes);
         store_as<InputStorage>(k_out, input_vec_x, lane_id);
         const auto k_out_y = pointer::offset(k_out, (kRopeDim / 2) * sizeof(DType));
         store_as<InputStorage>(k_out_y, input_vec_y, lane_id);
@@ -226,7 +230,7 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
       }
       store_as<InputStorage>(input, input_vec, lane_id);
       if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * k_head_stride_bytes);
         store_as<InputStorage>(k_out, input_vec, lane_id);
       }
     }
@@ -239,9 +243,9 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
     const int64_t token_id = idx / num_kv_heads;
     const int64_t head_id = idx % num_kv_heads;
     const auto loc = static_cast<const IdType*>(out_loc)[token_id];
-    const auto input = pointer::offset(v_ptr, token_id * v_stride_bytes, head_id * head_stride_bytes);
+    const auto input = pointer::offset(v_ptr, token_id * v_stride_bytes, head_id * k_head_stride_bytes);
     const auto input_vec = load_as<VStorage>(input, lane_id);
-    const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+    const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * k_head_stride_bytes);
     store_as<VStorage>(output, input_vec, lane_id);
   }
   PDLTriggerSecondary<kUsePDL>();
@@ -277,18 +281,19 @@ struct FusedRopeKernel {
     auto D = SymbolicSize{"rope_dim"};
     auto Dq = SymbolicSize{"q_stride"};
     auto Dk = SymbolicSize{"k_stride"};
-    auto Dd = SymbolicSize{"head_stride"};
+    auto Dd_q = SymbolicSize{"q_head_stride"};
+    auto Dd_k = SymbolicSize{"k_head_stride"};
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
     D.set_value(kRopeDim);
     device.set_options<kDLCUDA>();
     TensorMatcher({N, Q, D})  // q input
-        .with_strides({Dq, Dd, 1})
+        .with_strides({Dq, Dd_q, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
-        .with_strides({Dk, Dd, 1})
+        .with_strides({Dk, Dd_k, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(k);
@@ -306,10 +311,13 @@ struct FusedRopeKernel {
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
     const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
-    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+    const auto q_head_stride_bytes = static_cast<int64_t>(Dd_q.unwrap() * sizeof(DType));
+    const auto k_head_stride_bytes = static_cast<int64_t>(Dd_k.unwrap() * sizeof(DType));
 
-    // NOTE: we offset the k here to reduce computation cost in the kernel
-    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    // NOTE: we offset the k here to reduce computation cost in the kernel.
+    // Must use k's head stride for the offset since the kernel indexes k
+    // heads with k_head_stride_bytes.
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * k_head_stride_bytes;
     const auto params = FusedRopeParams{
         .q_ptr = q.data_ptr(),
         .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
@@ -317,7 +325,8 @@ struct FusedRopeKernel {
         .positions = positions.data_ptr(),
         .q_stride_bytes = q_stride_bytes,
         .k_stride_bytes = k_stride_bytes,
-        .head_stride_bytes = head_stride_bytes,
+        .q_head_stride_bytes = q_head_stride_bytes,
+        .k_head_stride_bytes = k_head_stride_bytes,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
         .num_tokens = num_tokens,
@@ -373,7 +382,8 @@ struct FusedRopeKernel {
     auto Dq = SymbolicSize{"q_stride"};
     auto Dk = SymbolicSize{"k_stride"};
     auto Dv = SymbolicSize{"v_stride"};
-    auto Dd = SymbolicSize{"head_stride"};
+    auto Dd_q = SymbolicSize{"q_head_stride"};
+    auto Dd_k = SymbolicSize{"k_head_stride"};
     auto Dc = SymbolicSize{"cache_stride"};
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
@@ -381,17 +391,17 @@ struct FusedRopeKernel {
     device.set_options<kDLCUDA>();
 
     TensorMatcher({N, Q, D})  // q input
-        .with_strides({Dq, Dd, 1})
+        .with_strides({Dq, Dd_q, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
-        .with_strides({Dk, Dd, 1})
+        .with_strides({Dk, Dd_k, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(k);
     TensorMatcher({N, K, D})  // v input
-        .with_strides({Dv, Dd, 1})
+        .with_strides({Dv, Dd_k, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(v);
@@ -416,15 +426,18 @@ struct FusedRopeKernel {
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
     const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
-    const auto head_stride = Dd.unwrap();
+    const auto q_head_stride = Dd_q.unwrap();
+    const auto k_head_stride = Dd_k.unwrap();
     const auto row_dim = R.unwrap();
-    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+    const auto q_head_stride_bytes = static_cast<int64_t>(q_head_stride * sizeof(DType));
+    const auto k_head_stride_bytes = static_cast<int64_t>(k_head_stride * sizeof(DType));
 
-    RuntimeCheck(kRopeDim == head_stride, "rope_dim ", kRopeDim, " should = head_stride ", head_stride);
+    RuntimeCheck(kRopeDim == q_head_stride, "rope_dim ", kRopeDim, " should = q_head_stride ", q_head_stride);
+    RuntimeCheck(kRopeDim == k_head_stride, "rope_dim ", kRopeDim, " should = k_head_stride ", k_head_stride);
     RuntimeCheck(num_kv_heads * kRopeDim == row_dim, "invalid kvcache");
 
     // NOTE: we offset the k here to reduce computation cost in the kernel
-    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * k_head_stride_bytes;
     const auto params = FusedRopeParams{
         .q_ptr = q.data_ptr(),
         .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
@@ -432,7 +445,8 @@ struct FusedRopeKernel {
         .positions = positions.data_ptr(),
         .q_stride_bytes = q_stride_bytes,
         .k_stride_bytes = k_stride_bytes,
-        .head_stride_bytes = head_stride_bytes,
+        .q_head_stride_bytes = q_head_stride_bytes,
+        .k_head_stride_bytes = k_head_stride_bytes,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
         .num_tokens = num_tokens,
@@ -443,7 +457,7 @@ struct FusedRopeKernel {
     const auto store_params = FusedRopeStoreParams{
         .base_params = params,
         .v_ptr = v.data_ptr(),
-        .k_cache = pointer::offset(k_cache.data_ptr(), -k_offset),
+        .k_cache = pointer::offset(k_cache.data_ptr(), -static_cast<int64_t>(num_qo_heads) * k_head_stride_bytes),
         .v_cache = v_cache.data_ptr(),
         .out_loc = out_loc.data_ptr(),
         .v_stride_bytes = v_stride_bytes,
