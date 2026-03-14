@@ -22,6 +22,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from flashinfer.gemm import tinygemm_bf16
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -97,6 +98,26 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
+class GptOssRouterLinear(ReplicatedLinear):
+    """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path."""
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            x.ndim == 2
+            and x.is_cuda
+            and torch.cuda.get_device_capability(x.device)[0] >= 9
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and (self.bias is None or self.bias.dtype == torch.bfloat16)
+            and not self.skip_bias_add
+        ):
+            out = x.new_empty((x.shape[0], self.output_size))
+            tinygemm_bf16(x, self.weight, out, self.bias)
+            return out, None
+
+        return super().forward(x)
+
+
 class GptOssSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -147,7 +168,7 @@ class GptOssSparseMoeBlock(nn.Module):
             **extra_kwargs,
         )
 
-        self.router = ReplicatedLinear(
+        self.router = GptOssRouterLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
