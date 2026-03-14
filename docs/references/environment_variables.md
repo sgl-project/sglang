@@ -76,8 +76,6 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
 | `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
-| `SGLANG_MORI_NEXTN_FP8_DISP` | Use FP8 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
-| `SGLANG_MORI_NEXTN_FP4_DISP` | Use MXFP4 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
