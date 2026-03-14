@@ -1,4 +1,4 @@
-#include "pytorch_extension_utils.h"
+#include <ATen/cuda/CUDAContext.h>
 #include "utils.h"
 
 template <typename T>
