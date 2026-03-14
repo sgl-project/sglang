@@ -24,7 +24,7 @@ INF = 1 << 60
 
 @dataclass(frozen=True)
 class ModeConfig:
-    one_shot_push_threshold: int  # below this, use push
+    one_shot_push_threshold: int  # below this, use one-shot push
     one_shot_pull_threshold: int  # below this, use one-shot pull
 
 
