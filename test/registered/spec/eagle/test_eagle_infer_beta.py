@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.kits.logprob_kit import LogprobCrossModeMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
@@ -19,10 +20,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=283, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=400, suite="stage-b-test-small-1-gpu")
 
 
-class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
+class TestEagleServerBase(CustomTestCase, MatchedStopMixin, LogprobCrossModeMixin):
+    logprob_decimal_places = 2
+    logprob_decimal_places = 2
+    logprob_decimal_places = 2
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5

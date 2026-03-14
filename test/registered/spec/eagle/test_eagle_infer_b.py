@@ -18,6 +18,7 @@ from sglang.test.kits.abort_timeout_kit import (
     RunningTimeoutTwoWaveMixin,
     WaitingTimeoutMixin,
 )
+from sglang.test.kits.logprob_kit import LogprobCrossModeMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
@@ -374,6 +375,11 @@ class TestEAGLERunningTimeout(RunningTimeoutTwoWaveMixin, EagleServerBase):
     def setUpClass(cls):
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(3):
             super().setUpClass()
+
+
+class TestEAGLELogprobCrossMode(EagleServerBase, LogprobCrossModeMixin):
+    logprob_decimal_places = 2
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
 
 if __name__ == "__main__":
