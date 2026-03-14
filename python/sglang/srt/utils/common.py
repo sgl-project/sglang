@@ -2278,24 +2278,9 @@ def set_gpu_proc_affinity(
         allowed_cpu_ids = None
     if allowed_cpu_ids:
         allowed_cpu_ids = sorted(set(allowed_cpu_ids))
-        total_allowed = len(allowed_cpu_ids)
-        num_cores_bind = max(total_allowed // tp_size_per_node, 1)
-        start_idx = (gpu_id * num_cores_bind) % total_allowed
-        end_idx = start_idx + num_cores_bind
-        if end_idx <= total_allowed:
-            bind_cpu_ids = allowed_cpu_ids[start_idx:end_idx]
-        else:
-            bind_cpu_ids = (
-                allowed_cpu_ids[start_idx:] + allowed_cpu_ids[: end_idx - total_allowed]
-            )
-        p.cpu_affinity(bind_cpu_ids)
-        logger.info(
-            "Process %s gpu_id %s is running on CPUs: %s",
-            pid,
-            gpu_id,
-            p.cpu_affinity(),
-        )
-        return
+        allowed_cpu_set = set(allowed_cpu_ids)
+    else:
+        allowed_cpu_set = None
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -2314,6 +2299,22 @@ def set_gpu_proc_affinity(
     else:
         # HT off
         bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    if allowed_cpu_set:
+        filtered = [id for id in bind_cpu_ids if id in allowed_cpu_set]
+        if filtered:
+            bind_cpu_ids = filtered
+        else:
+            total_allowed = len(allowed_cpu_ids)
+            num_cores_bind = max(total_allowed // tp_size_per_node, 1)
+            start_idx = (gpu_id * num_cores_bind) % total_allowed
+            end_idx = start_idx + num_cores_bind
+            if end_idx <= total_allowed:
+                bind_cpu_ids = allowed_cpu_ids[start_idx:end_idx]
+            else:
+                bind_cpu_ids = (
+                    allowed_cpu_ids[start_idx:] + allowed_cpu_ids[: end_idx - total_allowed]
+                )
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
