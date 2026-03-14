@@ -409,6 +409,7 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    forward_pass_metrics_port: Optional[int] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -4033,6 +4034,13 @@ class ServerArgs:
             type=str,
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-port",
+            type=int,
+            default=None,
+            help="Base TCP port for per-iteration forward pass metrics ZMQ publisher. "
+            "Each DP rank binds on port + dp_rank. Disabled when not set.",
         )
         parser.add_argument(
             "--enable-trace",

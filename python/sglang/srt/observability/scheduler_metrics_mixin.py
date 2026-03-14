@@ -160,6 +160,29 @@ class SchedulerMetricsMixin:
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
 
+        # Forward Pass Metrics (FPM) -- per-iteration scheduler telemetry
+        self.enable_fpm = False
+        fpm_base_port = self.server_args.forward_pass_metrics_port
+        if fpm_base_port is not None and self.attn_tp_rank == 0:
+            from sglang.srt.observability.forward_pass_metrics import (
+                _FpmPublisherThread,
+            )
+
+            self._fpm_dp_rank = self.dp_rank if self.dp_rank is not None else 0
+            port = fpm_base_port + self._fpm_dp_rank
+            self._fpm_worker_id = ""
+            self._fpm_publisher = _FpmPublisherThread(
+                f"tcp://*:{port}",
+                worker_id=self._fpm_worker_id,
+                dp_rank=self._fpm_dp_rank,
+            )
+            self.enable_fpm = True
+            logger.info(
+                "FPM: ZMQ PUB bound on tcp://*:%d (dp_rank=%d)",
+                port,
+                self._fpm_dp_rank,
+            )
+
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
@@ -605,6 +628,80 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def _emit_forward_pass_metrics(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        wall_time: float,
+    ):
+        """Emit per-iteration ForwardPassMetrics over ZMQ PUB."""
+        if not self.enable_fpm:
+            return
+
+        from sglang.srt.observability.forward_pass_metrics import (
+            ForwardPassMetrics,
+            QueuedRequestMetrics,
+            ScheduledRequestMetrics,
+            WelfordAccumulator,
+        )
+
+        # Scheduled requests
+        if batch.forward_mode.is_extend():
+            prefill_lengths = WelfordAccumulator()
+            for req in batch.reqs:
+                prefill_lengths.add(len(req.origin_input_ids))
+
+            stats = batch.prefill_stats
+            scheduled = ScheduledRequestMetrics(
+                num_prefill_requests=stats.num_new_seqs if stats else len(batch.reqs),
+                sum_prefill_tokens=stats.log_input_tokens if stats else 0,
+                sum_prefill_kv_tokens=stats.log_hit_tokens if stats else 0,
+                var_prefill_length=prefill_lengths.variance(),
+            )
+        elif batch.forward_mode.is_decode():
+            decode_kv = WelfordAccumulator()
+            for sl in batch.seq_lens_cpu:
+                decode_kv.add(int(sl))
+
+            scheduled = ScheduledRequestMetrics(
+                num_decode_requests=decode_kv.n,
+                sum_decode_kv_tokens=decode_kv.s,
+                var_decode_kv_tokens=decode_kv.variance(),
+            )
+        else:
+            scheduled = ScheduledRequestMetrics()
+
+        # Queued requests
+        prefill_q = WelfordAccumulator()
+        decode_q = WelfordAccumulator()
+        for req in self.waiting_queue:
+            if len(req.output_ids) > 0:
+                decode_q.add(req.seqlen)
+            else:
+                prefill_q.add(len(req.origin_input_ids))
+
+        queued = QueuedRequestMetrics(
+            num_prefill_requests=prefill_q.n,
+            sum_prefill_tokens=prefill_q.s,
+            var_prefill_length=prefill_q.variance(),
+            num_decode_requests=decode_q.n,
+            sum_decode_kv_tokens=decode_q.s,
+            var_decode_kv_tokens=decode_q.variance(),
+        )
+
+        fpm = ForwardPassMetrics(
+            worker_id=self._fpm_worker_id,
+            dp_rank=self._fpm_dp_rank,
+            wall_time=wall_time,
+            scheduled_requests=scheduled,
+            queued_requests=queued,
+        )
+        self._fpm_publisher.publish(fpm)
+
+    def _shutdown_fpm(self: Scheduler):
+        """Shut down the FPM publisher thread."""
+        if self.enable_fpm:
+            self._fpm_publisher.shutdown()
 
     def _log_hicache_stats(self: Scheduler):
         """Populate HiCache host-tier stats on self.stats.
