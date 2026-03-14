@@ -638,13 +638,12 @@ class Engine(EngineBase):
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
             scheduler_init_result.wait_for_ready()
-
+            # Sync the scheduler infos back to zero rank node without storing locally.
             if server_args.nnodes > 1:
-                scheduler_init_result.scheduler_infos[:] = (
-                    _sync_scheduler_infos_across_nodes(
-                        server_args, scheduler_init_result.scheduler_infos
-                    )
+                _sync_scheduler_infos_across_nodes(
+                    server_args, scheduler_init_result.scheduler_infos
                 )
+                
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
