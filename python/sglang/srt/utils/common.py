@@ -505,6 +505,38 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+# ---------------------------------------------------------------------------
+# UVM evictable memory registry
+#
+# On PCIe-attached discrete GPUs, cudaMemPrefetchAsync(→CPU) may not
+# immediately return physical GPU pages to the free pool.  The UVM driver
+# tends to keep CPU-preferred pages cached in GPU VRAM until a regular
+# cudaMalloc triggers eviction.  This means torch.cuda.mem_get_info()
+# under-reports available memory after UVM expert offloading is initialised,
+# causing SGLang's init_memory_pool check to raise a false "not enough
+# memory" error.
+#
+# ExpertOffloadManager calls register_uvm_evictable_memory() after each
+# layer's UVM setup to record the bytes it has placed in CPU-preferred
+# managed memory.  get_available_gpu_memory() adds these bytes to the
+# reported available memory.  When SGLang's KV-cache allocator then issues
+# actual cudaMalloc calls, the UVM driver evicts those pages on-demand —
+# exactly as designed.
+# ---------------------------------------------------------------------------
+_uvm_evictable_bytes: dict = {}  # {gpu_id: int (bytes)}
+
+
+def register_uvm_evictable_memory(gpu_id: int, nbytes: int) -> None:
+    """Register UVM-managed bytes that are logically available for gpu_id.
+
+    Called by ExpertOffloadManager after migrating offloaded expert pages to
+    CPU-preferred managed memory.  The bytes are included in
+    get_available_gpu_memory() so SGLang's memory-pool check accounts for
+    memory the UVM driver will evict on-demand.
+    """
+    _uvm_evictable_bytes[gpu_id] = _uvm_evictable_bytes.get(gpu_id, 0) + nbytes
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -598,6 +630,14 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+
+    # Add UVM-evictable bytes: CPU-preferred managed pages that the UVM driver
+    # has cached in GPU physical memory.  They will be evicted on-demand when
+    # regular cudaMalloc requests exceed the currently-free physical pages.
+    if device == "cuda":
+        extra = _uvm_evictable_bytes.get(gpu_id, 0)
+        if extra:
+            free_gpu_memory = free_gpu_memory + extra
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)

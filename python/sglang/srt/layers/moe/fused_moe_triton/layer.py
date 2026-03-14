@@ -31,6 +31,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.expert_offload import (
+    ExpertOffloadWrapperMethod,
+    create_expert_offload_config_from_server_args,
+)
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
@@ -278,6 +282,14 @@ class FusedMoE(torch.nn.Module):
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
                     self.use_triton_kernels, self.use_flashinfer_trtllm_moe
+                )
+            # Wrap with expert offloading if enabled (mutually exclusive with KT).
+            offload_config = create_expert_offload_config_from_server_args(
+                server_args, layer_id, self.num_local_experts
+            )
+            if offload_config is not None:
+                self.quant_method = ExpertOffloadWrapperMethod(
+                    self.quant_method, offload_config
                 )
 
         self.quant_method.create_weights(
@@ -975,6 +987,15 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+
+        # Record expert routing frequencies for adaptive resident selection.
+        if (
+            isinstance(self.quant_method, ExpertOffloadWrapperMethod)
+            and self.quant_method.manager is not None
+            and not self.quant_method.manager._warmup_done
+        ):
+            self.quant_method.manager.record_expert_usage(topk_output.topk_ids, self)
+
         if _use_aiter and self.dispatcher.local_expert_mapping is not None:
             self.expert_mask_gpu = (
                 (

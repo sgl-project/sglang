@@ -495,6 +495,12 @@ class CudaGraphRunner:
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+        if model_runner.server_args.expert_offload_num_resident >= 0:
+            log_info_on_rank0(
+                logger,
+                "[ExpertOffload] CUDA graph mode enabled. Offloaded experts will be accessed "
+                "transparently via PCIe, ensuring full decode quality.",
+            )
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:

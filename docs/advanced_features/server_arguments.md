@@ -376,6 +376,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kt-num-gpu-experts` | [ktransformers parameter] The number of GPU experts. | `None` | Type: int |
 | `--kt-max-deferred-experts-per-token` | [ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0. | `None` | Type: int |
 
+## Expert Weight Offloading (UVM)
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--expert-offload-num-resident` | Number of experts kept resident on GPU per MoE layer. `-1` disables offloading. Expert weights are stored in CUDA Unified Memory; offloaded experts live in CPU DRAM and are accessed by the GPU transparently via PCIe read-through. Mutually exclusive with `--kt-weight-path`. See [UVM-Based Expert Weight Offloading](expert_offload.md) for details. | `-1` | Type: int |
+| `--expert-offload-resident-selection` | Strategy for choosing which experts stay resident on GPU. `first_n` = experts 0..N-1; `frequency` = adaptive selection based on routing frequency warmup; `manual` = explicit list via `--expert-offload-resident-ids`. | `first_n` | Choices: `first_n`, `frequency`, `manual` |
+| `--expert-offload-resident-ids` | Comma-separated expert IDs to keep resident on GPU (for `manual` selection mode). | `None` | Type: str |
+
 ## Diffusion LLM
 
 | Argument | Description | Defaults | Options |
