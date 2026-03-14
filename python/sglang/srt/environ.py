@@ -333,6 +333,7 @@ class Envs:
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

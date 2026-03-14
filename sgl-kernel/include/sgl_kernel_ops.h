@@ -135,20 +135,6 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
-void apply_rope_pos_ids_cos_sin_cache(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor q_rope,
-    at::Tensor k_rope,
-    at::Tensor cos_sin_cache,
-    at::Tensor pos_ids,
-    bool interleave,
-    bool enable_pdl,
-    const std::optional<at::Tensor>& v,
-    const std::optional<at::Tensor>& k_buffer,
-    const std::optional<at::Tensor>& v_buffer,
-    const std::optional<at::Tensor>& kv_cache_loc);
-
 void rotary_embedding(
     torch::Tensor& positions,
     torch::Tensor& query,
@@ -239,7 +225,6 @@ void sgl_per_token_group_quant_8bit_v2(
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
-void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
     at::Tensor A,
@@ -609,7 +594,6 @@ void transfer_kv_all_layer_direct_lf_pf(
  * From csrc/memory
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
-void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
  * From FlashInfer

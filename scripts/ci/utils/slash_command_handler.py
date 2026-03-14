@@ -513,6 +513,20 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     Handles the /rerun-ut <file>::<TestClass.test_method> command.
     Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
     """
+    # SECURITY: Block /rerun-ut entirely for fork PRs. This command checks out and
+    # executes code from the PR branch on self-hosted GPU runners, which would bypass
+    # the run-ci label gate that requires maintainer review for fork PRs.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if is_fork:
+        print("Permission denied: /rerun-ut is not allowed on fork PRs.")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ `/rerun-ut` is not available for fork PRs (security restriction).\n\n"
+            "Please ask a maintainer to add the `run-ci` label and use the normal CI flow, "
+            "or use `/rerun-failed-ci` to rerun workflows that have already passed the gate."
+        )
+        return False
+
     if not (
         user_perms.get("can_rerun_ut", False)
         or user_perms.get("can_rerun_stage", False)
@@ -680,6 +694,7 @@ def main():
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
+    # Note: /rerun-ut is blocked entirely for fork PRs in handle_rerun_ut() itself.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
