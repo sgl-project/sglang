@@ -403,6 +403,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
+            is_nextn=is_nextn,
         )
 
         self.topk = TopK(
