@@ -213,6 +213,7 @@ if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+
     from sglang.srt.utils.custom_op import register_custom_op
 
     @lru_cache(maxsize=1)

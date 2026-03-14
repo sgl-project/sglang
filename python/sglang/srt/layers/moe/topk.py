@@ -81,6 +81,7 @@ if _is_cuda:
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
+
         from sglang.srt.utils.custom_op import register_custom_op
 
         @register_custom_op(

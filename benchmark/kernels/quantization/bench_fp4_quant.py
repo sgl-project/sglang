@@ -3,12 +3,12 @@ import itertools
 
 import torch
 import triton
-from sgl_kernel.elementwise import silu_and_mul
-
 from flashinfer import (
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from sgl_kernel.elementwise import silu_and_mul
+
 from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd

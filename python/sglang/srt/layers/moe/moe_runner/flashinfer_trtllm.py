@@ -304,6 +304,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         trtllm_fp8_block_scale_routed_moe,
         trtllm_fp8_per_tensor_scale_moe,
     )
+
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -551,6 +552,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
     """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType

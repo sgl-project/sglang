@@ -1,6 +1,5 @@
-import torch
-
 import cutlass
+import torch
 
 WARP_SIZE = 32
 

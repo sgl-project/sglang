@@ -1,10 +1,10 @@
 from typing import Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
+
 from sglang.jit_kernel.diffusion.cutedsl.common.norm_fusion import (
     apply_norm_cta,
     broadcast_tensor_for_bsfd,
