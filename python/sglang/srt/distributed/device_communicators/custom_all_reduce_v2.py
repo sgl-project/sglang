@@ -35,6 +35,8 @@ class CustomAllReduceV2:
         device: torch.device,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
+        max_pull_blocks: Optional[int] = None,
+        max_push_blocks: Optional[int] = None,
     ) -> None:
         _init_config()
         self.disabled = True
@@ -65,6 +67,8 @@ class CustomAllReduceV2:
             pull_buffer_bytes=self.max_pull_size,
             push_buffer_bytes=self.max_push_size,
             graph_input_count=131072,
+            max_pull_blocks=max_pull_blocks,
+            max_push_blocks=max_push_blocks,
         )
         self._post_init_obj()
         self.disabled = False
