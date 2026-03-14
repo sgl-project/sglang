@@ -394,7 +394,7 @@ add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
 find_package(CCCL QUIET PATHS "${CUDAToolkit_LIBRARY_DIR}/cmake/cccl")
-if (CCCL_FOUND AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND TARGET CCCL::CCCL)
+if (CCCL_FOUND AND "${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" AND TARGET CCCL::CCCL)
     message(STATUS "Linking CCCL::CCCL to mscclpp_obj for CUDA ${CUDA_VERSION}")
     target_link_libraries(mscclpp_obj PRIVATE CCCL::CCCL)
 endif()
