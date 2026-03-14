@@ -88,6 +88,16 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
+@dataclasses.dataclass
+class InitLoadBackParams:
+    """Unified parameters for init_load_back across different cache types"""
+
+    last_host_node: Any
+    host_hit_length: int
+    mem_quota: Optional[int] = None
+    req: Optional[Req] = None
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -191,8 +201,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
+        params: InitLoadBackParams,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
