@@ -23,10 +23,7 @@ register_cuda_ci(est_time=1400, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
-ACC_THRESHOLDS = {
-    QWEN35_FP4_MODEL: {"gsm8k": 0.95},
-    QWEN35_27B_MODEL: {"gsm8k": 0.8}
-}
+ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}, QWEN35_27B_MODEL: {"gsm8k": 0.8}}
 
 
 class TestQwen35FP4(CustomTestCase):
@@ -314,4 +311,3 @@ class TestQwen35WithHiCache(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
