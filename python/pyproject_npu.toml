@@ -61,9 +61,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.4.1",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [project.optional-dependencies]
