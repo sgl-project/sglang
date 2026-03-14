@@ -95,7 +95,12 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
-    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake() or a2a_backend.is_mori():
+    elif (
+        a2a_backend.is_deepep()
+        or a2a_backend.is_mooncake()
+        or a2a_backend.is_mori()
+        or a2a_backend.is_nixl()
+    ):
         return MaybeTboDeepEPDispatcher(
             group=(
                 get_tp_group().device_group
@@ -111,6 +116,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            is_nextn=moe_runner_config.is_nextn,
         )
     elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
@@ -189,6 +195,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        is_nextn: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -220,7 +227,10 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
-        self.use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.use_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary
@@ -261,6 +271,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            is_nextn=is_nextn,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -302,7 +313,10 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and get_moe_runner_backend().is_cutlass()
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
         )
 
         self.routing_method_type = routing_method_type
