@@ -2,7 +2,6 @@
 
 import ctypes
 import logging
-import os
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -16,7 +15,6 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
-    gpu_p2p_access_check,
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
@@ -33,20 +31,6 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
-
-
-def _can_p2p(rank: int, world_size: int) -> bool:
-    # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
-    for i in range(world_size):
-        if i == rank:
-            continue
-        if SGLANG_SKIP_P2P_CHECK:
-            logger.info("Skipping P2P check and trusting the driver's P2P report.")
-            return torch.cuda.can_device_access_peer(rank, i)
-        if not gpu_p2p_access_check(rank, i):
-            return False
-    return True
 
 
 class CustomAllreduce:
@@ -405,7 +389,7 @@ def dispatch_custom_allreduce():
     """
     # HARDCODED: opt-in flag for v2 JIT all-reduce.
     # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
-    if get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
+    if _is_cuda and get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
         logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")

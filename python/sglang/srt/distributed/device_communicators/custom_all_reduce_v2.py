@@ -162,6 +162,7 @@ def _init_config():
     KB, MB = 1024, 1024 * 1024
 
     if is_sm100_supported():
+        # NOTE: This result is based on benchmarks on B200 GPUs
         THRESHOLD_2_SHOT_MAP = {
             2: ModeConfig(4 * MB, INF),
             3: ModeConfig(4 * MB, 4 * MB),
@@ -172,6 +173,7 @@ def _init_config():
             8: ModeConfig(720 * KB, 720 * KB),
         }
     else:
+        # NOTE: This result is based on benchmarks on H200 GPUs
         THRESHOLD_2_SHOT_MAP = {
             2: ModeConfig(2 * MB, INF),
             3: ModeConfig(512 * MB, 512 * KB),
@@ -181,6 +183,7 @@ def _init_config():
             7: ModeConfig(192 * KB, 192 * KB),
             8: ModeConfig(160 * KB, 160 * KB),
         }
+    # TODO: tune on more GPUs, e.g A100
 
 
 THRESHOLD_2_SHOT_MAP: Dict[int, ModeConfig] = {}

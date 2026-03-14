@@ -154,6 +154,10 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             self._pull_config = ConfigResult(NUM_CTA, MAX_THREADS)
             self.configure_pull(*self._pull_config)  # type: ignore
 
+        @property
+        def world_size(self) -> int:
+            return self._world_size
+
         def all_reduce(
             self,
             input: torch.Tensor,
