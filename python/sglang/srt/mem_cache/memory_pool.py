@@ -156,10 +156,12 @@ class ReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        if not any(r.is_dllm() for r in reqs):
-            assert (
-                sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
-            ), "only one chunked request may reuse req_pool_idx in a batch"
+        # NOTE: this check is relaxed temporarily
+        # https://github.com/sgl-project/sglang/pull/20476
+        # if not any(r.is_dllm() for r in reqs):
+        #     assert (
+        #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+        #     ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
         ), "reusing request must be chunked or have committed KV"
