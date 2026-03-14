@@ -29,6 +29,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.logprob_kit import (
+    assert_position_logprobs_match,
+    hf_logprobs_for_sequence,
+)
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=120, suite="stage-b-test-small-1-gpu")
@@ -203,79 +207,6 @@ class TestOriginalLogprob(unittest.TestCase):
                         )
                 sgl_engine.shutdown()
 
-    # ---------------------------------------------------------------------
-    # Helper: compute HF per-position log-prob vectors for a token sequence.
-    # logprobs[i] = log_softmax(logits[i] / temperature) predicts token[i+1].
-    # ---------------------------------------------------------------------
-    def hf_logprobs_for_sequence(self, token_ids, temperature=1.0):
-        input_tensor = torch.tensor(
-            [token_ids], dtype=torch.long, device=self.hf_model.device
-        )
-        with torch.inference_mode():
-            logits = self.hf_model(input_ids=input_tensor, return_dict=True).logits[0]
-        if temperature != 1.0:
-            logits = logits / temperature
-        return F.log_softmax(logits.float(), dim=-1)
-
-    # ---------------------------------------------------------------------
-    # Helper: compare SGLang logprob outputs against HF at a single position.
-    # ---------------------------------------------------------------------
-    def assert_position_logprobs_match(
-        self,
-        hf_lp_vec,
-        sgl_token_logprob,
-        sgl_top_logprobs=None,
-        sgl_ids_logprobs=None,
-        random_token_ids=None,
-        tag="",
-    ):
-        sgl_val, sgl_idx = sgl_token_logprob[0], sgl_token_logprob[1]
-        if sgl_val is None:
-            return
-
-        hf_val = hf_lp_vec[sgl_idx].item()
-        self.assertTrue(
-            torch.allclose(
-                torch.tensor([hf_val]),
-                torch.tensor([float(sgl_val)]),
-                rtol=RTOL,
-                atol=ATOL,
-            ),
-            msg=f"[{tag}] token logprob mismatch: HF={hf_val:.6f} vs SGL={sgl_val:.6f}",
-        )
-
-        if sgl_top_logprobs is not None:
-            hf_topk_vals, _ = torch.topk(hf_lp_vec, k=TOP_LOGPROBS_NUM, dim=-1)
-            sgl_vals = [float(t[0]) for t in sgl_top_logprobs if t and t[0] is not None]
-            if sgl_vals:
-                sgl_topk = torch.tensor(
-                    sgl_vals[:TOP_LOGPROBS_NUM],
-                    dtype=torch.float32,
-                    device=self.hf_model.device,
-                )
-                k = min(hf_topk_vals.numel(), sgl_topk.numel())
-                self.assertTrue(
-                    torch.allclose(
-                        hf_topk_vals[:k], sgl_topk[:k], rtol=RTOL, atol=ATOL
-                    ),
-                    msg=f"[{tag}] top-k mismatch",
-                )
-
-        if sgl_ids_logprobs is not None and random_token_ids:
-            ids_tensor = torch.tensor(
-                random_token_ids, dtype=torch.long, device=hf_lp_vec.device
-            )
-            hf_ids_vals = hf_lp_vec[ids_tensor]
-            sgl_ids_vals = torch.tensor(
-                [float(v) for v, _, _ in sgl_ids_logprobs],
-                dtype=torch.float32,
-                device=self.hf_model.device,
-            )
-            self.assertTrue(
-                torch.allclose(hf_ids_vals, sgl_ids_vals, rtol=RTOL, atol=ATOL),
-                msg=f"[{tag}] token-IDs mismatch",
-            )
-
     def test_output_logprob_multi_token(self):
         """Multi-token decode: validate per-step logprobs across an 8-token generation."""
         vocab_size = self.tokenizer.vocab_size
@@ -325,19 +256,23 @@ class TestOriginalLogprob(unittest.TestCase):
                     hf_temp = (
                         1.0 if env_val == "True" else sampling_params["temperature"]
                     )
-                    hf_all_lp = self.hf_logprobs_for_sequence(
-                        full_sequence, temperature=hf_temp
+                    hf_all_lp = hf_logprobs_for_sequence(
+                        self.hf_model, full_sequence, temperature=hf_temp
                     )
 
                     max_diff = 0.0
                     for step in range(MULTI_TOKEN_COUNT):
                         hf_pos = prompt_len - 1 + step
-                        self.assert_position_logprobs_match(
-                            hf_lp_vec=hf_all_lp[hf_pos],
+                        assert_position_logprobs_match(
+                            self,
+                            ref_lp_vec=hf_all_lp[hf_pos],
                             sgl_token_logprob=meta["output_token_logprobs"][step],
                             sgl_top_logprobs=meta["output_top_logprobs"][step],
                             sgl_ids_logprobs=meta["output_token_ids_logprobs"][step],
-                            random_token_ids=random_token_ids,
+                            token_ids=random_token_ids,
+                            top_k=TOP_LOGPROBS_NUM,
+                            rtol=RTOL,
+                            atol=ATOL,
                             tag=f"Multi-token step {step}: {prompt} ({env_val})",
                         )
                         sgl_val = meta["output_token_logprobs"][step][0]
@@ -404,8 +339,8 @@ class TestOriginalLogprob(unittest.TestCase):
                     hf_temp = (
                         1.0 if env_val == "True" else sampling_params["temperature"]
                     )
-                    hf_all_lp = self.hf_logprobs_for_sequence(
-                        input_ids, temperature=hf_temp
+                    hf_all_lp = hf_logprobs_for_sequence(
+                        self.hf_model, input_ids, temperature=hf_temp
                     )
 
                     # Skip position 0 (no preceding logits for the first token)
@@ -420,12 +355,16 @@ class TestOriginalLogprob(unittest.TestCase):
                             input_ids_logprobs[pos] if input_ids_logprobs else None
                         )
 
-                        self.assert_position_logprobs_match(
-                            hf_lp_vec=hf_lp_vec,
+                        assert_position_logprobs_match(
+                            self,
+                            ref_lp_vec=hf_lp_vec,
                             sgl_token_logprob=input_token_logprobs[pos],
                             sgl_top_logprobs=sgl_top,
                             sgl_ids_logprobs=sgl_ids,
-                            random_token_ids=random_token_ids,
+                            token_ids=random_token_ids,
+                            top_k=TOP_LOGPROBS_NUM,
+                            rtol=RTOL,
+                            atol=ATOL,
                             tag=f"Input pos {pos}: {prompt} ({env_val})",
                         )
 
@@ -461,7 +400,9 @@ class TestOriginalLogprob(unittest.TestCase):
             input_ids = enc["input_ids"][0].tolist()
             prompt_len = len(input_ids)
 
-            hf_all_lp = self.hf_logprobs_for_sequence(input_ids, temperature=1.0)
+            hf_all_lp = hf_logprobs_for_sequence(
+                self.hf_model, input_ids, temperature=1.0
+            )
 
             for start_len in [0, 1, prompt_len // 2, prompt_len - 1]:
                 with self.subTest(prompt=prompt, logprob_start_len=start_len):
@@ -501,21 +442,14 @@ class TestOriginalLogprob(unittest.TestCase):
 
                     # Spot-check: verify the first returned position against HF
                     if start_len > 0 and expected_input_len > 0:
-                        first_lp = meta["input_token_logprobs"][0]
-                        hf_lp = hf_all_lp[start_len - 1]
-                        sgl_val = first_lp[0]
-                        if sgl_val is not None:
-                            hf_val = hf_lp[first_lp[1]].item()
-                            self.assertTrue(
-                                torch.allclose(
-                                    torch.tensor([hf_val]),
-                                    torch.tensor([float(sgl_val)]),
-                                    rtol=RTOL,
-                                    atol=ATOL,
-                                ),
-                                msg=f"First position (start_len={start_len}) "
-                                f"HF={hf_val:.6f} vs SGL={sgl_val:.6f}",
-                            )
+                        assert_position_logprobs_match(
+                            self,
+                            ref_lp_vec=hf_all_lp[start_len - 1],
+                            sgl_token_logprob=meta["input_token_logprobs"][0],
+                            rtol=RTOL,
+                            atol=ATOL,
+                            tag=f"First position (start_len={start_len})",
+                        )
 
                     print(
                         f"[logprob_start_len={start_len} {prompt}] "

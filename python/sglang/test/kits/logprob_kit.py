@@ -32,6 +32,19 @@ Usage as standalone functions:
     class TestMyServer(CustomTestCase):
         def test_logprobs(self):
             run_logprob_cross_mode_check(self, self.base_url)
+
+HF ground-truth comparison utilities:
+
+    from sglang.test.kits.logprob_kit import (
+        hf_logprobs_for_sequence,
+        assert_position_logprobs_match,
+    )
+
+    hf_lp = hf_logprobs_for_sequence(hf_model, token_ids, temperature=1.0)
+    assert_position_logprobs_match(
+        test_case, ref_lp_vec=hf_lp[pos], sgl_token_logprob=...,
+        top_k=50, rtol=0.20, atol=0.0, tag="...",
+    )
 """
 
 import numpy as np
@@ -179,7 +192,114 @@ def _compare_ids_logprobs(test_case, target_ids, baseline_ids, places, tag):
 
 
 # ---------------------------------------------------------------------------
-# Public API – standalone functions
+# Public API – HF ground-truth comparison utilities
+# ---------------------------------------------------------------------------
+
+
+def hf_logprobs_for_sequence(hf_model, token_ids, temperature=1.0):
+    """Run a HuggingFace forward pass and return per-position log-prob vectors.
+
+    Returns a ``[T, V]`` tensor where ``logprobs[i]`` is the log-softmax of
+    ``logits[i] / temperature``.  ``logits[i]`` predicts ``token[i+1]``.
+
+    Args:
+        hf_model: A HuggingFace ``AutoModelForCausalLM`` instance.
+        token_ids: List of token IDs forming the sequence.
+        temperature: Temperature divisor applied before log-softmax.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    input_tensor = torch.tensor([token_ids], dtype=torch.long, device=hf_model.device)
+    with torch.inference_mode():
+        logits = hf_model(input_ids=input_tensor, return_dict=True).logits[0]
+    if temperature != 1.0:
+        logits = logits / temperature
+    return F.log_softmax(logits.float(), dim=-1)
+
+
+def assert_position_logprobs_match(
+    test_case,
+    ref_lp_vec,
+    sgl_token_logprob,
+    sgl_top_logprobs=None,
+    sgl_ids_logprobs=None,
+    token_ids=None,
+    top_k=5,
+    rtol=0.20,
+    atol=0.0,
+    tag="",
+):
+    """Compare SGLang logprob output against a reference vector at one position.
+
+    Checks token-level logprob, top-k logprobs, and specified-token-ID
+    logprobs against the reference ``[V]`` log-prob vector (e.g. from HF).
+
+    Positions whose SGLang logprob value is ``None`` (e.g. position 0 of
+    input logprobs) are silently skipped.
+
+    Args:
+        test_case: ``unittest.TestCase`` instance for assertions.
+        ref_lp_vec: ``[V]`` reference log-prob vector (torch.Tensor).
+        sgl_token_logprob: ``(logprob, token_id, text)`` tuple from SGLang.
+        sgl_top_logprobs: List of ``(logprob, token_id, text)`` tuples, or
+            ``None`` to skip top-k comparison.
+        sgl_ids_logprobs: List of ``(logprob, token_id, text)`` tuples for
+            user-specified IDs, or ``None`` to skip.
+        token_ids: Token IDs corresponding to *sgl_ids_logprobs*.
+        top_k: Number of top logprobs to compare.
+        rtol: Relative tolerance for ``torch.allclose``.
+        atol: Absolute tolerance for ``torch.allclose``.
+        tag: Descriptive tag for error messages.
+    """
+    import torch
+
+    sgl_val, sgl_idx = sgl_token_logprob[0], sgl_token_logprob[1]
+    if sgl_val is None:
+        return
+
+    ref_val = ref_lp_vec[sgl_idx].item()
+    test_case.assertTrue(
+        torch.allclose(
+            torch.tensor([ref_val]),
+            torch.tensor([float(sgl_val)]),
+            rtol=rtol,
+            atol=atol,
+        ),
+        msg=f"[{tag}] token logprob mismatch: ref={ref_val:.6f} vs SGL={sgl_val:.6f}",
+    )
+
+    if sgl_top_logprobs is not None:
+        ref_topk_vals, _ = torch.topk(ref_lp_vec, k=top_k, dim=-1)
+        sgl_vals = [float(t[0]) for t in sgl_top_logprobs if t and t[0] is not None]
+        if sgl_vals:
+            sgl_topk = torch.tensor(
+                sgl_vals[:top_k],
+                dtype=torch.float32,
+                device=ref_lp_vec.device,
+            )
+            k = min(ref_topk_vals.numel(), sgl_topk.numel())
+            test_case.assertTrue(
+                torch.allclose(ref_topk_vals[:k], sgl_topk[:k], rtol=rtol, atol=atol),
+                msg=f"[{tag}] top-k mismatch",
+            )
+
+    if sgl_ids_logprobs is not None and token_ids:
+        ids_tensor = torch.tensor(token_ids, dtype=torch.long, device=ref_lp_vec.device)
+        ref_ids_vals = ref_lp_vec[ids_tensor]
+        sgl_ids_vals = torch.tensor(
+            [float(v) for v, _, _ in sgl_ids_logprobs],
+            dtype=torch.float32,
+            device=ref_lp_vec.device,
+        )
+        test_case.assertTrue(
+            torch.allclose(ref_ids_vals, sgl_ids_vals, rtol=rtol, atol=atol),
+            msg=f"[{tag}] token-IDs mismatch",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API – cross-mode comparison functions
 # ---------------------------------------------------------------------------
 
 
