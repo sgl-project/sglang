@@ -1,3 +1,9 @@
+// Partially migrated from AOT kernel:
+// https://github.com/sgl-project/sglang/blob/v0.5.9/sgl-kernel/csrc/allreduce/custom_all_reduce.cu
+// Which was originally adapted from:
+// https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cu
+// We redesign the controller interface to minimize control plane traffic,
+// and fuse the reduce-scatter and broadcast in the 2-shot all reduce
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

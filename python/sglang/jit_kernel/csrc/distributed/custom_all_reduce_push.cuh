@@ -1,3 +1,6 @@
+// Partially adapted from:
+// https://github.com/flashinfer-ai/flashinfer/blob/v0.6.4/include/flashinfer/comm/trtllm_allreduce_fusion.cuh
+// We simplify the lamport design and minimize the ring buffer count (from 3 -> 2)
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

@@ -5,7 +5,7 @@ The test compares the JIT custom all-reduce output against NCCL all-reduce
 for various tensor sizes and dtypes, in both eager and CUDA-graph modes.
 
 Usage:
-    python -m pytest test_jit_custom_allreduce.py -v
+    python -m pytest test_jit_custom_all_reduce.py -v
 
 This file doubles as the torchrun worker script.  The test class launches
     torchrun --nproc_per_node=N <this_file>
@@ -18,19 +18,18 @@ import itertools
 import logging
 import os
 import subprocess
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import pytest
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import AllReduceAlgo
-
-if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 
 # ---------------------------------------------------------------------------
 # Test parameters (shared between test class and worker)
@@ -105,11 +104,6 @@ def init_distributed():
 
     Returns (rank, device, cpu_group, nccl_group, comm).
     """
-    import sglang.srt.distributed.parallel_state as ps
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     rank = local_rank

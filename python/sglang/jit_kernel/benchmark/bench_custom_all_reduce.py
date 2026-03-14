@@ -59,7 +59,7 @@ MESSAGE_SIZES_BYTES = [
 # ---------------------------------------------------------------------------
 
 
-class NCCLBackend:
+class NCCLAllReduceBackend:
     name = "NCCL"
 
     def __init__(self, group: dist.ProcessGroup):
@@ -115,7 +115,7 @@ class JITAllReduceBackend:
         return self.comm.custom_all_reduce(tensor)
 
 
-class FlashInferBackend:
+class FlashInferAllReduceBackend:
     name = "FI"
 
     def __init__(self, group: dist.ProcessGroup, dtype: torch.dtype):
@@ -296,8 +296,8 @@ def init_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = local_rank
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_stream(torch.cuda.Stream())  # use a non-default stream
     torch.cuda.set_device(device)
+    torch.cuda.set_stream(torch.cuda.Stream())  # use a non-default stream
 
     torch.distributed.init_process_group(backend="gloo")
     ps._WORLD = coord = ps.init_world_group(
@@ -326,13 +326,13 @@ def main():
 
     # Instantiate backends.
     backends = [
-        NCCLBackend(nccl_group),
+        NCCLAllReduceBackend(nccl_group),
         JITAllReduceBackend(cpu_group, device),
     ]
     if world_size in [2, 4, 6, 8]:
         backends.insert(1, AOTAllReduceBackend(cpu_group, device))
     if world_size in [2, 4, 8]:
-        backends.append(FlashInferBackend(cpu_group, dtype))
+        backends.append(FlashInferAllReduceBackend(cpu_group, dtype))
 
     # Run benchmarks.
     all_results: Dict[str, Dict[int, float]] = {}
