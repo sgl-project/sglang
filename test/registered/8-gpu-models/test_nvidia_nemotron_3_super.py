@@ -11,13 +11,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=300, suite="stage-c-test-8-gpu-h200")
 
-NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
-NEMOTRON_3_SUPER_NVFP4_ARGS = [
+NEMOTRON_3_SUPER_BF16_ARGS = [
     "--tp-size",
-    "4",
+    "8",
     "--trust-remote-code",
     "--reasoning-parser",
     "nemotron_3",
@@ -25,7 +25,7 @@ NEMOTRON_3_SUPER_NVFP4_ARGS = [
     "qwen3_coder",
     "--disable-radix-cache",
     "--model-loader-extra-config",
-    '{"enable_multithread_load": true, "num_threads": 17}',
+    '{"enable_multithread_load": true, "num_threads": 50}',
 ]
 
 MTP_ARGS = [
@@ -60,16 +60,16 @@ def _run_gsm8k(test_case):
     test_case.assertGreaterEqual(metrics["score"], 0.96)
 
 
-class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
+class TestNvidiaNemotron3SuperBF16(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
+        cls.model = NEMOTRON_3_SUPER_BF16_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS,
+            other_args=NEMOTRON_3_SUPER_BF16_ARGS,
         )
 
     @classmethod
@@ -80,16 +80,16 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
         _run_gsm8k(self)
 
 
-class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
+class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
+        cls.model = NEMOTRON_3_SUPER_BF16_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS
+            other_args=NEMOTRON_3_SUPER_BF16_ARGS
             + MTP_ARGS
             + ["--max-running-requests", "200"],
         )
