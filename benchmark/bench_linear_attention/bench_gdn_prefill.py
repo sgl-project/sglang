@@ -25,10 +25,10 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import torch
+
 from flashinfer.gdn_prefill import (
     chunk_gated_delta_rule as flashinfer_chunk_gated_delta_rule,
 )
-
 from sglang.srt.layers.attention.fla.chunk import (
     chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
 )

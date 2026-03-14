@@ -4,9 +4,10 @@ import logging
 from typing import Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
+import torch
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 

@@ -1,10 +1,10 @@
 from typing import Optional, Tuple, Union
 
-import cutlass
-import cutlass.cute as cute
 import torch
 from einops import rearrange
 
+import cutlass
+import cutlass.cute as cute
 from sglang.jit_kernel.diffusion.cutedsl.common.reduce import (
     cta_reduce_sum,
     warp_reduce_sum,

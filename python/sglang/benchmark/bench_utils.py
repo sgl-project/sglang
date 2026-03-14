@@ -1,6 +1,7 @@
 """Triton do_bench/do_bench_cudagraph compatible wrapper using flashinfer.testing.bench_gpu_time."""
 
 import numpy as np
+
 from flashinfer.testing import bench_gpu_time
 
 

@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+
 #include "utils.h"
 
 template <typename T>

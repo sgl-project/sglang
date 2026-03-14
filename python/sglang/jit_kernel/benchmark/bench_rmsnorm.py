@@ -3,9 +3,9 @@ import itertools
 import torch
 import triton
 import triton.testing
-from flashinfer import rmsnorm as fi_rmsnorm
 from sgl_kernel import rmsnorm
 
+from flashinfer import rmsnorm as fi_rmsnorm
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,

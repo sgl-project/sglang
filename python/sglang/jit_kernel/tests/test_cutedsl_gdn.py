@@ -6,9 +6,9 @@ import torch
 
 try:
     import cuda.bindings.driver as cuda_driver
+
     import cutlass  # noqa: F401
     from cutlass.cute.runtime import from_dlpack
-
     from sglang.jit_kernel import cutedsl_gdn
 
     CUTEDSL_AVAILABLE = True

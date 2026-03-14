@@ -1,9 +1,10 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/93e1a2634e22355b0856246b032b285ad1d1da6b/tests/test_sampling.py
 
-import flashinfer.sampling
 import pytest
 import sgl_kernel
 import torch
+
+import flashinfer.sampling
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])

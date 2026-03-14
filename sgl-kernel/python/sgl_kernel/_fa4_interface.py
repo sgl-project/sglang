@@ -16,10 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
 from flash_attn_origin.cute import utils
 from flash_attn_origin.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -30,6 +27,10 @@ from flash_attn_origin.cute.block_sparsity import (
 from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn_origin.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 
 @lru_cache(maxsize=None)
