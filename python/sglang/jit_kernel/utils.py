@@ -172,7 +172,9 @@ def load_jit(
         selected_cuda_cflags = DEFAULT_HIP_CFLAGS
         extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
     else:
-        extra_cuda_cflags = [f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"] + extra_cuda_cflags
+        extra_cuda_cflags = [
+            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
+        ] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:

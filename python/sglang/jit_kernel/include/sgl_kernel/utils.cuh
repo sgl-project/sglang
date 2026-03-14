@@ -96,8 +96,8 @@ namespace device {
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
 #if defined(__CUDA_ARCH__)
-static_assert(__CUDA_ARCH__ == SGL_CUDA_ARCH,
-              "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
+static_assert(
+    __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
