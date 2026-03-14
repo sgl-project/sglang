@@ -1,8 +1,12 @@
-"""Backend test for CuteDSL MoE standard path (moe_a2a=none, no DeepEP).
+"""Backend tests for CuteDSL MoE (FlashInferCuteDslMoE layer, moe_a2a=none).
 
-Exercises the ModelOpt FP4 + FlashInfer CuteDSL apply path in modelopt_quant.py
-(_apply_flashinfer_cutedsl_standard) by launching a server with
---moe-runner-backend flashinfer_cutedsl and no --moe-a2a-backend.
+Exercises the dedicated FlashInferCuteDslMoE layer with ModelOpt FP4 by
+launching a server with --moe-runner-backend flashinfer_cutedsl.
+
+Two configurations are tested:
+  - EP=1, TP=4: each GPU holds all experts with TP-sharded intermediate dim
+  - EP=4, TP=4: each GPU holds 1/4 of experts at full intermediate width,
+    partial results combined via all-reduce (no A2A dispatch)
 
 CuteDslMoEWrapper pre-allocates buffers for CUDA graph up to max_num_tokens
 (derived from cuda_graph_max_bs). We use a smaller --cuda-graph-max-bs here
@@ -35,7 +39,7 @@ SERVER_LAUNCH_TIMEOUT = 1000
 
 
 class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
-    """CuteDSL standard path (no A2A): flashinfer_cutedsl + modelopt_fp4."""
+    """CuteDSL dedicated layer: flashinfer_cutedsl + modelopt_fp4, EP=1."""
 
     @classmethod
     def setUpClass(cls):
@@ -45,7 +49,7 @@ class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
             "--tp",
             "4",
             "--ep",
-            "4",
+            "1",
             "--mem-fraction-static",
             "0.75",
             "--attention-backend",
@@ -86,6 +90,63 @@ class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4-cutedsl-moe)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["accuracy"], 0.935)
+
+
+class TestDeepseekV3FP4CuteDSLMoEEP4(CustomTestCase):
+    """CuteDSL dedicated layer: flashinfer_cutedsl + modelopt_fp4, EP=TP=4 (all-reduce, no A2A)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "4",
+            "--ep",
+            "4",
+            "--mem-fraction-static",
+            "0.75",
+            "--attention-backend",
+            "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_cutedsl",
+            "--moe-a2a-backend",
+            "none",
+            "--quantization",
+            "modelopt_fp4",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=1319,
+            parallel=1319,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3-fp4-cutedsl-moe-ep4)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)

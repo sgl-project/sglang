@@ -577,7 +577,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             return FlashInferFusedMoE
 
     if (
-        get_moe_runner_backend().is_flashinfer_cutedsl_v2()
+        get_moe_runner_backend().is_flashinfer_cutedsl()
         and get_moe_a2a_backend().is_none()
     ):
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":

@@ -1724,7 +1724,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
             "flashinfer_cutedsl",
-            "flashinfer_cutedsl_v2",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:

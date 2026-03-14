@@ -85,12 +85,9 @@ class StandardDispatcher(BaseDispatcher):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         backend = get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
-        self.enable_flashinfer_cutedsl_moe = backend.is_flashinfer_cutedsl()
-        # Both FlashInfer CUTLASS and CuteDSL handle EP internally with global expert IDs.
-        # Skip local expert mapping so topk_ids stay in global space for these backends.
-        self.skip_local_expert_mapping = (
-            self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
-        )
+        # FlashInfer CUTLASS handles EP internally with global expert IDs.
+        # Skip local expert mapping so topk_ids stay in global space.
+        self.skip_local_expert_mapping = self.enable_flashinfer_cutlass_moe
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (

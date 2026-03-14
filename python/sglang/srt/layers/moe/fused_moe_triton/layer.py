@@ -1380,8 +1380,8 @@ class FlashInferCuteDslMoE(FusedMoE):
             RuntimeError: Inplace update to inference tensor outside
             InferenceMode is not allowed.
         The torch.no_grad() fix in model_runner._flashinfer_autotune() covers
-        both the v1 (FusedMoE + dispatcher) and v2 (this class) CuteDSL paths
-        equally, since both lazily allocate wrapper buffers on first forward.
+        this CuteDSL path, since it lazily allocates wrapper buffers on first
+        forward.
         """
         if self._cutedsl_wrapper is not None:
             return

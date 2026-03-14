@@ -88,10 +88,32 @@ def _num_prompts_for_concurrency(concurrency: int) -> int:
     return min(max(concurrency, 32), 256)
 
 
+def _resolve_a2a_backend(
+    backend: str, ep_size: int, moe_a2a_backend: str
+) -> str | None:
+    """Resolve the --moe-a2a-backend value for a given (backend, ep_size) pair.
+
+    Returns None when the flag should be omitted entirely (let the server
+    pick its own default).  Only flashinfer_cutedsl has explicit A2A routing
+    requirements; other backends rely on the server's default EP dispatch.
+    """
+    if moe_a2a_backend != "auto":
+        return moe_a2a_backend
+
+    if backend == "flashinfer_cutedsl":
+        return "deepep" if ep_size > 1 else "none"
+
+    # Non-CuteDSL backends: omit --moe-a2a-backend so the server uses its
+    # own default.  Forcing "deepep" here would route TRTLLM/CUTLASS into
+    # DeepEPMoE, which is only implemented for CuteDSL FP4 low-latency.
+    return None
+
+
 def _build_server_args(
     backend: str,
     tp_size: int,
     ep_size: int,
+    moe_a2a_backend: str,
     extra_server_args: list[str],
 ) -> list[str]:
     args = [
@@ -109,6 +131,9 @@ def _build_server_args(
         "--model-loader-extra-config",
         '{"enable_multithread_load": true}',
     ]
+    a2a = _resolve_a2a_backend(backend, ep_size, moe_a2a_backend)
+    if a2a is not None:
+        args.extend(["--moe-a2a-backend", a2a])
     args.extend(extra_server_args)
     return args
 
@@ -268,12 +293,18 @@ def main() -> None:
         help="Directory for output CSV / JSONL.",
     )
     parser.add_argument(
-        "--extra-server-args",
-        nargs="*",
-        default=[],
-        help="Additional server args passed to every launch (e.g. --disable-cuda-graph).",
+        "--moe-a2a-backend",
+        default="auto",
+        choices=["auto", "none", "deepep"],
+        help=(
+            "MoE all-to-all backend. 'auto' (default) sets 'deepep' for "
+            "flashinfer_cutedsl with EP>1, 'none' for EP=1, and omits the "
+            "flag entirely for other backends (letting the server choose). "
+            "Set explicitly to override for all backends."
+        ),
     )
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
+    args.extra_server_args = extra
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +339,7 @@ def main() -> None:
                 backend=backend,
                 tp_size=args.tp_size,
                 ep_size=ep_size,
+                moe_a2a_backend=args.moe_a2a_backend,
                 extra_server_args=args.extra_server_args,
             )
             process = popen_launch_server(

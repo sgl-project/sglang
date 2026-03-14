@@ -64,10 +64,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
-        StandardCombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.moe.topk import TopKOutput
 
 fp4_quantize = None
 try:
@@ -104,14 +102,6 @@ except ImportError:
     class ActivationType(IntEnum):
         Swiglu = 3
         Relu2 = 6
-
-
-try:
-    from flashinfer import CuteDslMoEWrapper
-    from flashinfer import fp4_quantize as flashinfer_fp4_quantize_cutedsl
-except ImportError:
-    CuteDslMoEWrapper = None
-    flashinfer_fp4_quantize_cutedsl = None
 
 
 # Initialize logger for the module
@@ -1453,10 +1443,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         """Access the global enable_flashinfer_cutedsl_moe setting."""
-        return (
-            get_moe_runner_backend().is_flashinfer_cutedsl()
-            or get_moe_runner_backend().is_flashinfer_cutedsl_v2()
-        )
+        return get_moe_runner_backend().is_flashinfer_cutedsl()
 
     def create_weights(
         self,
@@ -1858,9 +1845,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
 
-            if self.enable_flashinfer_cutedsl_moe:
-                layer._cutedsl_standard_scales = _resolve_cutedsl_standard_scales(layer)
-
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS/CuteDSL kernels assume [Up, Gate] Proj as W13.
@@ -1872,85 +1856,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-
-    def _apply_flashinfer_cutedsl_standard(
-        self,
-        x: torch.Tensor,
-        layer: FusedMoE,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-        standard_combine_input_cls: type[StandardCombineInput],
-    ) -> StandardCombineInput:
-        """Standard-path FlashInfer CuteDSL (moe_a2a=none): quantize x, run wrapper."""
-        if CuteDslMoEWrapper is None or flashinfer_fp4_quantize_cutedsl is None:
-            raise ImportError(
-                "Can't import CuteDslMoEWrapper from flashinfer. "
-                "Please check flashinfer version to use flashinfer_cutedsl backend "
-                "on standard MoE path."
-            )
-
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        if topk_ids.dtype != torch.int32:
-            topk_ids = topk_ids.to(torch.int32)
-
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = getattr(
-            layer, "_cutedsl_standard_scales", None
-        ) or _resolve_cutedsl_standard_scales(layer)
-
-        x_fp4, x_sf = flashinfer_fp4_quantize_cutedsl(
-            x,
-            used_input_scale,
-            16,  # sf_vec_size
-            False,  # sf_use_ue8m0 / use_ue8m0 (version-dependent name)
-            False,  # is_sf_swizzled_layout
-        )
-
-        if not hasattr(layer, "_flashinfer_cutedsl_moe_wrapper"):
-            from sglang.srt.server_args import get_global_server_args
-
-            _server_args = get_global_server_args()
-            _use_cuda_graph = (
-                _server_args is not None and not _server_args.disable_cuda_graph
-            )
-            _max_num_tokens = max(
-                getattr(_server_args, "cuda_graph_max_bs", None) or 512,
-                getattr(_server_args, "chunked_prefill_size", None) or 8192,
-            )
-
-            layer._flashinfer_cutedsl_moe_wrapper = CuteDslMoEWrapper(
-                num_experts=layer.num_experts,
-                top_k=(
-                    layer.top_k if layer.top_k is not None else moe_runner_config.top_k
-                ),
-                hidden_size=layer.hidden_size,
-                intermediate_size=layer.intermediate_size_per_partition,
-                use_cuda_graph=_use_cuda_graph,
-                max_num_tokens=_max_num_tokens,
-                num_local_experts=layer.num_local_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                output_dtype=x.dtype,
-                device=str(x.device),
-            )
-
-        w1_weight_sf = getattr(
-            layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
-        )
-        w2_weight_sf = getattr(layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled)
-
-        output = layer._flashinfer_cutedsl_moe_wrapper.run(
-            x=x_fp4,
-            x_sf=x_sf,
-            token_selected_experts=topk_ids,
-            token_final_scales=topk_weights,
-            w1_weight=layer.w13_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=layer.w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-        )
-        return standard_combine_input_cls(hidden_states=output)
 
     def apply(
         self,
@@ -1974,12 +1879,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
             # This layer was processed with flashinfer TRTLLM - delegate to its own forward
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
-
-        # Standard-path FlashInfer CuteDSL (moe_a2a=none). Masked / DeepEP path is in apply_without_routing_weights().
-        if self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_none():
-            return self._apply_flashinfer_cutedsl_standard(
-                x, layer, topk_output, moe_runner_config, StandardCombineInput
-            )
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
