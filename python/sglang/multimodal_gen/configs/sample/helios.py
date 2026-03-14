@@ -28,9 +28,6 @@ class HeliosT2VSamplingParams(SamplingParams):
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: [
             (640, 384),  # ~5:3
-            (384, 640),  # ~3:5
-            (832, 480),  # ~16:9-ish
-            (480, 832),  # ~9:16-ish
         ]
     )
 
