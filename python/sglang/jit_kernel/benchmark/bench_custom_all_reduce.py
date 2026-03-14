@@ -173,7 +173,10 @@ def bench_one(
     group: dist.ProcessGroup,
     register_input: bool,
 ) -> float:
-    """Run *warmup* + *iters* iterations and return median latency in us."""
+    """
+    Run *warmup* iterations of all-reduce first.
+    Return the average time for *iters* iterations of all-reduce.
+    """
     dist.barrier(group=group)
     for _ in range(warmup):
         backend.all_reduce(inp)
@@ -201,7 +204,7 @@ def bench_one(
     graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end)
+    return start.elapsed_time(end) / iters
 
 
 def bench_sweep(
@@ -222,7 +225,7 @@ def bench_sweep(
         inp = torch.zeros(numel, dtype=dtype, device=device)
         try:
             elapsed_ms = bench_one(backend, inp, warmup, iters, group, register_input)
-            results[sz] = elapsed_ms * 1000 / iters  # convert to us per iter
+            results[sz] = elapsed_ms * 1000  # convert to us per iter
         except AssertionError:
             results[sz] = float("nan")
     return results
