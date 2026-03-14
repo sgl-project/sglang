@@ -19,8 +19,8 @@ use crate::protocols::{
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
+use crate::routers::anthropic_protocol::{AnthropicCountTokensRequest, AnthropicMessagesRequest};
 
-pub mod anthropic;
 pub mod conversations;
 pub mod error;
 pub mod factory;
@@ -32,6 +32,7 @@ pub mod mesh;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
+pub mod anthropic_protocol;
 pub mod router_manager;
 pub mod tokenize;
 
@@ -195,6 +196,34 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
+
+    /// Route Anthropic Messages API requests
+    async fn route_anthropic_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &AnthropicMessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Anthropic messages not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route Anthropic count_tokens requests
+    async fn route_anthropic_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &AnthropicCountTokensRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Anthropic count_tokens not implemented",
+        )
+            .into_response()
     }
 
     /// Get router type name

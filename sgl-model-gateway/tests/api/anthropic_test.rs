@@ -1,8 +1,7 @@
 //! Integration tests for the Anthropic Messages API endpoint (`POST /v1/messages`).
 //!
-//! The gateway proxies Anthropic-format requests directly to the backend worker's
-//! `/v1/messages` endpoint without any protocol conversion, because the SGLang
-//! inference engine natively supports the Anthropic Messages API.
+//! The gateway forwards Anthropic-format requests to the backend worker's
+//! `/v1/messages` endpoint via the HTTP router.
 
 use axum::{
     body::Body,
@@ -10,34 +9,20 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use serde_json::json;
-use smg::config::{PolicyConfig, RouterConfig, RoutingMode};
+use smg::config::{PolicyConfig, RouterConfig};
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType as MockWorkerType},
     AppTestContext,
 };
 
-/// Build an [`AppTestContext`] whose router is in OpenAI (HTTP-proxy) mode so
-/// that requests are routed through [`OpenAIRouter`], which implements
-/// `route_anthropic_messages`.
-async fn openai_mode_ctx(worker_configs: Vec<MockWorkerConfig>) -> AppTestContext {
-    // Start mock workers first to obtain their URLs.
-    let mut workers = Vec::new();
-    let mut worker_urls = Vec::new();
-    for cfg in worker_configs {
-        let mut w = crate::common::mock_worker::MockWorker::new(cfg);
-        let url = w.start().await.expect("mock worker failed to start");
-        worker_urls.push(url);
-        workers.push(w);
-    }
-    if !workers.is_empty() {
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    }
-
+/// Build an [`AppTestContext`] whose router is in regular HTTP mode so
+/// that requests are routed through the HTTP router.
+async fn http_mode_ctx(worker_configs: Vec<MockWorkerConfig>) -> AppTestContext {
     let config = RouterConfig::builder()
-        .openai_mode(worker_urls)
-        .with_policy(PolicyConfig::Random)
+        .regular_mode(vec![])
+        .policy(PolicyConfig::Random)
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(256 * 1024 * 1024)
@@ -48,17 +33,33 @@ async fn openai_mode_ctx(worker_configs: Vec<MockWorkerConfig>) -> AppTestContex
         .queue_timeout_secs(60)
         .build_unchecked();
 
-    AppTestContext::new_with_config(config, vec![]).await
+    AppTestContext::new_with_config(config, worker_configs).await
 }
 
 fn make_worker_cfg() -> MockWorkerConfig {
     MockWorkerConfig {
         port: 0,
-        worker_type: WorkerType::Regular,
+        worker_type: MockWorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
     }
+}
+
+async fn assert_status_ok(resp: axum::response::Response) -> axum::response::Response {
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body_str = String::from_utf8_lossy(&body);
+        panic!(
+            "unexpected status {} headers={:?} body={}",
+            status, headers, body_str
+        );
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -71,7 +72,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_basic() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -92,7 +93,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = assert_status_ok(resp).await;
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -115,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_with_system_prompt() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -137,7 +138,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = assert_status_ok(resp).await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -149,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_multi_turn() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -174,7 +175,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let _resp = assert_status_ok(resp).await;
         ctx.shutdown().await;
     }
 
@@ -184,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_streaming() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -206,7 +207,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = assert_status_ok(resp).await;
 
         // Streaming response must use text/event-stream content type.
         let ct = resp
@@ -255,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_invalid_json() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let resp = app
@@ -284,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_messages_missing_model_field() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         // `model` is required for worker selection; omitting it must return 400.
@@ -315,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_count_tokens_basic() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -335,7 +336,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = assert_status_ok(resp).await;
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -353,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_count_tokens_with_system_and_tools() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -379,7 +380,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = assert_status_ok(resp).await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -391,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_count_tokens_invalid_json() {
-        let ctx = openai_mode_ctx(vec![make_worker_cfg()]).await;
+        let ctx = http_mode_ctx(vec![make_worker_cfg()]).await;
         let app = ctx.create_app().await;
 
         let resp = app
@@ -419,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_anthropic_count_tokens_no_workers() {
-        let ctx = openai_mode_ctx(vec![]).await;
+        let ctx = http_mode_ctx(vec![]).await;
         let app = ctx.create_app().await;
 
         let body = json!({
@@ -451,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn test_anthropic_messages_no_workers() {
         // No workers → the router returns a 4xx/5xx.
-        let ctx = openai_mode_ctx(vec![]).await;
+        let ctx = http_mode_ctx(vec![]).await;
         let app = ctx.create_app().await;
 
         let body = json!({

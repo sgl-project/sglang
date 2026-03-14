@@ -366,7 +366,6 @@ pub mod metrics_labels {
     pub const ROUTER_OPENAI: &str = "openai";
     pub const ROUTER_HTTP: &str = "http";
     pub const ROUTER_GRPC: &str = "grpc";
-    pub const ROUTER_ANTHROPIC: &str = "anthropic";
 
     // Backend types
     pub const BACKEND_REGULAR: &str = "regular";

@@ -53,7 +53,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        anthropic::{AnthropicCountTokensRequest, AnthropicMessagesRequest},
+        anthropic_protocol::{AnthropicCountTokensRequest, AnthropicMessagesRequest},
         conversations,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
@@ -281,7 +281,10 @@ async fn v1_anthropic_messages(
                 .into_response()
         }
     };
-    crate::routers::anthropic::router::proxy(&state.context, &headers, &routing, body).await
+    state
+        .router
+        .route_anthropic_messages(Some(&headers), &routing, Some(&routing.model))
+        .await
 }
 
 async fn v1_anthropic_count_tokens(
@@ -305,7 +308,9 @@ async fn v1_anthropic_count_tokens(
                 .into_response()
         }
     };
-    crate::routers::anthropic::router::proxy_count_tokens(&state.context, &headers, &routing, body)
+    state
+        .router
+        .route_anthropic_count_tokens(Some(&headers), &routing, Some(&routing.model))
         .await
 }
 
