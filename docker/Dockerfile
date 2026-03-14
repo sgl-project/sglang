@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.3
+ARG FLASHINFER_VERSION=0.6.4
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -320,6 +320,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cp target/release/sglang-router /usr/local/bin/sglang-router \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+
+# Pin nvidia-cutlass-dsl to 4.3.5
+RUN --mount=type=cache,target=/root/.cache/pip \
+   python3 -m pip uninstall nvidia-cutlass-dsl-libs-base; \
+   python3 -m pip install nvidia-cutlass-dsl==4.3.5 --force-reinstall;
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages

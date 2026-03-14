@@ -303,7 +303,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )
-            if get_global_server_args().enable_piecewise_cuda_graph
+            if not get_global_server_args().disable_piecewise_cuda_graph
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -387,7 +387,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if (
+            _is_cpu
+            or _is_npu
+            or not get_global_server_args().disable_piecewise_cuda_graph
+        ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -481,6 +485,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -509,6 +514,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                is_nextn=is_nextn,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -578,6 +584,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -684,6 +691,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                is_nextn=is_nextn,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -818,6 +826,7 @@ class Qwen3NextModel(nn.Module):
         config: Qwen3NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -843,6 +852,7 @@ class Qwen3NextModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
 
         self.layers = make_layers(
