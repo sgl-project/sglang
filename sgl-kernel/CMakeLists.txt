@@ -393,6 +393,11 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
+find_package(CCCL QUIET PATHS "${CUDAToolkit_LIBRARY_DIR}/cmake/cccl")
+if (CCCL_FOUND AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND TARGET CCCL::CCCL)
+    message(STATUS "Linking CCCL::CCCL to mscclpp_obj for CUDA ${CUDA_VERSION}")
+    target_link_libraries(mscclpp_obj PRIVATE CCCL::CCCL)
+endif()
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
