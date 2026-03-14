@@ -55,6 +55,8 @@ wget -O "${ASSET_DIR}/cat.png" \
   https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
 wget -O "${ASSET_DIR}/astronaut.jpg" \
   https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
+wget -O "${ASSET_DIR}/mova_single_person.jpg" \
+  https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 ```
 
 ---
@@ -162,6 +164,32 @@ sglang generate \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --vae-cpu-offload false --text-encoder-cpu-offload false \
   --enable-torch-compile --warmup
+```
+
+### HunyuanVideo (848×480, 65 frames, 30 steps)
+```bash
+sglang generate \
+  --model-path=hunyuanvideo-community/HunyuanVideo \
+  --text-encoder-cpu-offload --pin-cpu-memory \
+  --prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window." \
+  --save-output --num-frames=65 --width=848 --height=480 \
+  --num-inference-steps=30 \
+  --warmup --enable-torch-compile
+```
+
+### MOVA-720p (4 GPUs, 193 frames, 24 steps)
+```bash
+# Select four idle GPUs first:
+# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
+sglang generate \
+  --model-path=OpenMOSS-Team/MOVA-720p \
+  --prompt="A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, \"I would also believe that this advance in AI recently wasn’t unexpected.\"" \
+  --image-path="${ASSET_DIR}/mova_single_person.jpg" \
+  --adjust-frames=false \
+  --num-gpus=4 --ring-degree=1 --ulysses-degree=4 \
+  --num-frames=193 --fps=24 \
+  --num-inference-steps=24 \
+  --enable-torch-compile --save-output --warmup
 ```
 
 **Key metrics** (all models): denoise latency ★, end-to-end latency, peak GPU memory.
