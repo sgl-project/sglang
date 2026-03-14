@@ -19,12 +19,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1000, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=1400, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
-
+QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {
     QWEN35_FP4_MODEL: {"gsm8k": 0.95},
+    QWEN35_27B_MODEL: {"gsm8k": 0.8}
 }
 
 
@@ -241,7 +242,7 @@ class TestQwen35FP4MTPV2(CustomTestCase):
 class TestQwen35WithHiCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN35_FP4_MODEL
+        cls.model = QWEN35_27B_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.storage_dir = tempfile.mkdtemp(prefix="qwen35-hicache-")
         env = {
@@ -267,10 +268,6 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "128",
                 "--reasoning-parser",
                 "qwen3",
-                "--attention-backend",
-                "trtllm_mha",
-                "--quantization",
-                "modelopt_fp4",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true,"num_threads": 64}',
                 "--hicache-mem-layout",
@@ -317,3 +314,4 @@ class TestQwen35WithHiCache(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
