@@ -37,6 +37,10 @@ MTP_ARGS = [
     "1",
     "--speculative-num-draft-tokens",
     "4",
+    "--max-running-requests",
+    "200",
+    "--mem-fraction-static",
+    "0.75",
 ]
 
 
@@ -89,9 +93,7 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS
-            + MTP_ARGS
-            + ["--max-running-requests", "200"],
+            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + MTP_ARGS,
         )
 
     @classmethod
