@@ -316,6 +316,38 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertFalse(req.is_single)
         self.assertEqual(req.batch_size, 2)
 
+    def test_input_embeds_bytes_normalization(self):
+        """Test normalization of input_embeds_bytes."""
+        # Single: raw bytes with shape
+        req = GenerateReqInput(
+            input_embeds_bytes=b"\x00" * 8, input_embeds_shape=[1, 2]
+        )
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.batch_size, 1)
+
+        # Batch: list of bytes with list of shapes
+        req = GenerateReqInput(
+            input_embeds_bytes=[b"\x00" * 8, b"\x00" * 16],
+            input_embeds_shape=[[1, 2], [2, 2]],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.is_single)
+        self.assertEqual(req.batch_size, 2)
+        self.assertEqual(req[0].input_embeds_bytes, b"\x00" * 8)
+        self.assertEqual(req[0].input_embeds_shape, [1, 2])
+        self.assertEqual(req[1].input_embeds_shape, [2, 2])
+
+        # bytes without shape should fail
+        with self.assertRaises(ValueError):
+            GenerateReqInput(
+                input_embeds_bytes=b"\x00" * 8
+            ).normalize_batch_and_arguments()
+
+        # shape without bytes should fail
+        with self.assertRaises(ValueError):
+            GenerateReqInput(input_embeds_shape=[1, 2]).normalize_batch_and_arguments()
+
     def test_input_embeds_with_parallel_sampling(self):
         """Test input_embeds normalization with parallel sampling (n > 1)."""
         # Test single input_embeds with parallel sampling
@@ -547,17 +579,23 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
     def test_error_cases(self):
         """Test various error cases."""
-        # Test when neither text, input_ids, nor input_embeds is provided
+        # No input provided
         with self.assertRaises(ValueError):
-            req = GenerateReqInput()
-            req.normalize_batch_and_arguments()
+            GenerateReqInput().normalize_batch_and_arguments()
 
-        # Test when all of text, input_ids, and input_embeds are provided
-        with self.assertRaises(ValueError):
-            req = GenerateReqInput(
-                text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
-            )
-            req.normalize_batch_and_arguments()
+        # More than one input type provided
+        for kwargs in (
+            {"text": "Hello", "input_ids": [1, 2, 3]},
+            {"text": "Hello", "input_embeds": [[0.1, 0.2]]},
+            {
+                "input_ids": [1],
+                "input_embeds_bytes": b"x",
+                "input_embeds_shape": [1, 1],
+            },
+            {"text": "Hi", "input_ids": [1], "input_embeds": [[0.1]]},
+        ):
+            with self.assertRaises(ValueError):
+                GenerateReqInput(**kwargs).normalize_batch_and_arguments()
 
     def test_multiple_input_formats(self):
         """Test different combinations of input formats."""

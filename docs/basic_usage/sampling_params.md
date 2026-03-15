@@ -12,6 +12,8 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
 | input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
 | input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
+| input_embeds_bytes         | `Optional[Union[List[Base64Bytes], Base64Bytes]] = None`                     | Alternative to input_embeds: base64-encoded raw float32 bytes (row-major). Requires `input_embeds_shape`. Smaller on the wire and faster to decode than the JSON float list. See [example](#input_embeds_bytes). |
+| input_embeds_shape         | `Optional[Union[List[List[int]], List[int]]] = None`                         | Shape `[seq_len, d_model]` for `input_embeds_bytes`.                                                                                                            |
 | image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Supports three formats: (1) **Raw images**: PIL Image, file path, URL, or base64 string; (2) **Processor output**: Dict with `format: "processor_output"` containing HuggingFace processor outputs; (3) **Precomputed embeddings**: Dict with `format: "precomputed_embedding"` and `feature` containing pre-calculated visual embeddings. Can be a single image, list of images, or list of lists of images. See [Multimodal Input Formats](#multimodal-input-formats) for details. |
 | audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
 | sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
@@ -116,6 +118,26 @@ print(response.json())
 ```
 
 Detailed example in [send request](./send_request.ipynb).
+
+### input_embeds_bytes
+
+Send pre-computed embeddings as base64-encoded raw float32 bytes (smaller and faster than the JSON float list). Requires `--disable-radix-cache`. This bypasses the tokenizer; only enable for trusted clients.
+
+```python
+import base64, requests, torch
+
+# embeds: torch.Tensor of shape (seq_len, d_model)
+arr = embeds.to(torch.float32).contiguous().cpu().numpy()
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "input_embeds_bytes": base64.b64encode(arr.tobytes()).decode(),
+        "input_embeds_shape": list(arr.shape),
+        "sampling_params": {"max_new_tokens": 32},
+    },
+)
+print(response.json())
+```
 
 ### Streaming
 

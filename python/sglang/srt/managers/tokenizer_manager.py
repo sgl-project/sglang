@@ -32,6 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import uvloop
 import zmq
 import zmq.asyncio
@@ -665,6 +666,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _decode_input_embeds_bytes(self, data: bytes, shape: List[int]) -> np.ndarray:
+        """Decode raw float32 bytes into a (seq_len, d_model) ndarray."""
+        if not (isinstance(shape, list) and len(shape) == 2):
+            raise ValueError(
+                f"input_embeds_shape must be [seq_len, d_model], got {shape!r}"
+            )
+        seq_len, d_model = shape
+        max_len = self.max_req_input_len or self.context_len
+        if seq_len <= 0 or seq_len > max_len:
+            raise ValueError(
+                f"input_embeds_shape seq_len {seq_len} must be in (0, {max_len}]"
+            )
+        if d_model != self.model_config.hidden_size:
+            raise ValueError(
+                f"input_embeds_shape d_model {d_model} does not match "
+                f"model hidden_size {self.model_config.hidden_size}"
+            )
+        expected = seq_len * d_model * 4
+        if len(data) != expected:
+            raise ValueError(
+                f"input_embeds_bytes length {len(data)} does not match shape "
+                f"{shape} (expected {expected} bytes for float32)"
+            )
+        # copy: frombuffer yields a read-only view; downstream torch ops
+        # on a read-only array are undefined behavior
+        return np.frombuffer(data, dtype=np.float32).reshape(seq_len, d_model).copy()
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -677,14 +705,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
-        if obj.input_embeds is not None:
+        input_embeds_bytes = getattr(obj, "input_embeds_bytes", None)
+        if obj.input_embeds is not None or input_embeds_bytes is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
-            input_embeds = obj.input_embeds
+            if input_embeds_bytes is not None:
+                input_embeds = self._decode_input_embeds_bytes(
+                    input_embeds_bytes, obj.input_embeds_shape
+                )
+            else:
+                # ndarray: faster pickle IPC + tensor construction downstream
+                input_embeds = np.asarray(obj.input_embeds, dtype=np.float32)
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
@@ -933,7 +968,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
         input_ids: List[int],
-        input_embeds: Optional[Union[List[float], None]] = None,
+        input_embeds: Optional[np.ndarray] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
@@ -1061,7 +1096,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 raise ValueError(
                     "Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`."
                 )
-            if obj[i].input_embeds is not None:
+            if (
+                obj[i].input_embeds is not None
+                or getattr(obj[i], "input_embeds_bytes", None) is not None
+            ):
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
