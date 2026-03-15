@@ -787,14 +787,14 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-            # qk_head_dim == 256 for qwen3-next
-            if self.use_fia or layer.qk_head_dim == 256:
+            if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_token_padding = q.shape[0]
-                q, k, v = [
-                    data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
-                ]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    q, k, v = [
+                        data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                    ]
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=q,
                     key=k,
@@ -811,6 +811,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
+
                 if num_token_padding != forward_batch.num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
