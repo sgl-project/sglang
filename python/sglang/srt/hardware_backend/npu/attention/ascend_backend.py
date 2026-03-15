@@ -793,7 +793,8 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 if num_token_padding > forward_batch.num_token_non_padded_cpu:
                     q, k, v = [
-                        data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                        data[: forward_batch.num_token_non_padded_cpu]
+                        for data in [q, k, v]
                     ]
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=q,
