@@ -2,9 +2,19 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import sys
 import unittest
 import uuid
+from types import ModuleType
 from unittest.mock import Mock
+
+# Stub out sgl_kernel before any sglang import so the test runs on CPU.
+if "sgl_kernel" not in sys.modules:
+    _stub = ModuleType("sgl_kernel")
+    _stub_kvcacheio = ModuleType("sgl_kernel.kvcacheio")
+    _stub.kvcacheio = _stub_kvcacheio
+    sys.modules["sgl_kernel"] = _stub
+    sys.modules["sgl_kernel.kvcacheio"] = _stub_kvcacheio
 
 from fastapi import Request
 
