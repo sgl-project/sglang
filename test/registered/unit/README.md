@@ -22,6 +22,15 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
    pytest test/registered/unit/ -v            # all unit tests
    pytest test/registered/unit/mem_cache/ -v  # one module
    ```
+5. Run with coverage:
+   ```bash
+   # summary
+   pytest test/registered/unit/ --cov --cov-config=.coveragerc -v
+
+   # PR incremental check (require ≥60% on changed lines)
+   pytest test/registered/unit/ --cov --cov-config=.coveragerc --cov-report=xml
+   diff-cover coverage.xml --compare-branch=origin/main --fail-under=60
+   ```
 
 ## Example
 
