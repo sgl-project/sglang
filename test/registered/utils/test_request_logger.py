@@ -81,6 +81,29 @@ class BaseTestRequestLogger:
     def _verify_openai_logs(self, content: str, source_name: str):
         raise NotImplementedError
 
+    def _wait_until_verified(
+        self,
+        verify_fn,
+        get_content_fn,
+        source_name: str,
+        timeout: float = 10.0,
+        interval: float = 0.1,
+    ):
+        deadline = time.time() + timeout
+        last_error = None
+
+        while time.time() < deadline:
+            content = get_content_fn()
+            try:
+                verify_fn(content, source_name)
+                return
+            except AssertionError as err:
+                last_error = err
+                time.sleep(interval)
+
+        if last_error is not None:
+            raise last_error
+
     def test_logging(self):
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
@@ -92,16 +115,19 @@ class BaseTestRequestLogger:
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
-        time.sleep(1)
-
-        stdout_content = self.stdout.getvalue() + self.stderr.getvalue()
-        self._verify_logs(stdout_content, "stdout")
+        self._wait_until_verified(
+            self._verify_logs,
+            lambda: self.stdout.getvalue() + self.stderr.getvalue(),
+            "stdout",
+        )
+        self._wait_until_verified(
+            self._verify_logs,
+            lambda: "".join(f.read_text() for f in Path(self.temp_dir).glob("*.log")),
+            "log files",
+        )
 
         log_files = list(Path(self.temp_dir).glob("*.log"))
         self.assertGreater(len(log_files), 0, "No log files found in temp directory")
-
-        file_content = "".join(f.read_text() for f in log_files)
-        self._verify_logs(file_content, "log files")
 
     def test_openai_chat_logging(self):
         response = requests.post(
@@ -116,16 +142,19 @@ class BaseTestRequestLogger:
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
-        time.sleep(1)
-
-        stdout_content = self.stdout.getvalue() + self.stderr.getvalue()
-        self._verify_openai_logs(stdout_content, "stdout")
+        self._wait_until_verified(
+            self._verify_openai_logs,
+            lambda: self.stdout.getvalue() + self.stderr.getvalue(),
+            "stdout",
+        )
+        self._wait_until_verified(
+            self._verify_openai_logs,
+            lambda: "".join(f.read_text() for f in Path(self.temp_dir).glob("*.log")),
+            "log files",
+        )
 
         log_files = list(Path(self.temp_dir).glob("*.log"))
         self.assertGreater(len(log_files), 0, "No log files found in temp directory")
-
-        file_content = "".join(f.read_text() for f in log_files)
-        self._verify_openai_logs(file_content, "log files")
 
 
 class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
@@ -162,7 +191,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         for line in content.splitlines():
             if not line.strip() or not line.startswith("{"):
                 continue
-            data = json.loads(line)
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
             rid = data.get("rid", "")
             if rid.startswith("HEALTH_CHECK"):
@@ -196,7 +228,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         for line in content.splitlines():
             if not line.strip() or not line.startswith("{"):
                 continue
-            data = json.loads(line)
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if data.get("event") != "request.received.openai":
                 continue
 

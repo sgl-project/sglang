@@ -136,9 +136,6 @@ class RequestLogger:
         request: Optional["fastapi.Request"] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
-        if not self.log_requests or self.log_requests_level < 2:
-            return
-
         max_length, _, _ = self.metadata
         max_length = max_length if max_length is not None else 2048
         headers = _extract_whitelisted_headers(request)
