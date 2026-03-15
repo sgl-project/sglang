@@ -181,10 +181,10 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
         ssm_elems = 1024
         conv_elems = 512
 
-        ssm_states0 = torch.empty(
+        ssm_states0 = torch.randn(
             (L, C, ssm_elems), device=device, dtype=torch.bfloat16
         )
-        conv_states0 = torch.empty(
+        conv_states0 = torch.randn(
             (L, C, conv_elems), device=device, dtype=torch.bfloat16
         )
         intermediate_ssm = torch.randn(
