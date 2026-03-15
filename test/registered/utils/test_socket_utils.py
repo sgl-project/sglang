@@ -13,6 +13,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.utils import normalize_base_url, release_port, reserve_port
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
@@ -150,6 +151,70 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+class TestReservePort(CustomTestCase):
+    def test_reserve_port_returns_port_and_socket(self):
+        """reserve_port should return a (port, socket) tuple."""
+        port, sock = reserve_port("127.0.0.1")
+        try:
+            self.assertGreaterEqual(port, 30000)
+            self.assertLess(port, 40000)
+            self.assertEqual(sock.getsockname()[1], port)
+        finally:
+            release_port(sock)
+
+    def test_reserve_port_custom_range(self):
+        """reserve_port should respect custom start/end range."""
+        port, sock = reserve_port("127.0.0.1", start=40000, end=41000)
+        try:
+            self.assertGreaterEqual(port, 40000)
+            self.assertLess(port, 41000)
+        finally:
+            release_port(sock)
+
+    def test_reserve_port_holds_port(self):
+        """The reserved port should not be available until released."""
+        port, sock = reserve_port("127.0.0.1")
+        try:
+            self.assertFalse(is_port_available(port))
+        finally:
+            release_port(sock)
+
+    def test_reserve_port_no_free_port_raises(self):
+        """reserve_port should raise RuntimeError if no port is available."""
+        with patch(
+            "sglang.utils.try_bind_socket",
+            side_effect=OSError("mocked"),
+        ):
+            with self.assertRaises(RuntimeError):
+                reserve_port("127.0.0.1", start=50000, end=50002)
+
+
+class TestNormalizeBaseUrl(CustomTestCase):
+    def test_ipv4_host(self):
+        """normalize_base_url should produce http://host:port for IPv4."""
+        url = normalize_base_url("127.0.0.1", 8080)
+        self.assertEqual(url, "http://127.0.0.1:8080")
+
+    def test_ipv6_host(self):
+        """normalize_base_url should bracket IPv6 addresses."""
+        url = normalize_base_url("::1", 8080)
+        self.assertEqual(url, "http://[::1]:8080")
+
+    def test_hostname(self):
+        """normalize_base_url should work with hostnames."""
+        url = normalize_base_url("localhost", 3000)
+        self.assertEqual(url, "http://localhost:3000")
+
+    def test_deprecated_scheme_passthrough(self):
+        """normalize_base_url should pass through host with scheme (deprecated)."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            url = normalize_base_url("http://myhost", 9000)
+        self.assertEqual(url, "http://myhost:9000")
 
 
 if __name__ == "__main__":
