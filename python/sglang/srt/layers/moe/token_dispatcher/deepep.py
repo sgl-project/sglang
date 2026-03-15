@@ -741,6 +741,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        is_nextn: bool = False,
     ):
         super().__init__()
 
