@@ -8,6 +8,8 @@ This document explains how to enable and validate `direct_io` for the `HiCacheFi
 
 When enabled, file read/write operations in `HiCacheFile` use `os.open(..., O_DIRECT)` with `os.readv`/`os.writev`.
 
+For high-speed NVMe (especially PCIe Gen5 and above), bypassing page cache is often a better default for sustained write/read bandwidth, and it can also reduce page-cache DRAM pressure so CPU memory can be reserved for other workloads. 
+
 ### Why use Direct I/O?
 
 - Bypass page cache in high-throughput storage scenarios.

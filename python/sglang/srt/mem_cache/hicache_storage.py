@@ -316,7 +316,9 @@ class HiCacheFile(HiCacheStorage):
                 # Write through O_DIRECT + writev from tensor byte view.
                 # We intentionally keep it minimal (no proactive alignment handling).
                 try:
-                    io_view = memoryview(value.contiguous().view(dtype=torch.uint8).numpy())
+                    io_view = memoryview(
+                        value.contiguous().view(dtype=torch.uint8).numpy()
+                    )
                     num_bytes = len(io_view)
                     fd = os.open(
                         tensor_path,
