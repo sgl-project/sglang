@@ -938,11 +938,13 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
+        response = requests.get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
+            # Decode from full response bytes. Some servers/CDNs may return payloads
+            # that PIL cannot reliably decode via the streaming raw handle.
+            image = Image.open(BytesIO(response.content))
+            image.load()  # Force loading to avoid issues after closing the response
         finally:
             response.close()
     elif image_file.startswith("file://"):
