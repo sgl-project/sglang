@@ -184,7 +184,7 @@ class TestReservePort(CustomTestCase):
     def test_reserve_port_no_free_port_raises(self):
         """reserve_port should raise RuntimeError if no port is available."""
         with patch(
-            "sglang.utils.try_bind_socket",
+            "sglang.srt.utils.common.try_bind_socket",
             side_effect=OSError("mocked"),
         ):
             with self.assertRaises(RuntimeError):
