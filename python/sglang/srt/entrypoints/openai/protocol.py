@@ -1199,6 +1199,55 @@ class ResponsesRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_responses_input(cls, values: Any):
+        """Normalize common /v1/responses input variants before validation.
+
+        This keeps compatibility with clients that omit `"type": "message"` at the
+        message level or omit `detail` in `input_image` chunks.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        input_value = values.get("input")
+        if not isinstance(input_value, list):
+            return values
+
+        normalized_input = []
+        for item in input_value:
+            if not isinstance(item, dict):
+                normalized_input.append(item)
+                continue
+
+            normalized_item = dict(item)
+            if (
+                "type" not in normalized_item
+                and "role" in normalized_item
+                and "content" in normalized_item
+            ):
+                normalized_item["type"] = "message"
+
+            content = normalized_item.get("content")
+            if isinstance(content, list):
+                normalized_content = []
+                for chunk in content:
+                    if not isinstance(chunk, dict):
+                        normalized_content.append(chunk)
+                        continue
+                    normalized_chunk = dict(chunk)
+                    if (
+                        normalized_chunk.get("type") == "input_image"
+                        and "detail" not in normalized_chunk
+                    ):
+                        normalized_chunk["detail"] = "auto"
+                    normalized_content.append(normalized_chunk)
+                normalized_item["content"] = normalized_content
+
+            normalized_input.append(normalized_item)
+
+        return {**values, "input": normalized_input}
+
     def to_sampling_params(
         self, default_max_tokens: int, default_params: Optional[Dict] = None
     ) -> Dict[str, Any]:

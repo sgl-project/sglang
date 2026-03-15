@@ -67,35 +67,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _normalize_responses_input(
-    input_items: list,
-) -> list[ChatCompletionMessageParam]:
-    """Normalize Responses API input messages to Chat Completions format.
-
-    The OpenAI Responses API uses ``type: "input_text"`` for text content
-    parts, while the Chat Completions API uses ``type: "text"``.  This
-    function converts between the two so the downstream chat pipeline
-    receives the format it expects.
-    """
-    messages: list[ChatCompletionMessageParam] = []
-    for item in input_items:
-        if isinstance(item, dict):
-            item = dict(item)  # shallow copy
-            content = item.get("content")
-            if isinstance(content, list):
-                item["content"] = [_normalize_content_part(part) for part in content]
-            messages.append(item)  # type: ignore[arg-type]
-        else:
-            messages.append(item)  # type: ignore[arg-type]
-    return messages
-
-
-def _normalize_content_part(part: dict) -> dict:
-    """Convert a Responses API content part to Chat Completions format."""
-    if isinstance(part, dict) and part.get("type") == "input_text":
-        return {"type": "text", "text": part.get("text", "")}
-    return part
-
 
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
@@ -223,10 +194,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages, request_prompts, engine_prompts = (
                     self._make_request_with_harmony(request, prev_response)
                 )
+                processed_messages = None
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
-                    request, prev_response, tokenizer
-                )
+                (
+                    messages,
+                    request_prompts,
+                    engine_prompts,
+                    processed_messages,
+                ) = await self._make_request(request, prev_response, tokenizer)
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -307,9 +282,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    if isinstance(engine_prompt, str):
+                        prompt_kwargs = {"text": engine_prompt}
+                    else:
+                        prompt_kwargs = {"input_ids": engine_prompt}
+
+                    multimodal_kwargs = {}
+                    if not self.use_harmony and processed_messages is not None:
+                        multimodal_kwargs = {
+                            "image_data": processed_messages.image_data,
+                            "video_data": processed_messages.video_data,
+                            "audio_data": processed_messages.audio_data,
+                            "modalities": processed_messages.modalities or None,
+                        }
+
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
+                        **multimodal_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -405,7 +395,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
-    ):
+    ) -> tuple[
+        list[ChatCompletionMessageParam],
+        list[Any],
+        list[Any],
+        Optional[Any],
+    ]:
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
 
@@ -441,8 +436,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_ids = tokenizer.encode(prompt_text)
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
+            processed_messages = None
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, processed_messages
 
     def _make_request_with_harmony(
         self,
@@ -656,7 +652,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(_normalize_responses_input(request.input))  # type: ignore
+            for item in request.input:
+                if not isinstance(item, dict):
+                    messages.append(item)  # type: ignore[arg-type]
+                    continue
+
+                normalized_item = copy.deepcopy(item)
+                content = normalized_item.get("content")
+                if isinstance(content, list):
+                    for chunk in content:
+                        if not isinstance(chunk, dict):
+                            continue
+                        chunk_type = chunk.get("type")
+                        if chunk_type == "input_text":
+                            chunk["type"] = "text"
+                        elif chunk_type == "input_image":
+                            chunk["type"] = "image_url"
+                            image_url = chunk.get("image_url")
+                            detail = chunk.pop("detail", None)
+                            if isinstance(image_url, str):
+                                image_url_payload = {"url": image_url}
+                                if detail is not None:
+                                    image_url_payload["detail"] = detail
+                                chunk["image_url"] = image_url_payload
+                            elif isinstance(image_url, dict):
+                                if detail is not None and "detail" not in image_url:
+                                    image_url["detail"] = detail
+                messages.append(normalized_item)  # type: ignore[arg-type]
         return messages
 
     def _construct_input_messages_with_harmony(
