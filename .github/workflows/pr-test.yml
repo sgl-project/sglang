@@ -880,11 +880,11 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
-      - name: Run benchmark smoke tests
+      - name: Run benchmark tests
         timeout-minutes: 45
         run: |
           cd python/sglang/jit_kernel/benchmark
-          echo "Running jit-kernel benchmark smoke tests in CI mode..."
+          echo "Running jit-kernel benchmark tests in CI mode..."
 
           failures=()
 
@@ -898,11 +898,11 @@ jobs:
           done
 
           if [ ${#failures[@]} -ne 0 ]; then
-            echo "The following benchmark smoke tests failed: ${failures[*]}"
+            echo "The following benchmark tests failed: ${failures[*]}"
             exit 1
           fi
 
-          echo "All jit-kernel benchmark smoke tests completed successfully!"
+          echo "All jit-kernel benchmark tests completed successfully!"
 
   # =============================================== primary ====================================================
 
@@ -1272,6 +1272,7 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1330,6 +1331,7 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1664,7 +1666,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1, 2, 3]
 
     steps:
       - name: Checkout code
@@ -1693,7 +1695,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()

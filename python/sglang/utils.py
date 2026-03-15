@@ -16,7 +16,7 @@ import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
+from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -140,8 +140,16 @@ class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
 
+    @cached_property
+    def _body(self):
+        return self.resp.read()
+
     def json(self):
-        return json.loads(self.resp.read())
+        return json.loads(self._body)
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", errors="replace")
 
     @property
     def status_code(self):
