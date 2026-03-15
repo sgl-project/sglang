@@ -6,6 +6,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -3722,6 +3723,41 @@ function call<|role_sep|>
 
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params["city"], "Rome")
+
+
+class TestFunctionCallParserStructuralTagConstraint(unittest.TestCase):
+    def setUp(self):
+        self.strict_tool = Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                description="Get weather information",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                    },
+                    "required": ["location"],
+                },
+                strict=True,
+            ),
+        )
+
+    def test_kimi_k2_auto_uses_structural_tag(self):
+        parser = FunctionCallParser([self.strict_tool], "kimi_k2")
+        constraint = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
+
+    def test_non_kimi_parser_auto_uses_structural_tag_when_supported(self):
+        parser = FunctionCallParser([self.strict_tool], "qwen")
+        if not parser.detector.supports_structural_tag():
+            self.skipTest("qwen detector does not support structural_tag")
+        constraint = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
 
 
 if __name__ == "__main__":
