@@ -898,11 +898,11 @@ jobs:
           done
 
           if [ ${#failures[@]} -ne 0 ]; then
-            echo "The following benchmark smoke tests failed: ${failures[*]}"
+            echo "The following benchmark tests failed: ${failures[*]}"
             exit 1
           fi
 
-          echo "All jit-kernel benchmark smoke tests completed successfully!"
+          echo "All jit-kernel benchmark tests completed successfully!"
 
   # =============================================== primary ====================================================
 
