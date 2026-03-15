@@ -336,48 +336,13 @@ jobs:
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Wait for stage-a-test-1 to complete
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
         id: wait
-        uses: actions/github-script@v7
         with:
-          script: |
-            const maxWaitMinutes = 240;
-            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
-            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
-
-            for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: context.runId,
-                per_page: 100,
-              });
-
-              const stageAJob = jobs.find(job => job.name === 'stage-a-test-1');
-
-              if (stageAJob) {
-                console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
-
-                if (stageAJob.status === 'completed') {
-                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped') {
-                    core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
-                    return;
-                  } else {
-                    core.setOutput('result', 'failure');
-                    core.setFailed(`stage-a-test-1 ${stageAJob.conclusion}`);
-                    return;
-                  }
-                }
-              } else {
-                console.log('stage-a-test-1 job not found yet');
-              }
-
-              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-            }
-
-            core.setFailed('Timeout waiting for stage-a-test-1');
-            core.setOutput('result', 'timeout');
+          stage-name: stage-a
+          jobs: '["stage-a-test-1", "stage-a-cpu-only"]'
+          max-wait-minutes: '240'
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
@@ -396,88 +361,19 @@ jobs:
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Wait for stage-b jobs to complete
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
         id: wait
-        uses: actions/github-script@v7
         with:
-          script: |
-            const maxWaitMinutes = 480;
-            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
-            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
-
-            // Stage-b jobs to wait for
-            const stageBJobs = [
-              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },              // partitions 0-7
-              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 14 },             // partitions 0-13
-              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 4 },              // partitions 0-3
-              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 },
-            ];
-            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);  // 27 total
-
-            // Helper to match job names exactly (prefix alone or prefix + " (N)" for matrix jobs)
-            const matchesPrefix = (jobName, prefix) => {
-              return jobName === prefix || jobName.startsWith(prefix + ' (');
-            };
-
-            for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: context.runId,
-                per_page: 100,
-              });
-
-              let allCompleted = true;
-              let anyFailed = false;
-              let failedJobs = [];
-              let completedCount = 0;
-              let totalCount = 0;
-
-              for (const { prefix, expectedCount } of stageBJobs) {
-                const matchingJobs = jobs.filter(job => matchesPrefix(job.name, prefix));
-
-                // Check existing jobs for failures first (fail fast)
-                for (const job of matchingJobs) {
-                  totalCount++;
-                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
-
-                  if (job.status !== 'completed') {
-                    allCompleted = false;
-                  } else {
-                    completedCount++;
-                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
-                      anyFailed = true;
-                      failedJobs.push(job.name);
-                    }
-                  }
-                }
-
-                if (matchingJobs.length < expectedCount) {
-                  console.log(`${prefix}: found ${matchingJobs.length}/${expectedCount} jobs (waiting for more)`);
-                  allCompleted = false;
-                }
-              }
-
-              console.log(`Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})`);
-
-              // Fail fast if any jobs failed (don't wait for all jobs to be created)
-              if (anyFailed) {
-                core.setOutput('result', 'failure');
-                core.setFailed(`Stage-b jobs failed: ${failedJobs.join(', ')}`);
-                return;
-              }
-
-              if (allCompleted && totalCount >= totalExpectedJobs) {
-                core.setOutput('result', 'success');
-                return;
-              }
-
-              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-            }
-
-            core.setFailed('Timeout waiting for stage-b jobs');
-            core.setOutput('result', 'timeout');
+          stage-name: stage-b
+          jobs: |
+            [
+              {"prefix": "stage-b-test-small-1-gpu", "expected_count": 8},
+              {"prefix": "stage-b-test-large-1-gpu", "expected_count": 14},
+              {"prefix": "stage-b-test-large-2-gpu", "expected_count": 4},
+              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
+            ]
+          max-wait-minutes: '480'
 
   # =============================================== PR Gate ====================================================
   call-gate:
