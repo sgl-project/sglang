@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=400, suite="stage-b-test-4-gpu-b200")
+register_cuda_ci(est_time=500, suite="stage-b-test-4-gpu-b200")
 
 import os
 import random
