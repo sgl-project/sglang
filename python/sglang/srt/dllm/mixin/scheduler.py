@@ -68,29 +68,41 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        if result.next_token_ids:
-            self.token_to_kv_pool_allocator.free_group_begin()
+        self.token_to_kv_pool_allocator.free_group_begin()
 
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
+        for idx in range(batch.batch_size()):
+            req = batch.reqs[idx]
+            new_tokens = 0
 
+            if result.next_token_ids and len(result.next_token_ids) > idx:
                 next_token_ids = result.next_token_ids[idx].tolist()
                 new_tokens = len(next_token_ids)
-                if new_tokens == 0:
-                    continue
 
-                req.fill_ids[-new_tokens:] = next_token_ids[:]
-                self.num_generated_tokens += new_tokens
+                if new_tokens > 0:
+                    req.fill_ids[-new_tokens:] = next_token_ids[:]
+                    self.num_generated_tokens += new_tokens
+                    req.output_ids.extend(next_token_ids)
 
-                req.output_ids.extend(next_token_ids)
-                req.check_finished(new_accepted_len=new_tokens)
+            # For needs_full_prefill dLLM: sync output_ids from fill_ids if not yet done
+            if req.is_dllm() and req.dllm_config.needs_full_prefill:
+                expected_output_len = len(req.fill_ids) - len(req.origin_input_ids)
+                if len(req.output_ids) < expected_output_len:
+                    new_output_ids = req.fill_ids[len(req.origin_input_ids) :]
+                    new_tokens = len(new_output_ids) - len(req.output_ids)
+                    req.output_ids = new_output_ids
 
-                if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
+            req.check_finished(new_accepted_len=max(new_tokens, 1))
 
-            self.stream_output(batch.reqs, batch.return_logprob)
-            self.token_to_kv_pool_allocator.free_group_end()
+            if req.finished():
+                # For needs_full_prefill, don't insert to radix cache (recomputes each round)
+                is_insert = not (req.is_dllm() and req.dllm_config.needs_full_prefill)
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                req.time_stats.set_completion_time()
+
+            self.maybe_collect_customized_info(idx, req, result.logits_output)
+
+        self.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(

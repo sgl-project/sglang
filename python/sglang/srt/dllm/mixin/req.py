@@ -19,6 +19,7 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
+        self.dllm_ids = []  # For full-attention bidirectional models (LLaDA, DREAM)
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -54,16 +55,39 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
-        self.dllm_block_offset = (
-            0
-            if not self.fill_ids
-            else self.dllm_block_offset + self.dllm_config.block_size
-        )
-        self.fill_ids = (
-            self.origin_input_ids
-            + self.output_ids
-            + [self.dllm_config.mask_id] * self.dllm_config.block_size
-        )
+        # For full-attention bidirectional models (LLaDA, DREAM), use dllm_ids
+        if getattr(self.dllm_config, "pad_full_generation", False) or getattr(
+            self.dllm_config, "needs_full_prefill", False
+        ):
+            if not self.dllm_ids:
+                if self.dllm_config.pad_full_generation:
+                    # Full-attention algorithms: pad ALL max_new_tokens masks at once
+                    num_masks = self.sampling_params.max_new_tokens
+                else:
+                    num_masks = self.dllm_config.block_size
+                self.dllm_ids = (
+                    self.origin_input_ids + [self.dllm_config.mask_id] * num_masks
+                )
+            else:
+                if not self.dllm_config.needs_full_prefill:
+                    self.dllm_block_offset += self.dllm_config.block_size
+                if not self.dllm_config.pad_full_generation:
+                    self.dllm_ids += [
+                        self.dllm_config.mask_id
+                    ] * self.dllm_config.block_size
+            self.fill_ids = self.dllm_ids
+        else:
+            # Original dLLM logic (e.g., d3llm)
+            self.dllm_block_offset = (
+                0
+                if not self.fill_ids
+                else self.dllm_block_offset + self.dllm_config.block_size
+            )
+            self.fill_ids = (
+                self.origin_input_ids
+                + self.output_ids
+                + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)

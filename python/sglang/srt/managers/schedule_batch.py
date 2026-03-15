@@ -880,7 +880,13 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None:
+        # Bidirectional dLLM models (ENCODER_ONLY attention) recompute all tokens
+        # every round, so keep prefix_indices empty and skip tree cache matching.
+        if self.is_dllm() and self.dllm_config.needs_full_prefill:
+            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            self.last_node = None
+            self.cache_protected_len = 0
+        elif tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1502,6 +1508,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
+
+        # For needs_full_prefill models: free old KV slots before reallocating,
+        # since the full sequence is re-sent each round and prefix_indices is empty.
+        if self.is_dllm() and self.dllm_config.needs_full_prefill:
+            for req in reqs:
+                if req.kv_committed_len > 0 and req.req_pool_idx is not None:
+                    old_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : req.kv_committed_len
+                    ]
+                    self.token_to_kv_pool_allocator.free(old_indices)
+                    req.kv_committed_len = 0
+                    req.cache_protected_len = 0
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
@@ -2284,6 +2302,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            dllm_origin_input_lens=(
+                [len(req.origin_input_ids) for req in self.reqs]
+                if self.is_dllm()
+                else None
+            ),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2470,6 +2493,7 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+    dllm_origin_input_lens: Optional[List[int]] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

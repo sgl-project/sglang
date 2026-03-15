@@ -12,12 +12,20 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        needs_full_prefill: bool = False,
+        pad_full_generation: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        # Bidirectional models (e.g. Dream) cannot use prefix KV cache;
+        # they must recompute all tokens every forward pass.
+        self.needs_full_prefill = needs_full_prefill
+        # Full-attention algorithms pad ALL max_new_tokens masks at once
+        # instead of adding block_size masks per round.
+        self.pad_full_generation = pad_full_generation
 
     @staticmethod
     def from_server_args(
@@ -31,17 +39,25 @@ class DllmConfig:
             model_path=server_args.model_path,
             model_revision=server_args.revision,
         )
-        DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
-            "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-        }
-
+        needs_full_prefill = False
         arch = model_config.hf_config.architectures[0]
-        if arch in DLLM_PARAMS:
-            params = DLLM_PARAMS[arch]
-            block_size = params["block_size"]
-            mask_id = params["mask_id"]
+        if arch == "LLaDA2MoeModelLM":
+            block_size = 32
+            mask_id = 156895
+        elif arch == "Qwen3ForCausalLM":
+            block_size = 32
+            mask_id = 151670
+        elif arch == "DreamModel":
+            block_size = 32
+            mask_id = 151666
+            needs_full_prefill = True
+        elif arch == "LLaDAModelLM":
+            block_size = 32
+            mask_id = 126336
+            needs_full_prefill = True
+        elif arch in {"SDARForCausalLM", "SDARMoeForCausalLM"}:
+            block_size = 4
+            mask_id = 151669
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
@@ -66,10 +82,19 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        # Full-attention algorithms pad ALL max_new_tokens masks at once
+        _FULL_GEN_PAD_ALGORITHMS = {"FullAttnMultiBlock"}
+        pad_full_generation = (
+            needs_full_prefill
+            and server_args.dllm_algorithm in _FULL_GEN_PAD_ALGORITHMS
+        )
+
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            needs_full_prefill=needs_full_prefill,
+            pad_full_generation=pad_full_generation,
         )

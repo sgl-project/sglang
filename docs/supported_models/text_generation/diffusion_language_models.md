@@ -4,7 +4,7 @@ Diffusion language models have shown promise for non-autoregressive text generat
 
 ## Example Launch Command
 
-SGLang supports different DLLM algorithms such as `LowConfidence` and `JointThreshold`.
+SGLang supports different DLLM algorithms such as `LowConfidence`, `JointThreshold`, and `FullAttnMultiBlock`.
 
 ```shell
 python3 -m sglang.launch_server \
@@ -49,6 +49,24 @@ max_post_edit_steps: 16
 # 2-gram repetition penalty (default 0).
 # An empirical value of 3 is often sufficient to mitigate most repetitions.
 penalty_lambda: 0
+```
+
+FullAttnMultiBlock Config (for bidirectional models like LLaDA and DREAM):
+
+```yaml
+# Confidence threshold for accepting predicted tokens
+# Range: 0.0 - 1.0
+threshold: 0.5
+# Additional threshold increment per decoding step
+block_add: 0.1
+# Threshold for considering a token as "decoded"
+decoded_thresh: 0.95
+# Sub-block size for parallel decoding
+sub_block_size: 32
+# Number of iterations to delay before caching
+cache_delay_iter: 2
+# Interval for refreshing the attention cache
+refresh_interval: 10000
 ```
 
 ## Example Client Code Snippet
@@ -104,8 +122,12 @@ curl -X POST "http://127.0.0.1:30000/generate" \
 
 Below the supported models are summarized in a table.
 
-| Model Family               | Example Model                | Description                                                                                          |
-| -------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-flash` | LLaDA2.0-flash is a diffusion language model featuring a 100B Mixture-of-Experts (MoE) architecture. |
-| **SDAR (JetLM)**           | `JetLM/SDAR-8B-Chat`         | SDAR series diffusion language model (Chat), dense architecture.                                 |
-| **SDAR (JetLM)**           | `JetLM/SDAR-30B-A3B-Chat`    | SDAR series diffusion language model (Chat), MoE architecture.                                   |
+| Model Family               | Example Model                | Algorithm           | Description                                                                                          |
+| -------------------------- | ---------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------- |
+| **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-mini`  | LowConfidence       | LLaDA2.0-mini is a diffusion language model with dense architecture.                                 |
+| **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-flash` | LowConfidence       | LLaDA2.0-flash is a diffusion language model featuring a 100B Mixture-of-Experts (MoE) architecture. |
+| **LLaDA2.1-mini**          | `inclusionAI/LLaDA2.1-mini`  | LowConfidence       | LLaDA2.1-mini is an improved version of LLaDA2.0-mini with better performance.                       |
+| **d3LLM-LLaDA**            | `d3LLM/d3LLM_LLaDA`          | FullAttnMultiBlock  | Bidirectional diffusion LLM based on LLaDA architecture with full attention.                         |
+| **d3LLM-Dream**            | `d3LLM/d3LLM_Dream`          | FullAttnMultiBlock  | Bidirectional diffusion LLM based on DREAM architecture with full attention.                         |
+| **SDAR (JetLM)**           | `JetLM/SDAR-8B-Chat`         | JointThreshold      | SDAR series diffusion language model (Chat), dense architecture.                                     |
+| **SDAR (JetLM)**           | `JetLM/SDAR-30B-A3B-Chat`    | JointThreshold      | SDAR series diffusion language model (Chat), MoE architecture.                                       |

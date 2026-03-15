@@ -438,7 +438,11 @@ class PrefillAdder:
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
 
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        if dllm_config.needs_full_prefill:
+            # Bidirectional models process full sequences; use a large token budget.
+            self.rem_dllm_tokens = max_running_reqs * self.rem_input_tokens
+        else:
+            self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -532,6 +536,10 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
+        if self.dllm_config.needs_full_prefill:
+            # Bidirectional models process full sequences; don't cap at block_size.
+            return max(self.rem_dllm_tokens, 0)
+
         _rem_tokens = min(
             self.rem_dllm_tokens,
             self.dllm_block_size,
@@ -546,11 +554,17 @@ class PrefillAdder:
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
         # the diffusion unmask process may have some problems
         # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        if self.dllm_config.needs_full_prefill:
+            # Bidirectional models: send full sequence (no prefix KV reuse)
+            trunc_len = (
+                (len(req.fill_ids) - prefix_len) // self.page_size * self.page_size
+            )
+        else:
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
 
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
@@ -560,6 +574,9 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
+        # For needs_full_prefill dLLM, last_node may be None (no tree cache matching)
+        if req.last_node is None:
+            return
         if self.is_hybrid_swa:
             swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
             req.swa_uuid_for_lock = swa_uuid_for_lock
@@ -623,6 +640,10 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        # For needs_full_prefill dLLM, last_node may be None (no tree cache matching)
+        if last_node is None:
+            yield None
+            return
         try:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
