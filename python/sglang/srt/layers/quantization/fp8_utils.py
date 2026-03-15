@@ -536,10 +536,12 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             f"m={m} n={n} k={k} block_size={block_size}"
         )
         assert x_scale.dtype == torch.float32, (
-            f"FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, got {x_scale.dtype}."
+            "FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, "
+            f"got {x_scale.dtype}."
         )
         assert weight_scale.dtype == torch.float32, (
-            f"FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, got {weight_scale.dtype}."
+            "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
+            f"got {weight_scale.dtype}."
         )
     # TRTLLM path continues using the original quantized scale layout.
     output = gemm_fp8_nt_groupwise(
