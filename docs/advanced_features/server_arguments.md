@@ -538,6 +538,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-process-config` | Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`. | `{}` | Type: JSON / Dict |
 | `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
 | `--limit-mm-data-per-request` | Limit the number of multimodal inputs per request. e.g. '{"image": 1, "video": 1, "audio": 1}' | `None` | Type: JSON / Dict |
+| `--enable-mm-global-cache` | Enable Mooncake-backed global multimodal embedding cache on encoder servers so repeated images can reuse cached ViT embeddings instead of recomputing them. | `False` | bool flag (set to enable) |
 
 ## For checkpoint decryption
 | Argument | Description | Defaults | Options |
