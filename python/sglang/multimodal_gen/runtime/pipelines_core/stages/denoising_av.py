@@ -704,11 +704,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
-        # 4. Cleanup
-        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            offload_mgr.release_all()
-
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs.
 
