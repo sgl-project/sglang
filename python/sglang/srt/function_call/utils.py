@@ -225,7 +225,6 @@ def get_json_schema_constraint(
                 return {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
                     "items": _get_tool_schema(tool),
                 }
         return None

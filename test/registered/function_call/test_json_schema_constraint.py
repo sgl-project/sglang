@@ -102,7 +102,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertEqual(schema["maxItems"], 1)
+        self.assertNotIn("maxItems", schema)
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
@@ -121,7 +121,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertEqual(schema["maxItems"], 1)
+        self.assertNotIn("maxItems", schema)
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
