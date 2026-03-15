@@ -110,6 +110,19 @@ jobs:
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
+      - name: Run registered test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite per-commit-1-npu-a2 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+
       - name: Run test
         timeout-minutes: 60
         env:
@@ -289,6 +302,7 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
@@ -331,6 +345,7 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
@@ -370,6 +385,7 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"

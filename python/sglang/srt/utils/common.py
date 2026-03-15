@@ -79,7 +79,6 @@ import psutil
 import pybase64
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
@@ -94,7 +93,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -192,6 +191,11 @@ def is_musa() -> bool:
     except ImportError:
         return False
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -596,6 +600,8 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+    elif device == "mps":
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -736,31 +742,84 @@ def wait_port_available(
     return False
 
 
+def _get_addrinfos_for_bind(host=None, port=0):
+    """Return deduplicated addrinfo tuples for binding (one per address family).
+
+    Args:
+        host: Bind address. None (with AI_PASSIVE) resolves to wildcard
+              addresses (0.0.0.0 / ::) suitable for accepting on all interfaces.
+        port: Port number. 0 lets the OS assign an available ephemeral port.
+
+    Flags:
+        AI_ADDRCONFIG — only return families actually configured on this host.
+        AI_PASSIVE    — return wildcard addresses suitable for bind().
+
+    Falls back to AF_INET if getaddrinfo fails (e.g. DNS misconfiguration).
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+            0,
+            socket.AI_ADDRCONFIG | socket.AI_PASSIVE,
+        )
+        seen = set()
+        return [i for i in infos if i[0] not in seen and not seen.add(i[0])]
+    except socket.gaierror:
+        fallback_host = "0.0.0.0" if host is None else host
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (fallback_host, port))]
+
+
+def try_bind_socket(host=None, port=0, *, reuse_addr=True, listen=False):
+    """Bind a TCP socket on the first available address family (IPv4/IPv6).
+
+    Iterates over address families returned by _get_addrinfos_for_bind and
+    returns the first socket that successfully binds.
+
+    Args:
+        host: Bind address. None binds to all interfaces (0.0.0.0 / ::).
+        port: Port number. 0 lets the OS assign an available ephemeral port;
+              use sock.getsockname()[1] to retrieve the assigned port.
+        reuse_addr: Set SO_REUSEADDR to allow quick port reuse after close.
+        listen: Call listen(1) after bind, making the socket ready to accept.
+
+    Returns:
+        The bound socket. Caller is responsible for closing it.
+
+    Raises:
+        OSError: If bind fails on all configured address families.
+    """
+    for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(host, port):
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if reuse_addr:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(sockaddr)
+            if listen:
+                sock.listen(1)
+            return sock
+        except OSError:
+            sock.close()
+    raise OSError(f"Could not bind port {port} on any configured address family")
+
+
 def is_port_available(port):
     """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
-            return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
+    try:
+        sock = try_bind_socket(port=port, listen=True)
+        sock.close()
+        return True
+    except (OSError, OverflowError):
+        return False
 
 
 def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    sock = try_bind_socket()
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def decode_video_base64(video_base64):
@@ -845,57 +904,67 @@ def decode_video_base64(video_base64):
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
+    if sr is None:
+        sr = 16000
+
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
+    if isinstance(audio_file, bytes):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str):
+        source = audio_file
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
     import soundfile as sf
     import torch
     import torchaudio
 
-    if sr is None:
-        sr = 16000
-
-    # Load audio data
-    if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
-    elif audio_file.startswith("file://"):
-        audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
-    elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
     else:
-        raise ValueError(f"Invalid audio format: {audio_file}")
+        audio, original_sr = sf.read(source)
 
-    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
-    # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
         else:
-            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
-
+            audio_tensor = audio_tensor.T
         audio_tensor = torchaudio.functional.resample(
             audio_tensor, orig_freq=original_sr, new_freq=sr
         )
-
         if audio_tensor.shape[0] == 1:
             audio = audio_tensor.squeeze(0).numpy()
         else:
-            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
+            audio = audio_tensor.T.numpy()
 
     return audio
 
@@ -1115,7 +1184,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.4")
+        min_version: Minimum version required (e.g., "0.6.6")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1470,9 +1539,16 @@ def get_zmq_socket_on_host(
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    # Bind to random TCP port
+    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
+    if host:
+        if is_valid_ipv6_address(host):
+            socket.setsockopt(zmq.IPV6, 1)
+            bind_host = f"tcp://[{host}]"
+        else:
+            bind_host = f"tcp://{host}"
+    else:
+        bind_host = "tcp://*"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
 
@@ -1675,11 +1751,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
 
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
-    sock.bind(("", port))
-    sock.listen(1)
-    return sock
+    return try_bind_socket(port=port, listen=True)
 
 
 def get_amdgpu_memory_capacity():
@@ -2089,7 +2161,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2619,22 +2696,16 @@ def get_open_port() -> int:
         port = int(port)
         while True:
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", port))
-                    return port
+                sock = try_bind_socket(port=port, reuse_addr=False)
+                sock.close()
+                return port
             except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+                logger.info("Port %d is already in use, trying port %d", port, port + 1)
+                port += 1
+    sock = try_bind_socket()
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -2643,48 +2714,6 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def maybe_wrap_ipv6_address(address: str) -> str:
-    if is_valid_ipv6_address(address):
-        return f"[{address}]"
-    return address
-
-
-def format_tcp_address(ip: str, port: int) -> str:
-    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
-
-
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -2947,31 +2976,40 @@ def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
 
 
 def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
+    # Google's public DNS servers, used to discover the local IP.
+    # UDP connect doesn't send packets; it just selects the right source address.
+    # https://developers.google.com/speed/public-dns/docs/using#addresses
+    # Try IPv4 first, then IPv6. getaddrinfo on a literal IP returns exactly
+    # one result, so we unpack directly instead of looping.
+    for dns_host, dns_port in [("8.8.8.8", 80), ("2001:4860:4860::8888", 80)]:
+        try:
+            family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+                dns_host,
+                dns_port,
+                socket.AF_UNSPEC,
+                socket.SOCK_DGRAM,
+                0,
+                socket.AI_ADDRCONFIG,
+            )[0]
+            with socket.socket(family, socktype, proto) as s:
+                s.connect(sockaddr)
+                return s.getsockname()[0]
+        except (socket.gaierror, OSError):
+            continue
 
+    # Fallback: resolve the local hostname to an IP address via /etc/hosts or DNS.
+    # Unreliable — many machines resolve hostname to 127.0.0.1, so we skip loopback.
     try:
         hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+        ip = socket.getaddrinfo(
+            hostname, None, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG
+        )[0][4][0]
+        if ip and ip not in ("127.0.0.1", "0.0.0.0", "::1"):
             return ip
     except Exception:
         pass
 
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
+    logger.warning("Can not get local ip by remote")
     return None
 
 

@@ -367,12 +367,27 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
-            next_token_ids = next_token_ids.tolist()
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+            if batch.is_spec_v2:
+                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            else:
+                next_token_ids = next_token_ids.tolist()
+
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_spec_v2:
-            next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+
+                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -439,24 +454,39 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
+            if req.return_logprob and (
+                batch.spec_algorithm.is_none() or batch.is_spec_v2
+            ):
+                # Spec v1 handles logprobs inside its own worker.
+                # Normalize: non-spec has 1 token, spec v2 has multiple.
+                if batch.is_spec_v2:
+                    accepted_logprobs = next_token_logprobs[i]
+                    accepted_ids = next_token_id
+                    max_accept = len(accepted_logprobs)
+                else:
+                    accepted_logprobs = [next_token_logprobs[i]]
+                    accepted_ids = [next_token_id]
+                    max_accept = 1
+
+                for j, tok_id in enumerate(accepted_ids):
+                    req.output_token_logprobs_val.append(accepted_logprobs[j])
+                    req.output_token_logprobs_idx.append(tok_id)
+                    if req.top_logprobs_num > 0:
+                        flat_idx = i * max_accept + j
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[flat_idx]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[flat_idx]
+                        )
+                    if req.token_ids_logprob is not None:
+                        flat_idx = i * max_accept + j
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[flat_idx]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                        )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(

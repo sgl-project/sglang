@@ -142,7 +142,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
-    def _compile_regex(self, regex: str) -> Optional[OutlinesGrammar]:
+    def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1

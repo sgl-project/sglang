@@ -13,6 +13,8 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+from __future__ import annotations
+
 import datetime
 import gc
 import inspect
@@ -132,6 +134,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -301,6 +304,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
     ):
         # Parse args
@@ -322,6 +326,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
@@ -803,6 +808,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -2232,24 +2238,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_layers = []
         self.moe_fusions = []
         for layer in language_model.model.layers:
+            attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                    attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
-                    self.attention_layers.append(layer.self_attn.attn_mqa)
+                    attn_layer = layer.self_attn.attn_mqa
             # For hybrid model
             elif hasattr(layer, "attn"):
-                self.attention_layers.append(layer.attn)
+                attn_layer = layer.attn
             elif hasattr(layer, "linear_attn"):
                 if hasattr(layer.linear_attn, "attn"):
-                    self.attention_layers.append(layer.linear_attn.attn)
+                    attn_layer = layer.linear_attn.attn
                 else:
-                    self.attention_layers.append(layer.linear_attn)
+                    attn_layer = layer.linear_attn
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
-                    self.attention_layers.append(layer.attention.attn)
+                    attn_layer = layer.attention.attn
+            # For NemotronH and similar hybrid models using 'mixer' attribute
+            elif hasattr(layer, "mixer"):
+                if hasattr(layer.mixer, "attn"):
+                    attn_layer = layer.mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    # Mamba layer with split op support - store the layer itself
+                    attn_layer = layer
+
+            if attn_layer is not None:
+                self.attention_layers.append(attn_layer)
 
             moe_block = None
             moe_fusion = None
@@ -2264,6 +2281,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
                 moe_block = layer.moe.experts
                 moe_fusion = layer.moe
+            # For NemotronH MoE layers using 'mixer' attribute
+            if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
+                moe_block = layer.mixer.experts
+                moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
 

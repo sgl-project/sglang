@@ -59,11 +59,11 @@ def fused_recurrent_kda_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = torch.empty_like(k)
+    o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
     else:
-        final_state = q.new_empty(T, HV, K, V, dtype=initial_state.dtype)
+        final_state = q.new_empty(N, HV, V, K, dtype=initial_state.dtype)
 
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = final_state.stride(0)
@@ -113,6 +113,7 @@ def fused_recurrent_kda_fwd(
         num_stages=num_stages,
     )
 
+    o = o.squeeze(0)
     return o, final_state
 
 
@@ -756,11 +757,11 @@ def chunk_gla_fwd_kernel_o(
             (1, 0),
         )
         p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
-            (K, V),
-            (V, 1),
-            (i_k * BK, i_v * BV),
-            (BK, BV),
+            h + (i_tg * H + i_h) * V * K,
+            (V, K),
+            (K, 1),
+            (i_v * BV, i_k * BK),
+            (BV, BK),
             (1, 0),
         )
 
@@ -776,7 +777,7 @@ def chunk_gla_fwd_kernel_o(
         # works but dkw, owing to divine benevolence
         # [BT, BV]
         if i_k >= 0:
-            b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),

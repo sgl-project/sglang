@@ -15,10 +15,10 @@ classifiers = [
 ]
 
 dependencies = [
-  "torch==2.9.0",
-  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. torch==2.9.0 on XPU uses 0.9.1
+  "torch==2.10.0+xpu",
+  "torchcodec==0.10.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. torch==2.10.0 on XPU uses 0.10.0
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
-  "torchaudio==2.9.0",
+  "torchaudio==2.10.0+xpu",
   "torchvision",
   "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
   "IPython",
@@ -66,31 +66,36 @@ dependencies = [
   "uvicorn",
   "uvloop",
   # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
-  "smg-grpc-proto>=0.4.1",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [project.optional-dependencies]
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 test = [
   "accelerate",
+  "bitsandbytes",
   "expecttest",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft",
   "pytest",
   "sentence_transformers",
   "tabulate",
 ]
-all = []
+
 dev = ["sglang[test]"]
+
+all = [
+  "sglang[tracing]",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -130,4 +135,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"
