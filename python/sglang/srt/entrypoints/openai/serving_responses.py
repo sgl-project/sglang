@@ -67,7 +67,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
