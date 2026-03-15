@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, suite="stage-b-test-4-gpu-b200")
+register_cuda_ci(est_time=400, suite="stage-b-test-4-gpu-b200")
 
 import os
 import random
@@ -23,13 +23,6 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
-
-
-def _assert_blackwell_4gpu():
-    assert torch.cuda.device_count() >= 4, "These tests require at least 4 GPUs."
-    for gpu_id in range(4):
-        major, _ = torch.cuda.get_device_capability(gpu_id)
-        assert major >= 10, "These tests require Blackwell GPUs (sm100+)."
 
 
 class _BlackwellMXFP8ServerBase(CustomTestCase):
@@ -57,10 +50,6 @@ class _BlackwellMXFP8ServerBase(CustomTestCase):
             "moe_runner_backend": "flashinfer_trtllm_routed",
         },
     ]
-
-    @classmethod
-    def setUpClass(cls):
-        _assert_blackwell_4gpu()
 
     def _launch_server(self, fp8_gemm_backend, moe_runner_backend, env=None):
         return popen_launch_server(
@@ -116,9 +105,7 @@ class _BlackwellMXFP8ServerBase(CustomTestCase):
 
     def _assert_decode_signatures_different(self, sig_a, sig_b):
         text_changed = sig_a["text"] != sig_b["text"]
-        logprob_delta = abs(
-            sig_a["first_token_logprob"] - sig_b["first_token_logprob"]
-        )
+        logprob_delta = abs(sig_a["first_token_logprob"] - sig_b["first_token_logprob"])
         self.assertTrue(
             text_changed or logprob_delta > 1e-2,
             f"Expected decode signature to change, but got {sig_a=} and {sig_b=}",
@@ -375,7 +362,9 @@ class TestServerUpdateWeightsFromDistributedMXFP8(_BlackwellMXFP8ServerBase):
                                 ],
                                 load_format=update_test_suite["load_format"],
                                 low_target_value=update_test_suite["low_target_value"],
-                                high_target_value=update_test_suite["high_target_value"],
+                                high_target_value=update_test_suite[
+                                    "high_target_value"
+                                ],
                             ):
                                 group_name = (
                                     "test_parameter_update_group_mxfp8_"
@@ -424,7 +413,9 @@ class TestServerUpdateWeightsFromDistributedMXFP8(_BlackwellMXFP8ServerBase):
                                             target_value=update_test_suite[
                                                 "low_target_value"
                                             ],
-                                            load_format=update_test_suite["load_format"],
+                                            load_format=update_test_suite[
+                                                "load_format"
+                                            ],
                                         ),
                                         run_high_update=lambda: self._run_distributed_update(
                                             group=group,
@@ -434,7 +425,9 @@ class TestServerUpdateWeightsFromDistributedMXFP8(_BlackwellMXFP8ServerBase):
                                             target_value=update_test_suite[
                                                 "high_target_value"
                                             ],
-                                            load_format=update_test_suite["load_format"],
+                                            load_format=update_test_suite[
+                                                "load_format"
+                                            ],
                                         ),
                                     )
                                 finally:
