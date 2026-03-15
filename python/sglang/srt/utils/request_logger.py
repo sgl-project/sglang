@@ -33,6 +33,19 @@ _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
     h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
 ]
+_SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+}
+_MASKED_HEADER_VALUE = "***"
+
+
+def _sanitize_headers_for_logging(headers: Dict[str, str]) -> Dict[str, str]:
+    return {
+        k: (_MASKED_HEADER_VALUE if k.lower() in _SENSITIVE_HEADERS else v)
+        for k, v in headers.items()
+    }
 
 
 def _extract_whitelisted_headers(
@@ -40,7 +53,8 @@ def _extract_whitelisted_headers(
 ) -> Optional[Dict[str, str]]:
     if request is None:
         return None
-    return {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
+    headers = {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
+    return _sanitize_headers_for_logging(headers)
 
 
 class RequestLogger:
