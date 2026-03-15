@@ -880,11 +880,11 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
-      - name: Run benchmark smoke tests
+      - name: Run benchmark tests
         timeout-minutes: 45
         run: |
           cd python/sglang/jit_kernel/benchmark
-          echo "Running jit-kernel benchmark smoke tests in CI mode..."
+          echo "Running jit-kernel benchmark tests in CI mode..."
 
           failures=()
 
@@ -898,11 +898,11 @@ jobs:
           done
 
           if [ ${#failures[@]} -ne 0 ]; then
-            echo "The following benchmark smoke tests failed: ${failures[*]}"
+            echo "The following benchmark tests failed: ${failures[*]}"
             exit 1
           fi
 
-          echo "All jit-kernel benchmark smoke tests completed successfully!"
+          echo "All jit-kernel benchmark tests completed successfully!"
 
   # =============================================== primary ====================================================
 
