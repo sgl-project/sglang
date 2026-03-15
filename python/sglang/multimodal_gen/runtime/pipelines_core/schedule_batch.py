@@ -32,6 +32,9 @@ from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
 
+# Sentinel prefix for sleep-state errors, used by scheduler and HTTP layer.
+SLEEPING_ERROR_PREFIX = "[SLEEPING]"
+
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 

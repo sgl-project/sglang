@@ -60,6 +60,74 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 
 logger = init_logger(__name__)
 
+OOM_MSG = f"""
+OOM detected. Possible solutions:
+  - If the OOM occurs during loading:
+    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+  - If the OOM occurs during runtime:
+    1. Enable SP and/or TP (in a multi-GPU setup)
+    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
+    3. Opt for a sparse-attention backend
+    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    5. Enable quantization (e.g. nunchaku)
+  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
+"""
+
+
+def _get_module_device(module: torch.nn.Module) -> str:
+    """Return best-effort device string for a module."""
+    param = next(module.parameters(), None)
+    if param is not None:
+        return str(param.device)
+    buffer = next(module.buffers(), None)
+    if buffer is not None:
+        return str(buffer.device)
+
+    for key, val in vars(module).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(val, torch.Tensor):
+            return str(val.device)
+
+    return "cpu"
+
+
+def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
+    """
+    Move tensor attributes that are not covered by `module.to(device)`.
+
+    `module.to` handles parameters/buffers/submodules, but some models keep tensor
+    caches in plain Python attributes. We traverse `module.__dict__` and move tensor
+    leaves inside tensors / dict / list / tuple while keeping non-tensor objects.
+    """
+
+    def move_tensors(obj):
+        if torch.is_tensor(obj):
+            return obj.to(device)
+        if isinstance(obj, dict):
+            return {k: move_tensors(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [move_tensors(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(move_tensors(v) for v in obj)
+        return obj
+
+    attrs = module.__dict__
+    for attr_name, attr_value in list(attrs.items()):
+        if attr_name in {"_parameters", "_buffers", "_modules"}:
+            continue
+
+        try:
+            moved_value = move_tensors(attr_value)
+        except Exception as e:
+            logger.warning(
+                f"[move_unregistered_tensors] attr move failed: module={module.__class__.__name__} attr={attr_name} type={type(attr_value)} target={device} error={e}",
+            )
+            raise
+
+        if moved_value is not attr_value:
+            attrs[attr_name] = moved_value
+
 
 class GPUWorker:
     """
@@ -88,6 +156,12 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+
+        self._sleeping: bool = False
+        self._sleep_restore_map: dict[str, str] = {}
+
+    def is_sleeping(self) -> bool:
+        return self._sleeping
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -438,19 +512,142 @@ class GPUWorker:
             )
         return checksums
 
+    def _move_modules(self, names: list[str], device: str) -> bool:
+        """
+        Move selected modules to device.
 
-OOM_MSG = f"""
-OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
-  - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
-  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
-"""
+        This function has all-or-nothing semantics:
+        - Stop on first failure (missing module / device query / move / sanitize).
+        - Roll back modules already moved in this call.
+        - Raise RuntimeError to caller after rollback.
+        """
+        moved: list[str] = []
+
+        if self.pipeline is None:
+            raise RuntimeError(
+                f"_move_modules called but pipeline is None, target={device}"
+            )
+
+        modules = get_updatable_modules(self.pipeline)
+        src_device_map: dict[str, str] = {}
+        try:
+            for name in names:
+                module = modules.get(name)
+                if module is None:
+                    raise RuntimeError(
+                        f"module not found during move: name={name}, target={device}"
+                    )
+
+                src_device_map[name] = _get_module_device(module)
+                module.to(device)
+                moved.append(name)
+                _move_unregistered_tensors(module, device)
+        except Exception as e:
+            logger.warning(
+                f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
+            )
+            # TODO (mengyang, chenyang): If exception is raised
+            # during rollback, the original exception detail is lost.
+            for name in moved:
+                module = modules.get(name)
+                src_dev = src_device_map.get(name)
+                module.to(src_dev)
+                _move_unregistered_tensors(module, src_dev)
+            raise RuntimeError(
+                f"failed to move modules to {device}; rollback finished: error={e}"
+            ) from e
+
+        return True
+
+    def release_memory_occupation(self) -> dict:
+        logger.info(f"[SLEEP] GPUWorker.release_memory_occupation rank={self.rank}")
+        if self._sleeping:
+            return {"success": True, "sleeping": True, "message": "already sleeping"}
+        if self.pipeline is None:
+            return {
+                "success": False,
+                "sleeping": False,
+                "message": "pipeline not initialized",
+            }
+
+        try:
+            modules = get_updatable_modules(self.pipeline)
+            restore_map: dict[str, str] = {}
+            for name, m in modules.items():
+                try:
+                    dev_str = _get_module_device(m)
+                except RuntimeError as e:
+                    logger.debug(
+                        f"[SLEEP] module device query failed; skip module. rank={self.rank} module={name} error={e}",
+                    )
+                    continue
+                if not dev_str.startswith("cpu"):
+                    restore_map[name] = dev_str
+
+            self._move_modules(list(restore_map.keys()), "cpu")
+            device = torch.get_device_module()
+            device.synchronize()
+            gc.collect()
+            device.empty_cache()
+
+            self._sleep_restore_map = restore_map
+            self._sleeping = True
+            return {
+                "success": True,
+                "sleeping": True,
+                "message": "released GPU memory (moved active modules to CPU)",
+            }
+        except Exception as e:
+            logger.warning(
+                f"[SLEEP] release_memory_occupation failed. rank={self.rank} error={e}",
+            )
+            return {
+                "success": False,
+                "sleeping": self._sleeping,
+                "message": f"offload failed; rolled back to keep state consistent: {e}",
+            }
+
+    def resume_memory_occupation(self) -> dict:
+        "Resume previously released GPU memory occupation."
+        logger.info(f"[WAKE] GPUWorker.resume_memory_occupation rank={self.rank}")
+        if not self._sleeping:
+            return {"success": True, "sleeping": False, "message": "already awake"}
+        if self.pipeline is None:
+            return {
+                "success": False,
+                "sleeping": True,
+                "message": "pipeline not initialized",
+            }
+
+        try:
+            if not self._sleep_restore_map:
+                self._sleeping = False
+                return {
+                    "success": True,
+                    "sleeping": False,
+                    "message": "no restore map; marked awake",
+                }
+
+            for dev_str in sorted(set(self._sleep_restore_map.values())):
+                names = [n for n, d in self._sleep_restore_map.items() if d == dev_str]
+                self._move_modules(names, dev_str)
+
+            self._sleep_restore_map = {}
+            self._sleeping = False
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "resumed GPU memory (restored modules to original devices)",
+            }
+        except Exception as e:
+            logger.warning(
+                f"[WAKE] resume_memory_occupation failed. rank={self.rank} error={e}",
+            )
+            return {
+                "success": False,
+                "sleeping": self._sleeping,
+                "message": f"resume failed; rolled back to keep state consistent: {e}",
+            }
 
 
 def _oom_exceptions():
@@ -511,7 +708,7 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except _oom_exceptions() as _e:
-        logger.warning(OOM_MSG)
+        logger.warning(f"{OOM_MSG}")
         raise
     finally:
         # Clean up resources to speed up shutdown

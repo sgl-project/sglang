@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import socket
 import ssl
 import subprocess
@@ -21,6 +22,7 @@ from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
+import httpx
 import numpy as np
 import pybase64
 import requests
@@ -657,3 +659,45 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+
+def query_gpu_mem_used_mib(gpu_index: int = 0) -> int:
+    """Query the used memory of the 1 GPU runner in MiB."""
+    if shutil.which("nvidia-smi"):
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip()
+        return int(out.splitlines()[0].strip())
+
+    if shutil.which("rocm-smi"):
+        out = subprocess.check_output(
+            ["rocm-smi", "-d", str(gpu_index), "--showmeminfo", "vram"],
+            text=True,
+        )
+        for line in out.splitlines():
+            if "VRAM Total Used Memory (B)" in line:
+                used_bytes = int(line.split(":")[-1].strip())
+                return used_bytes // (1024 * 1024)
+
+
+def post_request(
+    base_url: str,
+    path: str,
+    payload: dict,
+    timeout_s: float = 300.0,
+    logger: logging.Logger = None,
+) -> httpx.Response:
+    request_start_time_s = time.time()
+    response = httpx.post(f"{base_url}{path}", json=payload, timeout=timeout_s)
+    request_elapsed_s = time.time() - request_start_time_s
+    if logger is not None:
+        logger.info(
+            f"[HTTP] POST {path} status={response.status_code} time={request_elapsed_s:.2f}s"
+        )
+    return response

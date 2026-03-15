@@ -46,6 +46,7 @@ Enable memory saver support when launching the server:
 
 - This call asserts there are no ongoing requests. Ensure the engine is idle before calling it.
 - If `kv_cache` is released, SGLang flushes cache; subsequent requests will rebuild KV cache as needed.
+- SGLang Diffusion also supports releasing memory occupation, but there are no `tags` field in the request body.
 
 ### Resume Memory
 
@@ -57,6 +58,8 @@ Enable memory saver support when launching the server:
 | --- | --- | --- | --- |
 | `tags` | Which memory regions to resume. If omitted, all are resumed. | `None` | Type: list[str], values: `kv_cache`, `weights` |
 <!-- python/sglang/srt/managers/io_struct.py#L1393 currently only supports `kv_cache`, `weights` -->
+
+SGLang Diffusion also supports resuming memory occupation, but there are no `tags` field in the request body.
 
 ## Open-To-Use Refit Functionality
 

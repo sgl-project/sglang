@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
 
 import httpx
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    SLEEPING_ERROR_PREFIX,
+    OutputBatch,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -260,14 +263,23 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
+
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
-            raise RuntimeError(
-                f"Model generation returned no output. Error from scheduler: {error_msg}"
-            )
+            if str(error_msg).startswith(SLEEPING_ERROR_PREFIX):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": error_msg,
+                    },
+                )
+            else:
+                raise RuntimeError(
+                    f"Model generation returned no output. Error from scheduler: {error_msg}"
+                )
 
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths

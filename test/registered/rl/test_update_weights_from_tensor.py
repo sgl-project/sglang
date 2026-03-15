@@ -49,7 +49,6 @@ def test_update_weights_from_tensor(tp_size):
 
     del new_tensor
     gc.collect()
-    torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
     assert (

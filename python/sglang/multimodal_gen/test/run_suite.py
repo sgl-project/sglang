@@ -21,7 +21,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+# RL / post-training tests
+_E2E_SLEEP_WAKE_UP_TEST_FILE = "../post_training/test_e2e_sleep_wake_up.py"
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = (
+    "../post_training/test_update_weights_from_disk.py"
+)
+
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
 _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "FLUX.2-klein-base-4B",
@@ -38,11 +43,14 @@ SUITES = {
         # add new unit tests here
     ],
     "1-gpu": [
+        # RL / post-training tests
+        _E2E_SLEEP_WAKE_UP_TEST_FILE,
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+        # Server tests
         "test_server_a.py",
         "test_server_b.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
-        "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [

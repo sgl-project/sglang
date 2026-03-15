@@ -5,7 +5,7 @@ import asyncio
 import os
 import pickle
 from collections import deque
-from typing import Any, List
+from typing import Any, Callable, List
 
 import zmq
 
@@ -16,6 +16,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -27,7 +29,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    SLEEPING_ERROR_PREFIX,
+    OutputBatch,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -96,6 +101,8 @@ class Scheduler:
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO, new reqs are appended
@@ -138,6 +145,11 @@ class Scheduler:
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
+        if self.worker.is_sleeping():
+            return OutputBatch(
+                error="Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
+            )
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
             model_path=req.model_path,
@@ -156,6 +168,10 @@ class Scheduler:
         return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
+        if self.worker.is_sleeping():
+            return OutputBatch(
+                error=f"{SLEEPING_ERROR_PREFIX} Server is sleeping. Call resume_memory_occupation first."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
@@ -433,3 +449,43 @@ class Scheduler:
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_memory_occupation(
+        self,
+        tag: str,
+        operation_name: str,
+        worker_call: Callable[[], dict[str, Any]],
+    ) -> OutputBatch:
+        logger.info(f"[{tag}] {operation_name} on rank={self.gpu_id}")
+
+        try:
+            detail = worker_call()
+        except Exception as e:
+            logger.exception(f"[{tag}] {operation_name} failed on rank={self.gpu_id}")
+            detail = {"success": False, "message": str(e)}
+
+        if not isinstance(detail, dict):
+            detail = {
+                "success": False,
+                "message": f"invalid worker response: {detail}",
+            }
+
+        normalized_detail = dict(detail)
+        normalized_detail["success"] = bool(normalized_detail.get("success", False))
+        normalized_detail["sleeping"] = self.worker.is_sleeping()
+        normalized_detail.setdefault("message", "memory occupation operation finished")
+        return OutputBatch(output=normalized_detail)
+
+    def _handle_release_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        return self._handle_memory_occupation(
+            tag="SLEEP",
+            operation_name="handle_release_memory_occupation",
+            worker_call=self.worker.release_memory_occupation,
+        )
+
+    def _handle_resume_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        return self._handle_memory_occupation(
+            tag="WAKE",
+            operation_name="handle_resume_memory_occupation",
+            worker_call=self.worker.resume_memory_occupation,
+        )
