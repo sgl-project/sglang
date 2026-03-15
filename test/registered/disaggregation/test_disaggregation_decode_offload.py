@@ -12,6 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
 )
 
