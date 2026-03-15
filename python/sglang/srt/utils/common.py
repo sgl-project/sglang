@@ -823,6 +823,7 @@ def is_port_available(port):
             try:
                 if family == socket.AF_INET6:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind(sockaddr)
             finally:
                 sock.close()
