@@ -741,14 +741,14 @@ class MambaRadixCache(BasePrefixCache):
 
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""
-        print("evict mamba num: ", mamba_num)
+        logger.info("evict mamba num: %d", mamba_num)
         if self.eviction_policy == "marconi" and self.model_config is not None:
             return self._evict_mamba_marconi(mamba_num)
         return self._evict_mamba_lru(mamba_num)
 
     def evict_full(self, full_num_tokens: int) -> int:
         """Evict full KV cache. Returns the number of tokens evicted."""
-        print("evict_full num tokens: ", full_num_tokens)
+        logger.info("evict_full num tokens: %d", full_num_tokens)
         if self.eviction_policy == "marconi" and self.model_config is not None:
             return self._evict_full_marconi(full_num_tokens)
         return self._evict_full_lru(full_num_tokens)
@@ -889,23 +889,28 @@ class MambaRadixCache(BasePrefixCache):
 
         mamba_num_evicted = 0
 
-        while mamba_num_evicted < mamba_num:
-            candidates = self._collect_unlocked_candidates(leaf_only=False)
-            if not candidates:
+        # Collect and rank all candidates once
+        candidates = self._collect_unlocked_candidates(leaf_only=False)
+        if not candidates:
+            return 0
+
+        ranked = self._rank_candidates_marconi(candidates)
+
+        for x in ranked:
+            if mamba_num_evicted >= mamba_num:
                 break
 
-            ranked = self._rank_candidates_marconi(candidates)
-            if not ranked:
-                break
+            # Skip if locked or already evicted since ranking
+            if x.mamba_lock_ref != 0:
+                continue
+            if not self.mamba_lru_list.in_list(x):
+                continue
 
-            # Evict the lowest-utility candidate
-            x = ranked[0]
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
                 len(x.mamba_value) == 1
             ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
-            assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
             if len(x.children) > 0:
                 # Internal node: free mamba only, tombstone
