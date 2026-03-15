@@ -2716,7 +2716,7 @@ def get_open_port() -> int:
                 return port
             logger.info("Port %d is already in use, trying port %d", port, port + 1)
             port += 1
-    sock = try_bind_socket(reuse_addr=False)
+    sock = try_bind_socket()
     port = sock.getsockname()[1]
     sock.close()
     return port
