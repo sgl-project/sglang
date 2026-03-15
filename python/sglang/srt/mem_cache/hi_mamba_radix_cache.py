@@ -810,7 +810,6 @@ class HiMambaRadixCache(MambaRadixCache):
         best_value_len: int,
         deepest_node: TreeNode,
     ) -> MatchResult:
-        cow_mamba = params.cow_mamba
         req = params.req
 
         # Full LRU: skip evicted nodes for full_lru_list
@@ -858,24 +857,6 @@ class HiMambaRadixCache(MambaRadixCache):
             and not last_host_backup_node.backuped
         ):
             last_host_backup_node = last_host_backup_node.parent
-
-        mamba_node = best_last_node
-        if cow_mamba and mamba_node.mamba_value is not None:
-            if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                if dst_index is None:
-                    self.inc_lock_ref(mamba_node)
-                    self.evict_mamba(1)
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(mamba_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = mamba_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = mamba_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
         value = value[:best_value_len]
         if value:

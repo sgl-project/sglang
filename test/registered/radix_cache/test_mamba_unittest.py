@@ -282,18 +282,11 @@ class TestMamba(unittest.TestCase):
         req9_token_ids = [1, 2, 3, 4, 5, 6, 7]
         req9 = make_dummy_req()
         result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(req9_token_ids), req=req9, cow_mamba=True)
+            MatchPrefixParams(key=RadixKey(req9_token_ids), req=req9)
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
-        assert req9.mamba_pool_idx is not None
-        assert torch.all(
-            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
-        )
-        assert torch.all(
-            mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
-        )
+        assert len(kv_indices) == 7
+        assert len(last_node.key) == 2
 
         print(tree.available_and_evictable_str())
         print(available_and_evictable_str(tree))

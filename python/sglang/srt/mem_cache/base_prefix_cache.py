@@ -38,8 +38,6 @@ class MatchPrefixParams:
 
     key: RadixKey
 
-    # Mamba specific
-    cow_mamba: bool = False
     req: Optional[Req] = None
 
 

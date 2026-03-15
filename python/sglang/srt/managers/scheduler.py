@@ -1796,7 +1796,7 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            req.init_next_round_input(self.tree_cache)
             last_host_node = (
                 req.last_host_backup_node
                 if req.last_host_backup_node is not None
@@ -2948,12 +2948,6 @@ class Scheduler(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # For mamba radix cache
-            if (
-                req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

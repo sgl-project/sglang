@@ -982,7 +982,6 @@ class MambaRadixCache(BasePrefixCache):
         best_value_len: int,
     ) -> MatchResult:
         """Post-process the matched result."""
-        cow_mamba = params.cow_mamba
         req = params.req
 
         # update time for matched nodes, and make nodes closer to root to be least recently used
@@ -1014,26 +1013,6 @@ class MambaRadixCache(BasePrefixCache):
             )
         else:
             mamba_branching_seqlen = None
-
-        # Copy mamba state to req local space if cow is true
-        if cow_mamba and last_node.mamba_value is not None:
-            # for reqs without mamba cache
-            if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
-                if dst_index is None:
-                    self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = last_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
         value = value[:best_value_len]
         if value:

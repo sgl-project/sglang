@@ -532,6 +532,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
                 mid = mid[0]
                 req.mamba_pool_idx = mid
+                # for radix cache, copy mamba state from last node in tree
+                if req.last_node is not None and req.last_node.mamba_value is not None:
+                    self.mamba_pool.copy_from(
+                        req.last_node.mamba_value, mid.unsqueeze(0)
+                    )
             mamba_indices.append(mid)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
