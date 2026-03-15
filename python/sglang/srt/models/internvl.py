@@ -346,14 +346,8 @@ class InternVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        if self.enable_cg and (not output_hidden_states):
-            # graph path only returns last_hidden_state
-            hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
-            hidden_states = self.cuda_graph_runner.run(hidden_states)
-            if not return_dict:
-                return (hidden_states,)
-            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
-
+        # Resolve defaults before the CUDA graph fast path so that
+        # `not None` doesn't accidentally evaluate to True.
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -362,6 +356,14 @@ class InternVisionEncoder(nn.Module):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+
+        if self.enable_cg and (not output_hidden_states):
+            # graph path only returns last_hidden_state
+            hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
+            hidden_states = self.cuda_graph_runner.run(hidden_states)
+            if not return_dict:
+                return (hidden_states,)
+            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
 
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
