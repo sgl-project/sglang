@@ -367,7 +367,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
-    stream_output: bool = False
+    incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
@@ -751,6 +751,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_xpu_backends()
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1026,6 +1027,15 @@ class ServerArgs:
                     "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
+
+    def _handle_xpu_backends(self):
+        if self.device == "xpu":
+            if not self.disable_piecewise_cuda_graph:
+                logger.warning(
+                    "XPU platform does not support piecewise CUDA graph, ignoring --disable-piecewise-cuda-graph"
+                    " flag and disabling piecewise CUDA graph."
+                )
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
@@ -3791,9 +3801,16 @@ class ServerArgs:
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
-            "--stream-output",
+            "--incremental-streaming-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action=DeprecatedStoreTrueAction,
+            dest="incremental_streaming_output",
+            new_flag="--incremental-streaming-output",
+            help="[Deprecated] Use --incremental-streaming-output instead.",
         )
         parser.add_argument(
             "--enable-streaming-session",
@@ -6282,6 +6299,32 @@ class DeprecatedAction(argparse.Action):
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )
+
+
+class DeprecatedStoreTrueAction(argparse.Action):
+    """Deprecated flag that still stores True and prints a warning."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest,
+        new_flag=None,
+        nargs=0,
+        const=True,
+        default=False,
+        **kwargs,
+    ):
+        self.new_flag = new_flag
+        super().__init__(
+            option_strings, dest, nargs=nargs, const=const, default=default, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, True)
 
 
 def auto_choose_speculative_params(self: ServerArgs):
