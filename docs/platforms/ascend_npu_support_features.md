@@ -84,7 +84,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
 | `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
 | `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
-| `--stream-output`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--incremental-streaming-output`                   | `False`  | bool flag (set to enable) |      A2, A3      |
 | `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
 | `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
 | `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |

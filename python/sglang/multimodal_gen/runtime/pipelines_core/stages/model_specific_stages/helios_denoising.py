@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -56,11 +57,13 @@ def sample_block_noise(
     _, ph, pw = patch_size
     block_size = ph * pw
 
+    # Explicitly use CPU to avoid requiring MAGMA for cholesky on ROCm/CUDA
     cov = (
-        torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
+        torch.eye(block_size, device="cpu") * (1 + gamma)
+        - torch.ones(block_size, block_size, device="cpu") * gamma
     )
     dist = torch.distributions.MultivariateNormal(
-        torch.zeros(block_size, device=cov.device), covariance_matrix=cov
+        torch.zeros(block_size, device="cpu"), covariance_matrix=cov
     )
     block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
 
@@ -113,55 +116,33 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         zero_steps=1,
         batch=None,
         server_args=None,
+        global_step_offset=0,
     ):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
 
         for i, t in enumerate(timesteps):
-            timestep = t.expand(batch_size)
-            latent_model_input = latents.to(target_dtype)
-
-            with set_forward_context(
-                current_timestep=t,
-                forward_batch=None,
-                attn_metadata=None,
+            with StageProfiler(
+                f"denoising_step_{global_step_offset + i}",
+                logger=logger,
+                metrics=batch.metrics if batch is not None else None,
+                perf_dump_path_provided=(
+                    batch.perf_dump_path is not None if batch is not None else False
+                ),
             ):
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    indices_hidden_states=indices_hidden_states,
-                    indices_latents_history_short=indices_latents_history_short,
-                    indices_latents_history_mid=indices_latents_history_mid,
-                    indices_latents_history_long=indices_latents_history_long,
-                    latents_history_short=(
-                        latents_history_short.to(target_dtype)
-                        if latents_history_short is not None
-                        else None
-                    ),
-                    latents_history_mid=(
-                        latents_history_mid.to(target_dtype)
-                        if latents_history_mid is not None
-                        else None
-                    ),
-                    latents_history_long=(
-                        latents_history_long.to(target_dtype)
-                        if latents_history_long is not None
-                        else None
-                    ),
-                )
+                timestep = t.expand(batch_size)
+                latent_model_input = latents.to(target_dtype)
 
-            if do_cfg:
                 with set_forward_context(
                     current_timestep=t,
-                    forward_batch=None,
+                    forward_batch=batch,
                     attn_metadata=None,
                 ):
-                    noise_uncond = self.transformer(
+                    noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
                         indices_hidden_states=indices_hidden_states,
                         indices_latents_history_short=indices_latents_history_short,
                         indices_latents_history_mid=indices_latents_history_mid,
@@ -183,29 +164,62 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         ),
                     )
 
-                if is_cfg_zero_star:
-                    noise_pred_text = noise_pred
-                    positive_flat = noise_pred_text.reshape(batch_size, -1)
-                    negative_flat = noise_uncond.reshape(batch_size, -1)
-
-                    alpha = optimized_scale(positive_flat, negative_flat)
-                    alpha = alpha.view(
-                        batch_size, *([1] * (len(noise_pred_text.shape) - 1))
-                    )
-                    alpha = alpha.to(noise_pred_text.dtype)
-
-                    if (i <= zero_steps) and use_zero_init:
-                        noise_pred = noise_pred_text * 0.0
-                    else:
-                        noise_pred = noise_uncond * alpha + guidance_scale * (
-                            noise_pred_text - noise_uncond * alpha
+                if do_cfg:
+                    with set_forward_context(
+                        current_timestep=t,
+                        forward_batch=batch,
+                        attn_metadata=None,
+                    ):
+                        noise_uncond = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            indices_hidden_states=indices_hidden_states,
+                            indices_latents_history_short=indices_latents_history_short,
+                            indices_latents_history_mid=indices_latents_history_mid,
+                            indices_latents_history_long=indices_latents_history_long,
+                            latents_history_short=(
+                                latents_history_short.to(target_dtype)
+                                if latents_history_short is not None
+                                else None
+                            ),
+                            latents_history_mid=(
+                                latents_history_mid.to(target_dtype)
+                                if latents_history_mid is not None
+                                else None
+                            ),
+                            latents_history_long=(
+                                latents_history_long.to(target_dtype)
+                                if latents_history_long is not None
+                                else None
+                            ),
                         )
-                else:
-                    noise_pred = noise_uncond + guidance_scale * (
-                        noise_pred - noise_uncond
-                    )
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    if is_cfg_zero_star:
+                        noise_pred_text = noise_pred
+                        positive_flat = noise_pred_text.reshape(batch_size, -1)
+                        negative_flat = noise_uncond.reshape(batch_size, -1)
+
+                        alpha = optimized_scale(positive_flat, negative_flat)
+                        alpha = alpha.view(
+                            batch_size, *([1] * (len(noise_pred_text.shape) - 1))
+                        )
+                        alpha = alpha.to(noise_pred_text.dtype)
+
+                        if (i <= zero_steps) and use_zero_init:
+                            noise_pred = noise_pred_text * 0.0
+                        else:
+                            noise_pred = noise_uncond * alpha + guidance_scale * (
+                                noise_pred_text - noise_uncond * alpha
+                            )
+                    else:
+                        noise_pred = noise_uncond + guidance_scale * (
+                            noise_pred - noise_uncond
+                        )
+
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False
+                )[0]
 
         return latents
 
@@ -234,6 +248,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         zero_steps=1,
         batch=None,
         server_args=None,
+        global_step_offset=0,
     ):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
@@ -256,6 +271,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             start_point_list = [latents]
 
         do_cfg = guidance_scale > 1.0
+        step_counter = global_step_offset
 
         for i_s in range(pyramid_num_stages):
             # Compute mu for current resolution
@@ -306,49 +322,26 @@ class HeliosChunkedDenoisingStage(PipelineStage):
 
             # Denoising loop for this pyramid stage
             for idx, t in enumerate(timesteps):
-                timestep = t.expand(batch_size)
-                latent_model_input = latents.to(target_dtype)
-
-                with set_forward_context(
-                    current_timestep=t,
-                    forward_batch=None,
-                    attn_metadata=None,
+                with StageProfiler(
+                    f"denoising_step_{step_counter}",
+                    logger=logger,
+                    metrics=batch.metrics if batch is not None else None,
+                    perf_dump_path_provided=(
+                        batch.perf_dump_path is not None if batch is not None else False
+                    ),
                 ):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        indices_hidden_states=indices_hidden_states,
-                        indices_latents_history_short=indices_latents_history_short,
-                        indices_latents_history_mid=indices_latents_history_mid,
-                        indices_latents_history_long=indices_latents_history_long,
-                        latents_history_short=(
-                            latents_history_short.to(target_dtype)
-                            if latents_history_short is not None
-                            else None
-                        ),
-                        latents_history_mid=(
-                            latents_history_mid.to(target_dtype)
-                            if latents_history_mid is not None
-                            else None
-                        ),
-                        latents_history_long=(
-                            latents_history_long.to(target_dtype)
-                            if latents_history_long is not None
-                            else None
-                        ),
-                    )
+                    timestep = t.expand(batch_size)
+                    latent_model_input = latents.to(target_dtype)
 
-                if do_cfg:
                     with set_forward_context(
                         current_timestep=t,
-                        forward_batch=None,
+                        forward_batch=batch,
                         attn_metadata=None,
                     ):
-                        noise_uncond = self.transformer(
+                        noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
+                            encoder_hidden_states=prompt_embeds,
                             indices_hidden_states=indices_hidden_states,
                             indices_latents_history_short=indices_latents_history_short,
                             indices_latents_history_mid=indices_latents_history_mid,
@@ -370,44 +363,81 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             ),
                         )
 
-                    if is_cfg_zero_star:
-                        noise_pred_text = noise_pred
-                        positive_flat = noise_pred_text.reshape(batch_size, -1)
-                        negative_flat = noise_uncond.reshape(batch_size, -1)
-
-                        alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                        alpha_cfg = alpha_cfg.view(
-                            batch_size,
-                            *([1] * (len(noise_pred_text.shape) - 1)),
-                        )
-                        alpha_cfg = alpha_cfg.to(noise_pred_text.dtype)
-
-                        if (i_s == 0 and idx <= zero_steps) and use_zero_init:
-                            noise_pred = noise_pred_text * 0.0
-                        else:
-                            noise_pred = noise_uncond * alpha_cfg + guidance_scale * (
-                                noise_pred_text - noise_uncond * alpha_cfg
+                    if do_cfg:
+                        with set_forward_context(
+                            current_timestep=t,
+                            forward_batch=batch,
+                            attn_metadata=None,
+                        ):
+                            noise_uncond = self.transformer(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                indices_hidden_states=indices_hidden_states,
+                                indices_latents_history_short=indices_latents_history_short,
+                                indices_latents_history_mid=indices_latents_history_mid,
+                                indices_latents_history_long=indices_latents_history_long,
+                                latents_history_short=(
+                                    latents_history_short.to(target_dtype)
+                                    if latents_history_short is not None
+                                    else None
+                                ),
+                                latents_history_mid=(
+                                    latents_history_mid.to(target_dtype)
+                                    if latents_history_mid is not None
+                                    else None
+                                ),
+                                latents_history_long=(
+                                    latents_history_long.to(target_dtype)
+                                    if latents_history_long is not None
+                                    else None
+                                ),
                             )
-                    else:
-                        noise_pred = noise_uncond + guidance_scale * (
-                            noise_pred - noise_uncond
-                        )
 
-                latents = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    return_dict=False,
-                    cur_sampling_step=idx,
-                    dmd_noisy_tensor=(
-                        start_point_list[i_s] if start_point_list is not None else None
-                    ),
-                    dmd_sigmas=self.scheduler.sigmas,
-                    dmd_timesteps=self.scheduler.timesteps,
-                    all_timesteps=timesteps,
-                )[0]
+                        if is_cfg_zero_star:
+                            noise_pred_text = noise_pred
+                            positive_flat = noise_pred_text.reshape(batch_size, -1)
+                            negative_flat = noise_uncond.reshape(batch_size, -1)
 
-        return latents
+                            alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                            alpha_cfg = alpha_cfg.view(
+                                batch_size,
+                                *([1] * (len(noise_pred_text.shape) - 1)),
+                            )
+                            alpha_cfg = alpha_cfg.to(noise_pred_text.dtype)
+
+                            if (i_s == 0 and idx <= zero_steps) and use_zero_init:
+                                noise_pred = noise_pred_text * 0.0
+                            else:
+                                noise_pred = (
+                                    noise_uncond * alpha_cfg
+                                    + guidance_scale
+                                    * (noise_pred_text - noise_uncond * alpha_cfg)
+                                )
+                        else:
+                            noise_pred = noise_uncond + guidance_scale * (
+                                noise_pred - noise_uncond
+                            )
+
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=idx,
+                        dmd_noisy_tensor=(
+                            start_point_list[i_s]
+                            if start_point_list is not None
+                            else None
+                        ),
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+
+                step_counter += 1
+
+        return latents, step_counter
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
@@ -537,6 +567,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         # Chunk loop
         image_latents = None
         total_generated_latent_frames = 0
+        chunk_latents_list = []  # Store per-chunk latents for chunk-by-chunk decode
+        global_step_offset = 0  # Track step index across chunks for perf logging
 
         self.log_info(
             f"Starting chunked denoising: {num_latent_chunk} chunks, "
@@ -582,19 +614,30 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 )
 
             # Generate noise latents for this chunk
-            latents = torch.randn(
+            # Use batch.generator to ensure identical noise across SP ranks
+            latent_shape = (
                 batch_size,
                 num_channels_latents,
                 (window_num_frames - 1) // vae_scale_factor_temporal + 1,
                 height // vae_scale_factor_spatial,
                 width // vae_scale_factor_spatial,
-                device=device,
+            )
+            generator = batch.generator
+            if isinstance(generator, list):
+                generator = generator[0] if len(generator) > 0 else None
+            gen_device = generator.device if generator is not None else device
+            latents = torch.randn(
+                latent_shape,
+                generator=generator,
+                device=gen_device,
                 dtype=torch.float32,
             )
+            if latents.device != device:
+                latents = latents.to(device)
 
             if is_enable_stage2:
                 # Stage 2: Pyramid SR denoising (handles scheduler internally)
-                latents = self._denoise_one_chunk_stage2(
+                latents, global_step_offset = self._denoise_one_chunk_stage2(
                     latents=latents,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=negative_prompt_embeds,
@@ -618,6 +661,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     zero_steps=zero_steps,
                     batch=batch,
                     server_args=server_args,
+                    global_step_offset=global_step_offset,
                 )
             else:
                 # Stage 1: Standard flat denoising
@@ -646,7 +690,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     zero_steps=zero_steps,
                     batch=batch,
                     server_args=server_args,
+                    global_step_offset=global_step_offset,
                 )
+                global_step_offset += num_inference_steps
 
             # Extract first frame as image_latents for subsequent chunks
             if keep_first_frame and is_first_chunk and image_latents is None:
@@ -655,6 +701,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             # Update history
             total_generated_latent_frames += latents.shape[2]
             history_latents = torch.cat([history_latents, latents], dim=2)
+            chunk_latents_list.append(latents)
 
         # Move transformer back to CPU after denoising
         if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
@@ -662,7 +709,10 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 self.transformer.to("cpu")
         torch.cuda.empty_cache()
 
-        # Store denoised latents for the standard DecodingStage to decode
+        # Store per-chunk latents for chunk-by-chunk VAE decode (matches diffusers behavior).
+        # The standard DecodingStage will check for this attribute and decode each chunk
+        # separately to avoid temporal artifacts at chunk boundaries.
+        batch.latent_chunks = chunk_latents_list
         batch.latents = history_latents[:, :, -total_generated_latent_frames:]
 
         return batch

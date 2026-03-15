@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
@@ -50,15 +51,39 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+
+
+def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+    return (n, k) in [
+        (1024, 8192),
+        (16384, 1536),
+        (2112, 7168),
+        (3072, 1536),
+        (32768, 8192),
+        (4096, 7168),
+        (4608, 7168),
+        (512, 7168),
+        (7168, 2048),
+        (7168, 16384),
+        (7168, 256),
+        (8192, 1024),
+        (8192, 32768),
+    ]
+
 
 if _use_aiter:
     import aiter
 
     # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
     from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+    from aiter.ops.triton.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -747,7 +772,19 @@ def aiter_w8a8_block_fp8_linear(
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    output = gemm_a8w8_blockscale(
+    n, k = weight.shape
+
+    if _use_aiter_gfx95:
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    else:
+        use_triton = True
+
+    if use_triton:
+        gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+    else:
+        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale
+
+    output = gemm_a8w8_blockscale_op(
         q_input,
         weight,
         x_scale,

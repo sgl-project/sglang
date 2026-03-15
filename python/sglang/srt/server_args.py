@@ -105,6 +105,7 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
@@ -366,7 +367,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
-    stream_output: bool = False
+    incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
@@ -750,6 +751,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_xpu_backends()
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1025,6 +1027,15 @@ class ServerArgs:
                     "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
+
+    def _handle_xpu_backends(self):
+        if self.device == "xpu":
+            if not self.disable_piecewise_cuda_graph:
+                logger.warning(
+                    "XPU platform does not support piecewise CUDA graph, ignoring --disable-piecewise-cuda-graph"
+                    " flag and disabling piecewise CUDA graph."
+                )
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
@@ -1546,7 +1557,8 @@ class ServerArgs:
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                     and (
-                        self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                        self.quantization
+                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
                     )
                 ):
@@ -1819,15 +1831,19 @@ class ServerArgs:
                 "modelopt",
                 "modelopt_fp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
             ]:
                 assert model_config.hf_config.mlp_hidden_act == "relu2"
                 if model_config.quantization == "modelopt":
-                    self.quantization = (
-                        "modelopt_fp4"
-                        if model_config.hf_config.quantization_config["quant_algo"]
-                        == "NVFP4"
-                        else "modelopt_fp8"
-                    )
+                    quant_algo = model_config.hf_config.quantization_config[
+                        "quant_algo"
+                    ]
+                    if quant_algo == "MIXED_PRECISION":
+                        self.quantization = "modelopt_mixed"
+                    else:
+                        self.quantization = (
+                            "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
+                        )
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
@@ -2479,8 +2495,9 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2492,9 +2509,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -3783,9 +3801,16 @@ class ServerArgs:
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
-            "--stream-output",
+            "--incremental-streaming-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action=DeprecatedStoreTrueAction,
+            dest="incremental_streaming_output",
+            new_flag="--incremental-streaming-output",
+            help="[Deprecated] Use --incremental-streaming-output instead.",
         )
         parser.add_argument(
             "--enable-streaming-session",
@@ -5696,11 +5721,6 @@ class ServerArgs:
         # Check LoRA
         self.check_lora_server_args()
 
-        # torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
-        # causing extremely slow nn.Conv3d performance.
-        # TODO(yhyang201): Remove this check when sglang no longer uses torch 2.9.1.
-        self.check_torch_2_9_1_cudnn_compatibility()
-
         # Check speculative decoding
         if self.speculative_algorithm is not None:
             assert (
@@ -5808,49 +5828,6 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
-
-    def check_torch_2_9_1_cudnn_compatibility(self):
-        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
-            return
-
-        if self.get_model_config().is_multimodal:
-            import torch
-
-            if torch_release[:3] == (2, 9, 1):
-                cudnn_version = None
-                try:
-                    cudnn_version = torch.backends.cudnn.version()
-                except Exception:
-                    cudnn_version = None
-                if cudnn_version is not None:
-                    version_float = float(str(cudnn_version)[:3]) / 100
-                    if version_float < 9.15:
-                        RED = "\033[91m"
-                        BOLD = "\033[1m"
-                        RESET = "\033[0m"
-                        msg = (
-                            f"{RED}{BOLD}"
-                            "CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
-                            "Issue:     There is a KNOWN BUG in PyTorch 2.9.1's `nn.Conv3d` implementation\n"
-                            "           when used with CuDNN versions older than 9.15. This can cause\n"
-                            "           SEVERE PERFORMANCE DEGRADATION and EXCESSIVE MEMORY USAGE.\n\n"
-                            "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
-                            "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
-                            "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
-                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"{RESET}"
-                        )
-                        raise RuntimeError(msg)
-                else:
-                    RED = "\033[91m"
-                    RESET = "\033[0m"
-                    logger.warning(
-                        f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
-                    )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
@@ -6274,6 +6251,32 @@ class DeprecatedAction(argparse.Action):
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )
+
+
+class DeprecatedStoreTrueAction(argparse.Action):
+    """Deprecated flag that still stores True and prints a warning."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest,
+        new_flag=None,
+        nargs=0,
+        const=True,
+        default=False,
+        **kwargs,
+    ):
+        self.new_flag = new_flag
+        super().__init__(
+            option_strings, dest, nargs=nargs, const=const, default=default, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, True)
 
 
 def auto_choose_speculative_params(self: ServerArgs):
