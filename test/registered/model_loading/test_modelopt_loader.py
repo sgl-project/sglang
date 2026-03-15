@@ -14,7 +14,11 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
 from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -618,6 +622,67 @@ class TestParseQuantHfConfig(CustomTestCase):
         result = self.model_config._parse_quant_hf_config()
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
+
+
+class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "nemotron_h"
+        model_config.hf_config.architectures = ["NemotronHForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_mixed_precision_override_does_not_hijack_w4afp8(self):
+        self.assertIsNone(
+            ModelOptMixedPrecisionConfig.override_quantization_method(
+                {"quant_method": "w4afp8", "quant_algo": "MIXED_PRECISION"},
+                "w4afp8",
+            )
+        )
+
+    def test_mixed_precision_uses_nvfp4_min_capability(self):
+        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+
+    def test_mixed_precision_quant_layer_resolution_after_mapping(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.1.mixer.experts.0.up_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "backbone.layers.2.mixer.q_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.2.mixer.k_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.2.mixer.v_proj": {"quant_algo": "FP8"},
+                },
+                "packed_modules_mapping": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                },
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            WeightsMapper(orig_to_new_prefix={"backbone.": "model."})
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.0.mixer.in_proj"),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.1.mixer.experts"),
+            "NVFP4",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
+            "FP8",
+        )
 
 
 if __name__ == "__main__":
