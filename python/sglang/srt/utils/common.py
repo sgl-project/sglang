@@ -771,6 +771,9 @@ def _get_addrinfos_for_bind(host=None, port=0):
             if info[0] not in seen_families:
                 seen_families.add(info[0])
                 deduped.append(info)
+        # Prefer IPv4 so that callers without an explicit host get consistent
+        # behaviour across platforms (some OSes list IPv6 first).
+        deduped.sort(key=lambda x: (x[0] != socket.AF_INET,))
         return deduped
     except socket.gaierror:
         fallback_host = "0.0.0.0" if host is None else host
@@ -813,12 +816,18 @@ def try_bind_socket(host=None, port=0, *, reuse_addr=True, listen=False):
 
 
 def is_port_available(port):
-    """Return whether a port is available."""
+    """Return whether a port is available on all configured address families."""
     try:
-        sock = try_bind_socket(port=port, listen=True)
-        sock.close()
+        for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(port=port):
+            sock = socket.socket(family, socktype, proto)
+            try:
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind(sockaddr)
+            finally:
+                sock.close()
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -2702,13 +2711,10 @@ def get_open_port() -> int:
     if port is not None:
         port = int(port)
         while True:
-            try:
-                sock = try_bind_socket(port=port, reuse_addr=False)
-                sock.close()
+            if is_port_available(port):
                 return port
-            except OSError:
-                logger.info("Port %d is already in use, trying port %d", port, port + 1)
-                port += 1
+            logger.info("Port %d is already in use, trying port %d", port, port + 1)
+            port += 1
     sock = try_bind_socket(reuse_addr=False)
     port = sock.getsockname()[1]
     sock.close()

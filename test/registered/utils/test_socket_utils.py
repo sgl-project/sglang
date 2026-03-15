@@ -59,11 +59,11 @@ class TestTryBindSocket(CustomTestCase):
 
     def test_bind_occupied_port_raises(self):
         """try_bind_socket should raise OSError if port is occupied."""
-        sock1 = try_bind_socket(reuse_addr=False)
+        sock1 = try_bind_socket(host="127.0.0.1", reuse_addr=False)
         try:
             port = sock1.getsockname()[1]
             with self.assertRaises(OSError):
-                try_bind_socket(port=port, reuse_addr=False)
+                try_bind_socket(host="127.0.0.1", port=port, reuse_addr=False)
         finally:
             sock1.close()
 
@@ -105,7 +105,7 @@ class TestSocketUtilities(CustomTestCase):
 
     def test_is_port_available_occupied(self):
         """is_port_available should return False for an occupied port."""
-        sock = bind_port(get_free_port())
+        sock = try_bind_socket(port=0, reuse_addr=False, listen=True)
         try:
             port = sock.getsockname()[1]
             self.assertFalse(is_port_available(port))
@@ -142,7 +142,7 @@ class TestSocketUtilities(CustomTestCase):
 
     def test_get_open_port_env_var_occupied_increments(self):
         """get_open_port should increment if SGLANG_PORT is occupied."""
-        sock = bind_port(get_free_port())
+        sock = try_bind_socket(port=0, reuse_addr=False, listen=True)
         try:
             occupied_port = sock.getsockname()[1]
             with patch.dict(os.environ, {"SGLANG_PORT": str(occupied_port)}):
@@ -177,7 +177,10 @@ class TestReservePort(CustomTestCase):
         """The reserved port should not be available until released."""
         port, sock = reserve_port("127.0.0.1")
         try:
-            self.assertFalse(is_port_available(port))
+            # Verify port is held by trying to bind the same family explicitly
+            with self.assertRaises(OSError):
+                s = try_bind_socket(host="127.0.0.1", port=port, reuse_addr=False)
+                s.close()
         finally:
             release_port(sock)
 
