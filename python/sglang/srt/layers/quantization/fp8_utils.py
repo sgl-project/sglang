@@ -513,33 +513,33 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         block_n, block_k = block_size
         m, k = input_2d.shape
         n = weight.shape[0]
-        expected_x_scale_shape = (k // block_k, m)
-        expected_weight_scale_shape = (k // block_k, n // block_n)
-        if x_scale.shape == (m, k // block_k):
+        # ceil_div is required (not //) because n or k may not be block-size multiples.
+        # The quantizer allocates ceil_div tiles to cover any partial trailing block.
+        expected_x_scale_shape = (ceil_div(k, block_k), m)
+        expected_weight_scale_shape = (ceil_div(k, block_k), ceil_div(n, block_n))
+        if x_scale.shape == (m, ceil_div(k, block_k)):
             x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
+        if weight_scale.shape == (ceil_div(n, block_n), ceil_div(k, block_k)):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
-            f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
+            f"(ceil_div(k,block_k), m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
             f"expected {expected_x_scale_shape}. "
             f"strides={x_scale.stride()} is_contiguous={x_scale.is_contiguous()} "
             f"m={m} n={n} k={k} block_size={block_size}"
         )
         assert weight_scale.shape == expected_weight_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects B scale layout "
-            f"(k//block_k, n//block_n) for scale_major_mode='MN', got {tuple(weight_scale.shape)}; "
-            f"expected {expected_weight_scale_shape}. "
+            f"(ceil_div(k,block_k), ceil_div(n,block_n)) for scale_major_mode='MN', "
+            f"got {tuple(weight_scale.shape)}; expected {expected_weight_scale_shape}. "
             f"strides={weight_scale.stride()} is_contiguous={weight_scale.is_contiguous()} "
             f"m={m} n={n} k={k} block_size={block_size}"
         )
         assert x_scale.dtype == torch.float32, (
-            "FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, "
-            f"got {x_scale.dtype}."
+            f"FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, got {x_scale.dtype}."
         )
         assert weight_scale.dtype == torch.float32, (
-            "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
-            f"got {weight_scale.dtype}."
+            f"FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, got {weight_scale.dtype}."
         )
     # TRTLLM path continues using the original quantized scale layout.
     output = gemm_fp8_nt_groupwise(
