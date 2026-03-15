@@ -16,11 +16,8 @@ from pydantic import BaseModel
 from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
-from sglang.bench_serving import (
-    get_dataset,
-    get_processor,
-    get_tokenizer,
-)
+from sglang.benchmark.datasets import get_dataset
+from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -97,6 +94,8 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_start_step: Optional[int] = None
     profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
@@ -144,6 +143,20 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=("CPU", "GPU"),
+            choices=["CPU", "GPU", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU. use torch profiler.",
+        )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=BenchArgs.profile_start_step,
+            help="Start profiling after this many forward steps. Useful for warmup.",
+        )
         parser.add_argument(
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
@@ -397,6 +410,8 @@ def run_one_case(
     result_filename: str,
     tokenizer: PreTrainedTokenizer | AutoProcessor,
     profile: bool = False,
+    profile_activities: Tuple[str] = ("CPU", "GPU"),
+    profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
@@ -526,10 +541,11 @@ def run_one_case(
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
-            activities=["CPU", "GPU"],
+            activities=profile_activities,
             output_dir=profile_output_dir,
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
+            start_step=profile_start_step,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -584,8 +600,8 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
+    input_throughput = batch_size * input_len / latency
+    output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":
@@ -813,17 +829,17 @@ def run_benchmark_internal(
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
         skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
+        print(f"{max_running_requests_per_dp=}")
+        print(f"{dp_size=}")
+        print(f"{skip_max_running_requests_threshold=}")
+        print(f"{skip_token_capacity_threshold=}")
+
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
         gsp_question_len=bench_args.gsp_question_len,
         gsp_output_len=bench_args.gsp_output_len,
     )
-
-    print(f"{max_running_requests_per_dp=}")
-    print(f"{dp_size=}")
-    print(f"{skip_max_running_requests_threshold=}")
-    print(f"{skip_token_capacity_threshold=}")
 
     # Warmup
     if not bench_args.skip_warmup:
@@ -921,6 +937,8 @@ def run_benchmark_internal(
                             parallel_batch=bench_args.parallel_batch,
                             cache_hit_rate=bench_args.cache_hit_rate,
                             profile=bench_args.profile,
+                            profile_activities=bench_args.profile_activities,
+                            profile_start_step=bench_args.profile_start_step,
                             profile_steps=bench_args.profile_steps,
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,

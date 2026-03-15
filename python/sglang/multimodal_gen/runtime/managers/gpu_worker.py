@@ -43,7 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -135,22 +135,21 @@ class GPUWorker:
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
             # enable layerwise offload if possible
-            for dit in filter(
-                None,
-                [
-                    self.pipeline.get_module("transformer"),
-                    self.pipeline.get_module("transformer_2"),
-                    self.pipeline.get_module("video_dit"),
-                    self.pipeline.get_module("video_dit_2"),
-                    self.pipeline.get_module("audio_dit"),
-                ],
-            ):
-                if isinstance(dit, OffloadableDiTMixin):
-                    dit.configure_layerwise_offload(self.server_args)
-                else:
-                    logger.info(
-                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                    )
+            for module_name in [
+                "transformer",
+                "transformer_2",
+                "video_dit",
+                "video_dit_2",
+                "audio_dit",
+            ]:
+                dit = self.pipeline.get_module(module_name)
+                if dit:
+                    if isinstance(dit, OffloadableDiTMixin):
+                        dit.configure_layerwise_offload(self.server_args)
+                    else:
+                        logger.info(
+                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                        )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
@@ -199,7 +198,7 @@ class GPUWorker:
         logger.info(
             f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb/peak_reserved_gb*100:.1f}%), "
+            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
@@ -255,19 +254,35 @@ class GPUWorker:
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only and self.rank == 0:
-                output_paths = save_outputs(
-                    output_batch.output,
-                    req.data_type,
-                    req.fps,
-                    True,
-                    lambda idx: req.output_file_path(len(output_batch.output), idx),
-                    audio=output_batch.audio,
-                    audio_sample_rate=output_batch.audio_sample_rate,
-                    output_compression=req.output_compression,
-                )
-                output_batch.output_file_paths = output_paths
+            if req.save_output and req.return_file_paths_only:
+                if self.rank == 0 and output_batch.output is not None:
+                    output_paths = save_outputs(
+                        output_batch.output,
+                        req.data_type,
+                        req.fps,
+                        True,
+                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        audio=output_batch.audio,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        output_compression=req.output_compression,
+                        enable_frame_interpolation=req.enable_frame_interpolation,
+                        frame_interpolation_exp=req.frame_interpolation_exp,
+                        frame_interpolation_scale=req.frame_interpolation_scale,
+                        frame_interpolation_model_path=req.frame_interpolation_model_path,
+                        enable_upscaling=req.enable_upscaling,
+                        upscaling_model_path=req.upscaling_model_path,
+                        upscaling_scale=req.upscaling_scale,
+                    )
+                    output_batch.output_file_paths = output_paths
+
+                # No rank needs to hold on to generated tensors once the file-path
+                # response has been materialized on rank 0
                 output_batch.output = None
+                output_batch.audio = None
+                output_batch.audio_sample_rate = None
+
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -470,6 +485,8 @@ def run_scheduler_process(
     globally_suppress_loggers()
     if current_platform.is_cuda():
         set_cuda_arch()
+    elif current_platform.is_musa():
+        set_musa_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 

@@ -21,9 +21,9 @@ to guard against abnormal quantization loss regressions.
 
 The following table summarizes quantization method support across NVIDIA and AMD GPUs.
 
-| Method | NVIDIA GPUs | AMD GPUs | Notes |
-|--------|:-----------:|:--------:|-------|
-| `fp8` | Yes (Hopper/SM90+, Blackwell/SM100+) | Yes (MI250/MI300X/MI325X/MI350X) | Aiter or Triton backend on AMD |
+| Method | NVIDIA GPUs | AMD GPUs (MI300X/MI325X/MI350X) | Notes |
+|--------|:-----------:|:-------------------------------:|-------|
+| `fp8` | Yes | Yes | Aiter or Triton backend on AMD |
 | `mxfp4` | Yes | Yes | Requires CDNA3/CDNA4 with MXFP support; uses Aiter |
 | `blockwise_int8` | Yes | Yes | Triton-based, works on both platforms |
 | `w8a8_int8` | Yes | Yes | |

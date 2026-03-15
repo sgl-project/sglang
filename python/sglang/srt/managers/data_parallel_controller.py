@@ -35,31 +35,25 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
-    trace_get_proc_propagate_context,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_end,
-    trace_slice_start,
-)
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     bind_port,
-    configure_ipv6,
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -197,15 +191,11 @@ class DataParallelController:
         self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
-        if self.server_args.enable_trace:
-            trace_set_proc_propagate_context(req.rid, req.trace_context)
-            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
+        req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
+        req.time_stats.set_dp_dispatch_time()
         self.dispatching(req)
-
-        if self.server_args.enable_trace:
-            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+        req.time_stats.set_dp_dispatch_finish_time()
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -299,13 +289,13 @@ class DataParallelController:
         """
         # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
-            endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
-        elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-            port, host = configure_ipv6(server_args.dist_init_addr)
-            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+            na = NetworkAddress(
+                "127.0.0.1", server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+            )
         else:
-            host, port = server_args.dist_init_addr.split(":")
-            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+            na = NetworkAddress.parse(server_args.dist_init_addr)
+            na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
+        endpoint = na.to_tcp()
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
@@ -504,9 +494,9 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+        if req.routed_dp_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
 

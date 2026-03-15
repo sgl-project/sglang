@@ -35,6 +35,7 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -203,7 +204,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = in_channels
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             in_channels,
             hidden_size,
             kernel_size=kernel_size,
@@ -212,6 +213,8 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x is 2-D: (num_patches, C * T * P * P)
+        # Reshape to 5-D for Conv3dLayer, then flatten back.
         x = x.view(
             -1,
             self.in_channels,
@@ -219,8 +222,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x).view(-1, self.hidden_size)
-        return x
+        return self.proj(x).view(-1, self.hidden_size)
 
 
 class Glm4vPatchMerger(nn.Module):

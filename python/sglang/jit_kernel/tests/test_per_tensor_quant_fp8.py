@@ -83,4 +83,4 @@ def test_jit_per_tensor_quant_supports_3d(shape):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])

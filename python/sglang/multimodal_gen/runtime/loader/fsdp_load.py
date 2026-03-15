@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -136,6 +139,20 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
+
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
+            if _is_npu:
+                # Activate the NZ format for storing weights,
+                # which is a specific optimization for Ascend NPU
+                torch.npu.config.allow_internal_format = True
+            quant_method.process_weights_after_loading(module)
+            if _is_npu:
+                torch.npu.empty_cache()
+
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
@@ -252,11 +269,13 @@ def load_model_from_full_model_state_dict(
     sorted_param_names = sorted(custom_param_sd.keys())
 
     sharded_sd = {}
+    skipped_checkpoint_keys: list[str] = []
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
         full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
+
         if meta_sharded_param is None:
             # For FSDP models, ensure all ranks process parameters consistently
             if strict or is_fsdp_model:
@@ -264,12 +283,17 @@ def load_model_from_full_model_state_dict(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
             else:
-                logger.warning(
-                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
-                )
+                skipped_checkpoint_keys.append(target_param_name)
                 continue
 
-        target_dtype = param_dtype if param_dtype else full_tensor.dtype
+        # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
+        # for non-quantized models meta dtype equals param_dtype anyway
+        if meta_sharded_param is None:
+            # for nunchaku, some scales are patched later
+            target_dtype = full_tensor.dtype
+        else:
+            target_dtype = meta_sharded_param.dtype
+
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
@@ -324,20 +348,37 @@ def load_model_from_full_model_state_dict(
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
+
+    if skipped_checkpoint_keys:
+        logger.warning(
+            "Checkpoint keys not loaded (no matching model parameter) %s",
+            (
+                skipped_checkpoint_keys[:20]
+                if len(skipped_checkpoint_keys) > 20
+                else skipped_checkpoint_keys
+            ),
+        )
+        if len(skipped_checkpoint_keys) > 20:
+            logger.warning(
+                "... and %d more skipped keys.",
+                len(skipped_checkpoint_keys) - 20,
+            )
+
     # parameters in nn.Module that doesn't exist in safetensor files
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # for nunchaku
+    # for nunchaku; norm_q/norm_k for SANA QK normalization layers
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
         "wtscale",
         "bias",
+        "norm_q",
+        "norm_k",
     ]
     for new_param_name in unused_keys:
-        # check unallowed missing params
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error(
                 "Unsupported new parameter: %s. Allowed patterns: %s",
@@ -350,21 +391,24 @@ def load_model_from_full_model_state_dict(
             )
 
         meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
 
-        if "wcscales" in new_param_name or "wtscale" in new_param_name:
+        if any(
+            p in new_param_name for p in ("wcscales", "wtscale", "norm_q", "norm_k")
+        ):
             init_like = torch.ones_like
         else:
             init_like = torch.zeros_like
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             sharded_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             sharded_tensor = distribute_tensor(
                 full_tensor,

@@ -18,8 +18,6 @@ from sgl_kernel.attention import (
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
-    FusedSetKVBufferArg,
-    apply_rope_with_cos_sin_cache_inplace,
     concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
@@ -38,31 +36,23 @@ from sgl_kernel.expert_specialization import (
     es_sm100_mxfp8_blockscaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_quant,
 )
-from sgl_kernel.fused_moe import moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
-    cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     gptq_gemm,
-    gptq_marlin_gemm,
     gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
-    scaled_fp4_experts_quant,
-    scaled_fp4_grouped_quant,
-    scaled_fp4_quant,
-    sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_8bit,
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
-    silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.kvcacheio import (
@@ -78,15 +68,9 @@ from sgl_kernel.mamba import (
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
 )
-from sgl_kernel.marlin import (
-    awq_marlin_moe_repack,
-    awq_marlin_repack,
-    gptq_marlin_repack,
-)
-from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
+from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
-    cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_qk_norm_rope,
     kimi_k2_moe_fused_gate,
@@ -107,13 +91,9 @@ from sgl_kernel.quantization import (
     ggml_mul_mat_vec_a8,
 )
 from sgl_kernel.sampling import (
-    min_p_sampling_from_probs,
     top_k_mask_logits,
     top_k_renorm_prob,
-    top_k_top_p_sampling_from_logits,
-    top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
-    top_p_sampling_from_probs,
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,

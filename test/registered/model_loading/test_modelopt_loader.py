@@ -14,7 +14,11 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
 from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -559,6 +563,126 @@ class TestModelOptLoaderIntegration(CustomTestCase):
         # Verify that modelopt_quant was properly parsed
         self.assertEqual(server_args.modelopt_quant, "fp8")
         self.assertEqual(server_args.model_path, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+
+class TestParseQuantHfConfig(CustomTestCase):
+    """Tests for _parse_quant_hf_config and _parse_modelopt_quant_config.
+
+    Regression tests for the fix where quant_method='modelopt' ignoring quant_algo.
+    """
+
+    # (quant_config_input, expected_quant_method)
+    _MODELOPT_CASES = [
+        ({"quant_method": "modelopt", "quant_algo": "FP8"}, "modelopt_fp8"),
+        ({"quant_method": "modelopt", "quant_algo": "FP4"}, "modelopt_fp4"),
+        ({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "modelopt_fp4"),
+        ({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}, "w4afp8"),
+        ({"quant_algo": "FP8"}, "modelopt_fp8"),
+        ({"quant_algo": "FP4"}, "modelopt_fp4"),
+        ({"quant_algo": "MIXED_PRECISION"}, "w4afp8"),
+        ({"quant_method": "modelopt"}, "modelopt"),
+    ]
+
+    def setUp(self):
+        """Set up a real ModelConfig using TinyLlama (already used elsewhere)."""
+        self.mock_tp_rank = patch(
+            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            return_value=0,
+        )
+        self.mock_tp_rank.start()
+
+        self.mock_mp_is_initialized = patch(
+            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            return_value=True,
+        )
+        self.mock_mp_is_initialized.start()
+
+        self.model_config = ModelConfig(
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        )
+
+    def tearDown(self):
+        self.mock_tp_rank.stop()
+        self.mock_mp_is_initialized.stop()
+
+    def test_modelopt_quant_parsing(self):
+        """Modelopt quant configs must resolve to the correct quant_method."""
+        for quant_cfg_input, expected in self._MODELOPT_CASES:
+            with self.subTest(quant_cfg=quant_cfg_input):
+                self.model_config.hf_config.quantization_config = dict(quant_cfg_input)
+                result = self.model_config._parse_quant_hf_config()
+                self.assertEqual(result["quant_method"], expected)
+
+    def test_non_modelopt_quant_method_unchanged(self):
+        """Non-modelopt quant_method (e.g. 'gptq') must NOT enter the modelopt path."""
+        self.model_config.hf_config.quantization_config = {
+            "quant_method": "gptq",
+            "bits": 4,
+        }
+        result = self.model_config._parse_quant_hf_config()
+        self.assertEqual(result["quant_method"], "gptq")
+        self.assertNotIn("quant_algo", result)
+
+
+class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "nemotron_h"
+        model_config.hf_config.architectures = ["NemotronHForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_mixed_precision_override_does_not_hijack_w4afp8(self):
+        self.assertIsNone(
+            ModelOptMixedPrecisionConfig.override_quantization_method(
+                {"quant_method": "w4afp8", "quant_algo": "MIXED_PRECISION"},
+                "w4afp8",
+            )
+        )
+
+    def test_mixed_precision_uses_nvfp4_min_capability(self):
+        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+
+    def test_mixed_precision_quant_layer_resolution_after_mapping(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.1.mixer.experts.0.up_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "backbone.layers.2.mixer.q_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.2.mixer.k_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.2.mixer.v_proj": {"quant_algo": "FP8"},
+                },
+                "packed_modules_mapping": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                },
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            WeightsMapper(orig_to_new_prefix={"backbone.": "model."})
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.0.mixer.in_proj"),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.1.mixer.experts"),
+            "NVFP4",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
+            "FP8",
+        )
 
 
 if __name__ == "__main__":

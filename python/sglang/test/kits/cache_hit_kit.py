@@ -5,12 +5,9 @@ import time
 import aiohttp
 import requests
 
-from sglang.bench_serving import (
-    RequestFuncOutput,
-    get_tokenizer,
-    remove_prefix,
-    sample_random_requests,
-)
+from sglang.bench_serving import RequestFuncOutput
+from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -90,6 +87,103 @@ async def async_request_sglang_generate(
     if pbar:
         pbar.update(1)
     return output
+
+
+async def async_request_openai_chat_completions(
+    payload,
+    url,
+    pbar=None,
+):
+    """Send a streaming request to an OpenAI-compatible /v1/chat/completions endpoint.
+
+    Returns a RequestFuncOutput with the same dynamic attributes as
+    async_request_sglang_generate (except output_ids, which is unavailable).
+    """
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        generated_text = ""
+        ttft = 0.0
+        latency = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        output = RequestFuncOutput()
+
+        try:
+            async with session.post(url=url, json=payload) as response:
+                if response.status == 200:
+                    prompt_tokens = 0
+                    cached_tokens = 0
+                    completion_tokens = 0
+
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            # Streaming token chunks
+                            if data.get("choices"):
+                                raw_delta = data["choices"][0].get("delta")
+                                text = raw_delta.get("content", "") if raw_delta else ""
+                                if text:
+                                    generated_text += text
+                                    timestamp = time.perf_counter()
+
+                                    if ttft == 0.0:
+                                        ttft = time.perf_counter() - st
+                                        output.ttft = ttft
+                                    else:
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
+
+                                    most_recent_timestamp = timestamp
+
+                            # Final chunk with usage stats
+                            usage = data.get("usage")
+                            if usage:
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                                details = usage.get("prompt_tokens_details", {}) or {}
+                                cached_tokens = details.get("cached_tokens", 0)
+
+                    output.generated_text = generated_text
+                    output.output_ids = []  # Not available from OpenAI endpoint
+                    output.success = True
+                    output.latency = latency
+                    output.prompt_len = prompt_tokens
+                    output.cached_tokens = cached_tokens
+                    output.generated_len = (
+                        completion_tokens if completion_tokens else len(output.itl) + 1
+                    )
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception as e:
+            output.success = False
+            output.error = str(e)
+            print(f"Request failed: {e}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+def gen_payload_openai(messages, output_len, model):
+    return {
+        "model": model,
+        "messages": messages,
+        "max_tokens": output_len,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
 
 
 def gen_payload(input_ids, output_len, lora_path=""):
