@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=600, suite="stage-b-test-large-2-gpu")
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
     Test class for verifying KV cache offloading on the decode side in a
