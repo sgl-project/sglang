@@ -8,7 +8,7 @@ Compares:
 Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels
 
 Usage:
-    cd /data/bbuf/sglang
+    cd /path/to/sglang
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_rmsnorm.py
 
 Requirements:

@@ -8,7 +8,7 @@ Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kerne
 
 Usage:
     # Baseline — single model
-    cd /data/bbuf/sglang
+    cd /path/to/sglang
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux
 
     # With custom JIT CUDA kernels
@@ -17,7 +17,7 @@ Usage:
     # Side-by-side comparison
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux --compare
 
-    # All 7 models, comparison
+    # All 9 models, comparison
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --all --compare
 
 Input images required for image-guided models:
@@ -26,6 +26,8 @@ Input images required for image-guided models:
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
     wget -O "${ASSET_DIR}/astronaut.jpg" \
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
+    wget -O "${ASSET_DIR}/mova_single_person.jpg" \
+      https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 """
 
 import argparse
@@ -182,11 +184,44 @@ MODELS = {
             "false",
         ],
     },
+    # 8. hunyuanvideo-community/HunyuanVideo — Text-to-Video, 848×480, 65 frames, 30 steps
+    "hunyuanvideo": {
+        "path": "hunyuanvideo-community/HunyuanVideo",
+        "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
+        "extra_args": [
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            "--num-frames=65",
+            "--width=848",
+            "--height=480",
+            "--num-inference-steps=30",
+        ],
+    },
+    # 9. OpenMOSS-Team/MOVA-720p — Image-to-Video, 4 GPUs, 193 frames, 24 steps
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    "mova-720p": {
+        "path": "OpenMOSS-Team/MOVA-720p",
+        "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
+        "image_path": str(ASSET_DIR / "mova_single_person.jpg"),
+        "extra_args": [
+            "--adjust-frames=false",
+            "--num-gpus=4",
+            "--ring-degree=1",
+            "--ulysses-degree=4",
+            "--num-frames=193",
+            "--fps=24",
+            "--num-inference-steps=24",
+        ],
+    },
 }
 
 
 def required_gpus_for_model(model_key: str) -> int:
-    return 8 if model_key == "wan-t2v" else 1
+    if model_key == "wan-t2v":
+        return 8
+    if model_key == "mova-720p":
+        return 4
+    return 1
 
 
 def build_sglang_cmd(
@@ -209,9 +244,11 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
-        f"--seed={seed}",
         "--log-level=info",
     ]
+
+    if seed is not None:
+        cmd.append(f"--seed={seed}")
 
     if "negative_prompt" in cfg:
         cmd.append(f"--negative-prompt={cfg['negative_prompt']}")
