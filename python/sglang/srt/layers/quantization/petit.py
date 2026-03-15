@@ -107,8 +107,16 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def is_petit_nvfp4_compatible(cls, quant_config: Dict[str, Any]) -> bool:
+        """Check if this NVFP4 checkpoint can run on ROCm via Petit.
+        Accepts quant_method 'modelopt' (from producer) or 'modelopt_fp4' (from _parse_modelopt_quant_config).
+        """
         quant_method = quant_config.get("quant_method", "").lower()
-        return _is_hip and quant_method == "modelopt"
+        quant_algo = quant_config.get("quant_algo", "").upper()
+        return (
+            _is_hip
+            and quant_method in ("modelopt", "modelopt_fp4")
+            and ("NVFP4" in quant_algo or "FP4" in quant_algo)
+        )
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:
