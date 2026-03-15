@@ -3301,6 +3301,26 @@ def configure_scheduler(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
+    def sigterm_handler(signum, frame):
+        """Handle SIGTERM for graceful shutdown of scheduler process.
+
+        The key here is to let the process exit normally so that Python/C++
+        cleanup mechanisms can run properly:
+
+        We use sys.exit(0) which allows:
+        - Python's atexit handlers to run
+        - Object __del__ methods to be called during garbage collection
+        - C++ destructors to run for extension modules
+        """
+        logger.info(f"SIGTERM received in scheduler process{prefix}. ")
+
+        # Exit normally to trigger cleanup mechanisms:
+        logger.info(f"Scheduler process{prefix} exiting to allow cleanup...")
+        sys.exit(0)
+
+    # Register SIGTERM handler for graceful shutdown
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
