@@ -731,4 +731,7 @@ class HeliosScheduler:
         return self.config.num_train_timesteps
 
 
-EntryClass = HeliosScheduler
+# Alias for Helios-Distilled which uses "HeliosDMDScheduler" in scheduler_config.json
+HeliosDMDScheduler = HeliosScheduler
+
+EntryClass = [HeliosScheduler, "HeliosDMDScheduler"]
