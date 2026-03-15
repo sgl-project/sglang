@@ -156,10 +156,12 @@ class ReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        if not any(r.is_dllm() for r in reqs):
-            assert (
-                sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
-            ), "only one chunked request may reuse req_pool_idx in a batch"
+        # NOTE: this check is relaxed temporarily
+        # https://github.com/sgl-project/sglang/pull/20476
+        # if not any(r.is_dllm() for r in reqs):
+        #     assert (
+        #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+        #     ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
         ), "reusing request must be chunked or have committed KV"
@@ -380,7 +382,7 @@ class MambaPool:
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
-        if dst_index == None:
+        if dst_index is None:
             return None
         self.copy_from(src_index, dst_index)
         return dst_index
@@ -1860,8 +1862,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -1876,7 +1880,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(

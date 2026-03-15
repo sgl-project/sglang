@@ -306,13 +306,12 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-        if self.current_scheduler_metrics_enabled:
-            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-            self.log_prefill_stats(
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        self.report_prefill_stats(
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -368,18 +367,35 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
-            next_token_ids = next_token_ids.tolist()
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+            if batch.is_spec_v2:
+                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            else:
+                next_token_ids = next_token_ids.tolist()
+
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_spec_v2:
-            next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+
+                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
-            self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
+            self.metrics_collector.increment_decode_cuda_graph_pass(
+                value=can_run_cuda_graph
+            )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -411,6 +427,12 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            if (
+                self.server_args.disaggregation_decode_enable_offload_kvcache
+                and not req.finished()
+            ):
+                self.decode_offload_manager.offload_kv_cache(req)
+
             if req.finished():
                 # delete feature to save memory
                 if req.multimodal_inputs is not None:
@@ -424,7 +446,7 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
                     release_kv_cache(req, self.tree_cache)
 
@@ -432,24 +454,39 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
+            if req.return_logprob and (
+                batch.spec_algorithm.is_none() or batch.is_spec_v2
+            ):
+                # Spec v1 handles logprobs inside its own worker.
+                # Normalize: non-spec has 1 token, spec v2 has multiple.
+                if batch.is_spec_v2:
+                    accepted_logprobs = next_token_logprobs[i]
+                    accepted_ids = next_token_id
+                    max_accept = len(accepted_logprobs)
+                else:
+                    accepted_logprobs = [next_token_logprobs[i]]
+                    accepted_ids = [next_token_id]
+                    max_accept = 1
+
+                for j, tok_id in enumerate(accepted_ids):
+                    req.output_token_logprobs_val.append(accepted_logprobs[j])
+                    req.output_token_logprobs_idx.append(tok_id)
+                    if req.top_logprobs_num > 0:
+                        flat_idx = i * max_accept + j
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[flat_idx]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[flat_idx]
+                        )
+                    if req.token_ids_logprob is not None:
+                        flat_idx = i * max_accept + j
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[flat_idx]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                        )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -479,12 +516,11 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if self.current_scheduler_metrics_enabled:
-            if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
-                self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-            self.log_decode_stats_every_iteration(
-                batch, num_accepted_tokens=result.num_accepted_tokens
-            )
+        self.report_decode_stats(
+            can_run_cuda_graph,
+            running_batch=batch,
+            num_accepted_tokens=result.num_accepted_tokens,
+        )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
