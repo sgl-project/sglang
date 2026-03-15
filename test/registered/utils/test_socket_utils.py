@@ -59,7 +59,7 @@ class TestTryBindSocket(CustomTestCase):
 
     def test_bind_occupied_port_raises(self):
         """try_bind_socket should raise OSError if port is occupied."""
-        sock1 = try_bind_socket()
+        sock1 = try_bind_socket(reuse_addr=False)
         try:
             port = sock1.getsockname()[1]
             with self.assertRaises(OSError):
