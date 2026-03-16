@@ -6,6 +6,7 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
@@ -66,6 +67,66 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+
+class TestSamplingParamsCliArgs(unittest.TestCase):
+    def test_get_cli_args_drops_unset_sampling_params(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args([])
+
+        kwargs = SamplingParams.get_cli_args(args)
+
+        self.assertEqual(kwargs, {})
+
+    def test_get_cli_args_keeps_explicit_sampling_params(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+                "--save-output",
+            ]
+        )
+
+        kwargs = SamplingParams.get_cli_args(args)
+
+        self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
+        self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
+        self.assertTrue(kwargs["save_output"])
+
+    def test_qwen_image_cli_path_preserves_model_defaults(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args([])
+
+        kwargs = SamplingParams.get_cli_args(args)
+        params = QwenImageSamplingParams(**kwargs)
+
+        self.assertEqual(params.negative_prompt, " ")
+        self.assertEqual(params.guidance_scale, 4.0)
+        self.assertEqual(params.num_inference_steps, 50)
+
+    def test_qwen_image_cli_path_allows_explicit_override_to_base_defaults(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+            ]
+        )
+
+        kwargs = SamplingParams.get_cli_args(args)
+        params = QwenImageSamplingParams(**kwargs)
+
+        self.assertEqual(params.guidance_scale, SamplingParams.guidance_scale)
+        self.assertEqual(params.negative_prompt, SamplingParams.negative_prompt)
 
 
 class TestNegativePromptMerge(unittest.TestCase):
