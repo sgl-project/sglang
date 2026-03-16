@@ -117,6 +117,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     draft_kv_ptrs: list[int]
     draft_dst_kv_item_len: int
+    is_send_target: bool
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
@@ -136,14 +137,15 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[9].decode("ascii")),
             draft_kv_ptrs=list(struct.unpack(f"{len(msg[10])//8}Q", msg[10])),
             draft_dst_kv_item_len=int(msg[11].decode("ascii")),
+            is_send_target=bool(int(msg[12].decode("ascii"))),
             dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
-                if len(msg) > 10 and len(msg[10]) > 0
+                list(struct.unpack(f"{len(msg[13])//4}I", msg[13]))
+                if len(msg) > 10 and len(msg[13]) > 0
                 else []
             ),
             dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
-                if len(msg) > 11 and len(msg[11]) > 0
+                list(struct.unpack(f"{len(msg[14])//4}I", msg[14]))
+                if len(msg) > 11 and len(msg[14]) > 0
                 else []
             ),
         )
@@ -696,6 +698,9 @@ class MooncakeKVManager(CommonKVManager):
                     dst_state_data_ptrs,
                 )
         elif state_type in ["swa", "nsa"]:
+            logger.debug(
+                f"maybe_send_extra swa/nsa {prefill_state_indices=} {dst_state_data_ptrs=} "
+            )
             # SWA and NSA hybrid models do not support different TP sizes yet
             if (
                 target_rank_registration_info is not None
@@ -716,6 +721,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
             return self._send_kvcache_generic(
+                is_mla_backend=self.is_mla_backend,
                 mooncake_session_id=req.mooncake_session_id,
                 src_data_ptrs=self.kv_args.state_data_ptrs,
                 dst_data_ptrs=dst_state_data_ptrs,
@@ -968,19 +974,9 @@ class MooncakeKVManager(CommonKVManager):
                         # start send kv cache
                         has_draft_data = len(self.kv_args.draft_kv_data_lens) > 0
                         is_send_fail = False
-                        is_need_send_target = True
-                        is_need_send_draft = True
-
-                        if (
-                            self.is_mla_backend
-                            and has_draft_data
-                            and not self.is_draft_mla_backend
-                        ):  # MLA target + MHA draft
-                            if local_rank != 0:  # only rank 0 need to send MLA kv cahce
-                                is_need_send_target = False
 
                         # target
-                        if is_need_send_target:
+                        if target_rank_registration_info.is_send_target:
                             ret = self._send_kv_cache(
                                 is_target=True,
                                 req=req,
@@ -993,7 +989,7 @@ class MooncakeKVManager(CommonKVManager):
                                 logger.error("target send kv cache failed")
                                 is_send_fail = True
                         # draft
-                        if is_need_send_draft and has_draft_data:
+                        if has_draft_data:
                             ret = self._send_kv_cache(
                                 is_target=False,
                                 req=req,
@@ -1031,13 +1027,26 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
-                                self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    target_rank_registration_info.dst_state_data_ptrs,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                if not self.is_mla_backend and (
+                                    self.attn_tp_size
+                                    != target_rank_registration_info.dst_attn_tp_size
+                                ):
+                                    raise RuntimeError(
+                                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA hybrid models yet."
+                                    )
+
+                                state_type = getattr(self.kv_args, "state_type", "none")
+                                assert state_type != "nsa" or target_rank_registration_info.is_send_target # nsa not suppot attn_tp > 1
+                                if (
+                                    state_type != "nsa"
+                                    or target_rank_registration_info.is_send_target
+                                ):  # only nsa care abort is_need_send_target flag
+                                    self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        target_rank_registration_info.dst_state_data_ptrs,
+                                        executor,
+                                    )
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
@@ -1445,6 +1454,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 draft_dst_kv_item_len = str(
                     self.kv_mgr.kv_args.draft_kv_item_lens[0]
                 ).encode("ascii")
+            is_send_target = bootstrap_info["is_send_target"]
+            is_send_target_str = b"1" if is_send_target else b"0"
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
@@ -1462,6 +1473,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         draft_packed_kv_data_ptrs,
                         draft_dst_kv_item_len,
+                        is_send_target_str,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                     ]
