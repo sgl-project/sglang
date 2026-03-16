@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -1169,12 +1168,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         ctx = self._get_teacache_context()
         if ctx is None:
             return False
-
-        # Wan uses WanTeaCacheParams with additional fields
-        teacache_params = ctx.teacache_params
-        assert isinstance(
-            teacache_params, WanTeaCacheParams
-        ), "teacache_params is not a WanTeaCacheParams"
 
         # Initialize Wan-specific parameters
         use_ret_steps = teacache_params.use_ret_steps
