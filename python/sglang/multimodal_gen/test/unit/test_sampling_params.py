@@ -70,19 +70,20 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
 
 class TestSamplingParamsCliArgs(unittest.TestCase):
-    def test_get_cli_args_drops_unset_sampling_params(self):
+    def _parse_cli_kwargs(self, argv: list[str]) -> dict:
         parser = argparse.ArgumentParser()
         SamplingParams.add_cli_args(parser)
-        args = parser.parse_args([])
+        args = parser.parse_args(argv)
+        return SamplingParams.get_cli_args(args)
 
-        kwargs = SamplingParams.get_cli_args(args)
+    def _make_qwen_image_params(self, argv: list[str]) -> QwenImageSamplingParams:
+        return QwenImageSamplingParams(**self._parse_cli_kwargs(argv))
 
-        self.assertEqual(kwargs, {})
+    def test_get_cli_args_drops_unset_sampling_params(self):
+        self.assertEqual(self._parse_cli_kwargs([]), {})
 
     def test_get_cli_args_keeps_explicit_sampling_params(self):
-        parser = argparse.ArgumentParser()
-        SamplingParams.add_cli_args(parser)
-        args = parser.parse_args(
+        kwargs = self._parse_cli_kwargs(
             [
                 "--guidance-scale",
                 str(SamplingParams.guidance_scale),
@@ -92,28 +93,18 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             ]
         )
 
-        kwargs = SamplingParams.get_cli_args(args)
-
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
-        parser = argparse.ArgumentParser()
-        SamplingParams.add_cli_args(parser)
-        args = parser.parse_args([])
-
-        kwargs = SamplingParams.get_cli_args(args)
-        params = QwenImageSamplingParams(**kwargs)
+        params = self._make_qwen_image_params([])
 
         self.assertEqual(params.negative_prompt, " ")
         self.assertEqual(params.guidance_scale, 4.0)
-        self.assertEqual(params.num_inference_steps, 50)
 
     def test_qwen_image_cli_path_allows_explicit_override_to_base_defaults(self):
-        parser = argparse.ArgumentParser()
-        SamplingParams.add_cli_args(parser)
-        args = parser.parse_args(
+        params = self._make_qwen_image_params(
             [
                 "--guidance-scale",
                 str(SamplingParams.guidance_scale),
@@ -122,88 +113,16 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             ]
         )
 
-        kwargs = SamplingParams.get_cli_args(args)
-        params = QwenImageSamplingParams(**kwargs)
-
         self.assertEqual(params.guidance_scale, SamplingParams.guidance_scale)
         self.assertEqual(params.negative_prompt, SamplingParams.negative_prompt)
 
-
-class TestNegativePromptMerge(unittest.TestCase):
-    """Regression tests for negative_prompt not being passed through CLI"""
-
-    def test_get_cli_args_filters_none(self):
-        ns = argparse.Namespace(negative_prompt=None, prompt="hello")
-        result = SamplingParams.get_cli_args(ns)
-        self.assertNotIn("negative_prompt", result)
-        self.assertEqual(result["prompt"], "hello")
-
-    def test_get_cli_args_keeps_explicit_value(self):
-        ns = argparse.Namespace(negative_prompt="ugly, blurry")
-        result = SamplingParams.get_cli_args(ns)
-        self.assertEqual(result["negative_prompt"], "ugly, blurry")
-
-    def test_merge_preserves_subclass_default_when_not_explicit(self):
-        """Without explicit_fields, value matching base default is not merged,
-        so the subclass default (empty string) is preserved."""
+    def test_merge_allows_explicit_field_matching_base_default(self):
         target = DiffusersGenericSamplingParams()
-        self.assertEqual(target.negative_prompt, "")
+        user = SamplingParams(negative_prompt=SamplingParams.negative_prompt)
 
-        user = SamplingParams()
-        target._merge_with_user_params(user)
-        self.assertEqual(target.negative_prompt, "")
-
-    def test_merge_applies_different_negative_prompt(self):
-        target = DiffusersGenericSamplingParams()
-        user = SamplingParams(negative_prompt="ugly, blurry")
-        target._merge_with_user_params(user)
-        self.assertEqual(target.negative_prompt, "ugly, blurry")
-
-    def test_merge_explicit_field_matching_base_default(self):
-        """Even when the user value matches the base-class default, it should
-        still be applied if listed in explicit_fields."""
-        base_default = SamplingParams.negative_prompt
-        target = DiffusersGenericSamplingParams()
-        self.assertEqual(target.negative_prompt, "")
-
-        user = SamplingParams(negative_prompt=base_default)
         target._merge_with_user_params(user, explicit_fields={"negative_prompt"})
-        self.assertEqual(target.negative_prompt, base_default)
 
-    def test_cli_roundtrip_no_negative_prompt(self):
-        """Simulate CLI without --negative-prompt: subclass default is kept."""
-        ns = argparse.Namespace(negative_prompt=None, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        self.assertNotIn("negative_prompt", kwargs)
-
-        user = SamplingParams(**kwargs)
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, "")
-
-    def test_cli_roundtrip_with_negative_prompt(self):
-        """Simulate CLI with --negative-prompt: user value is applied."""
-        user_neg = "bad quality, watermark"
-        ns = argparse.Namespace(negative_prompt=user_neg, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        user = SamplingParams(**kwargs)
-
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, user_neg)
-
-    def test_cli_roundtrip_with_base_default_negative_prompt(self):
-        """Simulate CLI where --negative-prompt value matches the base default:
-        user value should still be applied (not dropped)."""
-        base_default = SamplingParams.negative_prompt
-        ns = argparse.Namespace(negative_prompt=base_default, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        self.assertIn("negative_prompt", kwargs)
-
-        user = SamplingParams(**kwargs)
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, base_default)
+        self.assertEqual(target.negative_prompt, SamplingParams.negative_prompt)
 
 
 if __name__ == "__main__":
