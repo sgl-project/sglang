@@ -104,7 +104,6 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
-    get_zmq_socket,
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -113,6 +112,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -1574,7 +1574,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.text += recv_obj.output_strs[i]
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if self.server_args.incremental_streaming_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1590,7 +1590,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if self.server_args.incremental_streaming_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)

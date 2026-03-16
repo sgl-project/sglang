@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,7 +114,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

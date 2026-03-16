@@ -4,6 +4,10 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefResult,
+    IncLockRefResult,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,8 +38,8 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
-        tree_cache.inc_lock_ref.return_value = None
-        tree_cache.dec_lock_ref.return_value = None
+        tree_cache.inc_lock_ref.return_value = IncLockRefResult()
+        tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         return tree_cache
 
     def create_token_allocator(

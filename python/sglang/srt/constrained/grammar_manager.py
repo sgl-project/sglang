@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
+    InvalidGrammarObject,
     create_grammar_backend,
 )
 from sglang.srt.environ import envs
@@ -95,8 +95,12 @@ class GrammarManager:
                     req.grammar_key = key
                     add_to_grammar_queue = True
                 else:
-                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                    if isinstance(
+                        value, InvalidGrammarObject
+                    ):  # We hit a cached invalid grammar.
+                        error_msg = (
+                            f"Failed to compile {key[0]} grammar: {value.error_message}"
+                        )
                         req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
@@ -174,8 +178,8 @@ class GrammarManager:
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-            if req.grammar is INVALID_GRAMMAR_OBJ:
-                error_msg = f"Invalid grammar request: {req.grammar_key=}"
+            if isinstance(req.grammar, InvalidGrammarObject):
+                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
 
         # Return failed requests
@@ -185,7 +189,9 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+            self.grammar_backend.set_cache(
+                req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
+            )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 

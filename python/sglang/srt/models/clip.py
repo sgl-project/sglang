@@ -11,6 +11,7 @@ from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_ma
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -32,7 +33,7 @@ class CLIPVisionEmbeddings(nn.Module):
 
         self.class_embedding = nn.Parameter(torch.randn(self.embed_dim))
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

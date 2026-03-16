@@ -15,8 +15,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -817,9 +820,9 @@ class HiRadixCache(RadixCache):
         """
         return RadixKey(token_ids=list(token_ids))
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -831,11 +834,13 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -851,7 +856,7 @@ class HiRadixCache(RadixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -1011,7 +1016,8 @@ class HiRadixCache(RadixCache):
             ancester_node = node
 
         # protect the ancestor nodes from eviction
-        delta = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancester_node)
+        delta = result.delta
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])

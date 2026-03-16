@@ -37,9 +37,9 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `awq_marlin` | Yes | No | Marlin kernels are CUDA-only |
 | `gptq_marlin` | Yes | No | Marlin kernels are CUDA-only |
 | `gguf` | Yes | No | CUDA-only kernels in sgl-kernel |
-| `modelopt` / `modelopt_fp8` | Yes | No | NVIDIA ModelOpt, requires NVIDIA hardware |
-| `modelopt_fp4` | Yes (Blackwell) | No | NVIDIA Blackwell only |
-| `petit_nvfp4` | Yes (Blackwell) | No | NVIDIA NvFP4, Blackwell only |
+| `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
+| `modelopt_fp4` | Yes (Blackwell/SM100+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
+| `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
 | `bitsandbytes` | Yes | Experimental | Depends on bitsandbytes ROCm support |
 | `torchao` (`int4wo`, etc.) | Yes | Partial | `int4wo` not supported on AMD; other methods may work |
 
@@ -330,7 +330,7 @@ pip install nvidia-modelopt
 
 ##### Quantization and Export Workflow
 
-SGLang provides an example script that demonstrates the complete ModelOpt quantization and export workflow:
+SGLang provides an example script that demonstrates the complete ModelOpt quantization and export workflow. Run from the SGLang repository root (see [modelopt_quantize_and_export.py](https://github.com/sgl-project/sglang/blob/main/examples/usage/modelopt_quantize_and_export.py)):
 
 ```bash
 # Quantize and export a model using ModelOpt FP8 quantization
@@ -339,7 +339,7 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
     --export-dir ./quantized_tinyllama_fp8 \
     --quantization-method modelopt_fp8
 
-# For FP4 quantization
+# For FP4 quantization (requires Blackwell GPU)
 python examples/usage/modelopt_quantize_and_export.py quantize \
     --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --export-dir ./quantized_tinyllama_fp4 \
@@ -395,15 +395,16 @@ python -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Or using the Python API:
+Or using the Python API (use the same path as `modelopt_export_path` from the quantize step):
 
 ```python
 import sglang as sgl
 
 def main():
     # Deploy exported ModelOpt quantized model
+    # Path must match modelopt_export_path from quantize step (e.g., ./exported_model)
     llm = sgl.Engine(
-        model_path="./quantized_tinyllama_fp8",
+        model_path="./exported_model",
         quantization="modelopt",
     )
 
@@ -444,7 +445,7 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 # The checkpoint can be reused for future quantization runs and skip calibration
 ```
 
-**Export-only Workflow**: If you have a pre-existing fake quantized ModelOpt checkpoint, you can export it directly:
+**Export-only Workflow**: If you have a pre-existing fake quantized ModelOpt checkpoint, you can export it directly. See [LoadConfig](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/load_config.py) for the full API:
 
 ```python
 from sglang.srt.configs.device_config import DeviceConfig
@@ -463,7 +464,7 @@ load_config = LoadConfig(
     modelopt_export_path="./exported_model",
 )
 
-# Load and export the model
+# Load and export the model (DeviceConfig defaults to device="cuda")
 model_loader = get_model_loader(load_config, model_config)
 model_loader.load_model(model_config=model_config, device_config=DeviceConfig())
 ```
@@ -523,6 +524,8 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 - [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 - [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
 - [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer)
+- [NVIDIA Model Optimizer LLM PTQ](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq)
+- [Petit: NVFP4 on ROCm](https://github.com/causalflow-ai/petit-kernel) — [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/), [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html)
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
