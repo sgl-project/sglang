@@ -576,13 +576,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
-                    KVPoll.WaitingForInput,
-                    KVPoll.Transferring,
                 ):
                     logger.warning(
                         "PP rank %d: unexpected poll state %s for rid %s "
                         "from consensus; treating as undone",
-                        self.tp_rank,
+                        self.pp_rank,
                         poll,
                         req.rid,
                     )
