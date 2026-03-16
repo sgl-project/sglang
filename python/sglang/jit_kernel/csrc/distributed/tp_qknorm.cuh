@@ -1,3 +1,5 @@
+// Adapted from https://github.com/NVIDIA/TensorRT-LLM/pull/12163
+// We reuse the custom all reduce push buffer in SGLang
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

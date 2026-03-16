@@ -59,23 +59,19 @@ def init_distributed():
     )
     if rank == 0:
         print(f"Max occupancy for fused_parallel_qknorm: {max_occupancy} blocks/SM")
+
+    props = torch.cuda.get_device_properties(device)
     comm = CustomAllReduceV2(
         cpu_group,
         device,
         max_pull_size,
         max_push_size,
-        max_push_blocks=148 * max_occupancy,
+        max_push_blocks=props.multi_processor_count * max_occupancy,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
 
     return rank, world_size, device, cpu_group, nccl_group, comm
-
-
-def _all_gather_cat(x: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-    gathered = [torch.empty_like(x) for _ in range(dist.get_world_size(group=group))]
-    dist.all_gather(gathered, x, group=group)
-    return torch.cat(gathered, dim=-1)
 
 
 @torch.inference_mode()
@@ -111,9 +107,6 @@ def main():
             f"{'q_dim':>8} {'k_dim':>8} {'batch':>8} {'fused_us':>12} {'baseline_us':>12}"
         )
 
-    def all_gather(x: torch.Tensor) -> torch.Tensor:
-        return _all_gather_cat(x, nccl_group)
-
     for q_dim, k_dim in Q_K_DIMS:
         local_q_dim = q_dim // world_size
         local_k_dim = k_dim // world_size
@@ -126,10 +119,6 @@ def main():
             )
             q_weight = torch.randn(NUM_LAYERS, local_q_dim, device=device, dtype=DTYPE)
             k_weight = torch.randn(NUM_LAYERS, local_k_dim, device=device, dtype=DTYPE)
-            q_full = all_gather(q)
-            k_full = all_gather(k)
-            q_weight_full = all_gather(q_weight)
-            k_weight_full = all_gather(k_weight)
 
             def run_fused(i: int):
                 fused_parallel_qknorm(
@@ -142,8 +131,8 @@ def main():
                 )
 
             def run_baseline(i: int):
-                rmsnorm(q_full[i], q_weight_full[i], out=q_full[i], eps=EPS)
-                rmsnorm(k_full[i], k_weight_full[i], out=k_full[i], eps=EPS)
+                rmsnorm(q[i], q_weight[i], out=q[i], eps=EPS)
+                rmsnorm(k[i], k_weight[i], out=k[i], eps=EPS)
 
             fused_us = bench_one(run_fused, args.warmup, args.iters)
             baseline_us = bench_one(run_baseline, args.warmup, args.iters)
