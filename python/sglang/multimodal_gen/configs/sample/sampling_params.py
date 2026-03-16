@@ -22,6 +22,8 @@ from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams
+    from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -154,8 +156,12 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
-    # TeaCache parameters
+    # Cache acceleration
     enable_teacache: bool = False
+    teacache_params: "TeaCacheParams | None" = None
+    enable_magcache: bool = False
+    magcache_params: "MagCacheParams | None" = None
+    calibrate_cache: bool = False
 
     # Profiling
     profile: bool = False
@@ -603,6 +609,37 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
             default=SamplingParams.enable_teacache,
+            help="Enable TeaCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--teacache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
+                "Fields map directly to TeaCacheParams dataclass fields."
+            ),
+        )
+        parser.add_argument(
+            "--enable-magcache",
+            action="store_true",
+            default=SamplingParams.enable_magcache,
+            help="Enable MagCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--magcache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
+                "Fields map directly to MagCacheParams dataclass fields."
+            ),
+        )
+        parser.add_argument(
+            "--calibrate-cache",
+            action="store_true",
+            default=SamplingParams.calibrate_cache,
+            help="Run in calibration mode: collect magnitude ratio statistics instead of skipping steps.",
         )
 
         # profiling
