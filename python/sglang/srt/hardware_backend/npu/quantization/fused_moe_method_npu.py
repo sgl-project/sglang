@@ -247,12 +247,10 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
         layer.w13_weight_scale_bf16 = torch.nn.Parameter(
-            layer.w13_weight_scale.data.to(dtype=torch.bfloat16),
-            requires_grad=False
+            layer.w13_weight_scale.data.to(dtype=torch.bfloat16), requires_grad=False
         )
         layer.w2_weight_scale_bf16 = torch.nn.Parameter(
-            layer.w2_weight_scale.data.to(dtype=torch.bfloat16),
-            requires_grad=False
+            layer.w2_weight_scale.data.to(dtype=torch.bfloat16), requires_grad=False
         )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
@@ -272,6 +270,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
         layer.w13_weight_scale = layer.w13_weight_scale_bf16
         layer.w2_weight_scale = layer.w2_weight_scale_bf16
 
