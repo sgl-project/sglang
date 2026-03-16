@@ -20,9 +20,20 @@ void MM512_LOAD_VEC(
     const float* __restrict__ src_scale,
     int64_t ld_src,
     int64_t index,
-    const func_t& f,
-    __m512i& dst) {
-  dst = f(src + index * ld_src);
+    const func_t& get_mask,
+    __m512i& dst,
+    const int mask_type = 0) {
+  if (mask_type == 0) {
+    dst = _mm512_loadu_si512(src + index * ld_src);
+  } else if (mask_type == 1) {
+    __mmask32 vmask = get_mask();
+    dst = _mm512_maskz_loadu_epi16((__mmask32)vmask, src + index * ld_src);
+  } else if (mask_type == 2) {
+    __mmask16 vmask = get_mask();
+    dst = _mm512_maskz_loadu_epi32((__mmask16)vmask, src + index * ld_src);
+  } else {
+    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
+  }
 }
 
 const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
@@ -33,18 +44,29 @@ void MM512_LOAD_VEC(
     const float* __restrict__ src_scale,
     int64_t ld_src,
     int64_t index,
-    const func_t& f,
-    __m512i& dst) {
+    const func_t& get_mask,
+    __m512i& dst,
+    const int mask_type = 0) {
   const __m512 scale = _mm512_mul_ps(_mm512_set1_ps(src_scale[index]), vexp);
-  __m512i s8 = f(src + index * ld_src);
-  __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
-  __m512bh bf16_0 = CVT_FP8_TO_BF16_EXT(s8_0);
-  __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
-  __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+  __m256i s8;
+  if (mask_type == 0) {
+    s8 = _mm256_loadu_si256((__m256i const*)(src + index * ld_src));
+  } else if (mask_type == 1) {
+    __mmask32 vmask = get_mask();
+    s8 = _mm256_maskz_loadu_epi8((__mmask32)vmask, src + index * ld_src);
+  } else if (mask_type == 2) {
+    __mmask16 vmask = get_mask();
+    s8 = _mm256_maskz_loadu_epi8((__mmask16)vmask, src + index * ld_src);
+  } else {
+    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
+  }
+  __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
+  __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
+  __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
   f_lo = _mm512_mul_ps(f_lo, scale);
   f_hi = _mm512_mul_ps(f_hi, scale);
-  bf16_0 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
-  dst = (__m512i)bf16_0;
+  bf16 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+  dst = (__m512i)bf16;
 }
 
 template <typename func_t>
@@ -53,17 +75,28 @@ void MM512_LOAD_VEC(
     const float* __restrict__ src_scale,
     int64_t ld_src,
     int64_t index,
-    const func_t& f,
-    __m512i& dst) {
-  __m512i s8 = f(src + index * ld_src);
-  __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
-  __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8_0), 8);
+    const func_t& get_mask,
+    __m512i& dst,
+    const int mask_type = 0) {
+  __m256i s8;
+  if (mask_type == 0) {
+    s8 = _mm256_loadu_si256((__m256i const*)(src + index * ld_src));
+  } else if (mask_type == 1) {
+    __mmask32 vmask = get_mask();
+    s8 = _mm256_maskz_loadu_epi8((__mmask32)vmask, src + index * ld_src);
+  } else if (mask_type == 2) {
+    __mmask16 vmask = get_mask();
+    s8 = _mm256_maskz_loadu_epi16((__mmask16)vmask, src + index * ld_src);
+  } else {
+    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
+  }
+  __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
   __m256i ah = _mm512_extracti64x4_epi64(a, 0);
   __m256i bh = _mm512_extracti64x4_epi64(a, 1);
   __m512 a_ = _mm512_cvtph_ps(ah);
   __m512 b_ = _mm512_cvtph_ps(bh);
-  __m512bh bf16_0 = _mm512_cvtne2ps_pbh(b_, a_);
-  dst = (__m512i)bf16_0;
+  __m512bh bf16 = _mm512_cvtne2ps_pbh(b_, a_);
+  dst = (__m512i)bf16;
 }
 
 // key: from [N, 32] to [32/2, N, 2]
@@ -81,13 +114,7 @@ inline void pack_vnni_Nx32(
   int n = 0;
   for (; n < N; ++n) {
     index_t index = get_index(ind, n);
-    MM512_LOAD_VEC(
-        src,
-        src_scale,
-        ld_src,
-        index,
-        [](const packed_t* __restrict__ x) { return _mm512_loadu_si512(x); },
-        vinputs[n]);
+    MM512_LOAD_VEC(src, src_scale, ld_src, index, []() { return 0; }, vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -121,13 +148,7 @@ inline void pack_vnni_N_remainder(
   int n = 0;
   for (; n < N; ++n) {
     index_t index = get_index(ind, n);
-    MM512_LOAD_VEC(
-        src,
-        src_scale,
-        ld_src,
-        index,
-        [vmask](const packed_t* __restrict__ x) { return _mm512_maskz_loadu_epi32((__mmask16)vmask, x); },
-        vinputs[n]);
+    MM512_LOAD_VEC(src, src_scale, ld_src, index, [vmask]() { return vmask; }, vinputs[n], 2);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -158,13 +179,7 @@ inline void pack_vnni_Kx32(
   int k = 0;
   for (; k < K; ++k) {
     index_t index = get_index(ind, k);
-    MM512_LOAD_VEC(
-        src,
-        src_scale,
-        ld_src,
-        index,
-        [](const packed_t* __restrict__ x) { return _mm512_loadu_si512(x); },
-        vinputs[k]);
+    MM512_LOAD_VEC(src, src_scale, ld_src, index, []() { return 0; }, vinputs[k]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; k < 2; ++k) {
@@ -195,13 +210,7 @@ inline void pack_vnni_K_remainder(
   int k = 0;
   for (; k < K; ++k) {
     index_t index = get_index(ind, k);
-    MM512_LOAD_VEC(
-        src,
-        src_scale,
-        ld_src,
-        index,
-        [vmask](const packed_t* __restrict__ x) { return _mm512_maskz_loadu_epi16((__mmask32)vmask, x); },
-        vinputs[k]);
+    MM512_LOAD_VEC(src, src_scale, ld_src, index, [vmask]() { return vmask; }, vinputs[k], 1);
   }
   // padding with zero to avoid uninitialized vectors
   for (; k < 2; ++k) {

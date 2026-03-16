@@ -31,13 +31,7 @@ inline void pack_vnni_Nx32(
   __m512i vinputs[16];
   int n = 0;
   for (; n < N; ++n) {
-    MM512_LOAD_VEC(
-        src,
-        src_scale,
-        ld_src,
-        ind[n],
-        [](const packed_t* __restrict__ x) { return _mm512_loadu_si512(x); },
-        vinputs[n]);
+    MM512_LOAD_VEC(src, src_scale, ld_src, ind[n], []() { return 0; }, vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
