@@ -130,9 +130,9 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
     # (default VIDEO) before _adjust() set the correct one.
     if not has_explicit_compression and output_quality is not None:
-        resolved = adjust_output_quality(output_quality, sampling_params.data_type)
-        if resolved is not None:
-            sampling_params.output_compression = resolved
+        sampling_params.output_compression = adjust_output_quality(
+            output_quality, sampling_params.data_type
+        )
 
     return sampling_params
 
@@ -342,7 +342,14 @@ def add_common_data_to_response(
     return response
 
 
-def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+def adjust_output_quality(
+    output_quality: str, data_type: DataType | None = None
+) -> int:
     if output_quality == "default":
         return 50 if data_type == DataType.VIDEO else 75
-    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)
+    if output_quality not in OUTPUT_QUALITY_MAPPER:
+        valid = list(OUTPUT_QUALITY_MAPPER.keys()) + ["default"]
+        raise ValueError(
+            f"Invalid output_quality {output_quality!r}. Expected one of: {valid}"
+        )
+    return OUTPUT_QUALITY_MAPPER[output_quality]
