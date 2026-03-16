@@ -190,22 +190,14 @@ class BaseFormatDetector(ABC):
                 try:
                     obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
                 except (MalformedJSON, json.JSONDecodeError):
-                    # For block-based formats (e.g., Qwen25) the separator sits
-                    # between JSON objects but eot_token/bot_token markup also
-                    # appears in between.  If the separator branch landed on
-                    # non-JSON markup, fall back to searching for bot_token
-                    # which correctly skips past all markup.
-                    if used_separator_branch:
-                        tool_call_pos = current_text.find(self.bot_token)
-                        if tool_call_pos != -1:
-                            start_idx = tool_call_pos + len(self.bot_token)
-                            if start_idx >= len(current_text):
-                                return StreamingParseResult()
-                            obj, end_idx = _partial_json_loads(
-                                current_text[start_idx:], flags
-                            )
-                        else:
-                            raise
+                    # Separator landed on non-JSON markup; fall back to
+                    # bot_token which skips past all inter-object markup.
+                    # e.g. Qwen25: separator "," matches between eot/bot tags.
+                    if used_separator_branch and self.bot_token in current_text:
+                        start_idx = current_text.find(self.bot_token) + len(self.bot_token)
+                        if start_idx >= len(current_text):
+                            return StreamingParseResult()
+                        obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
                     else:
                         raise
 
