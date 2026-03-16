@@ -163,18 +163,21 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             max_pull_blocks: Optional[int] = None,
             max_push_blocks: Optional[int] = None,
         ) -> None:
+            max_pull_blocks = NUM_CTA if max_pull_blocks is None else max_pull_blocks
+            max_push_blocks = NUM_CTA if max_push_blocks is None else max_push_blocks
             self.__ffi_init__(
                 rank,
                 world_size,
-                NUM_CTA if max_pull_blocks is None else max_pull_blocks,
-                NUM_CTA if max_push_blocks is None else max_push_blocks,
+                max_pull_blocks,
+                max_push_blocks,
                 pull_buffer_bytes,
                 push_buffer_bytes,
                 graph_input_count,
             )
             self._world_size = world_size
-            self._pull_config = ConfigResult(NUM_CTA, MAX_THREADS)
-            self.configure_pull(*self._pull_config)  # type: ignore
+            self._pull_config = ConfigResult(min(NUM_CTA, max_pull_blocks), MAX_THREADS)
+            if max_pull_blocks > 0:  # special case: cannot configure 0 blocks
+                self.configure_pull(*self._pull_config)  # type: ignore
 
         @property
         def world_size(self) -> int:
