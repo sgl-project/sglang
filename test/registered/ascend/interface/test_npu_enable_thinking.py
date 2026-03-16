@@ -13,7 +13,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-2-npu-a3",
+    nightly=True,
+    disabled="https://github.com/Ascend/sglang/issues/32",
+)
 
 
 class TestEnableThinking(CustomTestCase):
@@ -28,23 +33,19 @@ class TestEnableThinking(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN3_30B_A3B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-1234"
         cls.other_args = [
-            "--reasoning-parser",
-            "qwen3",
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",
             "--mem-fraction-static",
             0.95,
             "--tp",
-            2,
+            16,
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
             other_args=cls.other_args,
         )
         cls.additional_chat_kwargs = {}
@@ -57,7 +58,6 @@ class TestEnableThinking(CustomTestCase):
         # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -81,7 +81,6 @@ class TestEnableThinking(CustomTestCase):
         # Test non-streaming with "enable_thinking": False, reasoning_content should be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -106,7 +105,6 @@ class TestEnableThinking(CustomTestCase):
         # Test streaming with "enable_thinking": True, reasoning_content should not be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -151,7 +149,6 @@ class TestEnableThinking(CustomTestCase):
         # Test streaming with "enable_thinking": False, reasoning_content should  be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": "Hello"}],

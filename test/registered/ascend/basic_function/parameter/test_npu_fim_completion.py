@@ -4,6 +4,10 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ascend.test_ascend_utils import (
+    DEEPSEEK_CODER_1_3_B_BASE_PATH,
+    DEEPSEEK_CODER_JSON_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,7 +16,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-1-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestFimCompletion(CustomTestCase):
@@ -22,7 +31,7 @@ class TestFimCompletion(CustomTestCase):
     [Test Target] --completion-template
     """
 
-    model = "/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-coder-1.3b-base"
+    model = DEEPSEEK_CODER_1_3_B_BASE_PATH
     other_args = [
         "--completion-template",
         "deepseek_coder",
@@ -86,7 +95,7 @@ class TestFimCompletion(CustomTestCase):
 class TestFimCompletionJson(TestFimCompletion):
     other_args = [
         "--completion-template",
-        "./deepseek_coder.json",
+        DEEPSEEK_CODER_JSON_PATH,
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",

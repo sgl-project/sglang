@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import MINICPM3_4B_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import GEMMA_3_4B_IT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -9,19 +9,18 @@ register_npu_ci(
     est_time=400,
     suite="nightly-1-npu-a3",
     nightly=True,
-    disabled="run failed",
 )
 
 
-class TestMiniCPM3(GSM8KAscendMixin, CustomTestCase):
-    """Testcase: Verify that the inference accuracy of the OpenBMB/MiniCPM3-4B model on the GSM8K dataset is no less than 0.69.
+class TestGemma34B(GSM8KAscendMixin, CustomTestCase):
+    """Testcase: Verify that the inference accuracy of the google/gemma-3-4b-it model on the GSM8K dataset is no less than 0.7.
 
     [Test Category] Model
-    [Test Target] OpenBMB/MiniCPM3-4B
+    [Test Target] google/gemma-3-4b-it
     """
 
-    model = MINICPM3_4B_WEIGHTS_PATH
-    accuracy = 0.69
+    model = GEMMA_3_4B_IT_WEIGHTS_PATH
+    accuracy = 0.7
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
@@ -30,9 +29,6 @@ class TestMiniCPM3(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--disable-radix-cache",
-        "--disable-overlap-schedule",
-        "--max-running-requests",
-        "128",
         "--chunked-prefill-size",
         "-1",
     ]
