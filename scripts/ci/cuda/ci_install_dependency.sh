@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.4
+FLASHINFER_VERSION=0.6.6
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -328,9 +328,14 @@ fi
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
+# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
+$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+$PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
+python3 -c "import cutlass; import cutlass.cute;"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"

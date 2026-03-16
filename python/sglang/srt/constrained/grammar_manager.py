@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
+    InvalidGrammarObject,
     create_grammar_backend,
 )
 from sglang.srt.environ import envs
@@ -60,7 +60,7 @@ class GrammarManager:
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                if req.grammar:
+                if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
@@ -95,8 +95,12 @@ class GrammarManager:
                     req.grammar_key = key
                     add_to_grammar_queue = True
                 else:
-                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                    if isinstance(
+                        value, InvalidGrammarObject
+                    ):  # We hit a cached invalid grammar.
+                        error_msg = (
+                            f"Failed to compile {key[0]} grammar: {value.error_message}"
+                        )
                         req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
@@ -115,6 +119,7 @@ class GrammarManager:
         ready_reqs = intersect(ready_reqs_all)
         failed_reqs = union(failed_reqs_all)
         """
+        assert self.grammar_backend
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
 
@@ -170,10 +175,11 @@ class GrammarManager:
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
                 continue
 
+            assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-            if req.grammar is INVALID_GRAMMAR_OBJ:
-                error_msg = f"Invalid grammar request: {req.grammar_key=}"
+            if isinstance(req.grammar, InvalidGrammarObject):
+                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
 
         # Return failed requests
@@ -181,8 +187,11 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
 
+            assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+            self.grammar_backend.set_cache(
+                req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
+            )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 

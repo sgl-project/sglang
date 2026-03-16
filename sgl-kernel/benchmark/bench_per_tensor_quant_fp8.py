@@ -7,7 +7,8 @@ import numpy as np
 import torch
 import triton
 import triton.testing
-from sgl_kernel import sgl_per_tensor_quant_fp8
+
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 # Optional imports
 try:
@@ -51,7 +52,7 @@ def sglang_scaled_fp8_quant(
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         is_static = False
-    sgl_per_tensor_quant_fp8(input, output, scale, is_static)
+    per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 
