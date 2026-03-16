@@ -71,6 +71,9 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
+
+    from aiter import gemma_fused_add_rmsnorm as aiter_gemma_fused_add_rmsnorm
+    from aiter import gemma_rmsnorm as aiter_gemma_rmsnorm
 elif _is_hip:
     try:
         from vllm._custom_ops import fused_add_rms_norm, rms_norm
@@ -434,9 +437,27 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-        # Re-dispatch
-        if _is_hip:
+        if _use_aiter:
+            self._forward_method = self.forward_gemma_aiter
+        elif _is_hip:
             self._forward_method = self.forward_native
+
+    def forward_gemma_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            aiter_gemma_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        return aiter_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
     def _forward_impl(
         self,
