@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from sglang.jit_kernel.utils import load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
 
-@lru_cache(maxsize=None)
+@cache_once
 def _jit_ngram_embedding_module() -> Module:
     return load_jit(
         "ngram_embedding",
@@ -27,7 +26,7 @@ def compute_n_gram_ids(
     ne_k: int,
     ne_weights: torch.Tensor,
     ne_mods: torch.Tensor,
-    exclusive_ne_embeder_size_sums: torch.Tensor,
+    exclusive_ne_embedder_size_sums: torch.Tensor,
     tokens: torch.Tensor,
     exclusive_req_len_sums: torch.Tensor,
     ne_token_table: torch.Tensor,
@@ -43,7 +42,7 @@ def compute_n_gram_ids(
         ne_k: k value for n-gram configurations
         ne_weights: weights tensor with shape [ne_n-1, ne_k, ne_n]
         ne_mods: mods tensor with shape [ne_n-1, ne_k]
-        exclusive_ne_embeder_size_sums: exclusive sum of embedder sizes
+        exclusive_ne_embedder_size_sums: exclusive sum of embedder sizes
         tokens: input token ids
         exclusive_req_len_sums: exclusive sum of request lengths
         ne_token_table: token table for all requests
@@ -57,7 +56,7 @@ def compute_n_gram_ids(
         ne_k,
         ne_weights,
         ne_mods,
-        exclusive_ne_embeder_size_sums,
+        exclusive_ne_embedder_size_sums,
         tokens,
         exclusive_req_len_sums,
         ne_token_table,

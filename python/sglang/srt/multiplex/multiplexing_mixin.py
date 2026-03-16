@@ -219,5 +219,3 @@ class SchedulerMultiplexMixin:
                         self.split_prefill_batch = None
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True
-
-            self.maybe_send_health_check_signal()

@@ -6,7 +6,7 @@ import triton.testing
 from flashinfer.norm import fused_add_rmsnorm as fi_fused_add_rmsnorm
 from flashinfer.norm import rmsnorm as fi_rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 
@@ -25,7 +25,7 @@ else:
     BS_LIST = [2**n for n in range(0, 14)]
     HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
 
-LINE_VALS = ["jit", "fi"]
+LINE_VALS = ["jit", "flashinfer"]
 LINE_NAMES = ["SGL JIT Kernel", "FlashInfer"]
 STYLES = [("blue", "--"), ("green", "-.")]
 
@@ -50,12 +50,10 @@ def benchmark_rmsnorm(hidden_size: int, batch_size: int, provider: str):
     weight = torch.randn(hidden_size, dtype=DTYPE, device=DEVICE)
     FN_MAP = {
         "jit": lambda: jit_rmsnorm(input.clone(), weight),
-        "fi": lambda: fi_rmsnorm(input.clone(), weight, out=input.clone()),
+        "flashinfer": lambda: fi_rmsnorm(input.clone(), weight, out=input.clone()),
     }
     fn = FN_MAP[provider]
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 @triton.testing.perf_report(
@@ -79,14 +77,12 @@ def benchmark_fused_add_rmsnorm(hidden_size: int, batch_size: int, provider: str
         "jit": lambda: jit_fused_add_rmsnorm(
             input.clone(), residual.clone(), weight, torch.finfo(DTYPE).eps
         ),
-        "fi": lambda: fi_fused_add_rmsnorm(
+        "flashinfer": lambda: fi_fused_add_rmsnorm(
             input.clone(), residual.clone(), weight, eps=torch.finfo(DTYPE).eps
         ),
     }
     fn = FN_MAP[provider]
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
