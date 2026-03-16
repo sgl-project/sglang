@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import socket
 import threading
 import time
 from collections import defaultdict
@@ -36,12 +35,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    format_tcp_address,
+from sglang.srt.utils.network import (
+    NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
-    is_valid_ipv6_address,
-    maybe_wrap_ipv6_address,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,11 +113,10 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         context = zmq.Context()
-        zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=zmq_bind_host
+            context, zmq.PULL, host=self.local_ip
         )
-        logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
+        logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
@@ -187,26 +183,13 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def ensure_parallel_info(
-        self, bootstrap_addr: str, max_retries: int = 20, retry_interval: float = 1.0
-    ) -> bool:
+    def ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Fetch and cache prefill parallel info if not yet available.
         Returns True if info is available (cached or freshly fetched).
-        Retries with backoff if the prefill server hasn't registered yet.
         """
         if bootstrap_addr in self.prefill_info_table:
             return True
-        info = None
-        for attempt in range(max_retries):
-            info = self._fetch_prefill_server_info(bootstrap_addr)
-            if info is not None:
-                break
-            if attempt < max_retries - 1:
-                logger.info(
-                    f"Prefill server info not available from {bootstrap_addr}, "
-                    f"retrying ({attempt + 1}/{max_retries})..."
-                )
-                time.sleep(retry_interval)
+        info = self._fetch_prefill_server_info(bootstrap_addr)
         if info is None:
             return False
 
@@ -255,20 +238,14 @@ class CommonKVManager(BaseKVManager):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
-            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
-                if self.dist_init_addr.endswith("]"):
-                    host = self.dist_init_addr
-                else:
-                    host, _ = self.dist_init_addr.rsplit(":", 1)
-            else:
-                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
+            host = NetworkAddress.parse(self.dist_init_addr).host
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
-            host = maybe_wrap_ipv6_address(host)
 
-        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
-        url = f"http://{bootstrap_server_url}/route"
+        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
+        bootstrap_server_url = bootstrap_na.to_host_port_str()
+        url = f"{bootstrap_na.to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -437,10 +414,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
-        if not self.kv_mgr.ensure_parallel_info(self.bootstrap_addr):
+        if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+                f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is down, prefill_info_table has been cleared."
+                f"Request (bootstrap_addr: {self.bootstrap_addr}) has been marked as failed.",
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.bootstrap_infos = None
@@ -656,10 +635,8 @@ class CommonKVReceiver(BaseKVReceiver):
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
-        is_ipv6_address = is_valid_ipv6_address(ip_address)
-        sock, lock = cls._connect(
-            format_tcp_address(ip_address, port), is_ipv6=is_ipv6_address
-        )
+        na = NetworkAddress(ip_address, port)
+        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
     def _register_kv_args(self):

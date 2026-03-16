@@ -783,6 +783,43 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    # ------------- X-Data-Parallel-Rank header tests -------------
+    def test_extract_routed_dp_rank_from_header_no_header(self):
+        """Test that None is returned when no header is present."""
+        self.fastapi_request.headers = {}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=None
+        )
+        self.assertIsNone(result)
+
+    def test_extract_routed_dp_rank_from_header_with_header(self):
+        """Test that header value is extracted correctly."""
+        self.fastapi_request.headers = {"x-data-parallel-rank": "2"}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=None
+        )
+        self.assertEqual(result, 2)
+
+    def test_extract_routed_dp_rank_header_overrides_body(self):
+        """Test that header value has higher priority than body."""
+        self.fastapi_request.headers = {"x-data-parallel-rank": "3"}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=1
+        )
+        self.assertEqual(result, 3)  # header wins
+
+    def test_extract_routed_dp_rank_from_header_invalid(self):
+        """Test that invalid header value raises HTTPException."""
+        from fastapi import HTTPException
+
+        self.fastapi_request.headers = {"x-data-parallel-rank": "abc"}
+        with self.assertRaises(HTTPException) as context:
+            self.chat.extract_routed_dp_rank_from_header(
+                self.fastapi_request, body_routed_dp_rank=None
+            )
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("must be an integer", context.exception.detail)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
