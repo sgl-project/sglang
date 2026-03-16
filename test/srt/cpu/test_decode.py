@@ -128,8 +128,16 @@ class TestDecodeAttention(CustomTestCase):
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
         torch.ops.sgl_kernel.decode_attention_cpu(
             q,
-            k_buffer if kvcache_dtype != torch.float8_e4m3fn else k_buffer_fp8,
-            v_buffer if kvcache_dtype != torch.float8_e4m3fn else v_buffer_fp8,
+            (
+                k_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else k_buffer_fp8
+            ),
+            (
+                v_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else v_buffer_fp8
+            ),
             k_scale,
             v_scale,
             o,
