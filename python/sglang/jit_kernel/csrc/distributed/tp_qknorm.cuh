@@ -82,6 +82,7 @@ struct KernelTrait {
   static constexpr uint32_t kNumQWarps = kNumQThreads / device::kWarpThreads;
   static constexpr uint32_t kNumKWarps = host::div_ceil(kNumKThreads, device::kWarpThreads);
   static constexpr uint32_t kBlockSize = (kNumQWarps + kNumKWarps) * device::kWarpThreads;
+  static constexpr uint32_t kOccupancy = 2048 / kBlockSize;
 
   using DType2 = packed_t<DType>;
   using Storage = device::AlignedVector<DType2, kVecSize>;
@@ -94,10 +95,11 @@ struct KernelTrait {
   static_assert(kNumQThreads % device::kWarpThreads == 0);
   static_assert(kBlockSize <= 1024);
   static_assert(sizeof(Storage) == 16 && alignof(Storage) == 16);
+  static_assert(kOccupancy * kBlockSize <= 2048);
 };
 
 template <typename Trait>
-__global__ __launch_bounds__(Trait::kBlockSize) void parallel_qknorm_across_head(
+__global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel_qknorm_across_head(
     const ParallelQKNormParams __grid_constant__ params, const PushController __grid_constant__ ctrl) {
   using namespace device;
 
@@ -113,10 +115,11 @@ __global__ __launch_bounds__(Trait::kBlockSize) void parallel_qknorm_across_head
   constexpr uint32_t kNumGPU = Trait::kNumGPU;
   constexpr uint32_t kNumQReduce = next_pow_of_2(Trait::kNumQWarps);
   constexpr uint32_t kNumKReduce = next_pow_of_2(Trait::kNumKWarps);
-  __shared__ float smem_q[kNumQReduce];
-  __shared__ float smem_k[kNumKReduce];
+  __shared__ float smem_qk[Trait::kNumQWarps + Trait::kNumKWarps];
   __shared__ float scale_q;
   __shared__ float scale_k;
+  const auto smem_q = smem_qk + 0;
+  const auto smem_k = smem_qk + Trait::kNumQWarps;
   const auto load_q = threadIdx.x < Trait::kNumQThreads;
   const auto tid = load_q ? threadIdx.x : threadIdx.x - Trait::kNumQThreads;
   const auto input_ptr = load_q ? q_ptr : k_ptr;
@@ -149,14 +152,7 @@ __global__ __launch_bounds__(Trait::kBlockSize) void parallel_qknorm_across_head
           local_sum += x * x + y * y;
         }
       }
-      const auto warp_sum = warp::reduce_sum(local_sum);
-      if (threadIdx.x % kWarpThreads == 0) {
-        if (load_q) {
-          smem_q[threadIdx.x / kWarpThreads] = warp_sum;
-        } else {
-          smem_k[tid / kWarpThreads] = warp_sum;
-        }
-      }
+      smem_qk[threadIdx.x / kWarpThreads] = warp::reduce_sum(local_sum);
     }
 
     // Stage 2. block reduce + push to peer ranks + poll from local rank
