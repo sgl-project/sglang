@@ -64,12 +64,10 @@ def get_dense_mlp_flops(
     return 6 * seqlen * hidden_size * intermediate_size
 
 
-def compute_flops_saved(prefix_len: int, total_len: int, config: Any) -> float:
-    """Total FLOPs saved by reusing a cached prefix of prefix_len tokens
-    for a request of estimated total_len tokens (caller passes 2*prefix_len
-    by default).
+def compute_flops_saved(seqlen_child: int, seqlen_total: int, config: Any) -> float:
+    """FLOPs saved by reusing this node's cached state.
     """
-    parent_len = max(0, total_len - prefix_len)
+    seqlen_parent = max(0, seqlen_total - seqlen_child)
 
     hidden_size = config.hidden_size
     num_heads = config.num_attention_heads
@@ -88,29 +86,38 @@ def compute_flops_saved(prefix_len: int, total_len: int, config: Any) -> float:
     for layer_idx, layer_type in enumerate(config.layers_block_type):
         # Attention / SSM layer
         if layer_type == "attention":
-            # Marginal savings: quadratic attention rewards deeper (longer) prefixes
             flops += get_full_attn_flops(
-                total_len, hidden_size, num_heads, num_kv_heads, head_dim
+                seqlen_total, hidden_size, num_heads, num_kv_heads, head_dim
             ) - get_full_attn_flops(
-                parent_len, hidden_size, num_heads, num_kv_heads, head_dim
+                seqlen_parent, hidden_size, num_heads, num_kv_heads, head_dim
             )
         else:
-            # linear_attention (Mamba2 / GatedDeltaNet): linear in seqlen
+            # Mamba2 / GatedDeltaNet: savings are only for this node's own segment
             flops += get_linear_attn_flops(
-                prefix_len, hidden_size, linear_num_heads, linear_head_dim, linear_state_size
+                seqlen_child, hidden_size, linear_num_heads, linear_head_dim, linear_state_size
             )
 
-        # FFN layer
+        # FFN layer: marginal savings relative to parent
         if is_moe and layer_idx not in mlp_only_layers:
             flops += get_moe_flops(
-                prefix_len,
+                seqlen_total,
+                hidden_size,
+                config.num_experts_per_tok,
+                config.moe_intermediate_size,
+                config.shared_expert_intermediate_size,
+            ) - get_moe_flops(
+                seqlen_parent,
                 hidden_size,
                 config.num_experts_per_tok,
                 config.moe_intermediate_size,
                 config.shared_expert_intermediate_size,
             )
         else:
-            flops += get_dense_mlp_flops(prefix_len, hidden_size, config.intermediate_size)
+            flops += get_dense_mlp_flops(
+                seqlen_total, hidden_size, config.intermediate_size
+            ) - get_dense_mlp_flops(
+                seqlen_parent, hidden_size, config.intermediate_size
+            )
 
     return flops
 
@@ -135,8 +142,8 @@ def compute_memory_bytes(
 
 
 def compute_flop_efficiency(
-    prefix_len: int,
-    total_len: int,
+    seqlen_child: int,
+    seqlen_total: int,
     cache_params: "BaseLinearStateParams",
     config: Any,
     model_config: "ModelConfig",
@@ -146,9 +153,9 @@ def compute_flop_efficiency(
     """Marconi efficiency score: FLOPs_saved / memory_bytes.
     Higher score = prefer to keep.
     """
-    return compute_flops_saved(prefix_len, total_len, config) / (
+    return compute_flops_saved(seqlen_child, seqlen_total, config) / (
         compute_memory_bytes(
-            prefix_len, cache_params, config, model_config, tp_world_size, kv_dtype_bytes
+            seqlen_total, cache_params, config, model_config, tp_world_size, kv_dtype_bytes
         )
         + 1e-8
     )

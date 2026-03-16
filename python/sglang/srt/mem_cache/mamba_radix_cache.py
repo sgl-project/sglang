@@ -818,8 +818,8 @@ class MambaRadixCache(BasePrefixCache):
 
         if node._flop_efficiency is None:
             node._flop_efficiency = compute_flop_efficiency(
-                prefix_len=node.num_cached_tokens,
-                total_len=2 * node.num_cached_tokens,
+                seqlen_child=len(node.key),
+                seqlen_total=node.num_cached_tokens,
                 cache_params=self.mamba_cache_params,
                 config=self.model_config.hf_text_config,
                 model_config=self.model_config,
@@ -838,7 +838,9 @@ class MambaRadixCache(BasePrefixCache):
         else:
             x = self.mamba_lru_list.get_lru_no_lock()
             while self.mamba_lru_list.in_list(x):
-                candidates.append(x)
+                # Only nodes with <=1 children are eligible for mamba eviction.
+                if len(x.children) <= 1:
+                    candidates.append(x)
                 x = self.mamba_lru_list.get_prev_no_lock(x)
         return candidates
 
