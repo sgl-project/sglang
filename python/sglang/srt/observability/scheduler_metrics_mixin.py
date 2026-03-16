@@ -114,8 +114,10 @@ class SchedulerMetricsMixin:
         self.stats = SchedulerStats()
 
         # Metrics
-        self.current_scheduler_metrics_enabled = (
-            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        self.enable_metrics = self.server_args.enable_metrics
+        self.is_stats_logging_rank = self.attn_tp_rank == 0
+        self.current_scheduler_metrics_enabled = self.enable_metrics and (
+            self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
@@ -158,7 +160,9 @@ class SchedulerMetricsMixin:
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
 
-        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
+        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
+            enable_metrics=self.enable_metrics
+        )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -179,12 +183,18 @@ class SchedulerMetricsMixin:
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
 
-    def log_prefill_stats(
+    def report_prefill_stats(
         self: Scheduler,
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        if (
+            not self.is_stats_logging_rank
+            and not self.current_scheduler_metrics_enabled
+        ):
+            return
+
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
@@ -267,9 +277,13 @@ class SchedulerMetricsMixin:
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
 
-        logger.info(msg)
+        if self.is_stats_logging_rank:
+            logger.info(msg)
 
-        if self.enable_metrics:
+        if self.current_scheduler_metrics_enabled:
+            self.metrics_collector.increment_prefill_cuda_graph_pass(
+                value=can_run_cuda_graph
+            )
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=prefill_stats.log_input_tokens,
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
@@ -332,10 +346,33 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def log_decode_stats(
-        self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+    def report_decode_stats(
+        self: Scheduler,
+        can_run_cuda_graph: bool,
+        running_batch: ScheduleBatch = None,
+        num_accepted_tokens: int = 0,
     ):
         batch = running_batch or self.running_batch
+
+        # Every-iteration work: realtime token counting + status logger
+        if self.current_scheduler_metrics_enabled:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
+            if x := self.scheduler_status_logger:
+                x.maybe_dump(batch, self.waiting_queue)
+
+        # Periodic work: log + heavy metrics at decode_log_interval
+        if self.forward_ct_decode % self.server_args.decode_log_interval != 0:
+            return
+        if (
+            not self.is_stats_logging_rank
+            and not self.current_scheduler_metrics_enabled
+        ):
+            return
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
@@ -455,8 +492,9 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-        logger.info(msg)
-        if self.enable_metrics:
+        if self.is_stats_logging_rank:
+            logger.info(msg)
+        if self.current_scheduler_metrics_enabled:
             priority_enabled = self.enable_priority_scheduling
             # Basics
             self.stats.num_running_reqs = QueueCount.from_reqs(
@@ -524,19 +562,6 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def log_decode_stats_every_iteration(
-        self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
-    ):
-        if self.enable_metrics:
-            self.metrics_collector.increment_realtime_tokens(
-                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-                decode_tokens=batch.batch_size() + num_accepted_tokens,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
-
-        if x := self.scheduler_status_logger:
-            x.maybe_dump(batch, self.waiting_queue)
-
     def log_batch_result_stats(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -589,7 +614,10 @@ class SchedulerMetricsMixin:
         if not self.enable_hierarchical_cache:
             return
 
-        host_pool = self.tree_cache.token_to_kv_pool_host
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            self.tree_cache, "full_kv_pool_host", None
+        )
+        assert host_pool is not None, "Host pool not found"
         self.stats.hicache_host_used_tokens = (
             host_pool.size - host_pool.available_size()
         )

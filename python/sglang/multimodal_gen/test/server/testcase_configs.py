@@ -233,12 +233,9 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
-    # TeaCache acceleration
-    enable_teacache: bool = False
-
-    # Frame interpolation
-    enable_frame_interpolation: bool = False
-    frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
+    # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
+    # merged directly into the OpenAI extra_body dict.
+    extras: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -462,6 +459,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "sana_image_t2i",
+        DiffusionServerArgs(
+            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            modality="image",
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
@@ -493,6 +499,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
         ),
         MULTI_FRAME_I2I_sampling_params,
+    ),
+    # Upscaling (Real-ESRGAN 4×) for T2I
+    DiffusionTestCase(
+        "flux_2_image_t2i_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki",
+            output_size="1024x1024",
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
+        ),
     ),
 ]
 
@@ -536,10 +555,10 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_teacache=True,
+            extras={"enable_teacache": True},
         ),
     ),
-    # Frame interpolation correctness (2× / exp=1)
+    # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_frame_interp_2x",
@@ -550,8 +569,40 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_frame_interpolation=True,
-            frame_interpolation_exp=1,
+            extras={"enable_frame_interpolation": True, "frame_interpolation_exp": 1},
+        ),
+    ),
+    # Upscaling (Real-ESRGAN 4×)
+    # Uses the same 1.3B model already in the suite;
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
+        ),
+    ),
+    # Combined: Frame interpolation (2×) + Upscaling (4×)
+    # Verifies that both post-processing steps compose correctly.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            extras={
+                "enable_frame_interpolation": True,
+                "frame_interpolation_exp": 1,
+                "enable_upscaling": True,
+                "upscaling_scale": 4,
+            },
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -627,6 +678,43 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             custom_validator="video",
         ),
         TI2V_sampling_params,
+    ),
+    # === Helios T2V ===
+    DiffusionTestCase(
+        "helios_base_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Base",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
+    ),
+    DiffusionTestCase(
+        "helios_mid_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Mid",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
+    ),
+    DiffusionTestCase(
+        "helios_distilled_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Distilled",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
     ),
 ]
 

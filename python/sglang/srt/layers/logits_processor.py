@@ -1055,7 +1055,7 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, delay_cpu_copy=True
+                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
             )
 
         # Get the logprob of top-k tokens

@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.pos_enc import rotary_embedding
+from sglang.jit_kernel.rope import rotary_embedding
 
 
 @triton.jit
