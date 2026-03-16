@@ -59,6 +59,12 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
 
+# Dynamic partitioning for CK paged attention decode
+# Reduces wasted GPU thread blocks by using actual batch max seq_len
+# instead of max_context_len for partition count calculation.
+# Requires --disable-cuda-graph to take effect (CUDA graph bakes in fixed grid size).
+_USE_DYNAMIC_PARTITIONS = get_bool_env_var("SGLANG_AITER_DYNAMIC_PARTITIONS", "False")
+
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
 # intra_batch_mode=False if _use_mla_ps_kernel else True
@@ -189,6 +195,7 @@ class AiterAttnBackend(AttentionBackend):
         self.max_num_partitions = (
             self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
         ) // _AITER_PARTITION_SIZE_ROCM
+        self._dynamic_max_partitions = self.max_num_partitions
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
@@ -621,6 +628,14 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
+
+            if _USE_DYNAMIC_PARTITIONS and not self.use_mla:
+                _batch_max_seq_len = forward_batch.seq_lens[:bs].max().item()
+                self._dynamic_max_partitions = min(
+                    (_batch_max_seq_len + _AITER_PARTITION_SIZE_ROCM - 1)
+                    // _AITER_PARTITION_SIZE_ROCM,
+                    self.max_num_partitions,
+                )
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -2241,7 +2256,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indices,
                 self.kv_last_page_len,
                 1,
-                self.max_num_partitions,
+                self._dynamic_max_partitions,
                 None,
                 "auto",
                 "NHD",
