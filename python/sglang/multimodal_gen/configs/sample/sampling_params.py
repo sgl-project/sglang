@@ -156,6 +156,9 @@ class SamplingParams:
 
     # TeaCache parameters
     enable_teacache: bool = False
+    teacache_params: Any = (
+        None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
+    )
 
     # Profiling
     profile: bool = False

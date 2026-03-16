@@ -1100,34 +1100,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        if ElasticEPStateManager.instance() is not None:
-            # TODO: refactor the weights update when elastic ep
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            assert old_expert_location_metadata is not None
-            old_expert_location_metadata.update(
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-            )
+        p2p_missing_logical_experts = self.expert_location_updater.update(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
+
+        if len(p2p_missing_logical_experts) > 0:
+            # Load the missing expert weights from disk
+            if callable(getattr(self.model, "generate_weight_name_filter", None)):
+                # Filter and load only missing expert weights
+                weight_name_filter = self.model.generate_weight_name_filter(
+                    p2p_missing_logical_experts
+                )
+            else:
+                # Do a full reload from disk/DRAM
+                logger.info(
+                    "[Elastic EP] Model does not implement generate_weight_name_filter. "
+                    "Performing full weight reload."
+                )
+                weight_name_filter = None
+
             if (
                 self.expert_backup_client is not None
                 and self.expert_backup_client.use_backup
             ):
-                self.expert_backup_client.update_weights()
-                return
-
-            self.update_weights_from_disk(
-                self.server_args.model_path,
-                self.server_args.load_format,
-                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
-            )
-        else:
-            self.expert_location_updater.update(
-                self.model.routed_experts_weights_of_layer,
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-                nnodes=self.server_args.nnodes,
-                rank=self.tp_rank,
-            )
+                # Load the missing weights from the DRAM backup
+                self.expert_backup_client.update_weights(weight_name_filter)
+            else:
+                # Load the missing weights from disk
+                self.update_weights_from_disk(
+                    get_global_server_args().model_path,
+                    get_global_server_args().load_format,
+                    weight_name_filter=weight_name_filter,
+                )
 
     def update_weights_from_disk(
         self,
