@@ -50,7 +50,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 ```{note}
 - FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
-- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend (NSA)](#dsa-attention-backend-nsa) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md) for details.
 ```
 
 ```{warning}
@@ -106,6 +106,24 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **AMD (ROCm)**: `triton` recommended.
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
 ```
+
+### DSA Attention Backend (NSA)
+
+DSA (Deepseek Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it and is selected via `--attention-backend nsa`.
+
+Internally, the NSA backend dispatches to different sub-backends for prefill and decode phases. You can override these with `--nsa-prefill-backend` and `--nsa-decode-backend`:
+
+| **Sub-backend**       | **Prefill** | **Decode** | **Notes**                                     |
+|-----------------------|-------------|------------|-----------------------------------------------|
+| **flashmla_sparse**   | ✅          | ✅         | Default prefill on Hopper and Blackwell (bf16) |
+| **flashmla_kv**       | ✅          | ✅         | Default decode for FP8 on Blackwell with DP   |
+| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype |
+| **fa3**               | ✅          | ✅         | Default decode on Hopper (bf16)               |
+| **trtllm**            | ✅          | ✅         | Default decode on Blackwell (bf16); default for both on Blackwell without DP |
+| **tilelang**          | ✅          | ✅         | Default on AMD (ROCm)                         |
+| **aiter**             | ✅          | ✅         | AMD-specific kernel library (requires aiter package) |
+
+For deployment examples, see the [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md).
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 

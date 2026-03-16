@@ -32,6 +32,15 @@ python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/
 
 ## Index
 
+Before running any benchmark, profiler, or kernel-validation command, use
+`scripts/diffusion_skill_env.py` to derive the repo root from `sglang.__file__`,
+verify the repo is writable, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and
+choose idle GPU(s) before starting perf work.
+
+- [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py)
+
+  Shared preflight helper for all diffusion skill commands. Use it to print the repo root, create benchmark/profile output directories, and choose idle GPUs before running `sglang generate`, torch profiler, nsys, or ncu.
+
 - [add-triton-kernel.md](./add-triton-kernel.md)
 
   Step-by-step guide for adding a new Triton kernel to SGLang Diffusion's `jit_kernel/diffusion/triton/` module, including authoring, autotune, `torch.compile` compatibility, integration, and tests. Use for fused elementwise ops, norm variants, RoPE variants, or when NPU/CPU fallback is needed.
@@ -64,5 +73,6 @@ Loaded by `add-cuda-kernel.md`. Adapted from [HuggingFace kernels cuda-kernels s
 
 ## Scripts (runnable benchmarks)
 
+- [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark: JIT CUDA vs PyTorch, correctness check, bandwidth efficiency analysis
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark via `sglang generate`, baseline vs custom kernels comparison table
