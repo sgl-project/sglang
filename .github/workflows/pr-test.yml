@@ -1386,9 +1386,6 @@ jobs:
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite unit
 
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
-
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
