@@ -2,13 +2,17 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """Utilities for selecting and loading models."""
+
 import contextlib
+import glob
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Dict, Type
 
 import torch
+from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -20,12 +24,14 @@ def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    yield
-    torch.set_default_dtype(old_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 def get_param_names_mapping(
-    mapping_dict: dict[str, str]
+    mapping_dict: dict[str, str | tuple[str, int, int]],
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
@@ -38,21 +44,50 @@ def get_param_names_mapping(
     """
 
     def mapping_fn(name: str) -> tuple[str, Any, Any]:
-        # Try to match and transform the name using the regex patterns in mapping_dict
-        for pattern, replacement in mapping_dict.items():
-            match = re.match(pattern, name)
-            if match:
-                merge_index = None
-                total_split_params = None
-                if isinstance(replacement, tuple):
-                    merge_index = replacement[1]
-                    total_split_params = replacement[2]
-                    replacement = replacement[0]
-                name = re.sub(pattern, replacement, name)
-                return name, merge_index, total_split_params
+        # support chained conversions, e.g.:
+        # transformer.xxx.lora_down -> xxx.lora_down -> xxx.proj_down
+        merge_index = None
+        total_split_params = None
+        max_steps = max(8, len(mapping_dict) * 2)
+        applied_patterns: set[str] = set()
+        visited_names: set[str] = {name}
 
-        # If no pattern matches, return the original name
-        return name, None, None
+        for _ in range(max_steps):
+            transformed = False
+            for pattern, replacement in mapping_dict.items():
+                # avoid re-applying the same rule on its own output
+                if pattern in applied_patterns:
+                    continue
+                if re.match(pattern, name) is None:
+                    continue
+
+                curr_merge_index = None
+                curr_total_split_params = None
+                if isinstance(replacement, tuple):
+                    curr_merge_index = replacement[1]
+                    curr_total_split_params = replacement[2]
+                    replacement = replacement[0]
+
+                new_name = re.sub(pattern, replacement, name)
+
+                if new_name != name:
+                    if curr_merge_index is not None:
+                        merge_index = curr_merge_index
+                        total_split_params = curr_total_split_params
+
+                    name = new_name
+                    applied_patterns.add(pattern)
+                    if name in visited_names:
+                        transformed = False
+                        break
+                    visited_names.add(name)
+                    transformed = True
+                    break
+
+            if not transformed:
+                break
+
+        return name, merge_index, total_split_params
 
     return mapping_fn
 
@@ -81,6 +116,8 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
+            continue
         reverse_param_names_mapping[target_param_name] = (
             source_param_name,
             merge_index,
@@ -100,3 +137,67 @@ def hf_to_custom_state_dict(
                 continue
         custom_param_sd[target_param_name] = full_tensor
     return custom_param_sd, reverse_param_names_mapping
+
+
+class skip_init_modules:
+    def __enter__(self):
+        # Save originals
+        self._orig_reset = {}
+        for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
+            self._orig_reset[cls] = cls.reset_parameters
+            cls.reset_parameters = lambda self: None  # skip init
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # restore originals
+        for cls, orig in self._orig_reset.items():
+            cls.reset_parameters = orig
+
+
+def _normalize_component_type(module_type: str) -> str:
+    """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
+    if module_type.endswith("_2"):
+        return module_type[:-2]
+    return module_type
+
+
+def _clean_hf_config_inplace(model_config: dict) -> None:
+    """Remove common extraneous HF fields if present."""
+    for key in (
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
+    ):
+        model_config.pop(key, None)
+
+
+def _list_safetensors_files(model_path: str) -> list[str]:
+    """List all .safetensors files under a directory."""
+    return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+
+
+BYTES_PER_GB = 1024**3
+
+
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
+
+# component name ->  ComponentLoader class
+component_name_to_loader_cls: Dict[str, Type[Any]] = {}

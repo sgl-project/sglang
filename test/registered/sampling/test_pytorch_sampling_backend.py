@@ -5,9 +5,6 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=66, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=66, suite="stage-b-test-small-1-gpu-amd")
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -16,6 +13,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=66, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=66, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestPyTorchSamplingBackend(CustomTestCase):

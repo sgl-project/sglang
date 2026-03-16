@@ -12,11 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+
 from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -26,6 +27,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -47,10 +49,12 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +85,6 @@ class BaseTpWorker(ABC):
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
-
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
-    def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
-
-    def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
 
     def get_memory_pool(self):
         return (
@@ -189,9 +184,29 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
-        lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ):
+        # The LoRA code handles TP sharding internally using slice_lora_a_weights
+        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        if recv_req.load_format == "flattened_bucket":
+            flattened_data = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors
+            )
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_data["flattened_tensor"],
+                metadata=flattened_data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        result = self.model_runner.load_lora_adapter_from_tensors(
+            recv_req.to_ref(),
+            tensors,
+            recv_req.config_dict,
+            recv_req.added_tokens_config,
+        )
+        return result
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -210,11 +225,14 @@ class TpModelWorker(BaseTpWorker):
         tp_rank: int,
         moe_ep_rank: int,
         pp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
@@ -232,9 +250,12 @@ class TpModelWorker(BaseTpWorker):
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.memory_pool_config = memory_pool_config
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
 
         # MTP model runners
-        self.model_runner_list = []
+        self.model_runner_list: List[ModelRunner] = []
 
         self._init_model_config()
         self._init_model_runner()
@@ -336,6 +357,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -361,6 +383,7 @@ class TpModelWorker(BaseTpWorker):
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
                 )
             )
@@ -394,6 +417,7 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.model_runner.forward_stream,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
