@@ -35,11 +35,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
+from sglang.srt.utils.network import (
+    NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
-from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 

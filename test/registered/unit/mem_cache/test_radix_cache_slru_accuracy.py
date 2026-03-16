@@ -20,7 +20,8 @@ class TestSLRUAccuracy(unittest.TestCase):
 
     def setUp(self):
         """Setup minimal memory pools for testing"""
-        device = "cpu"  # Using CPU for testing simplicity
+        torch.set_default_device(None)
+        device = "cpu"
         dtype = torch.float16
 
         # Create smaller KV cache to ensure evictions occur

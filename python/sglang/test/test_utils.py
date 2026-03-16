@@ -38,11 +38,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
     is_cuda,
-    is_port_available,
     is_xpu,
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 

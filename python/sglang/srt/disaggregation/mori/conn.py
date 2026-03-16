@@ -37,11 +37,8 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import (
-    get_int_env_var,
-    get_local_ip_auto,
-)
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.common import get_int_env_var
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"

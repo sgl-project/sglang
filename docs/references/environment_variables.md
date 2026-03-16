@@ -25,9 +25,9 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_ENABLE_TORCH_INFERENCE_MODE` | Control whether to use torch.inference_mode | `false` |
-| `SGLANG_ENABLE_TORCH_COMPILE` | Enable torch.compile | `true` |
-| `SGLANG_SET_CPU_AFFINITY` | Enable CPU affinity setting (often set to `1` in Docker builds) | `0` |
-| `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` | Allows the scheduler to overwrite longer context length requests (often set to `1` in Docker builds) | `0` |
+| `SGLANG_ENABLE_TORCH_COMPILE` | Enable torch.compile | `false` |
+| `SGLANG_SET_CPU_AFFINITY` | Enable CPU affinity setting (often set to `1` in Docker builds) | `false` |
+| `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` | Allows the scheduler to overwrite longer context length requests (often set to `1` in Docker builds) | `false` |
 | `SGLANG_IS_FLASHINFER_AVAILABLE` | Control FlashInfer availability check | `true` |
 | `SGLANG_SKIP_P2P_CHECK` | Skip P2P (peer-to-peer) access check | `false` |
 | `SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD` | Sets the threshold for enabling chunked prefix caching | `8192` |
@@ -38,12 +38,12 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DATA_PARALLEL_BUDGET_INTERVAL` | Interval for DPBudget updates | `1` |
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT` | Default weight value for scheduler recv skipper counter (used when forward mode doesn't match specific modes). Only active when `--scheduler-recv-interval > 1`. The counter accumulates weights and triggers request polling when reaching the interval threshold. | `1000` |
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE` | Weight increment for decode forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during decode phase. | `1` |
-| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_VERIFY` | Weight increment for target verify forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during verification phase. | `1` |
+| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY` | Weight increment for target verify forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during verification phase. | `1` |
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE` | Weight increment when forward mode is None in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency when no specific forward mode is active. | `1` |
 | `SGLANG_MM_BUFFER_SIZE_MB` | Size of preallocated GPU buffer (in MB) for multi-modal feature hashing optimization. When set to a positive value, temporarily moves features to GPU for faster hash computation, then moves them back to CPU to save GPU memory. Larger features benefit more from GPU hashing. Set to `0` to disable. | `0` |
 | `SGLANG_MM_PRECOMPUTE_HASH` | Enable precomputing of hash values for MultimodalDataItem | `false` |
 | `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
-| `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `4` |
+| `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `-1` |
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
 
 
@@ -56,7 +56,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS` | Number of workers for parallel DeepGEMM kernel compilation | `4` |
 | `SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE` | Indicator flag used during the DeepGEMM precompile script | `"false"` |
 | `SGLANG_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
-| `SGLANG_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
+| `SGLANG_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"false"` |
 | `SGLANG_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
 | `SGLANG_JIT_DEEPGEMM_FAST_WARMUP` | Precompile less kernels during warmup, which reduces the warmup time from 30min to less than 3min. Might cause performance degradation during runtime. | `"false"` |
 
@@ -76,8 +76,6 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
 | `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
-| `SGLANG_MORI_NEXTN_FP8_DISP` | Use FP8 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
-| `SGLANG_MORI_NEXTN_FP4_DISP` | Use MXFP4 for MTP (NextN) layer dispatch. When neither `SGLANG_MORI_NEXTN_FP8_DISP` nor `SGLANG_MORI_NEXTN_FP4_DISP` is set, falls back to `SGLANG_MORI_FP8_DISP`/`SGLANG_MORI_FP4_DISP`. | `"false"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
@@ -112,7 +110,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_USE_AITER` | Use AITER optimize implementation | `false` |
-| `SGLANG_MOE_PADDING` | Enable MoE padding (sets padding size to 128 if value is `1`, often set to `1` in Docker builds) | `0` |
+| `SGLANG_MOE_PADDING` | Enable MoE padding (sets padding size to 128 if value is `1`, often set to `1` in Docker builds) | `false` |
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
 
 ## Quantization
@@ -148,7 +146,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_IS_IN_CI` | Indicates if running in CI environment | `false` |
-| `SGLANG_IS_IN_CI_AMD` | Indicates running in AMD CI environment | `0` |
+| `SGLANG_IS_IN_CI_AMD` | Indicates running in AMD CI environment | `false` |
 | `SGLANG_TEST_RETRACT` | Enable retract decode testing | `false` |
 | `SGLANG_TEST_RETRACT_NO_PREFILL_BS` | When SGLANG_TEST_RETRACT is enabled, no prefill is performed if the batch size exceeds SGLANG_TEST_RETRACT_NO_PREFILL_BS. | `2 ** 31`     |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
@@ -169,7 +167,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
-| `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
+| `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `false` |
 | `SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE` | Use SGLang's custom Triton kernel cache implementation for lower overheads (automatically enabled on CUDA) | `false` |
 | `SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE` | Decode-side incremental KV cache offload stride. Rounded down to a multiple of `--page-size` (min is `--page-size`). If unset/invalid/<=0, it falls back to `--page-size`. | Not set (uses `--page-size`) |
 

@@ -2,9 +2,16 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import sys
 import unittest
 import uuid
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
+
+# Stub out sgl_kernel (and all submodules) before any sglang import so
+# the test runs on CPU-only runners without the real CUDA library.
+for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
+    if _mod not in sys.modules:
+        sys.modules[_mod] = MagicMock()
 
 from fastapi import Request
 
@@ -14,10 +21,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
 
 
 # Mock TokenizerManager for embedding tests
