@@ -8,32 +8,51 @@ Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kerne
 
 Usage:
     # Baseline — single model
-    python scripts/bench_diffusion_denoise.py --model flux
+    cd /path/to/sglang
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux
 
     # With custom JIT CUDA kernels
-    python scripts/bench_diffusion_denoise.py --model flux --custom-kernels
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux --custom-kernels
 
     # Side-by-side comparison
-    python scripts/bench_diffusion_denoise.py --model flux --compare
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux --compare
 
-    # All 7 models, comparison
-    python scripts/bench_diffusion_denoise.py --all --compare
+    # All 9 models, comparison
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --all --compare
 
 Input images required for image-guided models:
-    mkdir -p /workspace/gen_benchmark/figs
-    wget -O /workspace/gen_benchmark/figs/cat.png \
+    ASSET_DIR=$(python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py print-assets-dir --mkdir)
+    wget -O "${ASSET_DIR}/cat.png" \
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
-    wget -O /workspace/gen_benchmark/figs/astronaut.jpg \
+    wget -O "${ASSET_DIR}/astronaut.jpg" \
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
+    wget -O "${ASSET_DIR}/mova_single_person.jpg" \
+      https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 """
 
 import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from diffusion_skill_env import (
+    ensure_dir,
+    get_assets_dir,
+    get_output_dir,
+    get_repo_root,
+    pick_idle_gpus,
+)
+
+REPO_ROOT = get_repo_root()
+ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with diffusion-benchmark-and-profile.md
@@ -57,12 +76,12 @@ MODELS = {
         ],
     },
     # 2. Qwen/Qwen-Image-Edit-2511 — Image Editing, 1024×1024, 50 steps
-    # Requires: /workspace/gen_benchmark/figs/cat.png
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "qwen-edit": {
         "path": "Qwen/Qwen-Image-Edit-2511",
         "prompt": "Transform into anime style",
         "negative_prompt": " ",
-        "image_path": "/workspace/gen_benchmark/figs/cat.png",
+        "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
             "--width=1024",
             "--height=1024",
@@ -141,12 +160,12 @@ MODELS = {
         ],
     },
     # 7. Wan-AI/Wan2.2-TI2V-5B-Diffusers — Text-Image-to-Video, 720P, 1 GPU, 81 frames, 50 steps
-    # Requires: /workspace/gen_benchmark/figs/astronaut.jpg
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/astronaut.jpg
     "wan-ti2v": {
         "path": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         "prompt": "An astronaut hatching from an egg, on the surface of the moon, the darkness and depth of space realised in the background. High quality, ultrarealistic detail and breath-taking movie-like camera shot.",
         "negative_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
-        "image_path": "/workspace/gen_benchmark/figs/astronaut.jpg",
+        "image_path": str(ASSET_DIR / "astronaut.jpg"),
         "extra_args": [
             "--num-frames",
             "81",
@@ -165,7 +184,44 @@ MODELS = {
             "false",
         ],
     },
+    # 8. hunyuanvideo-community/HunyuanVideo — Text-to-Video, 848×480, 65 frames, 30 steps
+    "hunyuanvideo": {
+        "path": "hunyuanvideo-community/HunyuanVideo",
+        "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
+        "extra_args": [
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            "--num-frames=65",
+            "--width=848",
+            "--height=480",
+            "--num-inference-steps=30",
+        ],
+    },
+    # 9. OpenMOSS-Team/MOVA-720p — Image-to-Video, 4 GPUs, 193 frames, 24 steps
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    "mova-720p": {
+        "path": "OpenMOSS-Team/MOVA-720p",
+        "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
+        "image_path": str(ASSET_DIR / "mova_single_person.jpg"),
+        "extra_args": [
+            "--adjust-frames=false",
+            "--num-gpus=4",
+            "--ring-degree=1",
+            "--ulysses-degree=4",
+            "--num-frames=193",
+            "--fps=24",
+            "--num-inference-steps=24",
+        ],
+    },
 }
+
+
+def required_gpus_for_model(model_key: str) -> int:
+    if model_key == "wan-t2v":
+        return 8
+    if model_key == "mova-720p":
+        return 4
+    return 1
 
 
 def build_sglang_cmd(
@@ -188,9 +244,11 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
-        f"--seed={seed}",
         "--log-level=info",
     ]
+
+    if seed is not None:
+        cmd.append(f"--seed={seed}")
 
     if "negative_prompt" in cfg:
         cmd.append(f"--negative-prompt={cfg['negative_prompt']}")
@@ -230,6 +288,11 @@ def run_benchmark_once(
     )
 
     env = os.environ.copy()
+    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    if not env.get("CUDA_VISIBLE_DEVICES"):
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
+        )
     if use_custom_kernels:
         # NOTE: This env var is a convention for user-implemented kernel injection
         # logic. SGLang runtime does not read it by default — you must add handling
@@ -238,6 +301,7 @@ def run_benchmark_once(
 
     print(f"\n{'=' * 64}")
     print(f"[{label.upper()}] {model_key}")
+    print(f"  CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     print("  " + " \\\n  ".join(cmd))
     print()
 
@@ -425,7 +489,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/workspace/gen_benchmark/bench_results",
+        default=str(get_output_dir("benchmarks", REPO_ROOT)),
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")

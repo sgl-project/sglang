@@ -22,6 +22,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -69,6 +71,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
+            is_nextn=True,
         )
 
         if get_pp_group().is_last_rank:
@@ -83,6 +86,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = getattr(config, "text_config", config)
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -130,12 +142,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         hidden_states = self.fc(hidden_states)
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            hidden_states,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

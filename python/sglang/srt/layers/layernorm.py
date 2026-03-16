@@ -327,6 +327,12 @@ class RMSNorm(MultiPlatformOp):
                     )
                     if fused_result is not None:
                         return fused_result
+                    else:
+                        logger.warning(
+                            "AITER fused AR+RMSNorm failed, falling back to standard implementation"
+                        )
+                        x = tensor_model_parallel_all_reduce(x)
+                        return self.forward(x, residual, None)
                 else:
                     fused_result = flashinfer_allreduce_residual_rmsnorm(
                         input_tensor=x,
@@ -336,14 +342,12 @@ class RMSNorm(MultiPlatformOp):
                     )
                     if fused_result[0] is not None:
                         return fused_result
-
-                # For AITER route, preserve correctness when fused path is unavailable.
-                if (
-                    _use_aiter
-                    and get_global_server_args().enable_aiter_allreduce_fusion
-                ):
-                    x = tensor_model_parallel_all_reduce(x)
-                    return self.forward(x, residual, None)
+                    else:
+                        logger.warning(
+                            "FlashInfer allreduce fusion failed, falling back to standard implementation"
+                        )
+                        x = tensor_model_parallel_all_reduce(x)
+                        return self.forward(x, residual, None)
 
         return self.forward(x, residual, post_residual_addition)
 

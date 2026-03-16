@@ -945,6 +945,34 @@ class Engine(EngineBase):
             self.tokenizer_manager.unload_lora_adapter(obj, None)
         )
 
+    async def async_load_lora_adapter(
+        self, lora_name: str, lora_path: str, pinned: bool = False
+    ):
+        """
+        Asynchronous version of load_lora_adapter.
+
+        See load_lora_adapter() for detailed documentation.
+        """
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            pinned=pinned,
+        )
+
+        return await self.tokenizer_manager.load_lora_adapter(obj, None)
+
+    async def async_unload_lora_adapter(self, lora_name: str):
+        """
+        Asynchronous version of unload_lora_adapter.
+
+        See unload_lora_adapter() for detailed documentation.
+        """
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
@@ -1107,7 +1135,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.4",
+                "0.6.6",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

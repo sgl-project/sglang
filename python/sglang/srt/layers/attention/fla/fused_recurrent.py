@@ -64,17 +64,17 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     if not IS_KDA:
         p_g = g + bos * HV + i_hv
     else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
+        p_gk = g + (bos * H + i_h) * K + o_k
 
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    mask_h = mask_v[:, None] & mask_k[None, :]
 
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        p_h0 = h0 + i_nh * V * K + o_v[:, None] * K + o_k[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -86,24 +86,24 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
         b_q = b_q * scale
-        # [BK, BV]
+        # [BV, BK]
         if not IS_KDA:
             b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
         else:
-            b_gk = tl.load(p_gk).to(tl.float32)
-            b_h *= exp(b_gk[:, None])
+            b_gk = tl.load(p_gk, mask=mask_k, other=0).to(tl.float32)
+            b_h *= exp(b_gk[None, :])
         # [BV]
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
         b_v *= b_beta
-        # [BK, BV]
-        b_h += b_k[:, None] * b_v[None, :]
+        # [BV, BK]
+        b_h += b_v[:, None] * b_k[None, :]
         # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
+        b_o = tl.sum(b_h * b_q[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H * K
@@ -113,11 +113,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if not IS_KDA:
             p_g += HV
         else:
-            p_gk += HV * K
+            p_gk += H * K
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
-        p_ht = ht + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        p_ht = ht + i_nh * V * K + o_v[:, None] * K + o_k[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -144,7 +144,7 @@ def fused_recurrent_gated_delta_rule_fwd(
 
     o = q.new_empty(NK, *v.shape)
     if output_final_state:
-        final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+        final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
     else:
         final_state = None
 
@@ -252,11 +252,11 @@ def fused_recurrent_gated_delta_rule(
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
+            Initial state of shape `[N, HV, V, K]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, V, K]`. Default: `False`.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
@@ -264,7 +264,7 @@ def fused_recurrent_gated_delta_rule(
         o (torch.Tensor):
             Outputs of shape `[B, T, HV, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, V, K]` if `output_final_state=True` else `None`.
     Examples::
         >>> import torch
         >>> import torch.nn.functional as F
@@ -277,7 +277,7 @@ def fused_recurrent_gated_delta_rule(
         >>> v = torch.randn(B, T, HV, V, device='cuda')
         >>> g = F.logsigmoid(torch.rand(B, T, HV, device='cuda'))
         >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
-        >>> h0 = torch.randn(B, HV, K, V, device='cuda')
+        >>> h0 = torch.randn(B, HV, V, K, device='cuda')
         >>> o, ht = fused_gated_recurrent_delta_rule(
             q, k, v, g, beta,
             initial_state=h0,
@@ -413,9 +413,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    mask_h = mask_v[:, None] & mask_k[None, :]
 
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
@@ -424,8 +424,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[:, None] * K
+                + o_k[None, :]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -449,8 +449,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[:, None] * K
+                    + o_k[None, :]
                 )
                 b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
@@ -466,17 +466,17 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # [BK, BV]
         b_h *= exp(b_g)
         # [BV]
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
         b_v *= b_beta
-        # [BK, BV]
-        b_h += b_k[:, None] * b_v[None, :]
+        # [BV, BK]
+        b_h += b_v[:, None] * b_k[None, :]
         # [BV]
         if not DISABLE_OUTPUT_CALCULATION:
-            b_o = tl.sum(b_h * b_q[:, None], 0)
+            b_o = tl.sum(b_h * b_q[None, :], 1)
             # core attn output
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
@@ -490,8 +490,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[:, None] * K
+                    + o_k[None, :]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
@@ -513,8 +513,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[:, None] * K
+                + o_k[None, :]
             )
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 

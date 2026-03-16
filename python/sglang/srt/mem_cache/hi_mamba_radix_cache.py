@@ -647,6 +647,7 @@ class HiMambaRadixCache(MambaRadixCache):
         value,
         mamba_value,
         chunked: bool = False,
+        prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
@@ -677,12 +678,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = new_node
 
             if node.evicted:
-                # Unevicted nodes take ownership of the request's KV pages.
-                # Do NOT count them in total_prefix_length, otherwise
-                # cache_finished_req / cache_unfinished_req will free those
-                # pages even though the tree now references them.
                 self._unevict_node(node, value[:prefix_len])
             else:
+                if prev_prefix_len < total_prefix_length + prefix_len:
+                    start = max(0, prev_prefix_len - total_prefix_length)
+                    self.token_to_kv_pool_allocator.free(value[start:prefix_len])
                 total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 

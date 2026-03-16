@@ -38,11 +38,10 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
-    format_tcp_address,
     get_int_env_var,
     get_local_ip_auto,
-    is_valid_ipv6_address,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
@@ -417,10 +416,8 @@ class MoriKVManager(CommonKVManager):
         ]
         for info in infos:
             try:
-                endpoint = format_tcp_address(info.endpoint, info.dst_port)
-                socket = self._connect(
-                    endpoint, is_ipv6=is_valid_ipv6_address(info.endpoint)
-                )
+                na = NetworkAddress(info.endpoint, info.dst_port)
+                socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
                 socket.send_multipart(payload)
             except Exception:
                 logger.exception(
@@ -754,9 +751,8 @@ class MoriKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        socket = self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        )
+        na = NetworkAddress(remote, dst_port)
+        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
 
         socket.send_multipart(
             [

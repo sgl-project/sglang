@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import socket
 import threading
 import time
 from collections import defaultdict
@@ -37,12 +36,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    format_tcp_address,
     get_local_ip_auto,
     get_zmq_socket_on_host,
-    is_valid_ipv6_address,
-    maybe_wrap_ipv6_address,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +113,10 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         context = zmq.Context()
-        zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=zmq_bind_host
+            context, zmq.PULL, host=self.local_ip
         )
-        logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
+        logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
@@ -188,7 +184,7 @@ class CommonKVManager(BaseKVManager):
             self.failure_records[bootstrap_room] = failure_reason
 
     def ensure_parallel_info(
-        self, bootstrap_addr: str, max_retries: int = 20, retry_interval: float = 1.0
+        self, bootstrap_addr: str, max_retries: int = 5, retry_interval: float = 1.0
     ) -> bool:
         """Fetch and cache prefill parallel info if not yet available.
         Returns True if info is available (cached or freshly fetched).
@@ -255,20 +251,14 @@ class CommonKVManager(BaseKVManager):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
-            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
-                if self.dist_init_addr.endswith("]"):
-                    host = self.dist_init_addr
-                else:
-                    host, _ = self.dist_init_addr.rsplit(":", 1)
-            else:
-                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
+            host = NetworkAddress.parse(self.dist_init_addr).host
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
-            host = maybe_wrap_ipv6_address(host)
 
-        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
-        url = f"http://{bootstrap_server_url}/route"
+        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
+        bootstrap_server_url = bootstrap_na.to_host_port_str()
+        url = f"{bootstrap_na.to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -656,10 +646,8 @@ class CommonKVReceiver(BaseKVReceiver):
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
-        is_ipv6_address = is_valid_ipv6_address(ip_address)
-        sock, lock = cls._connect(
-            format_tcp_address(ip_address, port), is_ipv6=is_ipv6_address
-        )
+        na = NetworkAddress(ip_address, port)
+        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
     def _register_kv_args(self):
