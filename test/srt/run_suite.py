@@ -71,10 +71,12 @@ suite_xeon = {
 }
 
 # Add Intel XPU tests
+# NOTE: please sort the test cases alphabetically by the test file name
 suite_xpu = {
     "per-commit-xpu": [
-        TestFile("xpu/test_intel_xpu_backend.py"),
         TestFile("xpu/test_deepseek_ocr.py"),
+        TestFile("xpu/test_internvl.py"),
+        TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
@@ -85,7 +87,6 @@ suite_ascend = {
     "per-commit-1-npu-a2": [
         TestFile("ascend/test_ascend_autoround_dense.py", 400),
         TestFile("ascend/test_ascend_autoround_moe.py", 400),
-        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_gptq_moe.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
@@ -107,6 +108,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mla.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
+        TestFile("ascend/test_llada2_mini_ascend.py", 800),
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 3600),

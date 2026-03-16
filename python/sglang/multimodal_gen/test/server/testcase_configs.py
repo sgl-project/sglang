@@ -459,6 +459,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "sana_image_t2i",
+        DiffusionServerArgs(
+            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            modality="image",
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
@@ -669,6 +678,43 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             custom_validator="video",
         ),
         TI2V_sampling_params,
+    ),
+    # === Helios T2V ===
+    DiffusionTestCase(
+        "helios_base_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Base",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
+    ),
+    DiffusionTestCase(
+        "helios_mid_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Mid",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
+    ),
+    DiffusionTestCase(
+        "helios_distilled_t2v",
+        DiffusionServerArgs(
+            model_path="BestWishYsh/Helios-Distilled",
+            modality="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="640x384",
+            num_frames=33,
+        ),
     ),
 ]
 
