@@ -403,10 +403,6 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ):
-        # NOTE: If you change the pruning conditions or per-sequence token
-        # counts below, you must also update get_lm_head_pruned_lens() in
-        # sglang/srt/lora/utils.py, which precomputes matching batch metadata
-        # for lm_head LoRA.
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
@@ -804,6 +800,9 @@ class LogitsProcessor(nn.Module):
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if hasattr(lm_head, "reset_lm_head_pass"):
+            assert hasattr(
+                lm_head, "set_lm_head_pass"
+            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
             lm_head.reset_lm_head_pass()
 
         # Concatenate the results
