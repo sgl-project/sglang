@@ -89,6 +89,7 @@ class DecodeKVCacheOffloadManager:
             storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
         )
 
+        self.enable_storage = server_args.hicache_storage_backend is not None
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         self.offloaded_state = {}
@@ -114,12 +115,16 @@ class DecodeKVCacheOffloadManager:
         )
         state = self.offloaded_state.get(req.rid)
         if state is None:
-            prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
-            )
-            last_prefill_hash = (
-                prefill_hashes[-1] if prefill_offloaded_len > 0 else None
-            )
+            if self.enable_storage:
+                prefill_hashes = self._compute_prefix_hash(
+                    req.origin_input_ids[:prefill_offloaded_len]
+                )
+                last_prefill_hash = (
+                    prefill_hashes[-1] if prefill_offloaded_len > 0 else None
+                )
+            else:
+                last_prefill_hash = None
+
             state = OffloadedState(
                 prefill_len=prefill_offloaded_len,
                 inc_len=0,
@@ -171,21 +176,28 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-                cc.ack_backup_queue.qsize(),
-            ],
-            dtype=torch.int,
-        )
+        if self.enable_storage:
+            qsizes = torch.tensor(
+                [
+                    len(cc.ack_write_queue),
+                    cc.ack_backup_queue.qsize(),
+                ],
+                dtype=torch.int,
+            )
+        else:
+            qsizes = torch.tensor([len(cc.ack_write_queue)], dtype=torch.int)
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_write, n_backup = map(int, qsizes.tolist())
-        self._check_offload_progress(n_write)
-        self._check_backup_progress(n_backup)
+        if self.enable_storage:
+            n_write, n_backup = map(int, qsizes.tolist())
+            self._check_offload_progress(n_write)
+            self._check_backup_progress(n_backup)
+        else:
+            n_write = int(qsizes.tolist()[0])
+            self._check_offload_progress(n_write)
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
@@ -210,16 +222,17 @@ class DecodeKVCacheOffloadManager:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
 
-                prior_hash = (
-                    self.offloaded_state[req.rid].last_hash
-                    if req.rid in self.offloaded_state
-                    else None
-                )
-                last_hash = self._trigger_backup(
-                    req, host_indices, incremental_tokens, start_time, prior_hash
-                )
-                if req.rid in self.offloaded_state:
-                    self.offloaded_state[req.rid].last_hash = last_hash
+                if self.enable_storage:
+                    prior_hash = (
+                        self.offloaded_state[req.rid].last_hash
+                        if req.rid in self.offloaded_state
+                        else None
+                    )
+                    last_hash = self._trigger_backup(
+                        req, host_indices, incremental_tokens, start_time, prior_hash
+                    )
+                    if req.rid in self.offloaded_state:
+                        self.offloaded_state[req.rid].last_hash = last_hash
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
