@@ -12,28 +12,31 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=120, suite="stage-b-test-small-1-gpu")
 
-MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP8"
+PERTENSOR_MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP8"
+BLOCKWISE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
 
 class FP8GemmSM120Base:
+    model_path = None
     backend = None
+    quantization = None
 
     @classmethod
     def setUpClass(cls):
         if cls.backend is None:
             raise NotImplementedError("Subclass must set 'backend' attribute")
-        cls.model = try_cached_model(MODEL_PATH)
+        cls.model = try_cached_model(cls.model_path)
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--quantization",
-            "modelopt_fp8",
             "--fp8-gemm-backend",
             cls.backend,
             "--disable-piecewise-cuda-graph",
         ]
+        if cls.quantization:
+            other_args += ["--quantization", cls.quantization]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -49,7 +52,7 @@ class FP8GemmSM120Base:
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=5,
+            num_shots=self.num_shots,
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
@@ -59,12 +62,24 @@ class FP8GemmSM120Base:
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.73)
+        self.assertGreaterEqual(metrics["accuracy"], self.accuracy_threshold)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP8GemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
+class TestFP8PerTensorGemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
+    model_path = PERTENSOR_MODEL_PATH
     backend = "auto"
+    quantization = "modelopt_fp8"
+    num_shots = 5
+    accuracy_threshold = 0.73
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestFP8BlockwiseGemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
+    model_path = BLOCKWISE_MODEL_PATH
+    backend = "auto"
+    num_shots = 8
+    accuracy_threshold = 0.87
 
 
 if __name__ == "__main__":
