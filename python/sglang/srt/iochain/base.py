@@ -67,7 +67,16 @@ class IOFilter(ABC):
 
     @abstractmethod
     async def on_response(self, ctx: IOContext) -> None:
-        """Egress hook — called after a non-streaming response is built."""
+        """
+        Egress hook — called after the response is fully delivered.
+
+        For non-streaming requests ``ctx.response`` holds the complete response
+        object (e.g. ``ChatCompletionResponse``).
+
+        For streaming requests ``ctx.response`` is ``None`` — the response was
+        sent as a series of SSE chunks. Always guard response-level field
+        access with ``if ctx.response is not None``.
+        """
 
 
 async def _run_safe(coro: Any, filter_name: str, phase: str) -> None:

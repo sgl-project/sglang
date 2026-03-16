@@ -98,9 +98,13 @@ class OpenAIServingBase(ABC):
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                # Wrap streaming generator so _after_inference fires after the
+                # last chunk is sent. ctx.response is None for streaming —
+                # filters must guard with `if ctx.response is not None`.
+                return self._wrap_streaming_egress(response, request, adapted_request)
             else:
                 response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
@@ -229,13 +233,56 @@ class OpenAIServingBase(ABC):
         response: Any,
     ) -> None:
         """
-        Hook called after a non-streaming response is fully built.
+        Hook called after a response is fully delivered to the client.
+
+        For non-streaming requests: ``response`` is the fully-built response
+        object (e.g. ``ChatCompletionResponse``).
+
+        For streaming requests: called after the last SSE chunk is sent;
+        ``response`` is ``None`` because no single response object exists.
+        Filters must guard with ``if ctx.response is not None`` when accessing
+        response-level fields such as ``usage``.
 
         No-op by default. Override (or mix in IOChainMixin) to inspect or
         record the outgoing response. Exceptions are propagated to the caller.
-
-        Note: not called for streaming responses (planned for a future release).
         """
+
+    def _wrap_streaming_egress(
+        self,
+        response: Any,
+        request: OpenAIServingRequest,
+        adapted_request: Any,
+    ) -> Any:
+        """
+        Wrap a StreamingResponse so that ``_after_inference`` is called after
+        the last SSE chunk has been sent to the client.
+
+        If ``response`` is not a ``StreamingResponse`` (e.g. an error response
+        returned early), it is returned as-is without wrapping.
+
+        The ``finally`` block guarantees the egress hook fires even when the
+        client disconnects mid-stream or the generator raises.
+        """
+        if not isinstance(response, StreamingResponse):
+            return response
+
+        original_iterator = response.body_iterator
+
+        async def _wrapped():
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                # response=None signals streaming context to filters.
+                await self._after_inference(request, adapted_request, None)
+
+        return StreamingResponse(
+            _wrapped(),
+            status_code=response.status_code,
+            media_type=response.media_type,
+            headers=dict(response.headers),
+            background=response.background,
+        )
 
     def create_error_response(
         self,

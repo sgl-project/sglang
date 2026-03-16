@@ -52,11 +52,14 @@ class RequestLoggingFilter(IOFilter):
     async def on_response(self, ctx: IOContext) -> None:
         latency_ms = (time.monotonic() - ctx.start_time) * 1000
         model = getattr(ctx.raw_request, "model", "unknown")
+        # ctx.response is None for streaming — latency is time-to-last-chunk.
+        streaming = ctx.response is None
         logger.info(
             "request.complete",
             extra={
                 "request_id": ctx.request_id,
                 "model": model,
                 "latency_ms": round(latency_ms, 1),
+                "streaming": streaming,
             },
         )
