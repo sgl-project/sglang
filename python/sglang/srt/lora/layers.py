@@ -541,17 +541,31 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
-
-        if (
+        should_reduce = (
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
-        ):
+        )
+
+        if self.set_lora and should_reduce:
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                input_parallel, self.A_buffer
+            )
             output_ = tensor_model_parallel_all_reduce(output_parallel)
+            lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
+            output_ = self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output,
+                weights=self.B_buffer,
+                output_offset=self.output_offset,
+                base_output=output_,
+            )
         else:
-            output_ = output_parallel
+            if self.set_lora:
+                output_parallel = self.apply_lora(output_parallel, input_parallel)
+            if should_reduce:
+                output_ = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output_ = output_parallel
 
         if not self.base_layer.skip_bias_add:
             output = (

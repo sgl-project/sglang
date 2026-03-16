@@ -761,9 +761,15 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         elif forward_mode.is_draft_extend(include_v2=True):
             seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
+            num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices

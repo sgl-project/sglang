@@ -871,9 +871,7 @@ def get_generate_fn(
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         response = client.images.with_raw_response.generate(
             model=model_path,
@@ -898,6 +896,13 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(output_size)
+        if (
+            sampling_params.extras.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            expected_width *= sampling_params.extras.get("upscaling_scale", 4)
+            expected_height *= sampling_params.extras.get("upscaling_scale", 4)
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -947,8 +952,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"num_frames": sampling_params.num_frames}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
@@ -1076,22 +1080,18 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
         if sampling_params.num_frames:
             extra_body["num_frames"] = sampling_params.num_frames
-        if sampling_params.enable_frame_interpolation:
-            extra_body["enable_frame_interpolation"] = True
-            extra_body["frame_interpolation_exp"] = (
-                sampling_params.frame_interpolation_exp
-            )
 
         # Compute expected output frame count for validation
         expected_frame_count = None
-        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+        if (
+            sampling_params.extras.get("enable_frame_interpolation")
+            and sampling_params.num_frames
+        ):
             n = sampling_params.num_frames
-            exp = sampling_params.frame_interpolation_exp
+            exp = sampling_params.extras.get("frame_interpolation_exp", 1)
             expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
@@ -1118,9 +1118,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1140,8 +1138,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"reference_url": sampling_params.image_path}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         return _create_and_download_video(
             client,
@@ -1170,9 +1167,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1186,6 +1181,7 @@ def get_generate_fn(
                 extra_body={
                     "fps": sampling_params.fps,
                     "num_frames": sampling_params.num_frames,
+                    **extra_body,
                 },
             )
 

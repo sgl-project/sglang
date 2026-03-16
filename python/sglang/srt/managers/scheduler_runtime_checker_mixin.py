@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -23,6 +24,16 @@ class SchedulerRuntimeCheckerMixin:
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_tokens()
+        return 0
+
+    def _session_held_full_tokens(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_full_tokens()
+        return 0
+
+    def _session_held_swa_tokens(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_swa_tokens()
         return 0
 
     def _session_held_req_count(self: Scheduler) -> int:
@@ -103,11 +114,20 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        session_held = self._session_held_tokens()
-        memory_leak = (full_num_used - session_held) != 0 or swa_num_used != 0
+        session_held_full = self._session_held_full_tokens()
+        session_held_swa = self._session_held_swa_tokens()
+
+        # Streaming sessions hold tree locks during idle, so tree-protected
+        # tokens must be accounted for alongside session-held tokens.
+        full_protected = self.tree_cache.full_protected_size()
+        swa_protected = self.tree_cache.swa_protected_size()
+        full_leaked = full_num_used - full_protected - session_held_full
+        swa_leaked = swa_num_used - swa_protected - session_held_swa
+        memory_leak = full_leaked != 0 or swa_leaked != 0
         token_msg = (
-            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}, {session_held=}\n"
+            f"{full_leaked=}, {swa_leaked=}\n"
+            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected=}, {session_held_swa=}\n"
         )
         return memory_leak, token_msg
 
@@ -270,8 +290,7 @@ class SchedulerRuntimeCheckerMixin:
         self._check_req_pool()
 
         if (
-            self.enable_metrics
-            and self.current_scheduler_metrics_enabled
+            self.current_scheduler_metrics_enabled
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
@@ -301,26 +320,31 @@ class SchedulerRuntimeCheckerMixin:
                 ) = self._get_mamba_token_info()
             else:
                 num_used, token_usage, _, _ = self._get_token_info()
-            num_running_reqs = len(self.running_batch.reqs)
-            self.stats.num_running_reqs = num_running_reqs
+
+            priority_enabled = self.enable_priority_scheduling
+            self.stats.num_running_reqs = QueueCount.from_reqs(
+                self.running_batch.reqs, priority_enabled
+            )
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
             self.stats.gen_throughput = 0
-            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs = QueueCount.from_reqs(
+                self.waiting_queue, priority_enabled
+            )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
+                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
+                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_prefill_inflight_queue, priority_enabled
                 )
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
+                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
+                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+                    self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()

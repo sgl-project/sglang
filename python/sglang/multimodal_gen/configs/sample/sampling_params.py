@@ -14,7 +14,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
@@ -113,6 +113,13 @@ class SamplingParams:
         None  # local dir or HF repo ID with flownet.pkl (default: elfgum/RIFE-4.22.lite)
     )
 
+    # Upscaling
+    enable_upscaling: bool = False
+    upscaling_model_path: str | None = (
+        None  # local .pth, HF repo ID, or repo_id:filename (default: ai-forever/Real-ESRGAN)
+    )
+    upscaling_scale: int = 4
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
@@ -123,11 +130,14 @@ class SamplingParams:
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
+
+    # Subclasses can set these to provide model-specific default resolutions.
+    # The base __post_init__ will apply them when height/width are not provided.
+    _default_height: ClassVar[int | None] = None
+    _default_width: ClassVar[int | None] = None
+
     height: int | None = None
     width: int | None = None
-    # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
-    height_not_provided: bool = False
-    width_not_provided: bool = False
     fps: int = 24
 
     # Resolution validation
@@ -217,10 +227,10 @@ class SamplingParams:
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
 
-        if self.width is None:
-            self.width_not_provided = True
-        if self.height is None:
-            self.height_not_provided = True
+        if self.width is None and self._default_width is not None:
+            self.width = self._default_width
+        if self.height is None and self._default_height is not None:
+            self.height = self._default_height
 
         # Handle output_quality to output_compression conversion
         if self.output_compression is None and self.output_quality is not None:
@@ -361,8 +371,6 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
         if self.guidance_scale is None:
             try:
@@ -423,7 +431,7 @@ class SamplingParams:
 
         pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
 
-        if "wan" in pipeline_name_lower and (
+        if ("wan" in pipeline_name_lower or "helios" in pipeline_name_lower) and (
             self.enable_sequence_shard is None or self.enable_sequence_shard
         ):
             self.enable_sequence_shard = True
@@ -567,7 +575,9 @@ class SamplingParams:
         user_kwargs.pop("diffusers_kwargs", None)
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
-        sampling_params._merge_with_user_params(user_sampling_params)
+        sampling_params._merge_with_user_params(
+            user_sampling_params, explicit_fields=set(user_kwargs.keys())
+        )
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -626,13 +636,14 @@ class SamplingParams:
         parser.add_argument(
             "--prompt",
             type=str,
+            nargs="+",
             default=SamplingParams.prompt,
-            help="Text prompt for generation",
+            help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
         parser.add_argument(
             "--negative-prompt",
             type=str,
-            default=SamplingParams.negative_prompt,
+            default=None,
             help="Negative text prompt for generation",
         )
         parser.add_argument(
@@ -873,7 +884,30 @@ class SamplingParams:
             type=str,
             default=SamplingParams.frame_interpolation_model_path,
             help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
-            "(default: elfgum/RIFE-4.22.lite, downloaded automatically).",
+            "(default: elfgum/RIFE-4.22.lite, downloaded automatically). "
+            "Only RIFE 4.22.lite architecture is supported; other RIFE versions or "
+            "frame interpolation models are not compatible.",
+        )
+        parser.add_argument(
+            "--enable-upscaling",
+            action="store_true",
+            help="Enable post-generation upscaling using Real-ESRGAN.",
+        )
+        parser.add_argument(
+            "--upscaling-model-path",
+            type=str,
+            default=SamplingParams.upscaling_model_path,
+            help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
+            "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
+            "Only RRDBNet (e.g. RealESRGAN_x4plus) and SRVGGNetCompact (e.g. realesr-animevideov3) "
+            "architectures are supported; other super-resolution models are not compatible. "
+            "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
+        )
+        parser.add_argument(
+            "--upscaling-scale",
+            type=int,
+            default=SamplingParams.upscaling_scale,
+            help="Upscaling factor (default: 4).",
         )
         return parser
 
@@ -896,18 +930,29 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        args.height_not_provided = False
-        args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        return {
+            attr: getattr(args, attr)
+            for attr in attrs
+            if hasattr(args, attr) and getattr(args, attr) is not None
+        }
 
     def output_file_path(self):
         if self.output_path is None:
             return None
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params: "SamplingParams"):
+    def _merge_with_user_params(
+        self,
+        user_params: "SamplingParams",
+        explicit_fields: set[str] | None = None,
+    ):
         """
         Merges parameters from a user-provided SamplingParams object.
+
+        Args:
+            explicit_fields: field names explicitly set by the user (e.g. from
+                CLI kwargs). These are always treated as user-modified even when
+                their value matches the base-class default.
         """
         if user_params is None:
             return
@@ -921,15 +966,14 @@ class SamplingParams:
             user_value = getattr(user_params, field_name)
             default_class_value = getattr(SamplingParams, field_name)
 
-            # A field is considered user-modified if its value is different from the default
-            is_user_modified = user_value != default_class_value
+            is_user_modified = user_value != default_class_value or (
+                explicit_fields is not None and field_name in explicit_fields
+            )
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
-        self.height_not_provided = user_params.height_not_provided
-        self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
 
     @property

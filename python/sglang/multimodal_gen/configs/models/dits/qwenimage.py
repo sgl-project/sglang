@@ -43,7 +43,7 @@ class QwenImageArchConfig(DiTArchConfig):
 
 
 @dataclass
-class QwenImageEditPlus_2511_ArchConfig(DiTArchConfig):
+class QwenImageEditPlus_2511_ArchConfig(QwenImageArchConfig):
     zero_cond_t: bool = True
 
 

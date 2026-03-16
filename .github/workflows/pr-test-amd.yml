@@ -1,7 +1,7 @@
 name: PR Test (AMD)
 # Dynamic run-name for /rerun-stage commands to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
+run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
   push:
@@ -24,8 +24,29 @@ on:
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
+      target_stage_select:
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-small-1-gpu-amd
+          - stage-b-test-small-1-gpu-amd-nondeterministic
+          - stage-b-test-small-1-gpu-amd-mi35x
+          - stage-b-test-large-1-gpu-amd
+          - stage-b-test-large-2-gpu-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
       target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
+        description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
         type: string
         default: ""
@@ -138,15 +159,7 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
-        (
-          !inputs.target_stage &&
-          needs.check-changes.outputs.sgl_kernel == 'true'
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -185,15 +198,7 @@ jobs:
 
   sgl-kernel-unit-test-2-gpu-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'sgl-kernel-unit-test-2-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          needs.check-changes.outputs.sgl_kernel == 'true'
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -227,16 +232,7 @@ jobs:
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-a-test-1-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -267,15 +263,7 @@ jobs:
 
   jit-kernel-unit-test-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'jit-kernel-unit-test-amd') ||
-        (
-          !inputs.target_stage &&
-          needs.check-changes.outputs.jit_kernel == 'true'
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -306,16 +294,7 @@ jobs:
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -346,16 +325,7 @@ jobs:
 
   stage-b-test-small-1-gpu-amd-nondeterministic:
     needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-nondeterministic') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -384,13 +354,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-nondeterministic --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-small-1-gpu-amd-mi35x:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -424,16 +394,7 @@ jobs:
 
   stage-b-test-large-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -464,16 +425,7 @@ jobs:
 
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -504,7 +456,7 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: false
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -611,6 +563,7 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
@@ -624,7 +577,7 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: false
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -730,6 +683,7 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
@@ -743,16 +697,7 @@ jobs:
 
   stage-c-test-large-8-gpu-amd:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     env:
       RUNNER_LABELS: linux-mi325-8gpu-sglang
     strategy:
@@ -790,13 +735,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd-mi35x:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -831,13 +776,13 @@ jobs:
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )

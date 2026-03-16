@@ -469,6 +469,9 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+            hf_weights_files.sort()
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
@@ -2725,7 +2728,8 @@ def get_model_loader(
 
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
-        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
+        or model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
@@ -2734,7 +2738,8 @@ def get_model_loader(
     if (
         model_config
         and hasattr(model_config, "quantization")
-        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
+        and model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
     ):
         if model_config._is_already_quantized():
             logger.info(

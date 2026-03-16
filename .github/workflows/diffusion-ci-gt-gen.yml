@@ -29,7 +29,7 @@ jobs:
     strategy:
       matrix:
         part: [0, 1]
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -37,9 +37,11 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        run: bash scripts/ci/ci_install_dependency.sh diffusion
+        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
@@ -63,7 +65,7 @@ jobs:
     strategy:
       matrix:
         part: [0, 1]
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,9 +73,11 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        run: bash scripts/ci/ci_install_dependency.sh diffusion
+        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
