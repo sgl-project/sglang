@@ -2561,6 +2561,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
+        # Use precomputed SWA cache location
+        if forward_batch.out_cache_loc_swa is not None:
+            self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
