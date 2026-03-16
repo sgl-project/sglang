@@ -84,35 +84,45 @@ pip install -e "python[all_musa]"
 
 ## Platform-Specific: Windows (NVIDIA CUDA)
 
-Native Windows support uses the `sglang` backend with `torch_sdpa` attention.
+For native Windows with NVIDIA CUDA, SGLang Diffusion (`sglang.multimodal_gen`) supports diffusion generation through the `sglang` backend with `torch_sdpa` attention.
 
 Note:
+- This section is for SGLang Diffusion only. It does not support native Windows support for the SGLang LLM/SRT runtime.
 - Flash Attention (`fa`) is not supported on the native Windows CUDA path.
 - Use the Windows-specific dependency profile (`pyproject_other.toml`) for now.
 - Ensure you have a CUDA-enabled PyTorch build on Windows (`torch.cuda.is_available()` must be true).
 
 ```powershell
-# From repo root
+# Clone the repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Create and activate a virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install the Python packages
+python -m pip install --upgrade pip
 Copy-Item python/pyproject_other.toml python/pyproject.toml -Force
 pip install -e "python[diffusion_windows]"
 ```
 
 Quick test:
 
-```bash
-sglang generate \
-  --model-path black-forest-labs/FLUX.2-klein-4B \
-  --backend sglang \
-  --attention-backend torch_sdpa \
-  --num-gpus 1 \
-  --text-encoder-cpu-offload \
-  --dit-cpu-offload \
-  --vae-cpu-offload \
-  --pin-cpu-memory \
-  --prompt "a cinematic portrait of a robot engineer in a workshop" \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 4 \
+```powershell
+sglang generate `
+  --model-path black-forest-labs/FLUX.2-klein-4B `
+  --backend sglang `
+  --attention-backend torch_sdpa `
+  --num-gpus 1 `
+  --text-encoder-cpu-offload `
+  --dit-cpu-offload `
+  --vae-cpu-offload `
+  --pin-cpu-memory `
+  --prompt "a cinematic portrait of a robot engineer in a workshop" `
+  --height 1024 `
+  --width 1024 `
+  --num-inference-steps 4
 ```
 
 ## Platform-Specific: Ascend NPU
