@@ -17,7 +17,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import detect_nan, generate_token_bitmask
+from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +320,9 @@ class NGRAMWorker:
 
             # Sample
             if self.enable_nan_detection:
-                detect_nan(logits_output)
+                maybe_detect_nan(
+                    logits_output.next_token_logits, "verify: target model logits"
+                )
             (
                 predict,
                 accept_length,
