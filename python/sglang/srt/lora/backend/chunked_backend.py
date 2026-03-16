@@ -1,5 +1,5 @@
 import dataclasses
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -296,9 +296,21 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
 
         self.batch_info = batch_info
+        self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
+            self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
+        )
+
+    def _prepare_lm_head_batch_info(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        batch_info: LoRABatchInfo,
+    ) -> Tuple[Optional[LoRABatchInfo], Optional[List[LoRABatchInfo]]]:
 
         # Precompute lm_head_batch_info for pruned lm_head LoRA
         pruned_lens = get_lm_head_pruned_lens(forward_batch)
+        lm_head_batch_info = None
+        lm_head_pass_batch_infos = None
 
         if pruned_lens is not None:
             pruned_total = sum(pruned_lens)
@@ -306,21 +318,21 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             lm_head_segments = merge_and_chunk_segments(
                 weight_indices, pruned_lens, chunk_size=chunk_size
             )
-            self.lm_head_batch_info = self._build_lm_head_batch_info(
+            lm_head_batch_info = self._build_lm_head_batch_info(
                 lm_head_segments, batch_info, chunk_size, pruned_total
             )
 
             # Precompute per-pass batch_infos for logprobs chunking
             pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
             if pass_segments is not None:
-                self.lm_head_pass_batch_infos = []
+                lm_head_pass_batch_infos = []
                 for seg_wi, seg_lens_list in pass_segments:
                     pass_total = sum(seg_lens_list)
                     pass_chunk_size = self._determine_chunk_size_for_tokens(pass_total)
                     chunked_segments = merge_and_chunk_segments(
                         seg_wi, seg_lens_list, chunk_size=pass_chunk_size
                     )
-                    self.lm_head_pass_batch_infos.append(
+                    lm_head_pass_batch_infos.append(
                         self._build_lm_head_batch_info(
                             chunked_segments,
                             batch_info,
@@ -328,11 +340,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                             pass_total,
                         )
                     )
-            else:
-                self.lm_head_pass_batch_infos = None
-        else:
-            self.lm_head_batch_info = None
-            self.lm_head_pass_batch_infos = None
+
+        return lm_head_batch_info, lm_head_pass_batch_infos
 
     def _build_lm_head_batch_info(
         self,
@@ -341,7 +350,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         chunk_size: int,
         expected_tokens: int,
     ) -> LoRABatchInfo:
-        """Build a chunked LoRABatchInfo for pruned lm_head input."""
         seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
         pruned_total = sum(seg_lens_cpu)
         num_segments = len(seg_weight_indices_cpu)

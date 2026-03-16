@@ -1,5 +1,5 @@
 import dataclasses
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -233,23 +233,35 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+        self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
+            self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
+        )
+
+    def _prepare_lm_head_batch_info(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        batch_info: LoRABatchInfo,
+    ) -> Tuple[Optional[LoRABatchInfo], Optional[List[LoRABatchInfo]]]:
 
         # Precompute lm_head_batch_info for pruned lm_head LoRA
         pruned_lens = get_lm_head_pruned_lens(forward_batch)
+        lm_head_batch_info = None
+        lm_head_pass_batch_infos = None
 
         if pruned_lens is not None:
             pruned_total = sum(pruned_lens)
             lm_head_segments = merge_and_chunk_segments(
                 weight_indices, pruned_lens, chunk_size=pruned_total
             )
-            self.lm_head_batch_info = self._build_lm_head_batch_info(
+            lm_head_batch_info = self._build_lm_head_batch_info(
                 lm_head_segments, batch_info, pruned_total
             )
 
             # Precompute per-pass batch_infos for logprobs chunking
             pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
             if pass_segments is not None:
-                self.lm_head_pass_batch_infos = []
+                lm_head_pass_batch_infos = []
                 for seg_wi, seg_lens_list in pass_segments:
                     pass_total = sum(seg_lens_list)
                     merged_segments = merge_and_chunk_segments(
@@ -260,11 +272,8 @@ class TritonLoRABackend(BaseLoRABackend):
                             merged_segments, batch_info, pass_total
                         )
                     )
-            else:
-                self.lm_head_pass_batch_infos = None
-        else:
-            self.lm_head_batch_info = None
-            self.lm_head_pass_batch_infos = None
+
+        return lm_head_batch_info, lm_head_pass_batch_infos
 
     def _build_lm_head_batch_info(
         self,
@@ -272,7 +281,6 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info: LoRABatchInfo,
         expected_tokens: int,
     ) -> LoRABatchInfo:
-        """Build a LoRABatchInfo for pruned lm_head input."""
         seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
         num_segments = len(seg_weight_indices_cpu)
 
