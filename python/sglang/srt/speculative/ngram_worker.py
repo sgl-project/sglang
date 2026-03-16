@@ -48,7 +48,6 @@ class NGRAMWorker:
         self.max_match_window_size: int = (
             server_args.speculative_ngram_max_match_window_size
         )
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -157,7 +156,7 @@ class NGRAMWorker:
         assert len(batch.reqs) == len(self.prev_accept_lens)
         i = 0
         for req in batch.reqs:
-            # grammar doesn't support overlap and output_ids will be complete, so here should not concat with prev_tokens.
+            # grammar doesn't support overlap and output_ids will be complete.
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
                 if not batch.has_grammar
@@ -213,6 +212,7 @@ class NGRAMWorker:
         if USE_FULL_MASK:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
             for i in range(bs):
                 seq_len = batch.seq_lens_cpu[i]
                 req_mask = torch.ones((self.draft_token_num, seq_len)).to(
@@ -314,15 +314,14 @@ class NGRAMWorker:
                 if vocab_mask is not None:
                     assert verify_input.grammar is not None
                     vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
-                    # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                     # and will be applied to produce wrong results
                     model_worker_batch.sampling_info.vocab_mask = None
 
             # Sample
-            if self.enable_nan_detection:
-                maybe_detect_nan(
-                    logits_output.next_token_logits, "verify: target model logits"
-                )
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
             (
                 predict,
                 accept_length,
