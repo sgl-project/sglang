@@ -6,7 +6,6 @@
 
 import argparse
 import dataclasses
-import inspect
 import json
 import math
 import os
@@ -37,6 +36,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     is_valid_ipv6_address,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _sanitize_for_logging,
     configure_logger,
     init_logger,
 )
@@ -44,122 +44,10 @@ from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
+    expand_path_kwargs,
 )
 
 logger = init_logger(__name__)
-
-
-def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
-    """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
-    try:
-        import torch  # type: ignore
-
-        return isinstance(obj, torch.Tensor), torch
-    except Exception:
-        return False, None
-
-
-def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
-    """Recursively convert objects to JSON-serializable forms for concise logging.
-
-    Rules:
-    - Drop any field/dict key named 'param_names_mapping'.
-    - Render Enums using their value.
-    - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
-    - Dataclasses are expanded to dicts and sanitized recursively.
-    - Callables/functions are rendered as their qualified name.
-    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
-    - Fallback to str(...) for unknown types.
-    """
-    # Handle simple types quickly
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        # redact sensitive prompt fields
-        if key_hint in ("prompt", "negative_prompt"):
-            if isinstance(obj, str):
-                return f"<redacted, len={len(obj)}>"
-        return obj
-
-    # Enum -> value for readability
-    if isinstance(obj, Enum):
-        return obj.value
-
-    # torch.Tensor handling (lazy import)
-    is_tensor, torch_mod = _is_torch_tensor(obj)
-    if is_tensor:
-        try:
-            ten = obj.detach().cpu()
-            if key_hint == "scaling_factor":
-                # Provide a compact, single-line summary for scaling_factor
-                stats = {
-                    "shape": list(ten.shape),
-                    "dtype": str(ten.dtype),
-                }
-                # Stats might fail for some dtypes; guard individually
-                try:
-                    stats["min"] = float(ten.min().item())
-                except Exception:
-                    pass
-                try:
-                    stats["max"] = float(ten.max().item())
-                except Exception:
-                    pass
-                try:
-                    stats["mean"] = float(ten.float().mean().item())
-                except Exception:
-                    pass
-                return {"tensor": "scaling_factor", **stats}
-            # Generic tensor summary
-            return {"tensor": True, "shape": list(ten.shape), "dtype": str(ten.dtype)}
-        except Exception:
-            return "<tensor>"
-
-    # Dataclasses -> dict
-    if dataclasses.is_dataclass(obj):
-        result: dict[str, Any] = {}
-        for f in dataclasses.fields(obj):
-            if not f.repr:
-                continue
-            name = f.name
-            if "names_mapping" in name:  # drop noisy mappings
-                continue
-            try:
-                value = getattr(obj, name)
-            except Exception:
-                continue
-            result[name] = _sanitize_for_logging(value, key_hint=name)
-        return result
-
-    # Dicts -> sanitize keys/values; drop 'param_names_mapping'
-    if isinstance(obj, dict):
-        result_dict: dict[str, Any] = {}
-        for k, v in obj.items():
-            try:
-                key_str = str(k)
-            except Exception:
-                key_str = "<key>"
-            if key_str == "param_names_mapping":
-                continue
-            result_dict[key_str] = _sanitize_for_logging(v, key_hint=key_str)
-        return result_dict
-
-    # Sequences/Sets -> list
-    if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
-
-    # Functions / Callables -> qualified name
-    try:
-        if inspect.isroutine(obj) or inspect.isclass(obj):
-            module = getattr(obj, "__module__", "")
-            qn = getattr(obj, "__qualname__", getattr(obj, "__name__", "<callable>"))
-            return f"{module}.{qn}" if module else qn
-    except Exception:
-        pass
-
-    # Fallback: string representation
-    try:
-        return str(obj)
-    except Exception:
-        return "<unserializable>"
 
 
 class Backend(str, Enum):
@@ -1045,6 +933,7 @@ class ServerArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
+        kwargs = expand_path_kwargs(dict(kwargs))
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 

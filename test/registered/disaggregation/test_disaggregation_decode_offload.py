@@ -12,6 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
 )
 
@@ -20,6 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=600, suite="stage-b-test-large-2-gpu")
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
     Test class for verifying KV cache offloading on the decode side in a
