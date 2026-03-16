@@ -213,4 +213,9 @@ class TritonLoRABackend(BaseLoRABackend):
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
+        # Store CPU-side weight_indices for PCG replay (avoids GPU sync)
+        self._cpu_weight_indices = weight_indices
+
         self.batch_info = batch_info
+
+

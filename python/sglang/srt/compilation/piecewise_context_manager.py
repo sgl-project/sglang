@@ -69,6 +69,7 @@ class ForwardContext:
         self.forward_batch = None
         self.attention_layers = None
         self.quant_config = None
+        self.lora_backend = None
         self.moe_layers = None
         self.moe_fusions = None
 
@@ -87,6 +88,9 @@ class ForwardContext:
     def set_moe_fusions(self, fusions: List[Any]):
         self.moe_fusions = fusions
 
+    def set_lora_backend(self, lora_backend: Any):
+        self.lora_backend = lora_backend
+
 
 _forward_context: Optional[ForwardContext] = None
 
@@ -104,6 +108,7 @@ def set_forward_context(
     quant_config: Any,
     moe_layers: List[Any],
     moe_fusions: List[Any],
+    lora_backend: Any = None,
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -112,6 +117,8 @@ def set_forward_context(
     _forward_context.set_quant_config(quant_config)
     _forward_context.set_moe_layers(moe_layers)
     _forward_context.set_moe_fusions(moe_fusions)
+    if lora_backend is not None:
+        _forward_context.set_lora_backend(lora_backend)
     try:
         yield
     finally:

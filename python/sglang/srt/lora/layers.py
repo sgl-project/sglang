@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
@@ -22,6 +23,30 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Import to trigger custom op registration for PCG support
+import sglang.srt.lora.lora_custom_ops  # noqa: F401
+
+# Sentinel tensor reused when no extra embeddings exist, avoiding per-call allocation.
+_EMPTY_EXTRA_EMB_SENTINEL: Optional[torch.Tensor] = None
+
+
+def _get_empty_extra_emb_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a lazily-created (1,1,1) sentinel tensor, reused across calls."""
+    global _EMPTY_EXTRA_EMB_SENTINEL
+    if (
+        _EMPTY_EXTRA_EMB_SENTINEL is None
+        or _EMPTY_EXTRA_EMB_SENTINEL.device != device
+        or _EMPTY_EXTRA_EMB_SENTINEL.dtype != dtype
+    ):
+        _EMPTY_EXTRA_EMB_SENTINEL = torch.empty((1, 1, 1), device=device, dtype=dtype)
+    return _EMPTY_EXTRA_EMB_SENTINEL
+
+
+def _use_custom_ops() -> bool:
+    """Check if we should use custom ops (PCG mode) instead of direct backend calls."""
+    context = get_forward_context()
+    return context is not None and context.lora_backend is not None
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -93,6 +118,31 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_B @ lora_A_embedding(input_)
         """
+        if _use_custom_ops():
+            # Use custom ops for compiled mode (PCG)
+            rank = self.embedding_A_buffer.shape[1]
+            lora_a_output = torch.zeros(
+                (input_.shape[0], rank),
+                device=input_.device,
+                dtype=self.embedding_A_buffer.dtype,
+            )
+            has_extra = (
+                hasattr(self, "new_embeddings_buffer")
+                and self.new_embeddings_buffer is not None
+            )
+            extra_emb = (
+                self.new_embeddings_buffer
+                if has_extra
+                else _get_empty_extra_emb_sentinel(input_.device, self.embedding_A_buffer.dtype)
+            )
+            torch.ops.sglang.embedding_lora_a(
+                input_, self.embedding_A_buffer, lora_a_output,
+                self.vocab_size, has_extra, extra_emb,
+            )
+            torch.ops.sglang.lora_b_sgemm(
+                lora_a_output, self.embedding_B_buffer, base_output,
+            )
+            return base_output
 
         # Efficient embedding lookup for LoRA A (already support extra token embedding process)
         lora_a_output = self.run_lora_a_embedding(input_, batch_info)
@@ -250,6 +300,20 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
         """
+        if _use_custom_ops():
+            lora_a_output = torch.empty(
+                (hidden_states.shape[0], self.lm_head_A_buffer.shape[-2]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            torch.ops.sglang.lora_a_sgemm(
+                hidden_states, self.lm_head_A_buffer, lora_a_output, 1,
+            )
+            torch.ops.sglang.lora_b_sgemm(
+                lora_a_output, self.lm_head_B_buffer, base_output,
+            )
+            return base_output
+
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
             hidden_states, self.lm_head_A_buffer
@@ -325,6 +389,14 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if _use_custom_ops():
+            lora_a_output = torch.empty(
+                (x.shape[0], self.A_buffer.shape[-2]),
+                device=x.device, dtype=x.dtype,
+            )
+            torch.ops.sglang.lora_a_sgemm(x, self.A_buffer, lora_a_output, 1)
+            torch.ops.sglang.lora_b_sgemm(lora_a_output, self.B_buffer, base_output)
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -391,6 +463,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if _use_custom_ops():
+            output_dim = self.B_buffer_gate_up.shape[-2] // 2
+            torch.ops.sglang.gate_up_lora(
+                x, self.A_buffer_gate_up, self.B_buffer_gate_up,
+                base_output, output_dim,
+            )
+            return base_output
         lora_output = self.lora_backend.run_gate_up_lora(
             x=x,
             gate_up_lora_a=self.A_buffer_gate_up,
@@ -452,6 +531,12 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if _use_custom_ops():
+            torch.ops.sglang.qkv_lora(
+                x, self.A_buffer_qkv, self.B_buffer_qkv,
+                base_output, self.output_offset, self.max_qkv_out_dim,
+            )
+            return base_output
         lora_output = self.lora_backend.run_qkv_lora(
             x=x,
             qkv_lora_a=self.A_buffer_qkv,
@@ -518,6 +603,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if _use_custom_ops():
+            lora_a_output = torch.empty(
+                (x.shape[0], self.A_buffer.shape[-2]),
+                device=x.device, dtype=x.dtype,
+            )
+            torch.ops.sglang.lora_a_sgemm(x, self.A_buffer, lora_a_output, 1)
+            torch.ops.sglang.lora_b_sgemm(lora_a_output, self.B_buffer, base_output)
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
