@@ -37,9 +37,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from miles.utils.chat_template_utils.tito_tokenizer import (
-    get_tito_tokenizer,
-)
 from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
@@ -359,8 +356,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-        # Use chat template
-        if self.template_manager.chat_template_name is None:
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            result = MessageProcessingResult(
+                prompt=self.tokenizer_manager.tokenizer.decode(request.input_ids),
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=request.stop or [],
+            )
+        elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -375,14 +383,6 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
-        # Short-circuit: use pretokenized path if provided
-        if (
-            request.pretokenized_token_ids is not None
-            and request.pretokenized_num_message is not None
-            and request.pretokenized_num_message > 0
-        ):
-            return self._apply_pretokenized_template(request, tools)
-
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
@@ -602,117 +602,6 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=video_data,
             audio_data=audio_data,
             modalities=modalities,
-            stop=stop,
-        )
-
-    def _apply_pretokenized_template(
-        self,
-        request: ChatCompletionRequest,
-        tools: Optional[List[Dict]],
-    ) -> MessageProcessingResult:
-        """Apply pretokenized template with incremental tokenization for tool messages.
-
-        Supported input pattern (non-streaming, non-multimodal only):
-            messages[0..N-1] are pretokenized (token IDs provided via pretokenized_token_ids)
-            messages[N..end] are new tool responses to be incrementally tokenized
-
-        Constraints:
-            - messages[N-1] must be role="assistant" (the last pretokenized turn)
-            - messages[N..end] must all be role="tool" or "system"
-            - No multimodal content allowed in any message
-
-        Example valid pattern:
-            messages = [system, user, assistant(tool_calls), tool, tool, system, ...]
-            pretokenized_num_message = 3  (system + user + assistant are pretokenized)
-            pretokenized_token_ids = [...]  (token IDs for the first 3 messages)
-
-        How it works:
-            1. Tokenize first N messages with apply_chat_template(add_generation_prompt=False)
-               to get prefix_ids
-            2. Tokenize ALL messages with apply_chat_template(add_generation_prompt=True)
-               to get full_ids
-            3. Verify prefix_ids matches full_ids[:len(prefix_ids)]
-            4. incremental_ids = full_ids[len(prefix_ids):]
-            5. Final prompt_ids = pretokenized_token_ids + incremental_ids
-        """
-        N = request.pretokenized_num_message
-        messages = request.messages
-
-        # Only reject pretokenized input when the request actually contains
-        # multimodal content (e.g. images/videos).  Text-only requests on
-        # multimodal-capable models are fine.
-        if self.tokenizer_manager.model_config.is_multimodal:
-            for msg in messages:
-                content = getattr(msg, "content", None)
-                if isinstance(content, list) and any(
-                    getattr(part, "type", None) not in (None, "text")
-                    for part in content
-                ):
-                    raise ValueError(
-                        "Pretokenized token IDs input is not supported when the request contains multimodal content"
-                    )
-
-        if N > len(messages):
-            raise ValueError(
-                f"pretokenized_num_message ({N}) > total messages ({len(messages)})"
-            )
-
-        if messages[N - 1].role != "assistant":
-            raise ValueError(
-                f"Message at index {N - 1} must be assistant, got {messages[N - 1].role}"
-            )
-
-        ALLOWED_APPEND_ROLES = {"tool", "system"}
-        for i in range(N, len(messages)):
-            if messages[i].role not in ALLOWED_APPEND_ROLES:
-                raise ValueError(
-                    f"Message at index {i} must be one of {ALLOWED_APPEND_ROLES}, got {messages[i].role}"
-                )
-
-        all_msg_dicts = [msg.model_dump() for msg in messages]
-
-        # Process tool_calls arguments: str -> dict (consistent with standard path)
-        for msg in all_msg_dicts:
-            if (
-                msg["role"] == "assistant"
-                and "tool_calls" in msg
-                and isinstance(msg["tool_calls"], list)
-            ):
-                for item in msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
-                        item["function"]["arguments"], str
-                    ):
-                        item["function"]["arguments"] = orjson.loads(
-                            item["function"]["arguments"]
-                        )
-
-        chat_template_kwargs = request.chat_template_kwargs or {}
-
-        tito_tokenizer = get_tito_tokenizer(
-            self.tokenizer_manager.tokenizer,
-            tokenizer_type=request.tito_model or "default",
-            chat_template_kwargs=chat_template_kwargs,
-        )
-        new_messages = all_msg_dicts[N:]
-        incremental_ids = tito_tokenizer.tokenize_additional(
-            new_messages=new_messages,
-            pretokenized_token_ids=request.pretokenized_token_ids,
-            tools=tools,
-        )
-
-        prompt_ids = list(request.pretokenized_token_ids) + incremental_ids
-
-        # Decode prompt_ids to text for the prompt field
-        prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
-
-        stop = request.stop
-        return MessageProcessingResult(
-            prompt=prompt,
-            prompt_ids=prompt_ids,
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
             stop=stop,
         )
 

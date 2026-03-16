@@ -602,11 +602,10 @@ class ChatCompletionRequest(BaseModel):
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
 
-    # Pretokenized input: skip tokenization for first N messages
-    pretokenized_token_ids: Optional[List[int]] = None
-    pretokenized_num_message: Optional[int] = None
-    # TITOTokenizer type (e.g. "default", "qwen3", "glm47")
-    tito_model: Optional[str] = None
+    # Pre-computed prompt token IDs: when provided, bypasses chat template
+    # tokenization entirely.  Messages are still used to derive stop tokens
+    # and tool_call_constraint.
+    input_ids: Optional[List[int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
