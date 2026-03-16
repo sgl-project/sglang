@@ -42,7 +42,7 @@ def sgemm_lora_a_fwd(
                 x_seq,
                 w_seq.T,
                 beta=0,
-                alpha=scaling_tensor[lora_idx],
+                alpha=scaling_tensor[lora_idx].item(),
                 out=out_slice,
             )
 
