@@ -28,6 +28,8 @@ class RequestFuncInput:
     extra_body: Dict[str, Any] = field(default_factory=dict)
     image_paths: Optional[List[str]] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    slo_ms: Optional[float] = None
+    num_inference_steps: Optional[int] = None
 
 
 @dataclass
@@ -38,6 +40,7 @@ class RequestFuncOutput:
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
+    slo_achieved: Optional[bool] = None
 
 
 def is_dir_not_empty(path: str) -> bool:

@@ -20,7 +20,7 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
-- `docs/diffusion/performance/attention_backends.md`
+- `docs/diffusion/performance/attention_backends.md` (repo root)
 
 **Core Fusion Patterns**
 
@@ -109,3 +109,4 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - Keep CuTe compile cache keys aligned to `(dtype, ndim, D)`.
 - Avoid implicit broadcasts that force hidden `contiguous()` copies.
 - Preserve NPU and ROCm fallback paths.
+- **Always verify with ncu** (`ncu --set full`) that the kernel achieves adequate memory bandwidth utilization (>70% of peak for bandwidth-bound ops) and occupancy (>50%). See `diffusion-benchmark-and-profile.md` Step 3.5 for the ncu workflow.

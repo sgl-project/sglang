@@ -80,6 +80,7 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
@@ -199,6 +200,12 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.full_token_usage = Gauge(
+            name="sglang:full_token_usage",
+            documentation="The token usage for full attention layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -687,6 +694,14 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.gpu_overlap_wait_seconds_total = Counter(
+            name="sglang:gpu_overlap_wait_seconds_total",
+            documentation=(
+                "Total time that GPU forward stream was idle waiting for "
+                "the CPU schedule stream (overlap bubble)."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
@@ -758,22 +773,23 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-    def _log_gauge(self, gauge: Gauge, data: Union[int, float, QueueCount]) -> None:
-        # Convenience function for logging to gauge.
-        if isinstance(data, QueueCount):
-            # NOTE: When priority scheduling is enabled, the total is recorded under
-            # priority="" (the default label value). Per-priority breakdowns are recorded
-            # with priority="<int>". Grafana queries should use priority="" for totals.
-            gauge.labels(**self.labels).set(data.total)
-            if data.by_priority is not None:
-                self._known_priorities.update(data.by_priority.keys())
-                for priority in self._known_priorities:
-                    value = data.by_priority.get(priority, 0)
-                    labels = dict(self.labels)
-                    labels["priority"] = str(priority)
-                    gauge.labels(**labels).set(value)
-        else:
-            gauge.labels(**self.labels).set(data)
+    def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging a scalar to gauge.
+        gauge.labels(**self.labels).set(data)
+
+    def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
+        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
+        # NOTE: When priority scheduling is enabled, the total is recorded under
+        # priority="" (the default label value). Per-priority breakdowns are recorded
+        # with priority="<int>". Grafana queries should use priority="" for totals.
+        gauge.labels(**self.labels).set(data.total)
+        if data.by_priority is not None:
+            self._known_priorities.update(data.by_priority.keys())
+            for priority in self._known_priorities:
+                value = data.by_priority.get(priority, 0)
+                labels = dict(self.labels)
+                labels["priority"] = str(priority)
+                gauge.labels(**labels).set(value)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -850,9 +866,12 @@ class SchedulerMetricsCollector:
             num_retracted_output_tokens
         )
 
-    def increment_cuda_graph_pass(self, value: bool) -> None:
-        # leave room for piecewise cuda graph, etc
+    def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
+        mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
     def increment_eplb_balancedness(
@@ -884,6 +903,16 @@ class SchedulerMetricsCollector:
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
+    def increment_gpu_overlap_wait_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
+        self.gpu_overlap_wait_seconds_total.labels(
+            **self.labels, category=category
+        ).inc(t)
+
     def increment_gpu_execution_seconds(
         self,
         category: str,
@@ -900,9 +929,10 @@ class SchedulerMetricsCollector:
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
+        self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
@@ -910,7 +940,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
@@ -924,16 +954,16 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
         )
-        self._log_gauge(
+        self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
         # Retract

@@ -343,9 +343,9 @@ class DenoisingStage(PipelineStage):
             torch.full(
                 (batch_size,),
                 guidance_val,
-                dtype=torch.float32,
+                dtype=target_dtype,
                 device=device,
-            ).to(target_dtype)
+            )
             * 1000.0
         )
 
@@ -736,17 +736,6 @@ class DenoisingStage(PipelineStage):
             latents, batch
         )
 
-        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            offload_mgr.release_all()
-
-        if self.transformer_2 is not None:
-            offload_mgr_2 = getattr(
-                self.transformer_2, "_layerwise_offload_manager", None
-            )
-            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
-                offload_mgr_2.release_all()
-
         # Save STA mask search results if needed
         if (
             not is_warmup
@@ -754,6 +743,9 @@ class DenoisingStage(PipelineStage):
             and server_args.attention_backend_config.STA_mode == "STA_SEARCHING"
         ):
             self.save_sta_search_results(batch)
+
+        # Capture references before potential deletion on MPS
+        dits = list(filter(None, [self.transformer, self.transformer_2]))
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
@@ -772,7 +764,7 @@ class DenoisingStage(PipelineStage):
             )
 
         # reset offload managers with prefetching first layer for next forward
-        for dit in filter(None, [self.transformer, self.transformer_2]):
+        for dit in dits:
             if isinstance(dit, OffloadableDiTMixin):
                 # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
                 # TODO: should be make this an option?

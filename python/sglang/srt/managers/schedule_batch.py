@@ -39,6 +39,7 @@ import copy
 import dataclasses
 import logging
 import re
+from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -362,6 +363,7 @@ class MultimodalInputs:
     # QWen2-VL related
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -638,6 +640,7 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+        self.last_host_backup_node: Any = None
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -723,8 +726,10 @@ class Req(ReqDllmMixin):
         self.embedding = None
 
         # Constrained decoding
-        self.grammar_key: Optional[str] = None
-        self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_key: Optional[Tuple[str, str]] = None
+        self.grammar: Optional[Union[BaseGrammarObject, Future[BaseGrammarObject]]] = (
+            None
+        )
         self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
@@ -856,7 +861,11 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        cow_mamba: Optional[bool] = None,
+    ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -872,27 +881,34 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
+            if cow_mamba is None:
+                cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self,
-                    cow_mamba=tree_cache.supports_mamba(),
+                    cow_mamba=cow_mamba,
                 )
             )
             (
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
+                self.last_host_backup_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
+                match_result.last_host_backup_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
-            self.cache_protected_len = len(self.prefix_indices)
+            if match_result.cache_protected_len is not None:
+                self.cache_protected_len = match_result.cache_protected_len
+            else:
+                self.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1108,6 +1124,14 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
+        # When using input_embeds, we cannot easily mix the original input embeddings
+        # with the newly generated output token IDs during re-prefill of retracted request.
+        # output_ids will have no use, but will lead to wrong size cache indexes.
+        # Therefore, we discard the generated output_ids and restart prefill and generation
+        # to ensure shape consistency in KV cache.
+        if self.input_embeds is not None:
+            self.output_ids = []
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1144,7 +1168,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids) - 1
+            logprob_start_len = len(self.fill_ids)
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -1203,6 +1227,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -1503,8 +1528,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # If req.input_embeds is already a list, append its content directly
-                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+                # Slice to match extend_input_len — PrefillAdder truncates
+                # fill_ids/extend_input_len on chunk overflow but not input_embeds.
+                input_embeds.extend(
+                    req.input_embeds[pre_len : pre_len + req.extend_input_len]
+                )
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1568,7 +1596,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.fill_ids),
                 )
                 if req.logprob_start_len == -1:
-                    logprob_start_len = len(req.origin_input_ids) - 1
+                    logprob_start_len = len(req.origin_input_ids)
                 else:
                     logprob_start_len = req.logprob_start_len
                 # Apply logprob_start_len
@@ -1626,6 +1654,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # The reference by CudaIpcTensorTransportProxy was cut off,
                     # proactively delete to avoid slow gc.
                     del pixel_values
+                if get_global_server_args().language_only:
+                    precomputed_embeddings = getattr(
+                        mm_item, "precomputed_embeddings", None
+                    )
+                    if isinstance(precomputed_embeddings, torch.Tensor):
+                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
+                            self.device, non_blocking=True
+                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1861,12 +1897,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
+        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
-            # Retracting loops ends and still not enough memory
-            raise ValueError(
-                "Out of memory even after retracting all other requests in the decode batch."
+            # Even the last remaining request cannot fit in memory.
+            # Instead of crashing the scheduler, gracefully abort it.
+            last_idx = sorted_indices.pop()
+            last_req = self.reqs[last_idx]
+            last_req.to_finish = FINISH_ABORT(
+                "Out of memory even after retracting all other requests "
+                "in the decode batch. Aborting the last request.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            reqs_to_abort.append(last_req)
+            self.release_req(last_idx, 0, server_args)
+            logger.warning(
+                "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1883,7 +1930,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
@@ -1911,7 +1958,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1929,6 +1976,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        # Decode embeds the last output token via embed_tokens; clear the stale
+        # prefill-time tensor so it doesn't leak into ForwardBatch.
+        self.input_embeds = None
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
@@ -2213,6 +2263,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -2394,6 +2445,9 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None
+
+    # token table for ngram embedding
+    ne_token_table: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
