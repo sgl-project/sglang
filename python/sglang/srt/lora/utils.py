@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
@@ -91,16 +92,28 @@ def get_hidden_dim(
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "get_hidden_dim not implemented for " + module_name
+            )
 
 
 def get_normalized_target_modules(
-    target_modules: Iterable[str],
+    target_modules: Union[str, Iterable[str]],
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+
+    Also handles PEFT shorthand strings like "all-linear" or "all" by returning
+    {"all"} as a sentinel value (the caller should check for "all" and fall
+    back to the CLI --lora-target-modules to determine the concrete module set).
     """
+    # Handle PEFT shorthand strings — these cannot be resolved to concrete
+    # module names without inspecting the base model, so we return {"all"}
+    # and let the caller fall back to the CLI --lora-target-modules.
+    if isinstance(target_modules, str):
+        return {"all"}
+
     params_mapping = {
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
@@ -113,6 +126,7 @@ def get_normalized_target_modules(
         "word_embeddings": "embed_tokens",
         "lm_head": "lm_head",
         "output": "lm_head",
+        "unembed_tokens": "lm_head",
     }
 
     result = set()
@@ -151,3 +165,31 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+
+
+def generate_sequence_lengths(
+    forward_batch: ForwardBatch, device: Optional[torch.device] = None
+) -> torch.Tensor:
+
+    device = torch.get_default_device() if device is None else device
+    with torch.device(device):
+        if forward_batch.forward_mode.is_decode():
+            seg_lens = torch.ones(forward_batch.batch_size, dtype=torch.int32)
+        elif forward_batch.forward_mode.is_target_verify():
+            seg_lens = torch.full(
+                size=(forward_batch.batch_size,),
+                fill_value=forward_batch.spec_info.draft_token_num,
+                dtype=torch.int32,
+            )
+        elif forward_batch.forward_mode.is_extend():
+            seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.extend_seq_lens.device == device
+                else torch.tensor(
+                    forward_batch.extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
+    return seg_lens

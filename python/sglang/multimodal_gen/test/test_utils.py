@@ -1,21 +1,20 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
-import dataclasses
+import io
 import json
 import os
-import shlex
 import socket
 import subprocess
-import sys
+import tempfile
 import time
-import unittest
 from pathlib import Path
-from typing import Optional
+from urllib.parse import urljoin
 
 import cv2
+import httpx
+import numpy as np
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -25,6 +24,67 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Common model IDs for diffusion tests
+#
+# Centralised here so every test file references the same constants instead
+# of scattering hard-coded strings. When adding a new model that will be
+# reused across tests, define it here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+
+# Qwen image generation models
+DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
+DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
+DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
+DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"
+DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2511"
+DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
+
+# FLUX image generation models
+DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"
+DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-dev"
+DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST = (
+    "black-forest-labs/FLUX.2-klein-base-4B"
+)
+
+# Wan video generation models
+DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+)
+DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+)
+DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+
+
+def print_value_formatted(description: str, value: int | float | str):
+    """Helper function to print a metric value formatted."""
+    if isinstance(value, int):
+        if value >= 1e6:
+            value_str = f"{value / 1e6:<30.2f}M"
+        elif value >= 1e3:
+            value_str = f"{value / 1e3:<30.2f}K"
+        else:
+            value_str = f"{value:<30}"
+    elif isinstance(value, float):
+        value_str = f"{value:<30.2f}"
+    else:
+        value_str = f"{value:<30}"
+
+    print(f"{description:<45} {value_str}")
+
+
+def print_divider(length: int, char: str = "-"):
+    """Helper function to print a divider line."""
+    print(char * length)
+
 
 def is_image_url(image_path: str | Path | None) -> bool:
     """Check if image_path is a URL."""
@@ -33,31 +93,6 @@ def is_image_url(image_path: str | Path | None) -> bool:
     return isinstance(image_path, str) and (
         image_path.startswith("http://") or image_path.startswith("https://")
     )
-
-
-def run_command(command) -> Optional[float]:
-    """Runs a command and returns the execution time and status."""
-    print(f"Running command: {shlex.join(command)}")
-
-    duration = None
-    with subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-    ) as process:
-        for line in process.stdout:
-            sys.stdout.write(line)
-            if "Pixel data generated" in line:
-                words = line.split(" ")
-                duration = float(words[-2])
-
-    if process.returncode == 0:
-        return duration
-    else:
-        print(f"Command failed with exit code {process.returncode}")
-        return None
 
 
 def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
@@ -91,6 +126,107 @@ def get_dynamic_server_port() -> int:
     return base_port + 1000
 
 
+def find_free_port(host: str = "127.0.0.1") -> int:
+    """Bind to port 0 and let the OS assign an available port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def wait_for_server_health(
+    base_url: str,
+    path: str = "/health",
+    timeout: float = 180.0,
+    interval: float = 1.0,
+) -> None:
+    """Poll ``GET <base_url><path>`` until it returns HTTP 200."""
+    deadline = time.time() + timeout
+    last_err: httpx.RequestError | None = None
+    last_status: int | None = None
+    while time.time() < deadline:
+        try:
+            r = httpx.get(urljoin(base_url, path), timeout=5.0)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return
+        except httpx.RequestError as e:
+            last_err = e
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Server at {urljoin(base_url, path)} not healthy after {timeout}s. "
+        f"{last_status=} {last_err=}"
+    )
+
+
+def post_json(
+    base_url: str,
+    path: str,
+    payload: dict,
+    timeout: float = 300.0,
+) -> httpx.Response:
+    """POST JSON to ``<base_url><path>`` and return the response."""
+    return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# GPU memory helpers (nvidia-smi)
+# ---------------------------------------------------------------------------
+
+
+def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | None:
+    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure.
+
+    When *required* is ``True`` the function raises instead of returning ``None``.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip()
+        return int(out.splitlines()[0].strip())
+    except Exception as e:
+        logger.warning(f"nvidia-smi memory query failed: {type(e).__name__}: {e}")
+        assert not required, (
+            "nvidia-smi memory query is unavailable; "
+            "cannot enforce GPU memory assertions."
+        )
+        return None
+
+
+def require_gpu_mem_query(gpu_index: int = 0) -> int:
+    """Same as :func:`query_gpu_mem_used_mib` but asserts availability.
+
+    Raises ``AssertionError`` when ``nvidia-smi`` is unavailable instead of
+    returning ``None``, so callers can rely on a valid ``int`` result.
+    """
+    mem = query_gpu_mem_used_mib(gpu_index, required=True)
+    assert mem is not None
+    return mem
+
+
+def assert_gpu_mem_changed(
+    label: str,
+    before_mib: int,
+    after_mib: int,
+    min_delta_mib: int,
+) -> None:
+    """Assert that GPU memory changed by at least *min_delta_mib* MiB."""
+    delta = abs(after_mib - before_mib)
+    logger.debug(
+        f"[MEM] {label}: before={before_mib} MiB  after={after_mib} MiB  |delta|={delta} MiB"
+    )
+    assert delta >= min_delta_mib, (
+        f"GPU memory change too small for '{label}': "
+        f"|after-before|={delta} MiB < {min_delta_mib} MiB "
+        f"(before={before_mib} MiB, after={after_mib} MiB)"
+    )
+
+
 def is_mp4(data: bytes) -> bool:
     """Check if data represents a valid MP4 file by magic bytes."""
     if len(data) < 8:
@@ -111,6 +247,19 @@ def is_png(data):
 def is_webp(data: bytes) -> bool:
     # WebP files start with: RIFF....WEBP
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def detect_image_format(data: bytes) -> str:
+    """Detect image format from bytes (magic). Returns 'png'|'jpeg'|'webp'; default 'png'."""
+    if len(data) < 12:
+        return "png"
+    if is_png(data):
+        return "png"
+    if is_jpeg(data):
+        return "jpeg"
+    if is_webp(data):
+        return "webp"
+    return "png"
 
 
 def get_expected_image_format(
@@ -198,10 +347,9 @@ def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
 
 def wait_for_req_perf_record(
     request_id: str,
-    prev_len: int,
     log_path: Path,
     timeout: float = 30.0,
-) -> tuple[RequestPerfRecord | None, int]:
+) -> RequestPerfRecord | None:
     """
     the stage metrics of this request should be in the performance_log file with {request-id}
     """
@@ -209,16 +357,14 @@ def wait_for_req_perf_record(
     deadline = time.time() + timeout
     while time.time() < deadline:
         records = read_perf_logs(log_path)
-        if len(records) >= prev_len + 1:
-            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
-            # potential error when there are multiple servers
-            return records[-1], len(records)
+        for record in records:
+            if record.request_id == request_id:
+                return record
 
         time.sleep(0.5)
 
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-        records = read_perf_logs(log_path)
-        return None, len(records)
+        return None
 
     logger.error(f"record: {records}")
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
@@ -312,7 +458,7 @@ def _get_video_dimensions_from_metadata(
     if width == 0 or height == 0:
         return None
 
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
@@ -324,8 +470,6 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to read a frame from the video
     """
     ret, frame = cap.read()
     if not ret or frame is None:
@@ -333,7 +477,7 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
 
     # frame.shape is (height, width, channels)
     height, width = frame.shape[:2]
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def get_video_dimensions(file_path: str) -> tuple[int, int]:
@@ -341,14 +485,9 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
 
     Tries to get dimensions from metadata first, falls back to reading first frame.
 
-    Args:
-        file_path: Path to the video file
-
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to get video dimensions
     """
     cap = cv2.VideoCapture(file_path)
     try:
@@ -359,6 +498,22 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
 
         # Fall back to reading first frame
         return _get_video_dimensions_from_frame(cap)
+    finally:
+        cap.release()
+
+
+def get_video_frame_count(file_path: str) -> int:
+    """Return the number of frames in a video file using OpenCV."""
+    cap = cv2.VideoCapture(file_path)
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if count > 0:
+            return count
+        # Fallback: count frames manually
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        return n
     finally:
         cap.release()
 
@@ -402,197 +557,86 @@ def validate_video_file(
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
 
 
-@dataclasses.dataclass
-class TestResult:
-    name: str
-    key: str
-    duration: Optional[float]
-    succeed: bool
+def output_format_to_ext(output_format: str | None) -> str:
+    """Map output_format to file extension. Used by GT naming and consistency check."""
+    if not output_format:
+        return "png"
+    of = output_format.lower()
+    if of == "jpeg":
+        return "jpg"
+    if of in ("png", "webp", "jpg"):
+        return of
+    return "png"
 
-    @property
-    def duration_str(self):
-        return f"{self.duration:.4f}" if self.duration else "NA"
+
+def _consistency_gt_filenames(
+    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+) -> list[str]:
+    """Return the list of GT image filenames for a case. Reused by GT generation and consistency check."""
+    n = num_gpus
+    if is_video:
+        return [
+            f"{case_id}_{n}gpu_frame_0.png",
+            f"{case_id}_{n}gpu_frame_mid.png",
+            f"{case_id}_{n}gpu_frame_last.png",
+        ]
+    ext = output_format_to_ext(output_format)
+    return [f"{case_id}_{n}gpu.{ext}"]
 
 
-class TestCLIBase(unittest.TestCase):
-    model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-    # tested on h100
-    thresholds = {}
+def extract_key_frames_from_video(
+    video_bytes: bytes,
+    num_frames: int | None = None,
+) -> list[np.ndarray]:
+    """
+    Extract key frames (first, middle, last) from video bytes.
 
-    width: int = 720
-    height: int = 720
-    output_path: str = "test_outputs"
+    Args:
+        video_bytes: Raw video bytes (MP4 format)
+        num_frames: Total number of frames (if known), used for validation
 
-    base_command = [
-        "sglang",
-        "generate",
-        "--text-encoder-cpu-offload",
-        "--pin-cpu-memory",
-        "--prompt",
-        "A curious raccoon",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
+    Returns:
+        List of numpy arrays [first_frame, middle_frame, last_frame].
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
 
-    results = []
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("Failed to open video file")
 
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 1:
+            raise ValueError("Video has no frames")
 
-    def _run_command(self, name: str, model_path: str, test_key: str = "", args=[]):
-        command = (
-            self.base_command
-            + [f"--model-path={model_path}"]
-            + shlex.split(args or "")
-            + ["--output-file-name", f"{name}"]
-            + self.extra_args
+        first_idx = 0
+        mid_idx = total_frames // 2
+        last_idx = total_frames - 1
+        key_indices = [first_idx, mid_idx, last_idx]
+
+        frames = []
+        for idx in key_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                raise ValueError(f"Failed to read frame at index {idx}")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+
+        cap.release()
+        logger.info(
+            f"Extracted {len(frames)} key frames from video "
+            f"(total: {total_frames}, indices: {key_indices})"
         )
-        duration = run_command(command)
-        status = "Success" if duration else "Failed"
-        succeed = duration is not None
+        return frames
 
-        duration = float(duration) if succeed else None
-        self.results.append(TestResult(name, test_key, duration, succeed))
-
-        return name, duration, status
+    finally:
+        os.unlink(tmp_path)
 
 
-class TestGenerateBase(TestCLIBase):
-    model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-    # tested on h100
-    thresholds = {}
-
-    width: int = 720
-    height: int = 720
-    output_path: str = "test_outputs"
-    image_path: str | None = None
-    prompt: str | None = "A curious raccoon"
-
-    base_command = [
-        "sglang",
-        "generate",
-        # "--text-encoder-cpu-offload",
-        # "--pin-cpu-memory",
-        f"--prompt",
-        f"{prompt}",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
-
-    results: list[TestResult] = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
-
-    @classmethod
-    def tearDownClass(cls):
-        # Print markdown table
-        print("\n## Test Results\n")
-        print("| Test Case                      | Duration | Status  |")
-        print("|--------------------------------|----------|---------|")
-        test_keys = ["test_single_gpu", "test_cfg_parallel", "test_usp", "test_mixed"]
-        test_key_to_order = {
-            test_key: order for order, test_key in enumerate(test_keys)
-        }
-
-        ordered_results: list[TestResult] = [None] * len(test_keys)
-        for result in cls.results:
-            order = test_key_to_order[result.key]
-            ordered_results[order] = result
-
-        for result in ordered_results:
-            if not result:
-                continue
-            status = (
-                "Succeed"
-                if (
-                    result.succeed
-                    and float(result.duration) <= float(cls.thresholds[result.key])
-                )
-                else "Failed"
-            )
-            print(f"| {result.name:<30} | {result.duration_str:<8} | {status:<7} |")
-        print()
-        durations = [result.duration_str for result in cls.results]
-        print(" | ".join([""] + durations + [""]))
-
-    def _run_test(self, name: str, args, model_path: str, test_key: str):
-        time_threshold = self.thresholds[test_key]
-        name, duration, status = self._run_command(
-            name, args=args, model_path=model_path, test_key=test_key
-        )
-        self.verify(status, name, duration, time_threshold)
-
-    def verify(self, status, name, duration, time_threshold):
-        print("-" * 80)
-        print("\n" * 3)
-
-        # test task status
-        self.assertEqual(status, "Success", f"{name} command failed")
-        self.assertIsNotNone(duration, f"Could not parse duration for {name}")
-        self.assertLessEqual(
-            duration,
-            time_threshold,
-            f"{name} failed with {duration:.4f}s > {time_threshold}s",
-        )
-
-        # test output file
-        path = os.path.join(
-            self.output_path, f"{name}.{self.data_type.get_default_extension()}"
-        )
-        self.assertTrue(os.path.exists(path), f"Output file not exist for {path}")
-        if self.data_type == DataType.IMAGE:
-            with Image.open(path) as image:
-                check_image_size(self, image, self.width, self.height)
-        logger.info(f"{name} passed in {duration:.4f}s (threshold: {time_threshold}s)")
-
-    def model_name(self):
-        return self.model_path.split("/")[-1]
-
-    def test_single_gpu(self):
-        """single gpu"""
-        self._run_test(
-            name=f"{self.model_name()}_single_gpu",
-            args=None,
-            model_path=self.model_path,
-            test_key="test_single_gpu",
-        )
-
-    def test_cfg_parallel(self):
-        """cfg parallel"""
-        self._run_test(
-            name=f"{self.model_name()}_cfg_parallel",
-            args="--num-gpus 2 --enable-cfg-parallel",
-            model_path=self.model_path,
-            test_key="test_cfg_parallel",
-        )
-
-    def test_usp(self):
-        """usp"""
-        self._run_test(
-            name=f"{self.model_name()}_usp",
-            args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
-            model_path=self.model_path,
-            test_key="test_usp",
-        )
-
-    def test_mixed(self):
-        """mixed"""
-        self._run_test(
-            name=f"{self.model_name()}_mixed",
-            args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",
-            model_path=self.model_path,
-            test_key="test_mixed",
-        )
+def image_bytes_to_numpy(image_bytes: bytes) -> np.ndarray:
+    """Convert image bytes to numpy array."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.array(img)

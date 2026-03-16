@@ -5,7 +5,7 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 
@@ -283,24 +283,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         """
         with torch.device("cpu"):
             seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
-
-            if forward_batch.forward_mode.is_decode():
-                seg_lens_cpu = torch.ones(forward_batch.batch_size, dtype=torch.int32)
-            elif forward_batch.forward_mode.is_target_verify():
-                seg_lens_cpu = torch.full(
-                    size=(forward_batch.batch_size,),
-                    fill_value=forward_batch.spec_info.draft_token_num,
-                    dtype=torch.int32,
-                )
-            elif forward_batch.forward_mode.is_extend():
-                seg_lens_cpu = torch.tensor(
-                    forward_batch.extend_seq_lens_cpu,
-                    dtype=torch.int32,
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported forward mode: {forward_batch.forward_mode}"
-                )
+            seg_lens_cpu = generate_sequence_lengths(forward_batch)
 
             row_weight_indices = torch.repeat_interleave(
                 seq_weight_indices, seg_lens_cpu

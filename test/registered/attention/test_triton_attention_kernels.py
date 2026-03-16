@@ -19,11 +19,12 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=30, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
 
 
 def extend_attention_fwd_torch(
@@ -98,6 +99,54 @@ def extend_attention_fwd_torch(
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         o[q_start:q_end] = torch.einsum("qhk,khd->qhd", attn_weights, v_full_hq)
+
+
+def decode_attention_fwd_torch(
+    q: torch.Tensor,  # [B, H_Q, D]
+    k_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
+    v_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
+    kv_indptr: torch.Tensor,  # [B+1]
+    kv_indices: torch.Tensor,  # [prefix_tokens]
+    sm_scale: float,
+):
+    """
+    Torch reference implementation for decode attention with stable softmax.
+    Supports both MHA and GQA configurations.
+    """
+    B = kv_indptr.size(0) - 1
+    _, H_Q, D = q.shape
+    _, H_KV, _ = k_buffer.shape
+
+    assert H_Q % H_KV == 0, "H_Q must be divisible by H_KV for GQA"
+    group_size = H_Q // H_KV
+
+    o_ref = torch.empty((B, H_Q, D), dtype=torch.float32, device=q.device)
+
+    for b in range(B):
+        start = int(kv_indptr[b].item())
+        end = int(kv_indptr[b + 1].item())
+        idx = kv_indices[start:end]
+
+        k_seq = k_buffer.index_select(0, idx)  # [L, H_KV, D]
+        v_seq = v_buffer.index_select(0, idx)  # [L, H_KV, D]
+
+        if H_KV != H_Q:
+            k_seq = k_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+            v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+
+        q_f32 = q[b].to(torch.float32)  # [H_Q, D]
+        k_f32 = k_seq.to(torch.float32)  # [L, H_Q, D]
+        v_f32 = v_seq.to(torch.float32)  # [L, H_Q, D]
+
+        # logits: [H_Q, L]
+        logits = torch.einsum("hd,lhd->hl", q_f32, k_f32) * float(sm_scale)
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        p = torch.softmax(logits, dim=-1)  # [H_Q, L]
+
+        # out: [H_Q, D]
+        o_ref[b] = torch.einsum("hl,lhd->hd", p, v_f32)
+
+    return o_ref
 
 
 class TestTritonAttention(CustomTestCase):
@@ -202,6 +251,8 @@ class TestTritonAttention(CustomTestCase):
             True,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         b_seq_mask_len = b_seq_len_extend * b_seq_len
@@ -237,6 +288,8 @@ class TestTritonAttention(CustomTestCase):
             True,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         redundant_attention(
@@ -251,8 +304,10 @@ class TestTritonAttention(CustomTestCase):
             max_len_in_batch,
         )
 
-        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
-        self.assertTrue(torch.allclose(o_extend_mask, o_redundant, rtol=1e-2))
+        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2, atol=1e-3))
+        self.assertTrue(
+            torch.allclose(o_extend_mask, o_redundant, rtol=1e-2, atol=1e-3)
+        )
 
     def test_extend_attention(self):
 
@@ -346,6 +401,8 @@ class TestTritonAttention(CustomTestCase):
             is_causal=True,
             mask_indptr=None,
             max_len_extend=max_len_extend,
+            k_scale=1.0,
+            v_scale=1.0,
             sliding_window_size=WINDOW_SIZE,
         )
 
@@ -468,12 +525,22 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
+            1.0,
+        )
+
+        # Correctness reference (float32, stable softmax)
+        o_ref = decode_attention_fwd_torch(
+            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
+        )
+
+        max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.to(torch.float32), o_ref, atol=1e-2, rtol=1e-2),
+            msg=f"decode_attention mismatch, max_abs_err={max_abs_err}",
         )
 
     def test_decode_attention(self):
-        # Here we just to ensure there is no error
-        # TODO: correctnesss test
-
         # Test configurations
         configs = [
             (2, 4, 4, 64),  # MHA
@@ -534,6 +601,7 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
         )
 
         attn_logits1 = torch.empty(
@@ -559,6 +627,7 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
@@ -566,7 +635,10 @@ class TestTritonAttention(CustomTestCase):
         )
         print(cos_sim.item())
         self.assertTrue(cos_sim.item() > 0.99)
-        self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
+        if is_in_amd_ci():
+            self.assertTrue(torch.allclose(o, o_grouped, atol=5e-2))
+        else:
+            self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
 
     def test_grouped_decode_attention(self):
         seq_lens = [5, 100, 128, 500]
@@ -662,6 +734,8 @@ class TestTritonAttention(CustomTestCase):
             is_causal=True,
             mask_indptr=None,
             max_len_extend=max_len_extend,
+            k_scale=1.0,
+            v_scale=1.0,
         )
 
         # Build unified KV indices
@@ -690,6 +764,8 @@ class TestTritonAttention(CustomTestCase):
             o_unified,
             k_buffer,
             v_buffer,
+            1.0,
+            1.0,
             qo_indptr,
             unified_kv_indptr,
             unified_kv_indices,
@@ -703,11 +779,18 @@ class TestTritonAttention(CustomTestCase):
         )
 
         # Compare results
-        self.assertTrue(
-            torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.15),
-            f"Unified kernel output differs from 2-stage kernel. "
-            f"Max diff: {(o_regular - o_unified).abs().max()}",
-        )
+        if is_in_amd_ci():
+            self.assertTrue(
+                torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.17),
+                f"Unified kernel output differs from 2-stage kernel. "
+                f"Max diff: {(o_regular - o_unified).abs().max()}",
+            )
+        else:
+            self.assertTrue(
+                torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.15),
+                f"Unified kernel output differs from 2-stage kernel. "
+                f"Max diff: {(o_regular - o_unified).abs().max()}",
+            )
 
     def test_extend_attention_unified_vs_regular(self):
         """Test unified kernel matches 2-stage kernel across different configs."""

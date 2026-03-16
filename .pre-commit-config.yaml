@@ -1,9 +1,9 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^python/sglang/multimodal_gen/csrc
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/jit_kernel/flash_attention/cute)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-symlinks
       - id: destroyed-symlinks
@@ -17,15 +17,16 @@ repos:
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
+        exclude: ^sgl-model-gateway/tests/.*_test\.rs$
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
+    rev: 7.0.0
     hooks:
       - id: isort
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.7
+    rev: v0.15.1
     hooks:
       - id: ruff
         args:
@@ -42,7 +43,7 @@ repos:
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
           )$
   - repo: https://github.com/psf/black
-    rev: 24.10.0
+    rev: 26.1.0
     hooks:
       - id: black-jupyter
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
@@ -50,28 +51,33 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        additional_dependencies: ['tomli']
-        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge,PRIS']
-        exclude: |
-          (?x)^(
-            test/srt/test_reasoning_parser\.py|
-            docs/advanced_features/vlm_query\.ipynb|
-            python/sglang/srt/grpc/.*_pb2\.py|
-            python/sglang/srt/grpc/.*_pb2_grpc\.py|
-            python/sglang/srt/grpc/.*_pb2\.pyi|
-            python/sglang/srt/grpc/.*_pb2_grpc\.pyi|
-            sgl-model-gateway/src/tokenizer/chat_template\.rs
-          )$
+        args: ['--config', '.codespellrc']
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v18.1.8
+    rev: v20.1.7
     hooks:
     - id: clang-format
       types_or: [c++, cuda]
       args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
+    rev: 0.9.0
     hooks:
       - id: nbstripout
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: local
+    hooks:
+      - id: check-chinese-characters
+        name: check chinese characters in multimodal_gen
+        entry: >-
+          python3 -c 'import sys, re; p=re.compile(r"[\u4e00-\u9fff]"); ec=0; [ ([(print(f"{f}:{i+1}: {l.strip()}") or (ec:=1)) for i,l in enumerate(open(f, "r", encoding="utf-8", errors="ignore")) if p.search(l)]) for f in sys.argv[1:] ]; sys.exit(ec)'
+        language: system
+        files: ^python/sglang/multimodal_gen/.*
+        exclude: ^(python/sglang/multimodal_gen/configs/sample|python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/workflows|python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages)(/|$)
+        types_or: [python, markdown, json, text]
+      - id: sort-ci-permissions
+        name: sort CI_PERMISSIONS.json
+        entry: python3 .github/update_ci_permission.py --sort-only
+        language: system
+        files: ^\.github/CI_PERMISSIONS\.json$
+        pass_filenames: false

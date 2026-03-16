@@ -1,12 +1,13 @@
 """
-    This generates gpu kernel analysis output from nsys rep. Will call nsys
-    stats  -r cuda_gpu_kern_trace, get non-overlapped gpu cycles, then generate
-    csv and html output for analysis
+This generates gpu kernel analysis output from nsys rep. Will call nsys
+stats  -r cuda_gpu_kern_trace, get non-overlapped gpu cycles, then generate
+csv and html output for analysis
 """
 
 import argparse
 import logging
 import os
+import shlex
 
 import regex as re
 
@@ -24,7 +25,9 @@ def load_engine_model():
     json_files = glob.glob(os.path.join(os.path.dirname(__file__) or ".", "*.json"))
     for fname in json_files:
         with open(fname, encoding="utf-8") as f:
-            engine_model.update(json.load(f))
+            file_engine_model = json.load(f)
+        for engine, models in file_engine_model.items():
+            engine_model.setdefault(engine, {}).update(models)
     return engine_model
 
 
@@ -37,7 +40,6 @@ class GPUTrace2Graph:
         import pandas as pd  # avoid importing till needed
 
         self.pd = pd
-        self.pd.options.mode.copy_on_write = True
 
     # helper functions for generating trace->summary csvs
     def gen_nonoverlapped_sum_from_gputrace(self, in_file, out_file):
@@ -223,7 +225,7 @@ class GPUTrace2Graph:
                 "-o",
                 f"{file_dir}/{file_name}",
             ]
-            cmd_str = " ".join(cmd)
+            cmd_str = shlex.join(cmd)
             logger.info("+ %s", cmd_str)
             # estimate time based on calibrated 240M/min
             file_size_mb = os.path.getsize(file) / 1e6

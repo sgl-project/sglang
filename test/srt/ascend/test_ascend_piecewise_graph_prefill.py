@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-MODEL = "Qwen/Qwen2.5-7B-Instruct"
+MODEL = "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct"
 GSM8K_EXP_ACCURACY = 0.84
 EXP_PREFILL_LATENCY = 0.045
 TOKENS_TO_CAPTURE = [i for i in range(128, 4096, 128)]
@@ -36,9 +36,9 @@ class TestPiecewiseGraphPrefillCorrectness(CustomTestCase):
                 "ascend",
                 "--cuda-graph-bs",
                 128,
-                "--enable-piecewise-cuda-graph",
+                "--enforce-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
-                TOKENS_TO_CAPTURE,
+                *TOKENS_TO_CAPTURE,
             ],
         )
 
@@ -77,10 +77,10 @@ class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
                 0.8,
                 "--attention-backend",
                 "ascend",
-                "--enable-piecewise-cuda-graph",
+                "--enforce-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
-                TOKENS_TO_CAPTURE,
-            ],
+            ]
+            + TOKENS_TO_CAPTURE,
         )
         self.assertLess(prefill_latency, EXP_PREFILL_LATENCY)
 

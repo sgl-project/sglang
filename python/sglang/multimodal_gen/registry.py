@@ -12,13 +12,28 @@ import importlib
 import os
 import pkgutil
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
+    HeliosDistilledConfig,
+    HeliosMidConfig,
+    HeliosT2VConfig,
     HunyuanConfig,
-    StepVideoT2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -26,31 +41,68 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinPipelineConfig,
+    Flux2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import (
+    MOVA360PConfig,
+    MOVA720PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlus_2511_PipelineConfig,
     QwenImageEditPlusPipelineConfig,
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    TurboWanI2V720Config,
+    TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinSamplingParams,
+    FluxSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.helios import (
+    HeliosDistilledSamplingParams,
+    HeliosMidSamplingParams,
+    HeliosT2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.mova import (
+    MOVA_360P_SamplingParams,
+    MOVA_720P_SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
+    QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
+from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
+    Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
     Wan2_2_T2V_A14B_SamplingParam,
@@ -60,7 +112,10 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+from sglang.multimodal_gen.configs.sample.zimage import (
+    ZImageSamplingParams,
+    ZImageTurboSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -75,6 +130,10 @@ logger = init_logger(__name__)
 # --- Part 1: Pipeline Discovery ---
 
 _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
+
+# Registry for pipeline configuration classes (for safetensors files without model_index.json)
+# Maps pipeline_class_name -> (PipelineConfig class, SamplingParams class)
+_PIPELINE_CONFIG_REGISTRY: Dict[str, Tuple[Type[PipelineConfig], Type[Any]]] = {}
 
 
 def _discover_and_register_pipelines():
@@ -102,15 +161,43 @@ def _discover_and_register_pipelines():
                 )
 
                 for cls in entry_cls_list:
-                    if hasattr(cls, "pipeline_name"):
-                        if cls.pipeline_name in _PIPELINE_REGISTRY:
-                            logger.warning(
-                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                            )
-                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+                    if not issubclass(cls, ComposedPipelineBase):
+                        continue
+                    if cls.pipeline_name in _PIPELINE_REGISTRY:
+                        logger.warning(
+                            f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                        )
+                    _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+
+                    # Special handling for ComfyUI Pipelines:
+                    # Auto-register config classes if Pipeline class has them defined
+                    # since comfyui get model from a single weight file, so we need to register the config classes here
+                    if hasattr(cls, "pipeline_config_cls") and hasattr(
+                        cls, "sampling_params_cls"
+                    ):
+                        _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                            cls.pipeline_config_cls,
+                            cls.sampling_params_cls,
+                        )
+                        logger.debug(
+                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
+                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
+                            f"SamplingParams={cls.sampling_params_cls.__name__}"
+                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
+
+
+def get_pipeline_config_classes(
+    pipeline_class_name: str,
+) -> Tuple[Type[PipelineConfig], Type[Any]] | None:
+    """
+    Get the configuration classes for a pipeline.
+    """
+    # Ensure pipelines are discovered first
+    _discover_and_register_pipelines()
+    return _PIPELINE_CONFIG_REGISTRY.get(pipeline_class_name)
 
 
 # --- Part 2: Config Registration ---
@@ -163,15 +250,34 @@ def register_configs(
 
 def get_model_short_name(model_id: str) -> str:
     if "/" in model_id:
-        return model_id.split("/")[-1]
+        return model_id.rstrip("/").split("/")[-1]
     else:
         return model_id
 
 
-def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
+@lru_cache(maxsize=1)
+def _get_config_info(
+    model_path: str, model_id: Optional[str] = None
+) -> Optional[ConfigInfo]:
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+
+    # 0. Explicit model_id override: match by short name
+    if model_id is not None:
+        model_id_lower = model_id.lower()
+        for registered_hf_id in all_model_hf_paths:
+            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
+                logger.debug(
+                    f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
+                )
+                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+        logger.warning(
+            f"--model-id '{model_id}' did not match any registered model; "
+            "falling back to automatic detection."
+        )
+
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
@@ -179,12 +285,11 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         return _CONFIG_REGISTRY.get(model_id)
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_name = get_model_short_name(model_path.lower())
-    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+    model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
-        if registered_model_name == model_name:
+        if registered_model_name in model_short_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
@@ -233,8 +338,65 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
+def _get_diffusers_model_info(
+    model_path: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> ModelInfo:
+    """
+    Get model info for diffusers backend.
+
+    Returns a ModelInfo with DiffusersPipeline and generic configs.
+    When model_path is provided and has a registered native config,
+    inherits task_type from it so that validation (e.g. accepts_image_input)
+    works correctly even under the diffusers backend.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DiffusersGenericPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.diffusers_generic import (
+        DiffusersGenericSamplingParams,
+    )
+    from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+        DiffusersPipeline,
+    )
+
+    pipeline_config_cls = DiffusersGenericPipelineConfig
+
+    # If there is a registered native config for this model, inherit its task_type
+    if model_path is not None:
+        config_info = _get_config_info(model_path, model_id=model_id)
+        if config_info is not None:
+            native_task_type = config_info.pipeline_config_cls.task_type
+            if native_task_type != DiffusersGenericPipelineConfig.task_type:
+                pipeline_config_cls = dataclasses.make_dataclass(
+                    "DiffusersGenericPipelineConfig",
+                    [
+                        (
+                            "task_type",
+                            type(native_task_type),
+                            dataclasses.field(default=native_task_type),
+                        )
+                    ],
+                    bases=(DiffusersGenericPipelineConfig,),
+                )
+                logger.debug(
+                    "Inherited task_type=%s from native config for diffusers backend",
+                    native_task_type.name,
+                )
+
+    return ModelInfo(
+        pipeline_cls=DiffusersPipeline,
+        sampling_param_cls=DiffusersGenericSamplingParams,
+        pipeline_config_cls=pipeline_config_cls,
+    )
+
+
 @lru_cache(maxsize=1)
-def get_model_info(model_path: str) -> Optional[ModelInfo]:
+def get_model_info(
+    model_path: str,
+    backend: Optional[Union[str, "Backend"]] = None,
+    model_id: Optional[str] = None,
+) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
 
@@ -243,56 +405,135 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
        '_class_name' against an auto-discovered registry of pipeline implementations.
     2. Resolves the associated configuration classes (for sampling and pipeline) using a
        manually registered mapping based on the model path.
+
+    Args:
+        backend: Backend to use ('auto', 'sglang', 'diffusers'). If None, uses 'auto'.
+
     """
+    # import Backend enum here to avoid circular imports
+    from sglang.multimodal_gen.runtime.server_args import Backend
+
+    # Normalize backend
+    if backend is None:
+        backend = Backend.AUTO
+    elif isinstance(backend, str):
+        backend = Backend.from_string(backend)
+
+    # Handle explicit diffusers backend
+    if backend == Backend.DIFFUSERS:
+        logger.info(
+            "Using diffusers backend for model '%s' (explicitly requested)", model_path
+        )
+        return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
+
+    # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
-    # 2. Get pipeline class from model's model_index.json
-    try:
-        if os.path.exists(model_path):
-            config = verify_model_config_and_directory(model_path)
-        else:
-            config = maybe_download_model_index(model_path)
-    except Exception as e:
-        logger.error(f"Could not read model config for '{model_path}': {e}")
-        return None
+    # Detect quantized models and fallback to diffusers
+    is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
+    if is_quantized and backend != Backend.DIFFUSERS:
+        logger.info(
+            "Detected a quantized model format ('%s'). "
+            "The native sglang-diffusion engine currently only supports BF16/FP16. "
+            "Falling back to diffusers backend.",
+            model_path,
+        )
+        return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
 
-    pipeline_class_name = config.get("_class_name")
-    if not pipeline_class_name:
-        logger.error(f"'_class_name' not found in model_index.json for '{model_path}'")
-        return None
+    # 2. Get pipeline class - check non-diffusers models first
+    pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_class_name:
+        # Known non-diffusers model, skip model_index.json download
+        logger.debug(
+            f"Using registered pipeline '{pipeline_class_name}' for non-diffusers model '{model_path}'"
+        )
+    else:
+        # Try to get from model_index.json
+        try:
+            if os.path.exists(model_path):
+                config = verify_model_config_and_directory(model_path)
+            else:
+                config = maybe_download_model_index(model_path)
+        except Exception as e:
+            logger.error(f"Could not read model config for '{model_path}': {e}")
+            if backend == Backend.AUTO:
+                logger.info("Falling back to diffusers backend")
+                return _get_diffusers_model_info(
+                    model_path=model_path, model_id=model_id
+                )
+            return None
+
+        pipeline_class_name = config.get("_class_name")
+        if not pipeline_class_name:
+            logger.error(
+                f"'_class_name' not found in model_index.json for '{model_path}'"
+            )
+            if backend == Backend.AUTO:
+                logger.info("Falling back to diffusers backend")
+                return _get_diffusers_model_info(
+                    model_path=model_path, model_id=model_id
+                )
+            return None
 
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
     if not pipeline_cls:
-        logger.error(
-            f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
-            f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
-        )
-        return None
+        if backend == Backend.AUTO:
+            logger.warning(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
+                f"Falling back to diffusers backend."
+            )
+            return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
+        else:
+            logger.error(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
+                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
+                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+            )
+            return None
 
     # 3. Get configuration classes (sampling, pipeline config)
-    config_info = _get_config_info(model_path)
+    config_info = _get_config_info(model_path, model_id=model_id)
     if not config_info:
-        logger.error(
-            f"Could not resolve configuration for model '{model_path}'. "
-            "It is not a registered model path or detected by any registered model family detectors. "
-            f"Known model paths: {list(_MODEL_HF_PATH_TO_NAME.keys())}"
-        )
-        return None
+        if backend == Backend.AUTO:
+            logger.warning(
+                f"Could not resolve native configuration for model '{model_path}'. "
+                f"Falling back to diffusers backend."
+            )
+            return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
+        else:
+            logger.error(
+                f"Could not resolve configuration for model '{model_path}'. "
+                "It is not a registered model path or detected by any registered model family detectors. "
+                f"Known model paths: {list(_MODEL_HF_PATH_TO_NAME.keys())}. "
+                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+            )
+            return None
 
-    # 4. Combine the complete model info
+    # 4. Combine and return the complete model info
+    logger.debug("Using native sglang backend for model '%s'", model_path)
     model_info = ModelInfo(
         pipeline_cls=pipeline_cls,
         sampling_param_cls=config_info.sampling_param_cls,
         pipeline_config_cls=config_info.pipeline_config_cls,
     )
-    logger.info(f"Found model info: {model_info}")
+    logger.debug(f"Found model info: {model_info}")
 
     return model_info
 
 
 # Registration of model configs
 def _register_configs():
+    # LTX-2
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: "ltx-2" in path.lower(),
+        ],
+    )
+
     # Hunyuan
     register_configs(
         sampling_param_cls=HunyuanSamplingParams,
@@ -300,7 +541,7 @@ def _register_configs():
         hf_model_paths=[
             "hunyuanvideo-community/HunyuanVideo",
         ],
-        model_detectors=[lambda hf_id: "hunyuan" in hf_id.lower()],
+        model_detectors=[lambda hf_id: "hunyuanvideo" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FastHunyuanSamplingParam,
@@ -309,17 +550,6 @@ def _register_configs():
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
-
-    # StepVideo
-    register_configs(
-        sampling_param_cls=StepVideoT2VSamplingParams,
-        pipeline_config_cls=StepVideoT2VConfig,
-        hf_model_paths=[
-            "FastVideo/stepvideo-t2v-diffusers",
-        ],
-        model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
-    )
-
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
@@ -330,10 +560,25 @@ def _register_configs():
         model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
     )
     register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=WanT2V_14B_SamplingParams,
         pipeline_config_cls=WanT2V720PConfig,
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
+            "IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers",
         ],
     )
     register_configs(
@@ -352,6 +597,13 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=Turbo_Wan2_2_I2V_A14B_SamplingParam,
+        pipeline_config_cls=TurboWanI2V720Config,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=Wan2_1_Fun_1_3B_InP_SamplingParams,
         pipeline_config_cls=WanI2V480PConfig,
         hf_model_paths=[
@@ -365,7 +617,6 @@ def _register_configs():
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         ],
     )
-
     register_configs(
         sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
         pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
@@ -374,7 +625,6 @@ def _register_configs():
             "FastVideo/FastWan2.2-TI2V-5B-Diffusers",
         ],
     )
-
     register_configs(
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
@@ -392,7 +642,21 @@ def _register_configs():
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
-
+    # MOVA
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -403,45 +667,174 @@ def _register_configs():
         model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
     )
     register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2-klein" in hf_id.lower()
+            or "flux2-klein" in hf_id.lower()
+        ],
+    )
+    register_configs(
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=ZImageTurboSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
         pipeline_config_cls=ZImagePipelineConfig,
         hf_model_paths=[
-            "Tongyi-MAI/Z-Image-Turbo",
+            "Tongyi-MAI/Z-Image",
         ],
-        model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
+        ],
     )
-
     # Qwen-Image
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        model_detectors=[
+            lambda hf_id: "qwen-image" in hf_id.lower()
+            and "edit" not in hf_id.lower()
+            and "layered" not in hf_id.lower()
+            and "2512" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=QwenImage2512SamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2512"],
+        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+        model_detectors=[
+            lambda hf_id: "qwen-image-edit" in hf_id.lower()
+            and "2509" not in hf_id.lower()
+            and "2511" not in hf_id.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageLayeredSamplingParams,
+        pipeline_config_cls=QwenImageLayeredPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Layered"],
+        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
+    )
+
+    register_configs(
+        sampling_param_cls=GlmImageSamplingParams,
+        pipeline_config_cls=GlmImagePipelineConfig,
+        model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D2PipelineConfig,
+        hf_model_paths=[
+            "tencent/Hunyuan3D-2",
+        ],
+        model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )
+
+    # Helios
+    register_configs(
+        sampling_param_cls=HeliosT2VSamplingParams,
+        pipeline_config_cls=HeliosT2VConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Base",
+        ],
+        model_detectors=[
+            lambda hf_id: "helios" in hf_id.lower()
+            and "mid" not in hf_id.lower()
+            and "distill" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosMidSamplingParams,
+        pipeline_config_cls=HeliosMidConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Mid",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosDistilledSamplingParams,
+        pipeline_config_cls=HeliosDistilledConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Distilled",
+        ],
+    )
+
+    # SANA
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
     )
 
 
 _register_configs()
+
+
+# Known non-diffusers multimodal model patterns
+# Maps pattern -> pipeline_name for models that don't have model_index.json
+_NON_DIFFUSERS_MULTIMODAL_PATTERNS: Dict[str, str] = {
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+}
+
+
+def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
+    model_path_lower = model_path.lower()
+    return any(
+        pattern in model_path_lower for pattern in _NON_DIFFUSERS_MULTIMODAL_PATTERNS
+    )
+
+
+def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
+    """Get the pipeline name for a known non-diffusers model."""
+    model_path_lower = model_path.lower()
+    for pattern, pipeline_name in _NON_DIFFUSERS_MULTIMODAL_PATTERNS.items():
+        if pattern in model_path_lower:
+            return pipeline_name
+    return None

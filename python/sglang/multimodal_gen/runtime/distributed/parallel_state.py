@@ -1,5 +1,4 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
@@ -30,9 +29,10 @@ The typical workflow is:
 If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
+
 import contextlib
+import datetime
 import os
-import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -72,7 +72,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: dict[str, torch.Tensor | Any]
+    tensor_dict: dict[str, torch.Tensor | Any],
 ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -220,6 +220,7 @@ def init_distributed_environment(
     local_rank: int = 0,
     backend: str = "nccl",
     device_id: torch.device | None = None,
+    timeout: int | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -230,12 +231,14 @@ def init_distributed_environment(
         logger.info("Using gloo backend for %s platform", current_platform.device_name)
 
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d "
+        "distributed_init_method=%s backend=%s timeout=%s",
         world_size,
         rank,
         local_rank,
         distributed_init_method,
         backend,
+        timeout,
     )
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
@@ -243,8 +246,22 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, don't pass device_id as it doesn't support device indices
-        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
+        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        extra_args = (
+            {}
+            if (
+                current_platform.is_mps()
+                or current_platform.is_musa()
+                or current_platform.is_npu()
+            )
+            else dict(device_id=device_id)
+        )
+
+        if timeout is not None:
+
+            extra_args["timeout"] = datetime.timedelta(seconds=timeout)
+            logger.info(f"Setting distributed timeout to {timeout} seconds")
+
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -252,6 +269,7 @@ def init_distributed_environment(
             rank=rank,
             **extra_args,
         )
+
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -341,7 +359,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -404,10 +424,12 @@ def initialize_model_parallel(
     assert _SP is None, "sequence parallel group is already initialized"
 
     try:
-        from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
+        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .parallel_groups import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
     except ImportError:
-        _set_seq_parallel_pg = None
+        _set_seq_parallel_pg_by_sp_groups = None
 
         class _DummyProcessGroup:
             ULYSSES_PG = torch.distributed.group.WORLD
@@ -415,11 +437,15 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        _set_seq_parallel_pg(
+        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
+        # critical when TP>1, because SP groups may be strided in global ranks
+        # (e.g., tp-sp order).
+        sp_groups = rank_generator.get_ranks("sp")
+        _set_seq_parallel_pg_by_sp_groups(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
+            rank=get_world_group().rank,
+            sp_groups=sp_groups,
         )
         PROCESS_GROUP = _YC_PROCESS_GROUP
 
@@ -431,9 +457,6 @@ def initialize_model_parallel(
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
-
-    if ulysses_degree > 1:
-        _warmup_ulysses_communication()
 
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
@@ -569,6 +592,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ring_degree: int = 1,
     dp_size: int = 1,
     distributed_init_method: str = "env://",
+    dist_timeout: int | None = None,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -586,9 +610,10 @@ def maybe_init_distributed_environment_and_model_parallel(
     rank = int(os.environ.get("RANK", 0))
     device = get_local_torch_device()
     logger.info(
-        "Initializing distributed environment with world_size=%d, device=%s",
+        "Initializing distributed environment with world_size=%d, device=%s, timeout=%s",
         world_size,
         device,
+        dist_timeout,
         main_process_only=False,
     )
 
@@ -598,6 +623,8 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
+        backend=current_platform.get_torch_distributed_backend_str(),
+        timeout=dist_timeout,
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
@@ -612,6 +639,9 @@ def maybe_init_distributed_environment_and_model_parallel(
     if current_platform.is_cuda_alike():
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
+    elif current_platform.is_npu():
+        device = torch.device(f"npu:{local_rank}")
+        torch.npu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:
@@ -629,8 +659,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     This method is for draft workers of speculative decoding to run draft model
     with different tp degree from that of target model workers.
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
@@ -945,49 +973,6 @@ def get_ring_parallel_world_size():
 
 def get_ring_parallel_rank():
     return get_sp_group().ring_rank
-
-
-def _warmup_ulysses_communication():
-    """
-    Warmup NCCL communication for Ulysses all-to-all to avoid first-step latency.
-
-    This function performs a dummy all-to-all operation to initialize NCCL communication
-    channels, which can take several seconds on the first call.
-    """
-    logger.info("Warming up Ulysses all-to-all communication...")
-
-    try:
-        import torch.distributed._functional_collectives as ft_c
-
-        ulysses_pg = get_sp_group().ulysses_group
-        if ulysses_pg is None:
-            logger.warning("Ulysses group not initialized, skipping warmup")
-            return
-
-        warmup_start = time.time()
-
-        device = torch.device(f"cuda:{get_world_group().local_rank}")
-        dummy_tensor = torch.zeros(1024, device=device, dtype=torch.float32)
-
-        output = ft_c.all_to_all_single(
-            dummy_tensor,
-            output_split_sizes=None,
-            input_split_sizes=None,
-            group=ulysses_pg,
-        )
-
-        if isinstance(output, ft_c.AsyncCollectiveTensor):
-            output = output.wait()
-
-        torch.cuda.synchronize()
-
-        warmup_time = (time.time() - warmup_start) * 1000
-        logger.info(f"Ulysses communication warmup completed in {warmup_time:.2f}ms")
-
-    except Exception as e:
-        logger.warning(
-            f"Ulysses communication warmup failed: {e}. Continuing without warmup."
-        )
 
 
 # PP

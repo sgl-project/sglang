@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -14,8 +14,10 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+_is_npu = is_npu()
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -116,21 +118,28 @@ class FutureMap:
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        if self.spec_algo.is_eagle():
+        if self.spec_algo.is_none():
+            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+        else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            # The indices tensor was allocated on the default stream but is
+            # used here on the forward stream. Meanwhile, the old spec_info
+            # holding this tensor will lose all Python references (replaced at
+            # model_worker_batch.spec_info and batch.spec_info), so the
+            # caching allocator (torch GC) could reclaim the memory before
+            # the GPU finishes reading it.
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
-        else:
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -142,12 +151,12 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        if self.spec_algo.is_eagle():
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
-        else:
+        if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
+        else:
+            draft_input: EagleDraftInput = batch_result.next_draft_input
+            self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput

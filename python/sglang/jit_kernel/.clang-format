@@ -15,5 +15,11 @@ PenaltyBreakBeforeFirstCallParameter: 1  # Encourages breaking before the first 
 PenaltyReturnTypeOnItsOwnLine: 100    # Keeps return type with function name
 
 IncludeCategories:
-  - Regex: '^<sgl_kernel/.*>$'
+  - Regex: '^<sgl_kernel/.*\.h>$'
     Priority: 0
+  - Regex: '^<sgl_kernel/impl/.*>$'
+    Priority: 2
+  - Regex: '^<sgl_kernel/.*\.cuh>$'
+    Priority: 1
+  - Regex: '^<.*/.*>$'
+    Priority: 3

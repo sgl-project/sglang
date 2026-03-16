@@ -27,11 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import (
-    assign_extend_cache_locs,
-    fill_accepted_out_cache_loc,
-    fill_new_verified_id,
-)
+from sglang.srt.speculative.eagle_info_v2 import fill_new_verified_id
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -42,14 +38,15 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
+    maybe_detect_nan,
+    maybe_detect_oob,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk, next_power_of_2
+from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+    from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
 logger = logging.getLogger(__name__)
@@ -74,6 +71,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -121,16 +120,23 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
                 is_multi_layer_eagle=True,
             )
 
         # Alias for better readability
-        # self.draft_runner = self.draft_worker.model_runner
-        self.draft_runner_list = self.draft_worker.model_runner_list
+        self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
+
+        # Chain-style MTP: each step propagates its own output hidden states to the
+        # next step.  Non-chain: each step uses the target model's hidden states.
+        draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
+        self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
 
         self.init_lm_head()
 
@@ -282,6 +288,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states,
         )
 
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -325,6 +333,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -357,9 +371,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -383,10 +397,23 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
+            maybe_detect_nan(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
+            # Chain-style: use this step's output hidden_states as next step's input
+            if (
+                self.chain_mtp_hidden_states
+                and step < self.speculative_num_steps - 1
+                and output.logits_output.hidden_states is not None
+            ):
+                forward_batch.spec_info.hidden_states = (
+                    output.logits_output.hidden_states
+                )
             if forward_batch.extend_seq_lens is not None:
                 rotate_input_ids_triton(
                     forward_batch.input_ids,
@@ -416,8 +443,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         # Prepare for draft extend in a separate stream
@@ -471,11 +498,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                draft_logits_output, _ = self.draft_runner_list[step].forward(
+                draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
                 probs = torch.softmax(
-                    draft_logits_output.next_token_logits[select_index], dim=-1
+                    draft_logits_output.logits_output.next_token_logits[select_index],
+                    dim=-1,
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 if forward_batch.extend_seq_lens is not None:
@@ -498,13 +526,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.cuda_graph_runner_for_draft_extend.get_last_runner()
             )
             assign_hidden_states_pool_triton(
-                last_cuda_graph_runner.hidden_states,
-                last_cuda_graph_runner.req_pool_indices,
+                last_cuda_graph_runner.buffers.hidden_states,
+                last_cuda_graph_runner.buffers.req_pool_indices,
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
-                last_cuda_graph_runner.extend_seq_lens,
-                last_cuda_graph_runner.extend_start_loc,
+                last_cuda_graph_runner.buffers.extend_seq_lens,
+                last_cuda_graph_runner.buffers.extend_start_loc,
             )
 
         # Reorganize the spec info for the next batch
@@ -536,6 +564,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -544,7 +574,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -561,7 +590,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         self._draft_worker = MultiLayerEagleDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors
@@ -595,8 +632,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
-            # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            # Chain-style MTP needs FULL to get all-token hidden states;
+            # non-chain only needs LAST (the target model's hidden states).
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.draft_worker.chain_mtp_hidden_states
+                else CaptureHiddenMode.LAST
+            )
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,
@@ -673,8 +715,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         logits_output = forward_batch_output.logits_output
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,
@@ -708,48 +749,4 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-        )
-
-    def move_accepted_tokens_to_target_kvcache(
-        self,
-        batch: ModelWorkerBatch,
-        accept_index: torch.Tensor,
-        accept_length: torch.Tensor,
-    ):
-        """
-        Move accepted tokens to the target KV cache.
-
-        Args:
-            batch: The batch to run.
-            accept_index: The index of the accepted tokens.
-            accept_length: The length of the accepted tokens.
-        """
-        bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
-
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length,
-            tgt_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        fill_accepted_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accepted_out_cache_loc,
-            next_power_of_2(size),
-        )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
         )

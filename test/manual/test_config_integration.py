@@ -2,20 +2,23 @@
 Test script to verify SGLang config file integration.
 """
 
+import argparse
 import os
 import tempfile
 
 import pytest
 import yaml
 
-from sglang.srt.server_args import prepare_server_args
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
 
 @pytest.fixture
 def merger():
     """Fixture providing a ConfigArgumentMerger instance."""
-    return ConfigArgumentMerger()
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    return ConfigArgumentMerger(parser)
 
 
 def test_server_args_config_parser(merger):
@@ -28,7 +31,7 @@ def test_server_args_config_parser(merger):
         "tensor-parallel-size": 2,
         "trust-remote-code": False,
         "enable-metrics": True,
-        "stream-output": True,
+        "incremental-streaming-output": True,
         "skip-server-warmup": False,
         "log-requests": True,
         "show-time-cost": True,
@@ -61,7 +64,7 @@ def test_server_args_config_parser(merger):
 
         # Test boolean arguments
         assert "--enable-metrics" in merged_args  # True boolean
-        assert "--stream-output" in merged_args  # True boolean
+        assert "--incremental-streaming-output" in merged_args  # True boolean
         assert "--log-requests" in merged_args  # True boolean
         assert "--show-time-cost" in merged_args  # True boolean
         # False booleans should not be present (only add flag if True)
@@ -156,3 +159,7 @@ def test_error_handling():
             prepare_server_args(argv)
     finally:
         os.unlink(invalid_yaml_file)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

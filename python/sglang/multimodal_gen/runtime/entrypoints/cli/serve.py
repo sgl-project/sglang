@@ -31,7 +31,6 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
     server_args = ServerArgs.from_cli_args(args, unknown_args)
-    server_args.post_init_serve()
     launch_server(server_args)
 
     if server_args.webui:
@@ -61,7 +60,7 @@ class ServeSubcommand(CLISubcommand):
         serve_parser = subparsers.add_parser(
             "serve",
             help="Launch the server and start FastAPI listener.",
-            usage="sgl_diffusion serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
+            usage="sglang serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
         )
 
         serve_parser = add_multimodal_gen_serve_args(serve_parser)

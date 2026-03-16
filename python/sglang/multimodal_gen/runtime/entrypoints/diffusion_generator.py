@@ -8,22 +8,26 @@ This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
+import dataclasses
 import multiprocessing as mp
 import os
 import time
-from typing import Any
+from typing import Any, List, Union
 
-import numpy as np
-
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    UnmergeLoraWeightsReq,
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    post_process_sample,
+    GenerationResult,
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
+    format_lora_message,
     prepare_request,
+    save_outputs,
 )
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -31,6 +35,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    GREEN,
+    RESET,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -77,16 +83,11 @@ class DiffGenerator:
     @classmethod
     def from_pretrained(
         cls,
+        local_mode: bool = True,
         **kwargs,
     ) -> "DiffGenerator":
         """
         Create a DiffGenerator from a pretrained model.
-
-        Args:
-            **kwargs: Additional arguments to customize model loading, set any ServerArgs or PipelineConfig attributes here.
-
-        Returns:
-            The created DiffGenerator
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
@@ -100,10 +101,12 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args)
+        return cls.from_server_args(server_args, local_mode=local_mode)
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "DiffGenerator":
+    def from_server_args(
+        cls, server_args: ServerArgs, local_mode: bool = True
+    ) -> "DiffGenerator":
         """
         Create a DiffGenerator with the specified arguments.
 
@@ -116,9 +119,8 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        is_local_mode = server_args.is_local_mode
-        logger.info(f"Local mode: {is_local_mode}")
-        if is_local_mode:
+        logger.info(f"Local mode: {local_mode}")
+        if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
         else:
             # In remote mode, we just need to connect and check.
@@ -145,72 +147,80 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
+
+    @staticmethod
+    def _resolve_image_paths_per_prompt(
+        prompts: list[str], image_paths: str | list[str] | None
+    ) -> list[str | list[str] | None]:
+        if len(prompts) <= 1:
+            return [image_paths]
+
+        if not isinstance(image_paths, list) or len(image_paths) <= 1:
+            return [image_paths for _ in prompts]
+
+        if len(image_paths) != len(prompts):
+            raise ValueError(
+                "When using multiple prompts with multiple input images, "
+                "provide either one shared image or exactly one image per prompt."
+            )
+
+        return [[image_path] for image_path in image_paths]
 
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
-    ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]] | None:
-        """
-        Generate a image/video based on the given prompt.
+    ) -> GenerationResult | list[GenerationResult] | None:
+        """Generate image(s)/video(s) based on the given prompt(s).
 
-        Args:
-
-        Returns:
-            Either the output dictionary, list of frames, or list of results for batch processing
+        Returns a single GenerationResult for a single prompt, a list for
+        multiple prompts, or None when every request failed.
         """
         # 1. prepare requests
-        prompt = sampling_params_kwargs.get("prompt", None)
-        prompts: list[str] = []
-        # Handle batch processing from text file
-        if self.server_args.prompt_file_path is not None:
-            prompt_txt_path = self.server_args.prompt_file_path
-            if not os.path.exists(prompt_txt_path):
-                raise FileNotFoundError(
-                    f"Prompt text file not found: {prompt_txt_path}"
-                )
-            # Read prompts from file
-            with open(prompt_txt_path, encoding="utf-8") as f:
-                prompts.extend(line.strip() for line in f if line.strip())
+        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
-            if not prompts:
-                raise ValueError(f"No prompts found in file: {prompt_txt_path}")
+        if len(prompts) > 1 and user_output_file_name is not None:
+            raise ValueError(
+                "Cannot use multiple prompts with a fixed output_file_name. "
+                "Either remove --output-file-name or use a single prompt."
+            )
 
-            logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
-            if isinstance(prompt, str):
-                prompts.append(prompt)
-            elif isinstance(prompt, list):
-                prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
-        sampling_params = SamplingParams.from_user_sampling_params_args(
+        sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
 
         requests: list[Req] = []
-        for output_idx, p in enumerate(prompts):
-            sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=sampling_params,
-                )
-            )
+        image_paths_per_prompt = self._resolve_image_paths_per_prompt(
+            prompts, sampling_params_orig.image_path
+        )
 
-        results = []
+        for i, p in enumerate(prompts):
+            sampling_params = dataclasses.replace(
+                sampling_params_orig,
+                prompt=p,
+                output_file_name=user_output_file_name,
+                image_path=image_paths_per_prompt[i],
+            )
+            sampling_params._set_output_file_name()
+            req = prepare_request(
+                server_args=self.server_args,
+                sampling_params=sampling_params,
+            )
+            requests.append(req)
+
+        results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
 
-        # 2. send requests to scheduler, one at a time
+        # 2. send requests to scheduler one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             try:
@@ -221,67 +231,144 @@ class DiffGenerator:
                     if output_batch.error:
                         raise Exception(f"{output_batch.error}")
 
-                    if output_batch.output is None:
+                    if (
+                        output_batch.output is None
+                        and output_batch.output_file_paths is None
+                    ):
                         logger.error(
                             "Received empty output from scheduler for prompt %d",
                             request_idx + 1,
                         )
                         continue
-                    for output_idx, sample in enumerate(output_batch.output):
-                        num_outputs = len(output_batch.output)
-                        frames = post_process_sample(
-                            sample,
-                            fps=req.fps,
-                            save_output=req.save_output,
-                            # TODO: output file path for req should be determined
-                            save_file_path=req.output_file_path(
-                                num_outputs, output_idx
-                            ),
-                            data_type=req.data_type,
-                        )
 
-                        result_item: dict[str, Any] = {
-                            "samples": sample,
-                            "frames": frames,
-                            "prompts": req.prompt,
-                            "size": (req.height, req.width, req.num_frames),
-                            "generation_time": timer.duration,
-                            "peak_memory_mb": output_batch.peak_memory_mb,
-                            "timings": (
-                                output_batch.timings.to_dict()
-                                if output_batch.timings
-                                else {}
-                            ),
-                            "trajectory": output_batch.trajectory_latents,
-                            "trajectory_timesteps": output_batch.trajectory_timesteps,
-                            "trajectory_decoded": output_batch.trajectory_decoded,
-                            "prompt_index": output_idx,
-                        }
-                        results.append(result_item)
-            except Exception:
+                    common = dict(
+                        prompt=req.prompt,
+                        size=(req.height, req.width, req.num_frames),
+                        generation_time=timer.duration,
+                        peak_memory_mb=output_batch.peak_memory_mb,
+                        metrics=(
+                            output_batch.metrics.to_dict()
+                            if output_batch.metrics
+                            else {}
+                        ),
+                        trajectory_latents=output_batch.trajectory_latents,
+                        trajectory_timesteps=output_batch.trajectory_timesteps,
+                        trajectory_decoded=output_batch.trajectory_decoded,
+                    )
+
+                    if req.save_output and req.return_file_paths_only:
+                        for idx, path in enumerate(output_batch.output_file_paths):
+                            results.append(
+                                GenerationResult(
+                                    **common,
+                                    prompt_index=idx,
+                                    output_file_path=path,
+                                )
+                            )
+                        continue
+
+                    if req.data_type == DataType.MESH:
+                        for output_idx, sample in enumerate(
+                            output_batch.output_file_paths
+                        ):
+                            results.append(
+                                GenerationResult(
+                                    **common,
+                                    prompt_index=output_idx,
+                                    output_file_path=sample,
+                                )
+                            )
+                        continue
+
+                    samples_out: list[Any] = []
+                    audios_out: list[Any] = []
+                    frames_out: list[Any] = []
+                    num_outputs = len(output_batch.output)
+                    save_outputs(
+                        output_batch.output,
+                        req.data_type,
+                        req.fps,
+                        req.save_output,
+                        lambda idx: req.output_file_path(num_outputs, idx),
+                        audio=output_batch.audio,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        samples_out=samples_out,
+                        audios_out=audios_out,
+                        frames_out=frames_out,
+                        output_compression=req.output_compression,
+                        enable_frame_interpolation=req.enable_frame_interpolation,
+                        frame_interpolation_exp=req.frame_interpolation_exp,
+                        frame_interpolation_scale=req.frame_interpolation_scale,
+                        frame_interpolation_model_path=req.frame_interpolation_model_path,
+                        enable_upscaling=req.enable_upscaling,
+                        upscaling_model_path=req.upscaling_model_path,
+                        upscaling_scale=req.upscaling_scale,
+                    )
+
+                    for idx in range(len(samples_out)):
+                        results.append(
+                            GenerationResult(
+                                **common,
+                                samples=samples_out[idx],
+                                frames=frames_out[idx],
+                                audio=audios_out[idx],
+                                prompt_index=idx,
+                                output_file_path=req.output_file_path(num_outputs, idx),
+                            )
+                        )
+            except Exception as e:
+                logger.error(
+                    "Generation failed for prompt %d/%d: %s",
+                    request_idx + 1,
+                    len(requests),
+                    e,
+                    exc_info=True,
+                )
                 continue
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+        self._log_summary(results)
 
-        if results:
-            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
-            if peak_memories:
-                max_peak_memory = max(peak_memories)
-                avg_peak_memory = sum(peak_memories) / len(peak_memories)
-                logger.info(
-                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
-                    f"Avg peak: {avg_peak_memory:.2f} MB"
-                )
-
-        if len(results) == 0:
+        if not results:
             return None
-        else:
-            if requests[0].return_frames:
-                results = [r["frames"] for r in results]
-            if len(results) == 1:
-                return results[0]
-            return results
+        return results[0] if len(results) == 1 else results
+
+    def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
+        """Collect prompts from the argument or from a prompt file."""
+        if self.server_args.prompt_file_path is not None:
+            path = self.server_args.prompt_file_path
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Prompt text file not found: {path}")
+            with open(path, encoding="utf-8") as f:
+                prompts = [line.strip() for line in f if line.strip()]
+            if not prompts:
+                raise ValueError(f"No prompts found in file: {path}")
+            logger.info("Found %d prompts in %s", len(prompts), path)
+            return prompts
+
+        if prompt is None:
+            return [" "]
+        if isinstance(prompt, str):
+            return [prompt]
+        return list(prompt)
+
+    def _log_summary(self, results: list[GenerationResult]) -> None:
+        if not results:
+            return
+        if self.server_args.warmup:
+            total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
+            logger.info(
+                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                total_duration_ms / 1000.0,
+            )
+
+        peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
+        if peak_memories:
+            logger.info(
+                f"Memory usage - Max peak: {max(peak_memories):.2f} MB, "
+                f"Avg peak: {sum(peak_memories) / len(peak_memories):.2f} MB"
+            )
 
     def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
         """
@@ -292,35 +379,34 @@ class DiffGenerator:
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
         response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
+        if response.error is None:
             logger.info(success_msg)
+            return response
         else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
+            error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Union[str, None, List[Union[str, None]]] = None,
+        target: Union[str, List[str]] = "all",
+        strength: Union[float, List[float]] = 1.0,
     ) -> None:
         """
-        Set a LoRA adapter for the specified transformer(s).
+        Set LoRA adapter(s) for the specified transformer(s).
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
         Args:
-            lora_nickname: The nickname of the adapter.
-            lora_path: Path to the LoRA adapter.
-            target: Which transformer(s) to apply the LoRA to. One of:
+            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
+            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+                Valid values:
                 - "all": Apply to all transformers (default)
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
-            strength: LoRA strength for merge, default 1.0.
+            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -328,9 +414,13 @@ class DiffGenerator:
             target=target,
             strength=strength,
         )
+        nickname_str, target_str, strength_str = format_lora_message(
+            lora_nickname, target, strength
+        )
+
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
+            f"Successfully set LoRA adapter(s): {nickname_str} (target: {target_str}, strength: {strength_str})",
             "Failed to set LoRA adapter",
         )
 
@@ -362,6 +452,16 @@ class DiffGenerator:
             f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
+
+    def list_loras(self) -> dict:
+        """List loaded LoRA adapters and current application status per module."""
+        output = self._send_lora_request(
+            req=ListLorasReq(),
+            success_msg="Successfully listed LoRA adapters",
+            failure_msg="Failed to list LoRA adapters",
+        )
+        # _send_lora_request already raises on error, so output.error is always None here
+        return output.output or {}
 
     def _ensure_lora_state(
         self,
@@ -418,8 +518,13 @@ class DiffGenerator:
         If in local mode, it also shuts down the scheduler server.
         """
         # sends the shutdown command to the server
+        if self.local_scheduler_process and self.owns_scheduler_client:
+            try:
+                sync_scheduler_client.forward(ShutdownReq())
+            except Exception:
+                pass
+
         if self.local_scheduler_process:
-            logger.info("Waiting for local worker processes to terminate...")
             for process in self.local_scheduler_process:
                 process.join(timeout=10)
                 if process.is_alive():
@@ -432,6 +537,9 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def __enter__(self):
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
