@@ -1178,23 +1178,36 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # Initialize Wan-specific parameters
         use_ret_steps = teacache_params.use_ret_steps
-        cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
-        ret_steps = teacache_params.ret_steps
+        num_steps = ctx.num_inference_steps
 
-        # Adjust ret_steps and cutoff_steps for non-CFG mode
-        # (WanTeaCacheParams uses *2 factor assuming CFG)
+        # set the start and end skippable steps
+        if isinstance(teacache_params.start_skipping, float):
+            start_skipping = int(num_steps * teacache_params.start_skipping)
+        elif teacache_params.start_skipping < 0:
+            start_skipping = num_steps + teacache_params.start_skipping
+        else:
+            start_skipping = teacache_params.start_skipping
+
+        if isinstance(teacache_params.end_skipping, float):
+            end_skipping = int(num_steps * teacache_params.end_skipping)
+        elif teacache_params.end_skipping < 0:
+            end_skipping = num_steps + teacache_params.end_skipping
+        else:
+            end_skipping = teacache_params.end_skipping
+
+        # Adjust start_skipping and end_skipping for CFG mode
         if not ctx.do_cfg:
-            ret_steps = ret_steps // 2
-            cutoff_steps = cutoff_steps // 2
+            start_skipping = start_skipping * 2
+            end_skipping = end_skipping * 2
+
+        # Determine boundary step
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
         self.is_cfg_negative = ctx.is_cfg_negative
-
-        # Wan uses ret_steps/cutoff_steps for boundary detection
-        is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
 
         # Use shared helper to compute cache decision
         should_calc = self._compute_teacache_decision(
