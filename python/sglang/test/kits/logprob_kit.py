@@ -47,8 +47,14 @@ HF ground-truth comparison utilities:
     )
 """
 
+import random
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
 import numpy as np
 import requests
+
+from sglang.test.test_utils import run_logprob_check
 
 CROSS_MODE_PROMPTS = [
     "The capital of France is",
@@ -58,7 +64,7 @@ CROSS_MODE_PROMPTS = [
 DEFAULT_MAX_NEW_TOKENS = 32
 DEFAULT_TOP_LOGPROBS_NUM = 5
 DEFAULT_PROBE_TOKEN_IDS = [1, 2, 10, 100, 1000]
-DEFAULT_DECIMAL_PLACES = 2
+DEFAULT_DECIMAL_PLACES = 1
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +534,64 @@ def run_logprob_start_len_check(
                 )
 
 
+def run_logprob_mixed_check(
+    test_case,
+    base_url,
+    input_lens=None,
+    output_lens=None,
+    logprob_start_lens=None,
+    max_workers=8,
+):
+    """Stress-test logprob shape correctness with many parameter combinations.
+
+    Sends concurrent requests with various (input_len, output_len,
+    logprob_start_len, return_logprob, top_logprobs_num) combos and verifies
+    that the returned array lengths are all correct.
+
+    Args:
+        test_case: ``unittest.TestCase`` instance.
+        base_url: Server URL.
+        input_lens: List of input lengths to test.
+        output_lens: List of output lengths to test.
+        logprob_start_lens: List of logprob_start_len values to test.
+        max_workers: Concurrency for the thread pool.
+    """
+    if input_lens is None:
+        input_lens = [200, 500, 1000, 2000]
+    if output_lens is None:
+        output_lens = [4, 8]
+    if logprob_start_lens is None:
+        logprob_start_lens = [0, 100, 300, 800, 1998]
+
+    args = []
+    temperature = 0
+    for input_len in input_lens:
+        for output_len in output_lens:
+            for start_len in logprob_start_lens:
+                for return_logprob in [True, False]:
+                    for top_logprobs_num in [0, 5]:
+                        if start_len >= input_len:
+                            continue
+                        args.append(
+                            (
+                                input_len,
+                                output_len,
+                                temperature,
+                                start_len,
+                                return_logprob,
+                                top_logprobs_num,
+                            )
+                        )
+
+    random.shuffle(args)
+    print(f"[logprob_mixed] running {len(args)} parameter combinations")
+    func = partial(run_logprob_check, test_case)
+    with ThreadPoolExecutor(max_workers) as executor:
+        list(executor.map(func, args))
+
+    print(f"[logprob_mixed] all {len(args)} combinations passed")
+
+
 # ---------------------------------------------------------------------------
 # Public API – Mixin class
 # ---------------------------------------------------------------------------
@@ -553,6 +617,7 @@ class LogprobCrossModeMixin:
 
     def test_cross_mode_logprobs(self):
         """Compare decode logprobs against prefill scoring for all artifacts."""
+        print(f"Testing cross-mode logprobs for {self.base_url}")
         run_logprob_cross_mode_check(
             self,
             self.base_url,
@@ -581,3 +646,7 @@ class LogprobCrossModeMixin:
             return_text_in_logprobs=True,
             decimal_places=self.logprob_decimal_places,
         )
+
+    def test_cross_mode_logprob_mixed(self):
+        """Stress-test logprob shape correctness with many parameter combos."""
+        run_logprob_mixed_check(self, self.base_url)

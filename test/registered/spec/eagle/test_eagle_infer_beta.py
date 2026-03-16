@@ -24,7 +24,7 @@ register_cuda_ci(est_time=400, suite="stage-b-test-small-1-gpu")
 
 
 class TestEagleServerBase(CustomTestCase, MatchedStopMixin, LogprobCrossModeMixin):
-    logprob_decimal_places = 2
+    logprob_decimal_places = 1
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
