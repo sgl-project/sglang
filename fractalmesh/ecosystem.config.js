@@ -1,4 +1,4 @@
-// FractalMesh PM2 Ecosystem — v101
+// FractalMesh PM2 Ecosystem — v401.6
 // Samuel James Hiotis | ABN 56628117363 | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
 
@@ -73,6 +73,40 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-whitepaper-error.log`,
             out_file:   `${ROOT}/logs/fm-whitepaper-out.log`,
+        },
+
+        // ── PRODUCT DELIVERY ENGINE ───────────────────────────────────
+        {
+            name:              'fm-delivery',
+            script:            'agents/fm_delivery.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'64M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+            },
+            error_file: `${ROOT}/logs/fm-delivery-error.log`,
+            out_file:   `${ROOT}/logs/fm-delivery-out.log`,
+        },
+
+        // ── RF SALES BRIDGE ───────────────────────────────────────────
+        {
+            name:              'rf-bridge',
+            script:            'agents/rf_bridge.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'64M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+            },
+            error_file: `${ROOT}/logs/rf-bridge-error.log`,
+            out_file:   `${ROOT}/logs/rf-bridge-out.log`,
         },
 
         // ── DASHBOARD (serve static) ──────────────────────────────────

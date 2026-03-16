@@ -244,7 +244,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
 <header id="header">
   <div>
     <div class="logo">FRACTAL<span>MESH</span> OMEGA</div>
-    <div class="tagline">Sovereign AI — Titan v101 — Earth-Scale Neural</div>
+    <div class="tagline">Sovereign AI — v401.6 — 21 Agents Operational</div>
   </div>
   <div class="header-right">
     <div class="pulse"></div>
@@ -500,8 +500,18 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
           <div class="sys-items" id="agent-status">
             <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-pod</div><div class="sys-port">:5058 — checking...</div></div></div>
             <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-geosignal</div><div class="sys-port">:5057 — checking...</div></div></div>
-            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-trading</div><div class="sys-port">background — checking...</div></div></div>
-            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-whitepaper</div><div class="sys-port">cron 0 */10 — checking...</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-orchestrator</div><div class="sys-port">:5055 — background</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-lead</div><div class="sys-port">:5060 — background</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-stripe</div><div class="sys-port">:5059 — background</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-trading</div><div class="sys-port">background agent</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-arbitrage</div><div class="sys-port">background agent</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-nft-minter</div><div class="sys-port">background agent</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-delivery</div><div class="sys-port">background — delivery queue</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">rf-bridge</div><div class="sys-port">background — RF sales sync</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-whitepaper</div><div class="sys-port">cron 0 */10 — publisher</div></div></div>
+          </div>
+          <div style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--dim)">
+            v401.6 — 21 agents total — ~215MB RAM — ARM64 Termux
           </div>
         </div>
       </div>
@@ -940,10 +950,17 @@ async function loadSystem() {
   // Check fm-pod health
   const health = await apiFetch('/health');
   const agents = [
-    {name:'fm-pod',      port:5058, ok: !!health},
-    {name:'fm-geosignal',port:5057, ok: false},
-    {name:'fm-trading',  port:null, ok: false},
-    {name:'fm-whitepaper',port:null,ok: false},
+    {name:'fm-pod',        port:5058, ok: !!health,  label:'Master API'},
+    {name:'fm-geosignal',  port:5057, ok: false,     label:'Geospatial/Signals'},
+    {name:'fm-orchestrator',port:5055,ok: false,     label:'OpenRouter AI gateway'},
+    {name:'fm-lead',       port:5060, ok: false,     label:'Lead generation'},
+    {name:'fm-stripe',     port:5059, ok: false,     label:'Payment processing'},
+    {name:'fm-trading',    port:null, ok: false,     label:'KuCoin/Pionex trading'},
+    {name:'fm-arbitrage',  port:null, ok: false,     label:'Arbitrage scanner'},
+    {name:'fm-nft-minter', port:null, ok: false,     label:'Fractal NFT / IPFS'},
+    {name:'fm-delivery',   port:null, ok: false,     label:'Product delivery queue'},
+    {name:'rf-bridge',     port:null, ok: false,     label:'RF sales sync (5min)'},
+    {name:'fm-whitepaper', port:null, ok: false,     label:'Cron publisher (*/10h)'},
   ];
 
   // Check geosignal
@@ -952,12 +969,18 @@ async function loadSystem() {
     if (gs.ok) agents[1].ok = true;
   } catch(_) {}
 
+  // Check orchestrator
+  try {
+    const oc = await fetch('http://localhost:5055/health',{signal:AbortSignal.timeout(3000)});
+    if (oc.ok) agents[2].ok = true;
+  } catch(_) {}
+
   document.getElementById('agent-status').innerHTML = agents.map(a=>`
     <div class="sys-item">
       <div class="sys-dot ${a.ok?'green':'yellow'}"></div>
       <div>
         <div class="sys-name">${a.name}</div>
-        <div class="sys-port">${a.port?':'+a.port+' — '+(a.ok?'online':'checking...'):'background agent'}</div>
+        <div class="sys-port">${a.port?':'+a.port+' — '+(a.ok?'online':'checking...'):''+a.label}</div>
       </div>
     </div>`).join('');
 
