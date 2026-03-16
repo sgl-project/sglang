@@ -325,6 +325,9 @@ class SessionAwareCache(BasePrefixCache):
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
 
+    def flush_write_through_acks(self) -> None:
+        return self.inner.flush_write_through_acks()
+
     def check_hicache_events(self):
         return self.inner.check_hicache_events()
 

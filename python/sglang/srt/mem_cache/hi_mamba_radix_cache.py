@@ -343,6 +343,9 @@ class HiMambaRadixCache(MambaRadixCache):
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
 
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
+
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
