@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import socket
 import ssl
 import subprocess
 import sys
@@ -124,6 +123,8 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 
 
 def normalize_base_url(host: str, port: int) -> str:
+    from sglang.srt.utils.network import NetworkAddress
+
     if host.startswith("http://") or host.startswith("https://"):
         warnings.warn(
             f"Including the scheme in --host ('{host}') is deprecated. "
@@ -131,9 +132,8 @@ def normalize_base_url(host: str, port: int) -> str:
             DeprecationWarning,
             stacklevel=2,
         )
-    else:
-        host = f"http://{host}"
-    return f"{host}:{port}"
+        return f"{host}:{port}"
+    return NetworkAddress(host, port).to_url()
 
 
 class HttpResponse:
@@ -401,18 +401,15 @@ def reserve_port(host, start=30000, end=40000):
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
     """
+    from sglang.srt.utils.network import try_bind_socket
+
     candidates = list(range(start, end))
     random.shuffle(candidates)
-
     for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            # Attempt to bind to the port on localhost
-            sock.bind((host, port))
+            sock = try_bind_socket(host, port)
             return port, sock
-        except socket.error:
-            sock.close()  # Failed to bind, try next port
+        except OSError:
             continue
     raise RuntimeError("No free port available.")
 

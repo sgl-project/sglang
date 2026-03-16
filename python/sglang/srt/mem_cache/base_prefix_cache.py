@@ -89,6 +89,28 @@ class EvictResult:
 
 
 @dataclasses.dataclass
+class IncLockRefResult:
+    """Result of an inc_lock_ref operation."""
+
+    delta: Optional[int] = None
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Parameters for dec_lock_ref operation."""
+
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of an dec_lock_ref operation."""
+
+    delta: Optional[int] = None
+
+
+@dataclasses.dataclass
 class InitLoadBackParams:
     """Unified parameters for init_load_back across different cache types"""
 
@@ -168,11 +190,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         pass
 
     def evictable_size(self):

@@ -201,7 +201,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_numa_node,
-    get_zmq_socket,
     is_mps,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -217,6 +216,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 

@@ -27,7 +27,8 @@ from sglang.srt.disaggregation.encode_server import (
     launch_encoder,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, random_uuid
+from sglang.srt.utils import random_uuid
+from sglang.srt.utils.network import get_zmq_socket
 
 logger = logging.getLogger(__name__)
 SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
