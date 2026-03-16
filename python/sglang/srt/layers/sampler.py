@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -11,12 +11,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
 from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils.common import get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -51,28 +51,10 @@ class Sampler(nn.Module):
         self.enable_deterministic = (
             get_global_server_args().enable_deterministic_inference
         )
-        # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-        self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
-
-    def _preprocess_logits(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ) -> torch.Tensor:
-        """Apply custom logit processors and handle NaN detection."""
-        # Apply the custom logit processors if registered in the sampling info
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
-
-        return logits
+        self.output_logprob_processor = OutputLogprobProcessor(
+            use_nan_detection=self.use_nan_detection,
+        )
 
     def forward(
         self,
@@ -97,89 +79,65 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
-        logits = logits_output.next_token_logits
+        simple_sampling_case = (
+            not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        )
+        match_rl_trainer = self.rl_on_policy_target is not None and simple_sampling_case
 
-        # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits, sampling_info)
+        # Preprocess logits and compute logprobs / probs
+        logits, probs, logprobs, original_logprobs = (
+            self.output_logprob_processor.forward(
+                logits_output.next_token_logits,
+                sampling_info,
+                return_logprob,
+                sampling_info.is_all_greedy,
+                SGLANG_RETURN_ORIGINAL_LOGPROB,
+                match_rl_trainer,
+                skip_logprob_computation=self.use_ascend_backend,
+            )
+        )
 
+        # Sample
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
-            if return_logprob:
-                original_logprobs = logprobs = torch.nn.functional.log_softmax(
-                    logits, dim=-1
-                )
-        else:
-            simple_sampling_case = (
-                not sampling_info.need_top_p_sampling
-                and not sampling_info.need_top_k_sampling
-                and not sampling_info.need_min_p_sampling
+        elif self.use_ascend_backend:
+            batch_next_token_ids = self._forward_ascend_backend(
+                logits, sampling_info, simple_sampling_case
             )
-
-            # If requested, cache original logprobs before temperature scaling.
-            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
-                original_logprobs = torch.log_softmax(logits, dim=-1)
-
-            # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-            logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
-                logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
-                )
-                del logits_div_temperature
-
-            if self.use_ascend_backend:
-                # Ascend backend: sample from logits directly.
-                batch_next_token_ids, logprobs = self._forward_ascend_backend(
-                    logits, sampling_info, simple_sampling_case, return_logprob
-                )
-            elif (
-                self.use_log_softmax_logprob
-                and self.enable_deterministic
-                and simple_sampling_case
-            ):
-                # RL on-policy path: sample from logprobs to match the trainer.
-                batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs_via_logsoftmax_kernel,
-                    sampling_info,
-                    positions,
-                )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = logprobs_via_logsoftmax_kernel
-            else:
-                # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
-
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
-                )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
-                    )
-                del probs
-
-        # Attach logprobs to logits_output (in-place modification)
-        if return_logprob:
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                logprobs = original_logprobs
-            self._attach_logprobs_to_output(
-                logits_output,
+        elif match_rl_trainer:
+            batch_next_token_ids = self._sample_from_logprobs(
                 logprobs,
+                sampling_info,
+                positions,
+            )
+        else:
+            batch_next_token_ids = self._sample_from_probs(
+                probs, sampling_info, positions, simple_sampling_case
+            )
+            del probs
+
+        # Attach logprobs to logits_output
+        if return_logprob:
+            output_logprobs = (
+                original_logprobs if original_logprobs is not None else logprobs
+            )
+            result = self.output_logprob_processor.extract_logprobs_results(
+                output_logprobs,
+                batch_next_token_ids,
                 top_logprobs_nums,
                 token_ids_logprobs,
-                sampling_info,
-                batch_next_token_ids,
+            )
+            logits_output.next_token_logprobs = result.token_logprobs
+            logits_output.next_token_top_logprobs_val = result.top_logprobs_val
+            logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
+            logits_output.next_token_token_ids_logprobs_val = (
+                result.token_ids_logprobs_val
+            )
+            logits_output.next_token_token_ids_logprobs_idx = (
+                result.token_ids_logprobs_idx
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -290,55 +248,14 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
-        return_logprob: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Handle the full Ascend backend sampling path.
 
         Ascend backend has fused kernels that handle softmax internally,
         so we sample directly from temperature-scaled logits.
-
-        Returns:
-            A tuple of (batch_next_token_ids, logprobs). logprobs is None
-            when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
         logits.div_(sampling_info.temperatures)
-        batch_next_token_ids = self._sample_from_logits(
-            logits, sampling_info, simple_sampling_case
-        )
-        logprobs = None
-        if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.log_softmax(logits, dim=-1)
-        return batch_next_token_ids, logprobs
-
-    def _attach_logprobs_to_output(
-        self,
-        logits_output: LogitsProcessorOutput,
-        logprobs: torch.Tensor,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
-        sampling_info: SamplingBatchInfo,
-        batch_next_token_ids: torch.Tensor,
-    ):
-        # clamp to avoid -inf values
-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
-
-        # Attach logprobs to logits_output (in-place modification)
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
-
-        if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
-
-        logits_output.next_token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
-            batch_next_token_ids,
-        ]
+        return self._sample_from_logits(logits, sampling_info, simple_sampling_case)
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -386,25 +303,25 @@ class Sampler(nn.Module):
         if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
-        # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
-
-        # Compute logprobs
-        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-        # Handle top logprobs if requested
-        if needs_top_logprobs:
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
-
-        # Handle token_ids logprobs if requested
-        if needs_token_ids_logprobs:
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+        _, _, logprobs, _ = self.output_logprob_processor.forward(
+            logits_output.next_token_logits,
+            sampling_info,
+            return_logprob=True,
+            is_all_greedy=True,
+            return_original_logprob=False,
+            match_rl_trainer=False,
+        )
+        result = self.output_logprob_processor.extract_logprobs_results_for_prefill(
+            logprobs,
+            top_logprobs_nums,
+            token_ids_logprobs,
+            needs_token_ids_logprobs,
+            needs_top_logprobs,
+        )
+        logits_output.next_token_top_logprobs_val = result.top_logprobs_val
+        logits_output.next_token_top_logprobs_idx = result.top_logprobs_idx
+        logits_output.next_token_token_ids_logprobs_val = result.token_ids_logprobs_val
+        logits_output.next_token_token_ids_logprobs_idx = result.token_ids_logprobs_idx
 
 
 def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
@@ -617,94 +534,6 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-def get_token_ids_logprobs_batch_optimized(
-    logprobs: torch.Tensor,
-    token_ids_logprobs: List[List[int]],
-) -> Tuple[List, List]:
-    """
-    Vectorized batch processing for token ID logprobs extraction.
-
-    Uses a single GPU kernel call for the entire batch instead of multiple
-    separate calls, significantly improving performance for large batches.
-
-    Args:
-        logprobs: Log probabilities tensor [batch_size, vocab_size]
-        token_ids_logprobs: List of token IDs to extract logprobs for
-
-    Example:
-        # Input: batch_size=3, vocab_size=5
-        logprobs = torch.tensor([
-            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
-            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
-            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
-        ])
-        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
-
-        # Output:
-        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
-        # indices = [[1, 3], [2], [0, 2, 4]]
-    """
-    batch_size = len(token_ids_logprobs)
-    device = logprobs.device
-
-    # Step 1: Calculate lengths for each request, treating None as empty list
-    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
-    token_lengths = torch.tensor(
-        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
-    )
-    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
-
-    # Handle edge case where no tokens are requested
-    if total_tokens == 0:
-        return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
-            [] for _ in token_ids_logprobs
-        ]
-
-    # Step 2: Build flattened indices using torch operations
-    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
-    row_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), token_lengths
-    )
-    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
-    col_indices = torch.tensor(
-        [
-            token_id
-            for token_ids in token_ids_logprobs
-            for token_id in (token_ids or [])
-        ],
-        device=device,
-        dtype=torch.long,
-    )
-
-    # Step 3: Single vectorized gather operation
-    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
-    gathered_logprobs = logprobs[row_indices, col_indices]
-
-    # Step 4: Split results back per request using torch operations
-    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
-    split_logprobs = torch.split_with_sizes(
-        gathered_logprobs, token_lengths.tolist(), dim=0
-    )
-
-    # Step 5: Format output to match expected return structure
-    # Example: Convert split tensors back to list format with proper empty handling
-    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
-    # i=1: [2] -> append split_logprobs[1] and [2]
-    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None and len(token_ids) > 0:
-            output_token_ids_logprobs_val.append(split_logprobs[i])
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append(logprobs.new_empty(0))
-            output_token_ids_logprobs_idx.append([])
-
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
 def apply_custom_logit_processor(
