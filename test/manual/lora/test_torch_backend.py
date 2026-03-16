@@ -123,9 +123,9 @@ class TestTorchNativeLoRABackend(CustomTestCase):
         batch_size = 3
         num_loras = 3
         input_dim = 6
-        output_offset = [0, 3, 6, 9, 12]
+        output_offset = [0, 3, 6, 9]
         output_dim = output_offset[-1]
-        num_slices = len(output_offset) - 1
+        num_slices = len(output_offset) - 1  # 3 slices for Q, K, V
         max_lora_rank = max(self.lora_ranks)
         dtype = torch.float32
 
