@@ -422,6 +422,7 @@ jobs:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "1-gpu-runner"
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
 
         timeout-minutes: 60
         run: |
@@ -478,6 +479,7 @@ jobs:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "2-gpu-runner"
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
 
         timeout-minutes: 60
         run: |

@@ -11,7 +11,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.21
+ARG SGL_KERNEL_VERSION=0.4.0
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.4
+ARG FLASHINFER_VERSION=0.6.6
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -201,13 +201,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
+        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -320,6 +320,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cp target/release/sglang-router /usr/local/bin/sglang-router \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+
+# Pin nvidia-cutlass-dsl to 4.3.5
+RUN --mount=type=cache,target=/root/.cache/pip \
+   python3 -m pip uninstall nvidia-cutlass-dsl-libs-base; \
+   python3 -m pip install nvidia-cutlass-dsl==4.3.5 --force-reinstall;
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages

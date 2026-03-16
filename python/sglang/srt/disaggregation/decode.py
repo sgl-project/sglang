@@ -24,7 +24,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -265,6 +265,7 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
+        self._bootstrap_addr_retry_count: Dict[str, int] = {}
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -498,42 +499,72 @@ class DecodePreallocQueue:
         if not self.pending_reqs:
             return
 
-        bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
-
-        # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the prefill_dp_ranks
-        # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving it.
-        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-            return
+        # Group pending requests by bootstrap_addr
+        addr_to_reqs: Dict[str, List[Req]] = {}
+        for req in self.pending_reqs:
+            addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+            addr_to_reqs.setdefault(addr, []).append(req)
 
         resolved = []
-        need_query = []
-        for req in self.pending_reqs:
-            # NOTE: we need resolve it again because we may ensure the parallel info here
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is not None:
-                resolved.append((req, prefill_dp_rank))
-            else:
-                need_query.append(req)
+        remaining = []
 
-        if need_query:
-            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+        for bootstrap_addr, reqs in addr_to_reqs.items():
+            # If a request is following the bootstrap room,
+            # we need get the prefill info before resolving the prefill_dp_ranks
+            # which is a conflict with the lazy resolve logic in CommonKVReceiver,
+            # so we need to ensure the parallel info before resolving it.
+            if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
+                # Increment retry count for this bootstrap_addr
+                retry_count = (
+                    self._bootstrap_addr_retry_count.get(bootstrap_addr, 0) + 1
+                )
+                self._bootstrap_addr_retry_count[bootstrap_addr] = retry_count
 
-            rooms = [req.bootstrap_room for req in need_query]
-            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                bootstrap_addr, rooms
-            )
-            remaining = []
-            for req in need_query:
-                room_key = str(req.bootstrap_room)
-                if room_key in room_to_rank:
-                    resolved.append((req, int(room_to_rank[room_key])))
+                if retry_count >= 5:
+                    # Max retries reached, fail the requests
+                    error_message = f"Could not fetch prefill parallel info from bootstrap server {bootstrap_addr} after {retry_count} retries"
+                    logger.error(error_message)
+                    for req in reqs:
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        if self.scheduler.enable_metrics:
+                            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                        self.scheduler.stream_output([req], req.return_logprob)
+                    del self._bootstrap_addr_retry_count[bootstrap_addr]
                 else:
-                    remaining.append(req)
-            self.pending_reqs = remaining
-        else:
-            self.pending_reqs = []
+                    remaining.extend(reqs)
+                continue
+
+            if bootstrap_addr in self._bootstrap_addr_retry_count:
+                del self._bootstrap_addr_retry_count[bootstrap_addr]
+
+            need_query = []
+            for req in reqs:
+                # NOTE: we need resolve it again because we may ensure the parallel info here
+                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                if prefill_dp_rank is not None:
+                    resolved.append((req, prefill_dp_rank))
+                else:
+                    need_query.append(req)
+
+            if need_query:
+                from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+
+                rooms = [req.bootstrap_room for req in need_query]
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr, rooms
+                )
+                for req in need_query:
+                    room_key = str(req.bootstrap_room)
+                    if room_key in room_to_rank:
+                        resolved.append((req, int(room_to_rank[room_key])))
+                    else:
+                        remaining.append(req)
+
+        self.pending_reqs = remaining
 
         for req, prefill_dp_rank in resolved:
             self._create_receiver_and_enqueue(req, prefill_dp_rank)
