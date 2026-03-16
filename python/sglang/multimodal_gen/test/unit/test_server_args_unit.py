@@ -19,6 +19,18 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = ServerArgs.from_dict({"model_path": "/data/my-model"})
         self.assertEqual(args.model_path, "/data/my-model")
 
+    def test_component_paths_are_expanded_before_pipeline_resolution(self):
+        args = ServerArgs.from_dict(
+            {
+                "model_path": "Qwen/Qwen-Image",
+                "component_paths": {"vae": "~/fake/local/vae"},
+            }
+        )
+
+        self.assertEqual(
+            args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
+        )
+
 
 class TestModelIdResolution(unittest.TestCase):
     def setUp(self):
