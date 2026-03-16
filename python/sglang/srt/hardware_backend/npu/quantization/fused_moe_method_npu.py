@@ -77,12 +77,8 @@ def npu_fused_experts(
     )[0]
     # act_fn: swiglu
     if not use_wna16:
-        expert_tokens_diff = expert_tokens.diff(
-            prepend=torch.tensor([0], device=expert_tokens.device)
-        )
         hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
             hidden_states,
-            group_index=expert_tokens_diff,
             activate_left=True,
             quant_mode=1,
         )
@@ -250,6 +246,14 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w2_weight_scale = torch.nn.Parameter(
             layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
+        layer.w13_weight_scale_bf16 = torch.nn.Parameter(
+            layer.w13_weight_scale.data.to(dtype=torch.bfloat16),
+            requires_grad=False
+        )
+        layer.w2_weight_scale_bf16 = torch.nn.Parameter(
+            layer.w2_weight_scale.data.to(dtype=torch.bfloat16),
+            requires_grad=False
+        )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
@@ -268,6 +272,8 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        layer.w13_weight_scale = layer.w13_weight_scale_bf16
+        layer.w2_weight_scale = layer.w2_weight_scale_bf16
 
         if not torch.npu.is_current_stream_capturing():
             x = dispatch_output.hidden_states
