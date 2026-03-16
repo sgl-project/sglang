@@ -3,11 +3,11 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
-import os
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
 
+import orjson
 import torch
 from torch.nn.parameter import UninitializedParameter
 
@@ -205,12 +205,12 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
 
-        # Dev hack: load weights as EP instead of TP so each rank reads
-        # disjoint full experts rather than sharded slices of all experts.
+        # When flag is true, load weights as-if using EP instead, then redistribute
+        # via all_to_all after loading. This results in better disk IO patterns.
         # Only applies to pure TP (ep_size==1); with real EP this is a no-op.
+        extra_config = orjson.loads(get_global_server_args().model_loader_extra_config)
         self._ep_load_for_tp = (
-            os.environ.get("SGLANG_EP_LOAD_FOR_TP", "0") == "1"
-            and self.moe_ep_size == 1
+            extra_config.get("load_tp_by_experts", False) and self.moe_ep_size == 1
         )
         if self._ep_load_for_tp:
             self._orig_moe_tp_size = self.moe_tp_size
@@ -617,7 +617,7 @@ class FusedMoE(torch.nn.Module):
     def ep_to_tp_transform(self) -> None:
         """Transform EP-loaded weights to TP layout via all_to_all.
 
-        After SGLANG_EP_LOAD_FOR_TP loading, each rank holds a disjoint subset of
+        After load_tp_by_experts loading, each rank holds a disjoint subset of
         experts with full intermediate_size. This redistributes so every rank holds
         all experts with sharded intermediate_size (normal TP layout).
 
