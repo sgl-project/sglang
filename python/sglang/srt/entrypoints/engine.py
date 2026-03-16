@@ -96,10 +96,8 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
