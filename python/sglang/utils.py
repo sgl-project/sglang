@@ -401,7 +401,7 @@ def reserve_port(host, start=30000, end=40000):
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
     """
-    from sglang.srt.utils.common import try_bind_socket
+    from sglang.srt.utils.network import try_bind_socket
 
     candidates = list(range(start, end))
     random.shuffle(candidates)
