@@ -1,6 +1,6 @@
 """Test EP→TP weight transformation for MoE layers.
 
-Verifies that loading weights via SGLANG_EP_LOAD_FOR_TP=1 (EP-style loading
+Verifies that loading weights via load_tp_by_experts (EP-style loading
 followed by all_to_all redistribution) produces identical MoE weights to
 normal TP loading.
 
@@ -8,9 +8,9 @@ Launch with torchrun:
     torchrun --nproc_per_node=2 -m pytest python/sglang/test/test_ep_to_tp_transform.py -v -s
 """
 
-import os
+import contextlib
 import unittest
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, List, Tuple
 from unittest.mock import patch
 
 import torch
@@ -164,14 +164,29 @@ def _snapshot_moe_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return snapshot
 
 
+@contextlib.contextmanager
+def _load_tp_by_experts_config(enabled: bool):
+    """Temporarily set load_tp_by_experts in the global server args."""
+    from sglang.srt.server_args import get_global_server_args
+
+    server_args = get_global_server_args()
+    old_value = server_args.model_loader_extra_config
+    server_args.model_loader_extra_config = (
+        '{"load_tp_by_experts": true}' if enabled else "{}"
+    )
+    try:
+        yield
+    finally:
+        server_args.model_loader_extra_config = old_value
+
+
 def _create_model_and_load(
     config: PretrainedConfig, weights: List[Tuple[str, torch.Tensor]], ep_load: bool
 ) -> Dict[str, torch.Tensor]:
     """Create a DeepseekV3 model, load weights, and return MoE param snapshot."""
     from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 
-    env_patch = {"SGLANG_EP_LOAD_FOR_TP": "1" if ep_load else "0"}
-    with patch.dict(os.environ, env_patch):
+    with _load_tp_by_experts_config(ep_load):
         with torch.device("cuda"):
             model = DeepseekV3ForCausalLM(config, quant_config=None)
 
@@ -259,7 +274,7 @@ class TestEpToTpTransform(unittest.TestCase):
         config = _make_tiny_config(n_routed_experts=16)
         weights = _generate_checkpoint_weights(config)
 
-        with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
+        with _load_tp_by_experts_config(True):
             with torch.device("cuda"):
                 model = DeepseekV3ForCausalLM(config, quant_config=None)
 
@@ -368,7 +383,7 @@ class TestEpToTpTransform(unittest.TestCase):
         block_size = 16  # NVFP4 group_size
 
         # Load model with EP_LOAD to set up internal state
-        with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
+        with _load_tp_by_experts_config(True):
             with torch.device("cuda"):
                 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 
@@ -403,7 +418,7 @@ class TestEpToTpTransform(unittest.TestCase):
         # Now verify the actual transform logic on block-scale-shaped tensors
         # by constructing a fresh model with EP_LOAD and manually adding
         # block scale params before calling ep_to_tp_transform.
-        with patch.dict(os.environ, {"SGLANG_EP_LOAD_FOR_TP": "1"}):
+        with _load_tp_by_experts_config(True):
             with torch.device("cuda"):
                 model2 = DeepseekV3ForCausalLM(config, quant_config=None)
 
