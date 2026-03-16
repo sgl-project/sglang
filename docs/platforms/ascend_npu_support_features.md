@@ -84,7 +84,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
 | `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
 | `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
-| `--stream-output`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--incremental-streaming-output`                   | `False`  | bool flag (set to enable) |      A2, A3      |
 | `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
 | `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
 | `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |
@@ -194,7 +194,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--mm-attention-backend`               | `None`            | `ascend_attn`                                                                                  |      A2, A3      |
 | `--nsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/>`fa3`,<br/> `tilelang`,<br/> `aiter`            | Special for GPU  |
 | `--nsa-decode-backend`                 | `fa3`             | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/>`tilelang`,<br/> `aiter`               | Special for GPU  |
-| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
+| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`flashinfer_cutlass`,<br/>`flashinfer_deepgemm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
 | `--disable-flashinfer-`<br/>`autotune` | `False`           | bool flag<br/> (set to enable)                                                                 | Special for GPU  |
 
 ## Speculative decoding

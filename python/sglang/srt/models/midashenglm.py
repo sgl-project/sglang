@@ -10,6 +10,7 @@ import torchaudio.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -79,7 +80,7 @@ class AudioPatchEmbed(nn.Module):
         )
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_chans,
             embed_dim,
             kernel_size=self.patch_size,
