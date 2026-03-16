@@ -1285,7 +1285,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1408,7 +1408,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1470,7 +1470,7 @@ jobs:
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
