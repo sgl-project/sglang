@@ -14,8 +14,11 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -198,7 +201,8 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             ancestor_node = node
 
-        delta = self.inc_lock_ref(ancestor_node)
+        result = self.inc_lock_ref(ancestor_node)
+        delta = result.delta
 
         full_host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if (len(full_host_indices) < self.load_back_threshold) or (
@@ -988,9 +992,9 @@ class HiMambaRadixCache(MambaRadixCache):
             return
         super().sanity_check()
 
-    def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         if node.mamba_value is not None:
@@ -1014,11 +1018,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.evictable_full_device_leaves.discard(node)
             node.full_lock_ref += 1
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
 
@@ -1044,7 +1050,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.full_lock_ref == 0:
                 self._update_full_device_leaf_status(node)
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     # ---- L3 Support ----
 
