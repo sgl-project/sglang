@@ -83,9 +83,11 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
+        self.is_draft_mla_backend = is_draft_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -541,7 +543,14 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if self.kv_mgr.is_mla_backend and (
+                                len(self.kv_mgr.kv_args.draft_kv_data_ptrs) == 0
+                                or (
+                                    len(self.kv_mgr.kv_args.draft_kv_data_ptrs) > 0
+                                    and self.kv_mgr.is_draft_mla_backend
+                                )
+                            ):
+
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank

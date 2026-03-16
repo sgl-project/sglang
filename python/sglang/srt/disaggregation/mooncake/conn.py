@@ -115,6 +115,8 @@ class KVArgsRegisterInfo:
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
+    draft_kv_ptrs: list[int]
+    draft_dst_kv_item_len: int
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
@@ -132,6 +134,8 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
+            draft_kv_ptrs=list(struct.unpack(f"{len(msg[10])//8}Q", msg[10])),
+            draft_dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=(
                 list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
                 if len(msg) > 10 and len(msg[10]) > 0
@@ -174,8 +178,11 @@ class MooncakeKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(
+            args, disaggregation_mode, server_args, is_mla_backend, is_draft_mla_backend
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -223,6 +230,20 @@ class MooncakeKVManager(CommonKVManager):
             self.engine.batch_register(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
+            logger.debug(
+                f"register_buffer_to_engine {self.kv_args.kv_data_ptrs=} {self.kv_args.kv_data_lens=} {self.kv_args.kv_item_lens=}"
+            )
+
+        if (
+            len(self.kv_args.draft_kv_data_ptrs) > 0
+            and len(self.kv_args.draft_kv_data_lens) > 0
+        ):
+            self.engine.batch_register(
+                self.kv_args.draft_kv_data_ptrs, self.kv_args.draft_kv_data_lens
+            )
+            logger.debug(
+                f"register_buffer_to_engine {self.kv_args.draft_kv_data_ptrs=} {self.kv_args.draft_kv_data_lens=} {self.kv_args.draft_kv_item_lens=}"
+            )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
@@ -247,6 +268,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_kvcache_generic(
         self,
+        is_mla_backend: bool,
         mooncake_session_id: str,
         src_data_ptrs: list[int],
         dst_data_ptrs: list[int],
@@ -266,8 +288,8 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
-        # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        # pp is not supported on the decode side yet
+        if is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -329,6 +351,7 @@ class MooncakeKVManager(CommonKVManager):
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            logger.debug(f"process_layers {transfer_blocks=} ")
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
@@ -355,6 +378,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def send_kvcache(
         self,
+        is_mla_backend: bool,
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
@@ -362,6 +386,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         return self._send_kvcache_generic(
+            is_mla_backend=is_mla_backend,
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
@@ -374,12 +399,15 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
+        prefill_kv_indices: npt.NDArray[np.int64],
+        src_kv_ptrs: list[int],
+        src_kv_item_len: int,
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        num_kv_heads: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         """
@@ -392,8 +420,9 @@ class MooncakeKVManager(CommonKVManager):
         """
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        num_layers = len(src_kv_ptrs)
+        num_kv_heads = self.kv_args.kv_head_num
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
@@ -429,7 +458,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -446,31 +475,79 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
-        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
-        src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
-        )
-        dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
-        )
+        layers_params = [
+            (
+                src_k_ptrs[layer_id],
+                dst_k_ptrs[layer_id],
+                src_kv_item_len,
+                dst_kv_item_len,
+                src_head_slice_offset,
+                dst_head_slice_offset,
+                heads_bytes_per_token_to_send,
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ] + [
+            (
+                src_v_ptrs[layer_id],
+                dst_v_ptrs[layer_id],
+                src_kv_item_len,
+                dst_kv_item_len,
+                src_head_slice_offset,
+                dst_head_slice_offset,
+                heads_bytes_per_token_to_send,
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ]
 
-        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
-            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
-            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
-            src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
-            dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
+        def process_layer_tp_aware(layer_params):
+            (
+                src_ptr,
+                dst_ptr,
+                src_item_len,
+                dst_item_len,
+                src_head_slice_offset,
+                dst_head_slice_offset,
+                heads_bytes_per_token_to_send,
+            ) = layer_params
+            src_addr_list = []
+            dst_addr_list = []
+            length_list = []
 
-            src_addr_list = src_slice_addrs.reshape(-1).tolist()
-            if not src_addr_list:
-                # Nothing to transfer for this layer.
-                return 0
-            dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
-            total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
+            # Calculate strides for a single token slot
+            bytes_per_token_on_prefill = src_item_len // page_size
+            bytes_per_token_on_decode = dst_item_len // page_size
+
+            for i in range(len(prefill_kv_indices)):
+                prefill_page_idx = int(prefill_kv_indices[i])
+                decode_page_idx = int(dst_kv_indices[i])
+
+                # Get the starting addresses for the current src and dst pages
+                src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
+                dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
+
+                # Iterate through each valid token slot within the current page
+                for token_slot_in_page in range(page_size):
+                    # Calculate the start address of the current token slot
+                    src_token_slot_start_addr = (
+                        src_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_prefill
+                    )
+                    dst_token_slot_start_addr = (
+                        dst_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_decode
+                    )
+
+                    # Calculate final src and dst addresses by applying head-slice offsets
+                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
+                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
+
+                    src_addr_list.append(src_slice_addr)
+                    dst_addr_list.append(dst_slice_addr)
+                    length_list.append(heads_bytes_per_token_to_send)
+
+            logger.debug(
+                f"process_layer_tp_aware {src_addr_list=} {dst_addr_list=} {length_list=}"
+            )
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
@@ -767,6 +844,71 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def _send_kv_cache(
+        self,
+        is_target: bool,
+        req,
+        kv_chunk,
+        target_rank_registration_info,
+        chunked_dst_kv_indice,
+        executor,
+    ):
+        """
+        send target or draft
+        """
+        if is_target:
+            src_data_ptrs = self.kv_args.kv_data_ptrs
+            dst_data_ptrs = target_rank_registration_info.dst_kv_ptrs
+            src_item_lens = self.kv_args.kv_item_lens
+            dst_kv_item_len = target_rank_registration_info.dst_kv_item_len
+            is_mla_backend = self.is_mla_backend
+            prefill_indices = kv_chunk.prefill_kv_indices
+        else:
+            src_data_ptrs = self.kv_args.draft_kv_data_ptrs
+            dst_data_ptrs = target_rank_registration_info.draft_kv_ptrs
+            src_item_lens = self.kv_args.draft_kv_item_lens
+            dst_kv_item_len = target_rank_registration_info.draft_dst_kv_item_len
+            is_mla_backend = self.is_draft_mla_backend
+            prefill_indices = kv_chunk.prefill_kv_indices
+
+        if is_mla_backend or (
+            self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
+        ):
+            logger.debug(
+                f"{is_target=} _send_kvcache_generic {is_mla_backend=} {src_data_ptrs=} {dst_data_ptrs=} {prefill_indices=} {chunked_dst_kv_indice=} {src_item_lens=}"
+            )
+            return self._send_kvcache_generic(
+                is_mla_backend=is_mla_backend,
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=src_item_lens,
+                prefill_data_indices=prefill_indices,
+                dst_data_indices=chunked_dst_kv_indice,
+                executor=executor,
+            )
+        else:
+            if is_target:
+                num_kv_heads = self.kv_args.kv_head_num
+            else:
+                num_kv_heads = self.kv_args.draft_kv_head_num
+            logger.debug(
+                f"{is_target=} send_kvcache_slice {is_mla_backend=} {src_data_ptrs=} {dst_data_ptrs=} {prefill_indices=} {src_item_lens=}"
+            )
+            return self.send_kvcache_slice(
+                req.mooncake_session_id,
+                prefill_indices,
+                src_data_ptrs,
+                src_item_lens[0],
+                dst_data_ptrs,
+                chunked_dst_kv_indice,
+                target_rank_registration_info.dst_tp_rank,
+                target_rank_registration_info.dst_attn_tp_size,
+                dst_kv_item_len,
+                num_kv_heads,
+                executor,
+            )
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -822,29 +964,49 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
-                            self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
-                        ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
+
+                        # start send kv cache
+                        has_draft_data = len(self.kv_args.draft_kv_data_lens) > 0
+                        is_send_fail = False
+                        is_need_send_target = True
+                        is_need_send_draft = True
+
+                        if (
+                            self.is_mla_backend
+                            and has_draft_data
+                            and not self.is_draft_mla_backend
+                        ):  # MLA target + MHA draft
+                            if local_rank != 0:  # only rank 0 need to send MLA kv cahce
+                                is_need_send_target = False
+
+                        # target
+                        if is_need_send_target:
+                            ret = self._send_kv_cache(
+                                is_target=True,
+                                req=req,
+                                kv_chunk=kv_chunk,
+                                target_rank_registration_info=target_rank_registration_info,
+                                chunked_dst_kv_indice=chunked_dst_kv_indice,
+                                executor=executor,
                             )
-                        else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
+                            if ret != 0:
+                                logger.error("target send kv cache failed")
+                                is_send_fail = True
+                        # draft
+                        if is_need_send_draft and has_draft_data:
+                            ret = self._send_kv_cache(
+                                is_target=False,
+                                req=req,
+                                kv_chunk=kv_chunk,
+                                target_rank_registration_info=target_rank_registration_info,
+                                chunked_dst_kv_indice=chunked_dst_kv_indice,
+                                executor=executor,
                             )
-                        if ret != 0:
+                            if ret != 0:
+                                logger.error("draft send kv cache failed")
+                                is_send_fail = True
+
+                        if is_send_fail:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
@@ -1273,6 +1435,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            draft_packed_kv_data_ptrs = b""
+            draft_dst_kv_item_len = dst_kv_item_len
+            if len(self.kv_mgr.kv_args.draft_kv_data_ptrs) > 0:
+                draft_packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr)
+                    for ptr in self.kv_mgr.kv_args.draft_kv_data_ptrs
+                )
+                draft_dst_kv_item_len = str(
+                    self.kv_mgr.kv_args.draft_kv_item_lens[0]
+                ).encode("ascii")
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
@@ -1288,6 +1460,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
+                        draft_packed_kv_data_ptrs,
+                        draft_dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                     ]

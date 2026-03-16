@@ -246,6 +246,9 @@ class DecodePreallocQueue:
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
+        self.is_draft_mla_backend = False
+        if draft_token_to_kv_pool is not None:
+            self.is_draft_mla_backend = is_mla_backend(draft_token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -287,21 +290,23 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.kv_data_ptrs = kv_data_ptrs
+        kv_args.kv_data_lens = kv_data_lens
+        kv_args.kv_item_lens = kv_item_lens
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
+            kv_args.draft_kv_data_ptrs = draft_kv_data_ptrs
+            kv_args.draft_kv_data_lens = draft_kv_data_lens
+            kv_args.draft_kv_item_lens = draft_kv_item_lens
+        else:
+            kv_args.draft_kv_data_ptrs = []
+            kv_args.draft_kv_data_lens = []
+            kv_args.draft_kv_item_lens = []
         kv_args.page_size = self.token_to_kv_pool.page_size
-
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
@@ -341,6 +346,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_draft_mla_backend,
         )
         return kv_manager
 
