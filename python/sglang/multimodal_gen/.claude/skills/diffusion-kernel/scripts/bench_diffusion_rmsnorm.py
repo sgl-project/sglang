@@ -8,15 +8,27 @@ Compares:
 Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels
 
 Usage:
-    python scripts/bench_diffusion_rmsnorm.py
+    cd /data/bbuf/sglang
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_rmsnorm.py
 
 Requirements:
-    pip install triton  # for triton.testing timing utilities
-    # SGLang must be installed and CUDA available
+    # Run inside the configured SGLang diffusion container shell.
+    # This script auto-selects an idle GPU when CUDA_VISIBLE_DEVICES is unset.
 """
 
+import os
+import sys
 import time
+from pathlib import Path
 from typing import Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from diffusion_skill_env import configure_runtime_env
+
+configure_runtime_env(required_gpus=1)
 
 import torch
 
@@ -75,6 +87,7 @@ def run_benchmark():
     print("=" * 72)
     print("SGLang Diffusion RMSNorm Micro-Benchmark: JIT CUDA vs PyTorch")
     print("=" * 72)
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     print(f"Device: {torch.cuda.get_device_name(0)}")
     cap = torch.cuda.get_device_capability()
     print(f"Compute Capability: sm_{cap[0]}{cap[1]}")
