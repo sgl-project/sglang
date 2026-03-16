@@ -76,7 +76,7 @@ rocm700 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm700-cp310-abi3-manylinux2014_x86_64.whl#sha256=2d56ee97d8e6dae29d35a2524de4bffb8e07752bcc74e73313462496427832bf",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.0/sglang_kernel-0.4.0+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
 ]
 
 rocm720 = [
@@ -85,7 +85,7 @@ rocm720 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm720-cp310-abi3-manylinux2014_x86_64.whl#sha256=91a3f50ef0b9d2a140dbf6e2aabff45a50c45a4782b9215997bce6f71749180f",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.0/sglang_kernel-0.4.0+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
