@@ -44,7 +44,7 @@ class TestSessionControl(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--attention-backend",
-                "flashinfer",
+                "triton",
                 "--enable-streaming-session",
             ],
         )

@@ -116,13 +116,14 @@ With your AMD system properly configured and SGLang installed, you can now fully
 
 ## Quantization on AMD GPUs
 
-The [Quantization documentation](../advanced_features/quantization.md#platform-compatibility) has a full compatibility matrix. The short version: FP8, AWQ, MXFP4, W8A8, GPTQ, compressed-tensors, and Quark all work on AMD. Methods that depend on Marlin or NVIDIA-specific kernels (`awq_marlin`, `gptq_marlin`, `gguf`, `modelopt_fp8`, `modelopt_fp4`, `petit_nvfp4`) do not.
+The [Quantization documentation](../advanced_features/quantization.md#platform-compatibility) has a full compatibility matrix. The short version: FP8, AWQ, MXFP4, W8A8, GPTQ, compressed-tensors, Quark, and **petit_nvfp4** (NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel)) all work on AMD. Methods that depend on Marlin or NVIDIA-specific kernels (`awq_marlin`, `gptq_marlin`, `gguf`, `modelopt_fp8`, `modelopt_fp4`) do not.
 
 A few things to keep in mind:
 
 - FP8 works via Aiter or Triton. Pre-quantized FP8 models like DeepSeek-V3/R1 work out of the box.
 - AWQ uses Triton dequantization kernels on AMD. The faster Marlin path is not available.
 - MXFP4 requires CDNA3/CDNA4 and `SGLANG_USE_AITER=1`.
+- `petit_nvfp4` enables NVFP4 models (e.g., [Llama 3.3 70B FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4)) on MI250/MI300X via [Petit](https://github.com/causalflow-ai/petit-kernel). Install with `pip install petit-kernel`; no `--quantization` flag needed when loading pre-quantized NVFP4 models.
 - `quark_int4fp8_moe` is an AMD-only online quantization method for MoE models on CDNA3/CDNA4.
 
 Several of these backends are accelerated by [Aiter](https://github.com/ROCm/aiter). Enable it with:

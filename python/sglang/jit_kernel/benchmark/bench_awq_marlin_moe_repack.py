@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import torch
 import triton
@@ -9,6 +7,7 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
 try:
@@ -18,12 +17,8 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
-# Fixed parameters
 NUM_BITS = 4
 GROUP_SIZE = 128
 SIZE_N = 4096
@@ -111,8 +106,6 @@ def benchmark(num_experts, size_k, size_n, num_bits, provider):
         num_experts, size_k, size_n, num_bits, group_size
     )
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "jit":
         fn = lambda: jit_awq_marlin_moe_repack(
             b_q_weight, perm, size_k, size_n, num_bits
@@ -124,8 +117,7 @@ def benchmark(num_experts, size_k, size_n, num_bits, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
