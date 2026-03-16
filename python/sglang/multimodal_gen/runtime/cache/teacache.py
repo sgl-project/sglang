@@ -291,13 +291,19 @@ class TeaCacheMixin:
         if current_timestep == 0 and not self.is_cfg_negative:
             self.reset_teacache_state()
 
+        # Use coefficients callback if it exists, otherwise use hardcoded coefficients
+        if teacache_params.coefficients_callback is not None:
+            coefficients = teacache_params.coefficients_callback(teacache_params)
+        else:
+            coefficients = teacache_params.coefficients
+
         return TeaCacheContext(
             current_timestep=current_timestep,
             num_inference_steps=num_inference_steps,
             do_cfg=do_cfg,
             is_cfg_negative=is_cfg_negative,
             teacache_thresh=teacache_params.teacache_thresh,
-            coefficients=teacache_params.coefficients,
+            coefficients=coefficients,
             teacache_params=teacache_params,
         )
 
