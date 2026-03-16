@@ -35,8 +35,11 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -806,14 +809,14 @@ class MambaRadixCache(BasePrefixCache):
 
         return full_num_evicted
 
-    def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
         Increment the lock reference count for the node.
         It locks the full_lock_ref for nodes between the [last node, root), exclusive.
         It locks the mamba_lock_ref for current node if its mamba_value exists.
         """
         if self.disable:
-            return None
+            return IncLockRefResult()
 
         # protect mamba value in current node if it exists
         if node.mamba_value is not None:
@@ -832,16 +835,18 @@ class MambaRadixCache(BasePrefixCache):
                 self.full_protected_size_ += len(node.value)
             node.full_lock_ref += 1
             node = node.parent
-        return None
+        return IncLockRefResult()
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
         It unlocks the mamba_lock_ref for current node if its mamba_value exists.
         """
         if self.disable:
-            return None
+            return DecLockRefResult()
 
         if node.mamba_value is not None:
             assert (
@@ -861,6 +866,8 @@ class MambaRadixCache(BasePrefixCache):
                 self.full_protected_size_ -= len(node.value)
             node.full_lock_ref -= 1
             node = node.parent
+
+        return DecLockRefResult()
 
     def sanity_check(self):
         if self.disable:
