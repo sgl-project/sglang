@@ -115,6 +115,16 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
+            if dtype in (torch.float16, torch.bfloat16):
+                logger.info("Using AITER Sage backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
+            else:
+                logger.warning(
+                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    dtype,
+                )
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
@@ -171,6 +181,48 @@ class RocmPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Replace nn.GroupNorm with AITer GroupNorm for improved ROCm VAE performance."""
+        if not envs.SGLANG_USE_ROCM_VAE:
+            return vae
+        try:
+            from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
+
+            count = cls._replace_groupnorm(vae, AiterGroupNorm)
+            if count > 0:
+                logger.info(
+                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
+                    count,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to apply AITer GroupNorm to VAE.",
+                exc_info=True,
+            )
+        return vae
+
+    @staticmethod
+    def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
+        count = 0
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.GroupNorm) and child.affine:
+                replacement = aiter_gn_cls(
+                    num_groups=child.num_groups,
+                    num_channels=child.num_channels,
+                    eps=child.eps,
+                    affine=True,
+                    device=child.weight.device,
+                    dtype=child.weight.dtype,
+                )
+                replacement.weight = child.weight
+                replacement.bias = child.bias
+                setattr(module, name, replacement)
+                count += 1
+            else:
+                count += RocmPlatform._replace_groupnorm(child, aiter_gn_cls)
+        return count
 
     @classmethod
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:

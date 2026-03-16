@@ -1,7 +1,7 @@
 name: PR Test ROCm 7.2 (AMD)
 # Dynamic run-name for /rerun-stage commands to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
+run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
   # run rocm 720 pr tests once a day at 2am UTC to avoid overwhelming the CI system
@@ -27,8 +27,29 @@ on:
   #     - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
+      target_stage_select:
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-small-1-gpu-amd
+          - stage-b-test-small-1-gpu-amd-nondeterministic
+          - stage-b-test-small-1-gpu-amd-mi35x
+          - stage-b-test-large-1-gpu-amd
+          - stage-b-test-large-2-gpu-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
       target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
+        description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
         type: string
         default: ""
@@ -144,9 +165,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -190,9 +211,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'sgl-kernel-unit-test-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -231,9 +252,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -270,9 +291,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'jit-kernel-unit-test-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
@@ -308,9 +329,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -319,7 +340,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-1gpu-sglang]
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -340,16 +361,16 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-small-1-gpu-amd-nondeterministic:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-nondeterministic') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -385,9 +406,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -423,9 +444,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -462,9 +483,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -501,9 +522,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'multimodal-gen-test-1-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -615,6 +636,7 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
@@ -631,9 +653,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'multimodal-gen-test-2-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -744,6 +766,7 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
@@ -760,9 +783,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -807,9 +830,9 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
-          !inputs.target_stage &&
+          !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -841,6 +864,118 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
+  # =============================================== Disaggregation ====================================================
+  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-8.fabric]
+
+    runs-on: ${{matrix.runner}}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Check Host RDMA Environment
+        id: rdma_detect
+        run: |
+          set +e
+          echo "=== Checking Host RDMA Environment ==="
+
+          echo ""
+          echo "=== 1. Ionic driver library check ==="
+          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
+
+          echo ""
+          echo "=== 2. Infiniband devices ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "/sys/class/infiniband not found"
+
+          echo ""
+          echo "=== 3. ibv_devinfo ==="
+          which ibv_devinfo 2>/dev/null && ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+          echo ""
+          echo "=== 4. Kernel modules ==="
+          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "No RDMA kernel modules loaded"
+
+          echo ""
+          echo "=== 5. Detect RDMA Devices for test environment ==="
+          if [ -d "/sys/class/infiniband" ]; then
+            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            echo "Detected RDMA Devices: $RDMA_DEVS"
+            echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
+          else
+            echo "No RDMA devices found in /sys/class/infiniband"
+            echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
+          fi
+
+          echo ""
+          echo "=== Host RDMA Check Complete ==="
+
+      - name: Start Special Container
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify RDMA in Container
+        run: |
+          docker exec -u root ci_sglang bash -c '
+            echo "=== Container RDMA Verification ==="
+            echo "Device nodes:"
+            ls -la /dev/infiniband/
+            echo ""
+            echo "Provider libraries:"
+            ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
+            echo ""
+            echo "HCA devices:"
+            HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            ibv_devinfo -list
+            if [ "$HCA_COUNT" -gt 0 ]; then
+              echo ""
+              echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
+            else
+              echo ""
+              echo "=== WARNING: No HCAs detected. RDMA tests may fail ==="
+            fi
+          '
+
+      - name: Run Aiter Op Test (RMSNorm)
+        timeout-minutes: 10
+        run: |
+          echo "Running pre-check: test_rmsnorm2d.py"
+          docker exec \
+            -e MAX_JOBS=192 \
+            ci_sglang \
+            python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
+
+      - name: Run test_disaggregation
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+
   pr-test-amd-finish:
     needs:
       [
@@ -859,6 +994,7 @@ jobs:
         stage-b-test-small-1-gpu-amd-mi35x,
         stage-b-test-large-1-gpu-amd,
         stage-b-test-large-2-gpu-amd,
+        stage-b-test-large-8-gpu-35x-disaggregation-amd,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
       ]

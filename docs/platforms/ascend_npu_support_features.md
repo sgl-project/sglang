@@ -16,7 +16,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--tokenizer-worker-num`               | `1`      | Type: int                             |      A2, A3      |
 | `--skip-tokenizer-init`                | `False`  | bool flag (set to enable)             |      A2, A3      |
 | `--load-format`                        | `auto`   | `auto`, `safetensors`                 |      A2, A3      |
-| `--model-loader-` <br/> `extra-config` | {}       | Type: str                             |      A2, A3      |
+| `--model-loader-` <br/> `extra-config` | `{}`     | Type: str                             |      A2, A3      |
 | `--trust-remote-code`                  | `False`  | bool flag (set to enable)             |      A2, A3      |
 | `--context-length`                     | `None`   | Type: int                             |      A2, A3      |
 | `--is-embedding`                       | `False`  | bool flag (set to enable)             |      A2, A3      |
@@ -71,6 +71,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--page-size`                                       | `128`    | Type: int                      |      A2, A3      |
 | `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
 | `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
@@ -84,7 +85,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
 | `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
 | `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
-| `--stream-output`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--incremental-streaming-output`                   | `False`  | bool flag (set to enable) |      A2, A3      |
 | `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
 | `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
 | `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |
@@ -104,7 +105,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--log-level-http`                                 | `None`            | Type: str                      |      A2, A3      |
 | `--log-requests`                                   | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
 | `--log-requests-level`                             | `2`               | `0`, `1`, `2`, `3`             |      A2, A3      |
-| `--log-requests-format`                            | text              | text, json                     |      A2, A3      |
+| `--log-requests-format`                            | `text`            | `text`, `json`                 |      A2, A3      |
 | `--crash-dump-folder`                              | `None`            | Type: str                      |      A2, A3      |
 | `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-metrics-for-`<br/>`all-schedulers`       | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
@@ -122,6 +123,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--kv-events-config`                               | `None`            | Type: str                      | Special for GPU  |
 | `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
 | `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      |      A2, A3      |
+| `--log-requests-target`                            | `None`            | Type: str                      |      A2, A3      |
+| `--uvicorn-access-log-exclude-prefixes`            | `DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES` | Type: str                      |      A2, A3      |
 
 ## RequestMetricsExporter configuration
 
@@ -142,7 +145,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--completion-template` | `None`    | Type: str                      |      A2, A3      |
 | `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
 | `--reasoning-parser`    | `None`    | `deepseek-r1`                  |      A2, A3      |
-| `--tool-call-parser`    | `None`    | `llama`,`pythonic`             |      A2, A3      |
+| `--tool-call-parser`    | `None`    | `deepseekv3`<br/>`deepseekv31`<br/>`glm`<br/>`glm45`<br/>`glm47`<br/>`gpt-oss`<br/>`kimi_k2`<br/>`llama3`<br/>`mistral`<br/>`pythonic`<br/>`qwen`<br/>`qwen25`<br/>`qwen3_coder`<br/>`step3`<br/>`gigachat3`            |      A2, A3      |
 | `--sampling-defaults`   | `model`   | `openai`, `model`              |      A2, A3      |
 
 ## Data parallelism
@@ -150,7 +153,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                               | Defaults      | Options                                                   | Server supported |
 |----------------------------------------|---------------|-----------------------------------------------------------|:----------------:|
 | `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                 |      A2, A3      |
-| `--load-balance-method`                | `round_robin` | `round_robin`,<br/> `total_requests`,<br/> `total_tokens` |      A2, A3      |
+| `--load-balance-method`                | `auto` | `auto`,<br/> `round_robin`,<br/> `follow_bootstrap_room`,<br/> `total_requests`,<br/> `total_tokens` |      A2, A3      |
 | `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                            |      A2, A3      |
 
 ## Multi-node distributed serving
@@ -179,7 +182,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--max-loras-per-batch`  | `8`      | Type: int                           |      A2, A3      |
 | `--max-loaded-loras`     | `None`   | Type: int                           |      A2, A3      |
 | `--lora-eviction-policy` | `lru`    | `lru`,<br/> `fifo`                  |      A2, A3      |
-| `--lora-backend`         | `triton` | `triton`                            |      A2, A3      |
+| `--lora-backend`         | `csgmv`  | `triton`,<br/>`csgmv`,<br/>`ascend`,<br/>`torch_native`  |      A2, A3      |
 | `--max-lora-chunk-size`  | `16`     | `16`, `32`,<br/> `64`, `128`        | Special for GPU  |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
@@ -194,7 +197,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--mm-attention-backend`               | `None`            | `ascend_attn`                                                                                  |      A2, A3      |
 | `--nsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/>`fa3`,<br/> `tilelang`,<br/> `aiter`            | Special for GPU  |
 | `--nsa-decode-backend`                 | `fa3`             | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/>`tilelang`,<br/> `aiter`               | Special for GPU  |
-| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
+| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`flashinfer_cutlass`,<br/>`flashinfer_deepgemm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
 | `--disable-flashinfer-`<br/>`autotune` | `False`           | bool flag<br/> (set to enable)                                                                 | Special for GPU  |
 
 ## Speculative decoding
@@ -259,9 +262,9 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                     | Defaults  | Options                                       | Server supported |
 |------------------------------|-----------|-----------------------------------------------|:----------------:|
 | `--max-mamba-cache-size`     | `None`    | Type: int                                     |      A2, A3      |
-| `--mamba-ssm-dtype`          | `float32` | `float32`,<br/> `bfloat16`                    |      A2, A3      |
-| `--mamba-full-memory-ratio`  | `0.2`     | Type: float                                   |      A2, A3      |
-| `--mamba-scheduler-strategy` | `auto`    | `auto`, <br/>`no_buffer`,<br/> `extra_buffer` |      A2, A3      |
+| `--mamba-ssm-dtype`          | `float32` | `float32`,<br/>`bfloat16`,<br/>`float16`      |      A2, A3      |
+| `--mamba-full-memory-ratio`  | `0.9`     | Type: float                                   |      A2, A3      |
+| `--mamba-scheduler-strategy` | `auto`    | Only `auto`, `no_buffer` supported            |      A2, A3      |
 | `--mamba-track-interval`     | `256`     | Type: int                                     |      A2, A3      |
 
 ## Hierarchical cache
@@ -271,8 +274,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable)                                      |      A2, A3      |
 | `--hicache-ratio`                               | `2.0`           | Type: float                                                         |      A2, A3      |
 | `--hicache-size`                                | `0`             | Type: int                                                           |      A2, A3      |
-| `--hicache-write-policy`                        | `write_through` | `write_back`,<br/> `write_through`,<br/>  `write_through_selective` |      A2, A3      |
-| `--radix-eviction-policy`                       | `lru`           | `lru`,                                     `lfu`                    |      A2, A3      |
+| `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                               |      A2, A3      |
 | `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                  |      A2, A3      |
 | `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`    |      A2, A3      |
 | `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                              |      A2, A3      |
@@ -290,10 +292,10 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                  | Defaults | Options   | Server supported |
 |---------------------------|----------|-----------|:----------------:|
 | `--cpu-offload-gb`        | `0`      | Type: int |      A2, A3      |
-| `--offload-group-size`    | `-1`     | Type: int |      A2, A3      |
-| `--offload-num-in-group`  | `1`      | Type: int |      A2, A3      |
-| `--offload-prefetch-step` | `1`      | Type: int |      A2, A3      |
-| `--offload-mode`          | `cpu`    | Type: str |      A2, A3      |
+| `--offload-group-size`    | `-1`     | Type: int |      Planned     |
+| `--offload-num-in-group`  | `1`      | Type: int |      Planned     |
+| `--offload-prefetch-step` | `1`      | Type: int |      Planned     |
+| `--offload-mode`          | `cpu`    | Type: str |      Planned     |
 
 ## Args for multi-item scoring
 
@@ -316,9 +318,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-tokenizer-`<br/>`batch-encode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-outlines-`<br/>`disk-cache`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
@@ -334,7 +335,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |      A2, A3      |
 | `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |      A2, A3      |
 | `--torch-compile-max-bs`                                | `32`     | Type: int                      |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `4096`   | Type: int                      |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `None`   | Type: int                      |      A2, A3      |
 | `--torchao-config`                                      | ``       | Type: str                      | Special for GPU  |
 | `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
@@ -356,6 +357,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |      A2, A3      |
 | `--numa-node`                                           | `None`   | List[int]                      |      A2, A3      |
+| `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable) |     Planned      |
 | `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
 | `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
@@ -385,8 +387,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-mode`                                 | `null`     | `null`,<br/> `prefill`,<br/> `decode` |      A2, A3      |
 | `--disaggregation-transfer-backend`                     | `mooncake` | `ascend`                              |      A2, A3      |
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
-| `--disaggregation-decode-tp`                            | `None`     | Type: int                             |      A2, A3      |
-| `--disaggregation-decode-dp`                            | `None`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
 | `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
 | `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
@@ -426,8 +426,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                      | Defaults | Options                        | Server supported |
 |-----------------------------------------------|----------|--------------------------------|:----------------:|
-| `--mm-max-concurrent-calls`                   | 32       | Type: int                      |      A2, A3      |
-| `--mm-per-request-timeout`                    | 10.0     | Type: float                    |      A2, A3      |
+| `--mm-max-concurrent-calls`                   | `32`     | Type: int                      |      A2, A3      |
+| `--mm-per-request-timeout`                    | `10.0`   | Type: float                    |      A2, A3      |
 | `--enable-broadcast-mm-`<br/>`inputs-process` | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--mm-process-config`                         | `None`   | Type: JSON / Dict              |      A2, A3      |
 | `--mm-enable-dp-encoder`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
@@ -441,13 +441,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--decrypted-draft-config-file` | `None`   | Type: str                      |      A2, A3      |
 | `--enable-prefix-mm-cache`      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
-## For deterministic inference
-
-| Argument                                  | Defaults | Options                        | Server supported |
-|-------------------------------------------|----------|--------------------------------|:----------------:|
-| `--enable-deterministic-`<br/>`inference` | `False`  | bool flag<br/> (set to enable) |     Planned      |
-
-## For registering hooks
+## Forward hooks
 
 | Argument          | Defaults | Options         | Server supported |
 |-------------------|----------|-----------------|:----------------:|

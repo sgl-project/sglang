@@ -61,6 +61,10 @@ suites_ascend = {
         "ascend/test_server_2_npu.py",
         # add new 2-npu test files here
     ],
+    "8-npu": [
+        "ascend/test_server_8_npu.py",
+        # add new 8-npu test files here
+    ],
 }
 
 SUITES.update(suites_ascend)
