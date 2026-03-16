@@ -332,7 +332,9 @@ async def lifespan(fast_api_app: FastAPI):
         fast_api_app.state.openai_serving_chat
     )
 
-    # Wire IOChain into all OpenAI serving handlers (no-op if chain is empty)
+    # Wire IOChain into all OpenAI serving handlers (no-op if chain is empty).
+    # TODO: replace hardcoded attribute list with a handler registry so new
+    #       serving handlers are wired automatically without editing this file.
     if iochain._filters:
         _iochain_handler_attrs = [
             "openai_serving_completion",

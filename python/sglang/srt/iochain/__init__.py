@@ -39,7 +39,6 @@ reference implementation.
 
 from sglang.srt.iochain.base import IOChain, IOContext, IOFilter
 from sglang.srt.iochain.filters.request_logging import RequestLoggingFilter
-from sglang.srt.iochain.mixin import IOChainMixin
 
 # Shared default chain — empty until plugins are loaded.
 # Nothing is activated implicitly; all filters are opt-in.
@@ -55,7 +54,6 @@ __all__ = [
     "IOChain",
     "IOContext",
     "IOFilter",
-    "IOChainMixin",
     "RequestLoggingFilter",
     "get_default_chain",
 ]

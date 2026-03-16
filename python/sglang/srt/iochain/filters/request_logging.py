@@ -10,6 +10,10 @@ RequestLoggingFilter — reference IOFilter implementation.
    deployment (structured logging, OpenTelemetry spans, Prometheus histograms,
    etc.).
 
+.. TODO::
+   Move this file to ``examples/iochain/`` once that directory exists, so
+   bundled filters are clearly separated from the core framework.
+
 Logs the model name on ingress and end-to-end latency on egress for every
 non-streaming request.
 
