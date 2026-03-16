@@ -773,6 +773,7 @@ class ServerArgs:
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
+        self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
 
         # Handle Hicache settings.
@@ -2397,6 +2398,15 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+    def _handle_nccl_pre_warm(self):
+        # pre_warm_nccl is only used with CUDA or HIP hardware
+        if self.pre_warm_nccl and not (is_cuda() or is_hip()):
+            logger.warning(
+                "pre_warm_nccl is only applicable for CUDA or HIP hardware. "
+                "Ignoring pre_warm_nccl setting on current hardware."
+            )
+            self.pre_warm_nccl = False
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
