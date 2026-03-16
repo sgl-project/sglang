@@ -24,6 +24,7 @@ class GSM8KAscendMixin(ABC):
         "--disable-cuda-graph",
     ]
     gsm8k_num_shots = 5
+    gsm8k_num_questions = 200
 
     @classmethod
     def setUpClass(cls):
@@ -56,7 +57,7 @@ class GSM8KAscendMixin(ABC):
         args = SimpleNamespace(
             num_shots=self.gsm8k_num_shots,
             data_path=None,
-            num_questions=200,
+            num_questions=self.gsm8k_num_questions,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
