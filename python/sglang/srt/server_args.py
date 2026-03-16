@@ -6040,7 +6040,10 @@ class ServerArgs:
         )
 
     def validate_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
+        if (
+            importlib.util.find_spec("mooncake") is None
+            or importlib.util.find_spec("mooncake.engine") is None
+        ):
             logger.warning(
                 "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
