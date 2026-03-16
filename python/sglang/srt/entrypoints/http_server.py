@@ -42,7 +42,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 
 import numpy as np
-import orjson
 import requests
 import uvicorn
 import uvloop
@@ -164,11 +163,6 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils.json_response import (
-    SGLangORJSONResponse,
-    dumps_json,
-    orjson_response,
-)
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -178,6 +172,11 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.json_response import (
+    SGLangORJSONResponse,
+    dumps_json,
+    orjson_response,
+)
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
