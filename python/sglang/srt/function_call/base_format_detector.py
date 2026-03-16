@@ -194,10 +194,14 @@ class BaseFormatDetector(ABC):
                     # bot_token which skips past all inter-object markup.
                     # e.g. Qwen25: separator "," matches between eot/bot tags.
                     if used_separator_branch and self.bot_token in current_text:
-                        start_idx = current_text.find(self.bot_token) + len(self.bot_token)
+                        start_idx = current_text.find(self.bot_token) + len(
+                            self.bot_token
+                        )
                         if start_idx >= len(current_text):
                             return StreamingParseResult()
-                        obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                        obj, end_idx = _partial_json_loads(
+                            current_text[start_idx:], flags
+                        )
                     else:
                         raise
 
