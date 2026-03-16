@@ -1284,8 +1284,18 @@ class DummyModelLoader(BaseModelLoader):
                     self.load_config,
                     quant_config,
                 )
-
+            from sglang.srt.layers.utils.common import PPMissingLayer
             for _, module in model.named_modules():
+                
+                # PPMissingLayer overrides attribute access to always
+                # return `self`
+                # The quant checks will fire because of this which causes
+                # a crash: 
+                #   - module.is_weights_quantized() -> self() -> self.forward()
+                # PPMissingLayer.forward expects either args or kwargs
+                if type(module) is PPMissingLayer:
+                    continue
+
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     # Skip FusedMoE layers already quantized during init (FP8 or FP4)
