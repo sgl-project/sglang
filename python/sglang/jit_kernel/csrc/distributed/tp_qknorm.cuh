@@ -3,6 +3,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -31,6 +32,7 @@ struct ParallelQKNormParams {
   uint32_t rank;
   uint32_t num_tokens;
   uint32_t epoch_bytes;
+  uint32_t num_clean_up_count = 0;
 };
 
 template <typename T>
@@ -95,7 +97,7 @@ struct KernelTrait {
 };
 
 template <typename Trait>
-__global__ __launch_bounds__(Trait::kBlockSize, 1) void parallel_qknorm_across_head(
+__global__ __launch_bounds__(Trait::kBlockSize) void parallel_qknorm_across_head(
     const ParallelQKNormParams __grid_constant__ params, const PushController __grid_constant__ ctrl) {
   using namespace device;
 
@@ -104,8 +106,9 @@ __global__ __launch_bounds__(Trait::kBlockSize, 1) void parallel_qknorm_across_h
   using DType2 = typename Trait::DType2;
   const auto &[
       buffer, q_ptr, k_ptr, q_weight, k_weight, q_stride_bytes, k_stride_bytes, //
-      eps, rank, num_tokens, epoch_bytes
+      eps, rank, num_tokens, epoch_bytes, num_clean_up_count
   ] = params;
+
   using Package = AlignedVector<float, 2>;
   constexpr uint32_t kNumGPU = Trait::kNumGPU;
   constexpr uint32_t kNumQReduce = next_pow_of_2(Trait::kNumQWarps);
@@ -122,6 +125,15 @@ __global__ __launch_bounds__(Trait::kBlockSize, 1) void parallel_qknorm_across_h
   const auto input_stride_bytes = load_q ? q_stride_bytes : k_stride_bytes;
   PDLWaitPrimary<Trait::kUsePDL>();
   PDLTriggerSecondary<Trait::kUsePDL>();
+  if (num_clean_up_count > 0 && blockIdx.x >= num_tokens) {
+    [[unlikely]];
+    // In this case, we use the last few blocks to clean up other controllers
+    const auto tid = (blockIdx.x - num_tokens) * blockDim.x + threadIdx.x;
+    const auto stride = (gridDim.x - num_tokens) * blockDim.x;
+    for (uint32_t i = tid; i < num_clean_up_count; i += stride)
+      ctrl.exit_unsafe(num_tokens + i);
+    return;
+  }
   const auto epoch_offset = ctrl.epoch() * epoch_bytes;  // only for comm
   for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
     // Stage 1. local reduce (warp-level)
@@ -164,28 +176,21 @@ __global__ __launch_bounds__(Trait::kBlockSize, 1) void parallel_qknorm_across_h
         /// we add here to ensure that the sum is never zero
         sum_q_k[0] = sum_q + eps;
         sum_q_k[1] = sum_k + eps;
-        const auto ptr = pointer::offset(buffer[tx], epoch_offset);
-        st_global_volatile_8B(sum_q_k, ptr, i * kNumGPU + rank);
-      }
-      float global_sum_q = 0.0f;
-      float global_sum_k = 0.0f;
-      const auto ptr = pointer::offset(buffer[rank], epoch_offset);
-      if (tx < kNumGPU) {
-        Package sum_q_k;
+        const auto push_ptr = pointer::offset(buffer[tx], epoch_offset);
+        st_global_volatile_8B(sum_q_k, push_ptr, i * kNumGPU + rank);
+        const auto poll_ptr = pointer::offset(buffer[rank], epoch_offset);
         while (true) {
-          ld_global_volatile_8B(sum_q_k, ptr, i * kNumGPU + tx);
+          ld_global_volatile_8B(sum_q_k, poll_ptr, i * kNumGPU + tx);
           if (sum_q_k[0] != 0.0f && sum_q_k[1] != 0.0f) break;
         }
-        global_sum_q = sum_q_k[0];
-        global_sum_k = sum_q_k[1];
-        sum_q_k.fill(0.0f);
-        st_global_volatile_8B(sum_q_k, ptr, i * kNumGPU + tx);
-      }
-      global_sum_q = warp::reduce_sum<kNumGPU>(global_sum_q);
-      global_sum_k = warp::reduce_sum<kNumGPU>(global_sum_k);
-      if (tx == 0) {
+        constexpr uint32_t kActiveMask = (1 << kNumGPU) - 1;
+        const auto global_sum_q = warp::reduce_sum<kNumGPU>(sum_q_k[0], kActiveMask);
+        const auto global_sum_k = warp::reduce_sum<kNumGPU>(sum_q_k[1], kActiveMask);
         scale_q = math::rsqrt(global_sum_q / static_cast<float>(Trait::kQDim));
         scale_k = math::rsqrt(global_sum_k / static_cast<float>(Trait::kKDim));
+        Package zeros;
+        zeros.fill(0.0f);
+        zeros.store(poll_ptr, i * kNumGPU + tx);
       }
     }
 
@@ -212,8 +217,8 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
   static constexpr auto kernel = parallel_qknorm_across_head<Trait>;
   static_assert(kNumGPU <= device::distributed::kMaxNumGPU, "kNumGPU exceeds the maximum supported GPUs");
 
-  void
-  run(const tvm::ffi::Tensor q,
+  void _run(
+      const tvm::ffi::Tensor q,
       const tvm::ffi::Tensor k,
       const tvm::ffi::Tensor q_weight,
       const tvm::ffi::Tensor k_weight,
@@ -244,8 +249,16 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
         .with_device(device_)
         .verify(k_weight);
     const auto device = device_.unwrap();
-    const auto num_blocks = m_max_num_cta_push;  // must be constant to ensure correctness
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    // use at most `world_size` blocks to clean up,
+    // this is based on the observation that occupancy is usually linear
+    // with respect to the world size
+    const bool need_clean = num_tokens < m_max_num_cta_push;
+    const auto num_clean = need_clean ? (m_max_num_cta_push - num_tokens) : 0;
+    const auto num_blocks = need_clean ? num_tokens + div_ceil(num_clean, Trait::kBlockSize)  //
+                                       : m_max_num_cta_push;                                  //
     const auto num_threads = Trait::kBlockSize;
+    RuntimeCheck(num_blocks <= m_max_num_cta_push, "internal error");
     ParallelQKNormParams params;
     for (uint32_t i = 0; i < kNumGPU; ++i) {
       params.buffer[i] = get_push_buffer(m_peer_storage[i]);
@@ -258,10 +271,11 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     params.k_stride_bytes = k.stride(0) * sizeof(DType);
     params.eps = eps / kNumGPU;  // scale down eps by number of GPUs
     params.rank = m_rank;
-    params.num_tokens = N.unwrap();
+    params.num_tokens = num_tokens;
     params.epoch_bytes = m_push_buffer_bytes;
+    params.num_clean_up_count = num_clean;
 
-    const auto needed_buffer_bytes = static_cast<int64_t>(params.num_tokens) * kNumGPU * 2 * sizeof(float);
+    const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * kNumGPU * 2 * sizeof(float);
     RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(m_push_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");
@@ -273,18 +287,21 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     LaunchKernel(num_blocks, num_threads, device)  //
         .enable_pdl(kUsePDL)(kernel, params, *m_push_ctrl);
   }
-};
 
-template <typename DType, uint32_t kNumGPU, int64_t kQDim, int64_t kKDim, bool kUsePDL>
-void fused_parallel_qknorm(
-    CustomAllReduceRef obj,
-    tvm::ffi::Tensor q,
-    tvm::ffi::Tensor k,
-    tvm::ffi::Tensor q_weight,
-    tvm::ffi::Tensor k_weight,
-    float eps) {
-  using Impl = FusedParallelQKNormAcrossHead<DType, kNumGPU, kQDim, kKDim, kUsePDL>;
-  static_cast<Impl&>(*obj.get()).run(q, k, q_weight, k_weight, eps);
-}
+  static uint32_t get_max_occupancy() {
+    return host::runtime::get_blocks_per_sm(kernel, Trait::kBlockSize);
+  }
+
+  static void
+  run(CustomAllReduceRef obj,
+      const tvm::ffi::Tensor q,
+      const tvm::ffi::Tensor k,
+      const tvm::ffi::Tensor q_weight,
+      const tvm::ffi::Tensor k_weight,
+      const float eps) {
+    using Self = FusedParallelQKNormAcrossHead;
+    return static_cast<Self*>(obj.get())->_run(q, k, q_weight, k_weight, eps);
+  }
+};
 
 }  // namespace

@@ -101,10 +101,14 @@ struct PushController {
   SGL_DEVICE void exit() const {
     __syncthreads();
     if (threadIdx.x == 0) {
-      auto& signal = m_local_signal[blockIdx.x];
-      const auto epoch = signal.get_counter();
-      signal.set_counter((epoch + 1) % kNumStages);
+      this->exit_unsafe(blockIdx.x);
     }
+  }
+
+  SGL_DEVICE void exit_unsafe(uint32_t which) const {
+    auto& signal = m_local_signal[which];
+    const auto epoch = signal.get_counter();
+    signal.set_counter((epoch + 1) % kNumStages);
   }
 
  private:

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, cast
 
 import torch
 import tvm_ffi
+from tvm_ffi import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -92,7 +93,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
+def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
         "custom_all_reduce_pull",
@@ -104,7 +105,7 @@ def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
 
 
 @cache_once
-def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int):
+def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
         "custom_all_reduce_push",
@@ -118,14 +119,18 @@ def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int):
 @cache_once
 def _jit_fused_parallel_qknorm_module(
     dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
-):
+) -> Module:
     args = make_cpp_args(dtype, world_size, q_dim, k_dim, is_arch_support_pdl())
+    cls_name = f"FusedParallelQKNormAcrossHead<{args}>"
     return load_jit(
         "tp_qknorm",
         *args,
         extra_ldflags=["-lcuda"],
         cuda_files=["distributed/tp_qknorm.cuh"],
-        cuda_wrappers=[("fused_parallel_qknorm", f"fused_parallel_qknorm<{args}>")],
+        cuda_wrappers=[
+            ("fused_parallel_qknorm", f"{cls_name}::run"),
+            ("get_max_occupancy", f"{cls_name}::get_max_occupancy"),
+        ],
     )
 
 
@@ -208,6 +213,13 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             self.free_storage()  # type: ignore
 
     return cast(type["CustomAllReduceObj"], CustomAllReduceObjReal)
+
+
+def get_fused_parallel_qknorm_max_occupancy(
+    dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
+) -> int:
+    module = _jit_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
+    return module.get_max_occupancy()
 
 
 def fused_parallel_qknorm(
