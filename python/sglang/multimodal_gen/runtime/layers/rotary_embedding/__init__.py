@@ -31,12 +31,16 @@ from .factory import get_rope, get_rotary_pos_embed
 from .mrope import NDRotaryEmbedding
 from .utils import (
     _apply_rotary_emb,
+    _use_aiter_rope,
+    apply_aiter_rope_qk,
     apply_flashinfer_rope_qk_inplace,
 )
 
 __all__ = [
     # _utils
     "_apply_rotary_emb",
+    "_use_aiter_rope",
+    "apply_aiter_rope_qk",
     "apply_flashinfer_rope_qk_inplace",
     # _base
     "RotaryEmbedding",

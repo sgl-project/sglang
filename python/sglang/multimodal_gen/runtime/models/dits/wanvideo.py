@@ -42,6 +42,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
+    _use_aiter_rope,
+    apply_aiter_rope_qk,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -548,6 +550,8 @@ class WanTransformerBlock(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif _use_aiter_rope and query.shape == key.shape:
+            query, key = apply_aiter_rope_qk(query, key, cos, sin)
         else:
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
@@ -775,6 +779,8 @@ class WanTransformerBlock_VSA(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif _use_aiter_rope and query.shape == key.shape:
+            query, key = apply_aiter_rope_qk(query, key, cos, sin)
         else:
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False

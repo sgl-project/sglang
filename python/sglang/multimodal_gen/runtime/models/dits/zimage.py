@@ -24,6 +24,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
+    _use_aiter_rope,
+    apply_aiter_rope_qk,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -259,6 +261,8 @@ class ZImageAttention(nn.Module):
                 q, k = apply_flashinfer_rope_qk_inplace(
                     q, k, cos_sin_cache, is_neox=False
                 )
+            elif _use_aiter_rope and q.shape == k.shape:
+                q, k = apply_aiter_rope_qk(q, k, cos, sin)
             else:
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
