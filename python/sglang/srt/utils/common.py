@@ -79,7 +79,6 @@ import psutil
 import pybase64
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
@@ -743,31 +742,101 @@ def wait_port_available(
     return False
 
 
-def is_port_available(port):
-    """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+def _get_addrinfos_for_bind(host=None, port=0):
+    """Return deduplicated addrinfo tuples for binding (one per address family).
+
+    Args:
+        host: Bind address. None (with AI_PASSIVE) resolves to wildcard
+              addresses (0.0.0.0 / ::) suitable for accepting on all interfaces.
+        port: Port number. 0 lets the OS assign an available ephemeral port.
+
+    Flags:
+        AI_ADDRCONFIG — only return families actually configured on this host.
+        AI_PASSIVE    — return wildcard addresses suitable for bind().
+
+    Falls back to AF_INET if getaddrinfo fails (e.g. DNS misconfiguration).
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+            0,
+            socket.AI_ADDRCONFIG | socket.AI_PASSIVE,
+        )
+        deduped = []
+        seen_families = set()
+        for info in infos:
+            if info[0] not in seen_families:
+                seen_families.add(info[0])
+                deduped.append(info)
+        # Prefer IPv4 so that callers without an explicit host get consistent
+        # behaviour across platforms (some OSes list IPv6 first).
+        deduped.sort(key=lambda x: (x[0] != socket.AF_INET,))
+        return deduped
+    except socket.gaierror:
+        fallback_host = "0.0.0.0" if host is None else host
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (fallback_host, port))]
+
+
+def try_bind_socket(host=None, port=0, *, reuse_addr=True, listen=False):
+    """Bind a TCP socket on the first available address family (IPv4/IPv6).
+
+    Iterates over address families returned by _get_addrinfos_for_bind and
+    returns the first socket that successfully binds.
+
+    Args:
+        host: Bind address. None binds to all interfaces (0.0.0.0 / ::).
+        port: Port number. 0 lets the OS assign an available ephemeral port;
+              use sock.getsockname()[1] to retrieve the assigned port.
+        reuse_addr: Set SO_REUSEADDR to allow quick port reuse after close.
+        listen: Call listen(1) after bind, making the socket ready to accept.
+
+    Returns:
+        The bound socket. Caller is responsible for closing it.
+
+    Raises:
+        OSError: If bind fails on all configured address families.
+    """
+    for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(host, port):
+        sock = socket.socket(family, socktype, proto)
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
-            return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if reuse_addr:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(sockaddr)
+            if listen:
+                sock.listen(1)
+            return sock
+        except (OSError, OverflowError):
+            sock.close()
+    raise OSError(f"Could not bind port {port} on any configured address family")
+
+
+def is_port_available(port):
+    """Return whether a port is available on all configured address families."""
+    try:
+        for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(port=port):
+            sock = socket.socket(family, socktype, proto)
+            try:
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(sockaddr)
+            finally:
+                sock.close()
+        return True
+    except (OSError, OverflowError):
+        return False
 
 
 def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    sock = try_bind_socket()
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def decode_video_base64(video_base64):
@@ -1132,7 +1201,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.4")
+        min_version: Minimum version required (e.g., "0.6.6")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1699,11 +1768,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
 
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
-    sock.bind(("", port))
-    sock.listen(1)
-    return sock
+    return try_bind_socket(port=port, listen=True)
 
 
 def get_amdgpu_memory_capacity():
@@ -2647,23 +2712,14 @@ def get_open_port() -> int:
     if port is not None:
         port = int(port)
         while True:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", port))
-                    return port
-            except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+            if is_port_available(port):
+                return port
+            logger.info("Port %d is already in use, trying port %d", port, port + 1)
+            port += 1
+    sock = try_bind_socket()
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -2934,31 +2990,40 @@ def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
 
 
 def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
+    # Google's public DNS servers, used to discover the local IP.
+    # UDP connect doesn't send packets; it just selects the right source address.
+    # https://developers.google.com/speed/public-dns/docs/using#addresses
+    # Try IPv4 first, then IPv6. getaddrinfo on a literal IP returns exactly
+    # one result, so we unpack directly instead of looping.
+    for dns_host, dns_port in [("8.8.8.8", 80), ("2001:4860:4860::8888", 80)]:
+        try:
+            family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+                dns_host,
+                dns_port,
+                socket.AF_UNSPEC,
+                socket.SOCK_DGRAM,
+                0,
+                socket.AI_ADDRCONFIG,
+            )[0]
+            with socket.socket(family, socktype, proto) as s:
+                s.connect(sockaddr)
+                return s.getsockname()[0]
+        except (socket.gaierror, OSError):
+            continue
 
+    # Fallback: resolve the local hostname to an IP address via /etc/hosts or DNS.
+    # Unreliable — many machines resolve hostname to 127.0.0.1, so we skip loopback.
     try:
         hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+        ip = socket.getaddrinfo(
+            hostname, None, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG
+        )[0][4][0]
+        if ip and ip not in ("127.0.0.1", "0.0.0.0", "::1"):
             return ip
     except Exception:
         pass
 
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
+    logger.warning("Can not get local ip by remote")
     return None
 
 
