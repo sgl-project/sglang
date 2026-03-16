@@ -81,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
     BaseReq,
+    BatchFinishReqACK,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
@@ -2627,6 +2628,19 @@ class Scheduler(
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        
+        # [Failover] Report finished requests to Controller for accounting
+        if self.server_args.dp_size > 1:
+            finished_rids = []
+            for req in batch.reqs:
+                if req.finished():
+                    finished_rids.append(req.rid)
+            if finished_rids:
+                try:
+                    # logger.info(f"Sending finish ack for {len(finished_rids)} reqs")
+                    self.send_to_tokenizer.send_output(BatchFinishReqACK(dp_rank=self.dp_rank, rids=finished_rids))
+                except Exception as e:
+                    logger.error(f"Failed to send finish ack: {e}")
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

@@ -30,7 +30,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    AbortReqACK,
+    BatchFinishReqACK,
     BlockReqInput,
+    RetrieveTokenBackupReq,
+    RetrieveTokenBackupRes,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -131,6 +135,9 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -152,6 +159,10 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
+        # [Failover] index: rid -> rank -> req
+        self.inflight_requests: dict[str, int] = {}
+        self.inflight_request_store: dict[str, Req] = {}
+        self.pending_reschedule_requests: dict[str, Req] = {}
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -185,8 +196,108 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    # [Failover] 
+    def _record_inflight(self, req: Req, rank: int):
+        self.inflight_requests[req.rid] = rank
+        self.inflight_request_store[req.rid] = req
+
+    # [Failover] 
+    def _clear_inflight(self, rid: str):
+        self.inflight_requests.pop(rid, None)
+        self.inflight_request_store.pop(rid, None)
+
+    # [Failover] 
+    def distribute(self, req: Req, rank: int):
+        logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {rank} at {time.time()}")
+        self._record_inflight(req, rank)
+        self.workers[rank].send_pyobj(req)
+
+    # [Failover] Handle finished request ACK
+    def handle_batch_finish_req(self, obj: BatchFinishReqACK):
+        logger.info(f"[TrafficMonitor] Received batch finish ack from Rank {obj.dp_rank}: {obj.rids} at {time.time()}")
+        for rid in obj.rids:
+            self._clear_inflight(rid)
+
+    # [Failover] Handle aborted request ACK
+    def handle_abort_req(self, obj: AbortReqACK):
+        logger.info(f"[TrafficMonitor] Received abort ack for rid {obj.rid}")
+        self._clear_inflight(obj.rid)
+
+    # [Failover] Collect failed req & send token backup retrieval requests
+    def realloc_req_with_token_backup(self, newly_failed_ranks: list[int]):
+        # Collect reqs from newly_failed_ranks
+        all_rids_to_retrieve = []
+        for rank in newly_failed_ranks:
+            failed_rids = [
+                rid for rid, r in self.inflight_requests.items() if r == rank
+            ]
+
+            if not failed_rids:
+                continue
+            logger.warning(
+                f"[Failover] Rank {rank} failed! Rescheduling {len(failed_rids)} requests: {failed_rids}"
+            )
+
+            for rid in failed_rids:
+                req = self.inflight_request_store.get(rid)
+                self._clear_inflight(rid)
+                if req:
+                    self.pending_reschedule_requests[rid] = req
+                    all_rids_to_retrieve.append(rid)
+
+        # Batch request for token backup
+        if all_rids_to_retrieve:
+            logger.info(f"[Failover] Requesting token backup for {len(all_rids_to_retrieve)} requests at {time.time()}")
+            try:
+                self.send_to_tokenizer.send_pyobj(RetrieveTokenBackupReq(all_rids_to_retrieve))
+            except Exception as e:
+                logger.error(f"[Failover] Failed to send token backup request: {e}")
+                logger.error(f"[Failover] Dispatching directly without backup")
+                # Fallback: reschedule without backup
+                for rid in all_rids_to_retrieve:
+                    if rid in self.pending_reschedule_requests:
+                        self.dispatching_with_trace(self.pending_reschedule_requests.pop(rid))
+
+    # [Failover] Handle backup retrieval response
+    def handle_token_backup_res(self, obj: RetrieveTokenBackupRes):
+        current_time = time.time()
+        logger.info(f"[Failover] Received backup token response for {len(obj.token_ids)} requests at {current_time}")
+
+        for rid, output_ids in obj.token_ids.items():
+            if rid in self.pending_reschedule_requests:
+                req = self.pending_reschedule_requests.pop(rid)
+                
+                # If output_ids is None, Tokenizer doesn't have state -> Request likely finished
+                if output_ids is None:
+                    logger.info(f"[Failover] Req {rid} not found in backup (likely finished). Skipping reschedule.")
+                    continue
+
+                if output_ids:
+                    logger.info(f"[Failover] Restoring {len(output_ids)} tokens for req {rid}")
+                    req.input_ids += output_ids
+                    if req.sampling_params.max_new_tokens > 0:
+                        req.sampling_params.max_new_tokens = max(0, req.sampling_params.max_new_tokens - len(output_ids))
+
+                # Reschedule
+                self.dispatching_with_trace(req)
+            
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.status == ranks.status:
+            return
+
+        current_time = time.time()
+        logger.info(f"[Failover] Received active ranks update: {ranks.status} at {current_time}")
+        # Identify newly failed ranks
+        newly_failed_ranks = [
+            i for i, (old, new) in enumerate(zip(self.status, ranks.status))
+            if old and not new
+        ]
+        # Update status immediately
         self.status = ranks.status
+        if not newly_failed_ranks:
+            return
+        # realloc req from newly failed ranks to active ranks
+        self.realloc_req_with_token_backup(newly_failed_ranks)
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
@@ -203,6 +314,9 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (BatchFinishReqACK, self.handle_batch_finish_req),
+                (AbortReqACK, self.handle_abort_req),
+                (RetrieveTokenBackupRes, self.handle_token_backup_res),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -494,7 +608,7 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            self.distribute(req, req.routed_dp_rank)
             return True
         return False
 
@@ -505,7 +619,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.distribute(req, self.round_robin_counter)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -533,19 +647,19 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        self.distribute(req, target_rank)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        self.distribute(req, target_worker)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.workers[target_worker].send_pyobj(req)
+        self.distribute(req, target_worker)
 
     def event_loop(self):
         while True:
