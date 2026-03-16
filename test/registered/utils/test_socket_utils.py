@@ -3,7 +3,7 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.utils.common import (
+from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
@@ -78,7 +78,7 @@ class TestTryBindSocket(CustomTestCase):
     def test_gaierror_fallback(self):
         """_get_addrinfos_for_bind should fall back to AF_INET on gaierror."""
         with patch(
-            "sglang.srt.utils.common.socket.getaddrinfo",
+            "sglang.srt.utils.network.socket.getaddrinfo",
             side_effect=socket.gaierror("mocked"),
         ):
             infos = _get_addrinfos_for_bind()
@@ -90,7 +90,7 @@ class TestTryBindSocket(CustomTestCase):
     def test_gaierror_fallback_preserves_host(self):
         """Fallback should use the provided host, not default to 0.0.0.0."""
         with patch(
-            "sglang.srt.utils.common.socket.getaddrinfo",
+            "sglang.srt.utils.network.socket.getaddrinfo",
             side_effect=socket.gaierror("mocked"),
         ):
             infos = _get_addrinfos_for_bind(host="10.0.0.1", port=8080)
@@ -187,7 +187,7 @@ class TestReservePort(CustomTestCase):
     def test_reserve_port_no_free_port_raises(self):
         """reserve_port should raise RuntimeError if no port is available."""
         with patch(
-            "sglang.srt.utils.common.try_bind_socket",
+            "sglang.srt.utils.network.try_bind_socket",
             side_effect=OSError("mocked"),
         ):
             with self.assertRaises(RuntimeError):

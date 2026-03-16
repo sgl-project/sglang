@@ -25,8 +25,9 @@ from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReq
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData, get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
 
 logger = logging.getLogger(__name__)
 

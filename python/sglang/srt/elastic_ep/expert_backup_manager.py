@@ -17,7 +17,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto
+from sglang.srt.utils.network import get_local_ip_auto
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
