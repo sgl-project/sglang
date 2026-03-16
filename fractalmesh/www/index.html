@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FractalMesh Omega — Sovereign AI Dashboard</title>
+<style>
+:root {
+  --bg0:    #060a0f;
+  --bg1:    #0b1118;
+  --bg2:    #111922;
+  --bg3:    #182230;
+  --cyan:   #00d2ff;
+  --cyan2:  #00f5c8;
+  --purple: #a855f7;
+  --gold:   #f59e0b;
+  --green:  #10b981;
+  --red:    #ef4444;
+  --yellow: #eab308;
+  --text:   #e2e8f0;
+  --dim:    #64748b;
+  --border: rgba(0,210,255,.12);
+  --glow:   0 0 20px rgba(0,210,255,.15);
+  --mono:   'JetBrains Mono','Fira Code','Courier New',monospace;
+  --sans:   'Inter','Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;overflow-x:hidden}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--bg1)}
+::-webkit-scrollbar-thumb{background:var(--cyan);border-radius:2px}
+
+/* ── HEADER ── */
+#header{position:sticky;top:0;z-index:100;background:rgba(6,10,15,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:16px}
+#header .logo{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);letter-spacing:2px;white-space:nowrap}
+#header .logo span{color:var(--purple)}
+#header .tagline{font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:3px;text-transform:uppercase}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:12px}
+.pulse{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+#clock{font-family:var(--mono);font-size:11px;color:var(--cyan)}
+.op-badge{font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:1px;padding:4px 10px;border:1px solid var(--border)}
+
+/* ── TICKER BAR ── */
+#ticker{background:var(--bg1);border-bottom:1px solid var(--border);padding:6px 0;overflow:hidden}
+.ticker-inner{display:flex;gap:40px;white-space:nowrap;animation:scroll-left 30s linear infinite}
+@keyframes scroll-left{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.tick-item{font-family:var(--mono);font-size:11px;display:flex;align-items:center;gap:8px}
+.tick-pair{color:var(--dim)}
+.tick-price{color:var(--text);font-weight:600}
+.tick-change{font-size:10px}
+.up{color:var(--green)}
+.down{color:var(--red)}
+.tick-sig{font-size:9px;padding:2px 6px;letter-spacing:1px}
+.sig-buy{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.sig-sell{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.sig-hold{background:rgba(234,179,8,.12);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+
+/* ── LAYOUT ── */
+#app{display:grid;grid-template-columns:220px 1fr;grid-template-rows:auto;min-height:calc(100vh - 90px)}
+#sidebar{background:var(--bg1);border-right:1px solid var(--border);padding:16px 0}
+#main{background:var(--bg0);overflow:hidden}
+
+/* ── NAV ── */
+.nav-section{padding:8px 16px 4px;font-family:var(--mono);font-size:8px;letter-spacing:3px;color:var(--dim);text-transform:uppercase}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 20px;cursor:pointer;transition:all .15s;font-size:13px;color:var(--dim);border-left:2px solid transparent}
+.nav-item:hover{background:rgba(0,210,255,.05);color:var(--text)}
+.nav-item.active{background:rgba(0,210,255,.08);color:var(--cyan);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.nav-badge{margin-left:auto;font-family:var(--mono);font-size:9px;background:var(--cyan);color:#000;padding:2px 6px;border-radius:2px}
+
+/* ── SECTIONS ── */
+.section{display:none;padding:24px;animation:fadein .2s}
+.section.active{display:block}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ── PAGE HEADER ── */
+.page-hdr{margin-bottom:24px}
+.page-hdr h1{font-family:var(--mono);font-size:18px;font-weight:700;color:var(--cyan);letter-spacing:1px}
+.page-hdr p{font-size:12px;color:var(--dim);margin-top:4px;font-family:var(--mono)}
+
+/* ── STAT CARDS ── */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{background:var(--bg1);border:1px solid var(--border);padding:20px;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cyan),var(--purple))}
+.stat-label{font-family:var(--mono);font-size:9px;letter-spacing:3px;color:var(--dim);text-transform:uppercase;margin-bottom:10px}
+.stat-value{font-family:var(--mono);font-size:28px;font-weight:700;color:var(--cyan);line-height:1}
+.stat-sub{font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:6px}
+.stat-change{font-size:11px;margin-top:6px}
+
+/* ── PANELS ── */
+.panel{background:var(--bg1);border:1px solid var(--border);margin-bottom:20px}
+.panel-hdr{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.panel-hdr h2{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--cyan);text-transform:uppercase}
+.panel-hdr .count{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--dim)}
+.panel-body{padding:20px}
+
+/* ── GRID 2 COL ── */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px}
+@media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
+
+/* ── SIGNAL CARDS ── */
+.signal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.signal-card{background:var(--bg2);border:1px solid var(--border);padding:16px;position:relative}
+.signal-pair{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text)}
+.signal-badge{position:absolute;top:12px;right:12px;font-family:var(--mono);font-size:9px;padding:3px 8px;letter-spacing:1px}
+.signal-price{font-family:var(--mono);font-size:20px;font-weight:700;margin:8px 0 2px;color:var(--cyan)}
+.signal-change{font-family:var(--mono);font-size:11px}
+.signal-meta{display:flex;gap:16px;margin-top:10px}
+.signal-meta span{font-family:var(--mono);font-size:9px;color:var(--dim)}
+.signal-meta strong{color:var(--text)}
+.fractal-bar{height:3px;background:var(--bg3);margin-top:10px;border-radius:1px}
+.fractal-fill{height:100%;border-radius:1px;transition:width .5s}
+
+/* ── TABLE ── */
+.fm-table{width:100%;border-collapse:collapse}
+.fm-table th{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;padding:8px 12px;border-bottom:1px solid var(--border);text-align:left}
+.fm-table td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.03);font-size:13px}
+.fm-table tr:hover td{background:rgba(0,210,255,.04)}
+.fm-table .mono{font-family:var(--mono);font-size:11px}
+.badge{font-family:var(--mono);font-size:9px;padding:3px 8px;letter-spacing:1px;display:inline-block}
+.badge-green{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.badge-red{background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.badge-cyan{background:rgba(0,210,255,.12);color:var(--cyan);border:1px solid rgba(0,210,255,.25)}
+.badge-gold{background:rgba(245,158,11,.12);color:var(--gold);border:1px solid rgba(245,158,11,.25)}
+.badge-purple{background:rgba(168,85,247,.12);color:var(--purple);border:1px solid rgba(168,85,247,.25)}
+
+/* ── SCORE BAR ── */
+.score-bar{width:60px;height:4px;background:var(--bg3);display:inline-block;vertical-align:middle;border-radius:2px;margin-left:8px}
+.score-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--cyan),var(--purple))}
+
+/* ── PRODUCTS ── */
+.product-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px}
+.product-card{background:var(--bg1);border:1px solid var(--border);padding:24px;position:relative;transition:border-color .2s,transform .15s}
+.product-card:hover{border-color:rgba(0,210,255,.35);transform:translateY(-2px)}
+.product-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.product-card.p1::before{background:linear-gradient(90deg,var(--cyan),var(--purple))}
+.product-card.p2::before{background:linear-gradient(90deg,var(--purple),var(--gold))}
+.product-card.p3::before{background:linear-gradient(90deg,var(--gold),var(--green))}
+.product-card.p4::before{background:linear-gradient(90deg,var(--green),var(--cyan))}
+.prod-badge{position:absolute;top:16px;right:16px;font-family:var(--mono);font-size:9px;padding:3px 8px;letter-spacing:1px;background:var(--cyan);color:#000;font-weight:700}
+.prod-name{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px}
+.prod-tagline{font-size:12px;color:var(--dim);margin-bottom:16px}
+.prod-price{font-family:var(--mono);font-size:32px;font-weight:700;color:var(--cyan)}
+.prod-price span{font-size:13px;color:var(--dim)}
+.prod-features{list-style:none;margin:16px 0}
+.prod-features li{font-size:12px;color:var(--dim);padding:4px 0;padding-left:16px;position:relative}
+.prod-features li::before{content:'→';position:absolute;left:0;color:var(--cyan)}
+.btn-buy{display:block;width:100%;padding:12px;margin-top:16px;background:var(--cyan);color:#000;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-align:center;text-decoration:none;text-transform:uppercase;transition:opacity .15s;cursor:pointer;border:none}
+.btn-buy:hover{opacity:.85}
+.btn-buy.secondary{background:transparent;color:var(--cyan);border:1px solid rgba(0,210,255,.4)}
+.btn-buy.secondary:hover{background:rgba(0,210,255,.08)}
+
+/* ── CHAT ── */
+#chat-messages{height:360px;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:80%;padding:10px 14px;font-size:13px;line-height:1.5;position:relative}
+.msg.user{align-self:flex-end;background:rgba(0,210,255,.12);border:1px solid rgba(0,210,255,.2);color:var(--text)}
+.msg.assistant{align-self:flex-start;background:var(--bg2);border:1px solid var(--border);color:var(--text)}
+.msg-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;margin-bottom:5px}
+.msg.user .msg-label{color:var(--cyan)}
+.msg.assistant .msg-label{color:var(--purple)}
+.chat-input-row{display:flex;border-top:1px solid var(--border)}
+#chat-input{flex:1;background:var(--bg2);border:none;padding:14px 16px;color:var(--text);font-family:var(--mono);font-size:13px;outline:none}
+#chat-input::placeholder{color:var(--dim)}
+#chat-send{padding:14px 20px;background:var(--cyan);color:#000;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;border:none;cursor:pointer;transition:opacity .15s}
+#chat-send:hover{opacity:.85}
+.typing{align-self:flex-start}
+.typing-dots span{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dim);margin:0 2px;animation:bounce .8s infinite}
+.typing-dots span:nth-child(2){animation-delay:.15s}
+.typing-dots span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
+
+/* ── FRACTAL CANVAS ── */
+#fractal-canvas{width:100%;height:280px;display:block;background:var(--bg2)}
+
+/* ── NFT GALLERY ── */
+.nft-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}
+.nft-card{background:var(--bg2);border:1px solid var(--border);overflow:hidden;cursor:pointer;transition:border-color .2s}
+.nft-card:hover{border-color:rgba(0,210,255,.4)}
+.nft-art{width:100%;height:120px;display:block}
+.nft-info{padding:8px}
+.nft-id{font-family:var(--mono);font-size:9px;color:var(--cyan)}
+.nft-price{font-family:var(--mono);font-size:11px;color:var(--gold);margin-top:2px}
+
+/* ── NFT MINT FORM ── */
+.mint-form{display:flex;gap:10px;margin-top:16px}
+.mint-form input{flex:1;background:var(--bg2);border:1px solid var(--border);padding:10px 14px;color:var(--text);font-family:var(--mono);font-size:12px;outline:none}
+.mint-form input::placeholder{color:var(--dim)}
+.mint-form input:focus{border-color:rgba(0,210,255,.4)}
+
+/* ── AI STUDIO LINKS ── */
+.ai-links{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+.ai-link{font-family:var(--mono);font-size:10px;padding:8px 16px;text-decoration:none;transition:all .15s;display:flex;align-items:center;gap:8px}
+.ai-link.primary{background:var(--cyan);color:#000;font-weight:700}
+.ai-link.primary:hover{opacity:.85}
+.ai-link.secondary{color:var(--cyan);border:1px solid rgba(0,210,255,.3)}
+.ai-link.secondary:hover{background:rgba(0,210,255,.08)}
+.ai-link.tertiary{color:var(--dim);border:1px solid var(--border)}
+.ai-link.tertiary:hover{color:var(--text)}
+
+/* ── CHART STUB ── */
+.chart-area{height:180px;display:flex;align-items:flex-end;gap:3px;padding:10px;background:var(--bg2);position:relative}
+.chart-bar{background:linear-gradient(to top,var(--cyan),rgba(0,210,255,.3));transition:height .5s;min-width:8px;flex:1;border-radius:2px 2px 0 0;cursor:pointer}
+.chart-bar:hover{background:linear-gradient(to top,var(--purple),rgba(168,85,247,.4))}
+.chart-labels{display:flex;justify-content:space-between;padding:4px 10px;font-family:var(--mono);font-size:9px;color:var(--dim)}
+
+/* ── SYSTEM STATUS ── */
+.sys-items{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.sys-item{background:var(--bg2);border:1px solid var(--border);padding:14px;display:flex;align-items:center;gap:12px}
+.sys-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.sys-dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.sys-dot.red{background:var(--red);box-shadow:0 0 6px var(--red)}
+.sys-dot.yellow{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+.sys-name{font-family:var(--mono);font-size:11px;color:var(--text)}
+.sys-port{font-family:var(--mono);font-size:9px;color:var(--dim);margin-top:2px}
+
+/* ── AUDIT ── */
+.audit-item{display:flex;align-items:flex-start;gap:12px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.03)}
+.audit-time{font-family:var(--mono);font-size:9px;color:var(--dim);white-space:nowrap;min-width:140px}
+.audit-event{font-family:var(--mono);font-size:10px;color:var(--cyan);white-space:nowrap}
+.audit-detail{font-size:12px;color:var(--dim)}
+
+/* ── LOADING ── */
+.loading{display:flex;align-items:center;gap:8px;color:var(--dim);font-family:var(--mono);font-size:11px;padding:20px}
+.loading-spin{width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── FOOTER ── */
+#footer{background:var(--bg1);border-top:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+.footer-op{font-family:var(--mono);font-size:10px;color:var(--dim)}
+.footer-op strong{color:var(--cyan)}
+.footer-links{display:flex;gap:16px}
+.footer-links a{font-family:var(--mono);font-size:9px;color:var(--dim);text-decoration:none;letter-spacing:1px}
+.footer-links a:hover{color:var(--cyan)}
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ── -->
+<header id="header">
+  <div>
+    <div class="logo">FRACTAL<span>MESH</span> OMEGA</div>
+    <div class="tagline">Sovereign AI — Titan v101 — Earth-Scale Neural</div>
+  </div>
+  <div class="header-right">
+    <div class="pulse"></div>
+    <div id="clock"></div>
+    <div class="op-badge">ABN 56628117363</div>
+  </div>
+</header>
+
+<!-- ── TICKER ── -->
+<div id="ticker">
+  <div class="ticker-inner" id="ticker-inner">
+    <div class="loading"><div class="loading-spin"></div> Loading signals...</div>
+  </div>
+</div>
+
+<!-- ── APP ── -->
+<div id="app">
+
+  <!-- ── SIDEBAR ── -->
+  <nav id="sidebar">
+    <div class="nav-section">Command</div>
+    <div class="nav-item active" data-section="dashboard" onclick="nav(this)">
+      <span class="nav-icon">⬡</span> Dashboard
+    </div>
+    <div class="nav-item" data-section="signals" onclick="nav(this)">
+      <span class="nav-icon">◈</span> Signals
+      <span class="nav-badge" id="nav-signals">5</span>
+    </div>
+    <div class="nav-section">Commerce</div>
+    <div class="nav-item" data-section="orders" onclick="nav(this)">
+      <span class="nav-icon">◎</span> Orders
+      <span class="nav-badge" id="nav-orders">—</span>
+    </div>
+    <div class="nav-item" data-section="leads" onclick="nav(this)">
+      <span class="nav-icon">◉</span> Leads
+      <span class="nav-badge" id="nav-leads">—</span>
+    </div>
+    <div class="nav-item" data-section="products" onclick="nav(this)">
+      <span class="nav-icon">▣</span> Products
+    </div>
+    <div class="nav-section">Intelligence</div>
+    <div class="nav-item" data-section="chat" onclick="nav(this)">
+      <span class="nav-icon">◌</span> Neural Chat
+    </div>
+    <div class="nav-item" data-section="nft" onclick="nav(this)">
+      <span class="nav-icon">◆</span> NFT Mint
+    </div>
+    <div class="nav-section">Infrastructure</div>
+    <div class="nav-item" data-section="ai-studio" onclick="nav(this)">
+      <span class="nav-icon">▲</span> AI Studio
+    </div>
+    <div class="nav-item" data-section="system" onclick="nav(this)">
+      <span class="nav-icon">◫</span> System
+    </div>
+  </nav>
+
+  <!-- ── MAIN ── -->
+  <main id="main">
+
+    <!-- ── DASHBOARD ── -->
+    <section class="section active" id="sec-dashboard">
+      <div class="page-hdr">
+        <h1>COMMAND CENTRE</h1>
+        <p id="status-line">Connecting to FractalMesh backend...</p>
+      </div>
+
+      <div class="stat-grid" id="stat-grid">
+        <div class="stat-card"><div class="stat-label">Revenue</div><div class="stat-value" id="stat-rev">—</div><div class="stat-sub" id="stat-rev-sub">loading...</div></div>
+        <div class="stat-card"><div class="stat-label">Orders</div><div class="stat-value" id="stat-orders">—</div><div class="stat-sub">completed</div></div>
+        <div class="stat-card"><div class="stat-label">Leads</div><div class="stat-value" id="stat-leads">—</div><div class="stat-sub">Albury-Wodonga pipeline</div></div>
+        <div class="stat-card"><div class="stat-label">Top Signal</div><div class="stat-value" id="stat-signal" style="color:var(--green)">—</div><div class="stat-sub" id="stat-signal-sub">loading...</div></div>
+      </div>
+
+      <div class="grid2">
+        <div class="panel">
+          <div class="panel-hdr"><h2>Revenue by Product</h2></div>
+          <div class="panel-body">
+            <div class="chart-area" id="rev-chart"></div>
+            <div class="chart-labels" id="rev-labels"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hdr"><h2>Signal Confidence</h2><span class="count" id="sig-updated">—</span></div>
+          <div class="panel-body" id="mini-signals">
+            <div class="loading"><div class="loading-spin"></div> Loading signals...</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-hdr"><h2>Recent Orders</h2></div>
+        <div class="panel-body">
+          <table class="fm-table" id="dash-orders-table">
+            <thead><tr><th>Session</th><th>Product</th><th>Contact</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead>
+            <tbody id="dash-orders-body"><tr><td colspan="6"><div class="loading"><div class="loading-spin"></div> Loading...</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── SIGNALS ── -->
+    <section class="section" id="sec-signals">
+      <div class="page-hdr">
+        <h1>FRACTAL SIGNALS</h1>
+        <p>Live RL-powered signals — updated every 30s</p>
+      </div>
+      <div class="signal-grid" id="signal-grid">
+        <div class="loading"><div class="loading-spin"></div> Loading signals...</div>
+      </div>
+      <div class="panel" style="margin-top:20px">
+        <div class="panel-hdr"><h2>Signal History</h2></div>
+        <div class="panel-body">
+          <table class="fm-table">
+            <thead><tr><th>Pair</th><th>Signal</th><th>Confidence</th><th>Fractal Score</th><th>Price</th><th>24h Change</th></tr></thead>
+            <tbody id="signals-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── ORDERS ── -->
+    <section class="section" id="sec-orders">
+      <div class="page-hdr">
+        <h1>ORDERS</h1>
+        <p>All Stripe-processed transactions</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">Total Revenue</div><div class="stat-value" id="ord-rev">—</div></div>
+        <div class="stat-card"><div class="stat-label">Completed</div><div class="stat-value" id="ord-count">—</div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Order Log</h2><span class="count" id="orders-count">—</span></div>
+        <div class="panel-body">
+          <table class="fm-table">
+            <thead><tr><th>Session ID</th><th>Product</th><th>Contact</th><th>Amount (AUD)</th><th>Status</th><th>Created</th></tr></thead>
+            <tbody id="orders-body"><tr><td colspan="6"><div class="loading"><div class="loading-spin"></div></div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── LEADS ── -->
+    <section class="section" id="sec-leads">
+      <div class="page-hdr">
+        <h1>LEADS PIPELINE</h1>
+        <p>Albury-Wodonga corridor — scored by RL engine</p>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Pipeline</h2><span class="count" id="leads-count">—</span></div>
+        <div class="panel-body">
+          <table class="fm-table">
+            <thead><tr><th>Company</th><th>Contact</th><th>Phone</th><th>Score</th><th>Context</th><th>Status</th></tr></thead>
+            <tbody id="leads-body"><tr><td colspan="6"><div class="loading"><div class="loading-spin"></div></div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── PRODUCTS ── -->
+    <section class="section" id="sec-products">
+      <div class="page-hdr">
+        <h1>PRODUCTS</h1>
+        <p>FractalMesh sovereign technology — live Stripe checkout</p>
+      </div>
+      <div class="product-grid" id="product-grid">
+        <div class="loading"><div class="loading-spin"></div> Loading products...</div>
+      </div>
+    </section>
+
+    <!-- ── CHAT ── -->
+    <section class="section" id="sec-chat">
+      <div class="page-hdr">
+        <h1>NEURAL CHAT</h1>
+        <p>FractalMesh AI — powered by OpenRouter / Llama 3.1</p>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>AI Assistant</h2></div>
+        <div id="chat-messages">
+          <div class="msg assistant">
+            <div class="msg-label">FRACTALMESH AI</div>
+            G'day! I'm the FractalMesh sovereign AI. Ask me about signals, products, revenue, or your Albury pipeline.
+          </div>
+        </div>
+        <div class="chat-input-row">
+          <input id="chat-input" type="text" placeholder="Ask about signals, products, leads..." onkeydown="if(event.key==='Enter')sendChat()">
+          <button id="chat-send" onclick="sendChat()">SEND →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── NFT ── -->
+    <section class="section" id="sec-nft">
+      <div class="page-hdr">
+        <h1>NFT MINT</h1>
+        <p>Fractal art generated by RL engine — Solana mainnet — every 10 min</p>
+      </div>
+      <div class="grid2">
+        <div class="panel">
+          <div class="panel-hdr"><h2>Mint NFT</h2></div>
+          <div class="panel-body">
+            <canvas id="fractal-canvas"></canvas>
+            <div class="mint-form">
+              <input id="wallet-input" type="text" placeholder="Enter Solana wallet address...">
+              <button class="btn-buy" onclick="mintNFT()" style="width:auto;padding:10px 20px">MINT →</button>
+            </div>
+            <div id="mint-result" style="margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--green);display:none"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hdr"><h2>Recent Mints</h2></div>
+          <div class="panel-body">
+            <div id="nft-gallery" class="nft-grid">
+              <div class="loading"><div class="loading-spin"></div> Loading gallery...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── AI STUDIO ── -->
+    <section class="section" id="sec-ai-studio">
+      <div class="page-hdr">
+        <h1>AI STUDIO</h1>
+        <p>Cloud Run deployments — asia-southeast1 — antigravity-auto-updater-dev</p>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Cloud Run Endpoints</h2></div>
+        <div class="panel-body" id="ai-studio-body">
+          <div class="loading"><div class="loading-spin"></div> Loading endpoints...</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Antigravity Status</h2></div>
+        <div class="panel-body">
+          <div class="sys-items">
+            <div class="sys-item"><div class="sys-dot green"></div><div><div class="sys-name">antigravity-auto-updater</div><div class="sys-port">us-central1-apt.pkg.dev</div></div></div>
+            <div class="sys-item"><div class="sys-dot green"></div><div><div class="sys-name">GCP Project</div><div class="sys-port">antigravity-auto-updater-dev</div></div></div>
+            <div class="sys-item"><div class="sys-dot green"></div><div><div class="sys-name">Region</div><div class="sys-port">asia-southeast1</div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── SYSTEM ── -->
+    <section class="section" id="sec-system">
+      <div class="page-hdr">
+        <h1>SYSTEM STATUS</h1>
+        <p>PM2 agents, endpoints, and audit log</p>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Agent Status</h2></div>
+        <div class="panel-body">
+          <div class="sys-items" id="agent-status">
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-pod</div><div class="sys-port">:5058 — checking...</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-geosignal</div><div class="sys-port">:5057 — checking...</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-trading</div><div class="sys-port">background — checking...</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-whitepaper</div><div class="sys-port">cron 0 */10 — checking...</div></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-hdr"><h2>Audit Log</h2></div>
+        <div class="panel-body" id="audit-log">
+          <div class="loading"><div class="loading-spin"></div> Loading...</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ── FOOTER ── -->
+<footer id="footer">
+  <div class="footer-op">
+    <strong>Samuel James Hiotis</strong> | Sole Trader | ABN 56628117363 | Albury NSW 2640
+  </div>
+  <div class="footer-links">
+    <a href="https://ai.studio/apps/bafddcde-c79c-4e7b-931e-d4d218e325de" target="_blank">AI Studio →</a>
+    <a href="https://github.com/samhiotisiddn-jpg/delegation-toolkit" target="_blank">GitHub →</a>
+    <a href="https://eu1.make.com/public/shared-scenario/XYRkxwURee3/integration-webhooks" target="_blank">Make.com →</a>
+  </div>
+</footer>
+
+<script>
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const API = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+  ? 'http://localhost:5058'
+  : '';   // same origin in production
+
+// ─── CLOCK ────────────────────────────────────────────────────────────────────
+function updateClock(){
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toLocaleString('en-AU',{hour12:false,timeZone:'Australia/Sydney',
+      year:'numeric',month:'2-digit',day:'2-digit',
+      hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(',','');
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ─── NAV ──────────────────────────────────────────────────────────────────────
+function nav(el) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  el.classList.add('active');
+  const sec = el.dataset.section;
+  document.getElementById('sec-' + sec).classList.add('active');
+  // lazy load
+  if (sec === 'signals')    loadSignals();
+  if (sec === 'orders')     loadOrders();
+  if (sec === 'leads')      loadLeads();
+  if (sec === 'products')   loadProducts();
+  if (sec === 'ai-studio')  loadAIStudio();
+  if (sec === 'system')     loadSystem();
+  if (sec === 'nft')        { loadNFTGallery(); drawFractal(); }
+}
+
+// ─── API FETCH ────────────────────────────────────────────────────────────────
+async function apiFetch(path) {
+  try {
+    const r = await fetch(API + path);
+    if (!r.ok) throw new Error(r.status);
+    return await r.json();
+  } catch(e) {
+    console.error('API error', path, e);
+    return null;
+  }
+}
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+async function loadDashboard() {
+  const [status, revenue, signals, orders] = await Promise.all([
+    apiFetch('/api/status'),
+    apiFetch('/api/revenue'),
+    apiFetch('/api/signals'),
+    apiFetch('/api/orders'),
+  ]);
+
+  if (status) {
+    document.getElementById('status-line').textContent =
+      `Online since ${new Date(status.online_since).toLocaleString('en-AU')} · v${status.version || '101'}`;
+    document.getElementById('stat-orders').textContent = status.orders;
+    document.getElementById('stat-leads').textContent  = status.leads;
+    document.getElementById('nav-orders').textContent  = status.orders;
+    document.getElementById('nav-leads').textContent   = status.leads;
+    document.getElementById('stat-rev').textContent    = `$${(status.revenue_aud||0).toLocaleString()}`;
+    document.getElementById('stat-rev-sub').textContent = 'AUD completed';
+    document.getElementById('ord-rev').textContent     = `$${(status.revenue_aud||0).toLocaleString()}`;
+    document.getElementById('ord-count').textContent   = status.orders;
+  }
+
+  if (revenue && revenue.by_product) {
+    const prods = revenue.by_product.slice(0,5);
+    const maxT  = Math.max(...prods.map(p=>p.total||0), 1);
+    const chart = document.getElementById('rev-chart');
+    chart.innerHTML = prods.map(p=>
+      `<div class="chart-bar" title="${p.product}: $${(p.total||0).toLocaleString()} AUD"
+        style="height:${Math.max(10, ((p.total||0)/maxT)*100)}%"></div>`
+    ).join('');
+    document.getElementById('rev-labels').innerHTML = prods.map(p=>
+      `<span style="font-size:8px">${(p.product||'').split(' ')[0]}</span>`
+    ).join('');
+  }
+
+  if (signals && signals.signals) {
+    const top = signals.signals[0];
+    if (top) {
+      document.getElementById('stat-signal').textContent = top.pair;
+      document.getElementById('stat-signal-sub').textContent =
+        `${top.signal} · ${Math.round((top.confidence||0)*100)}% conf · score ${top.fractal_score}`;
+    }
+    document.getElementById('sig-updated').textContent = 'Live';
+    document.getElementById('mini-signals').innerHTML = signals.signals.map(s=>
+      `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)">
+        <span style="font-family:var(--mono);font-size:12px;color:var(--text);min-width:90px">${s.pair}</span>
+        <span class="tick-sig sig-${(s.signal||'').toLowerCase()}">${s.signal}</span>
+        <div class="score-bar" style="flex:1"><div class="score-fill" style="width:${(s.confidence||0)*100}%"></div></div>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">${Math.round((s.confidence||0)*100)}%</span>
+      </div>`
+    ).join('');
+  }
+
+  if (orders) {
+    const tbody = document.getElementById('dash-orders-body');
+    tbody.innerHTML = orders.slice(0,5).map(o=>orderRow(o)).join('') || '<tr><td colspan="6" style="color:var(--dim);padding:20px;text-align:center">No orders yet</td></tr>';
+  }
+}
+
+function orderRow(o) {
+  const status_class = o.status === 'completed' ? 'badge-green' : o.status === 'pending' ? 'badge-gold' : 'badge-red';
+  const sess = (o.stripe_session||'').slice(0,20);
+  return `<tr>
+    <td class="mono">${sess}...</td>
+    <td>${o.product||'—'}</td>
+    <td style="color:var(--dim)">${o.contact||'—'}</td>
+    <td class="mono" style="color:var(--gold)">$${parseFloat(o.amount_aud||0).toFixed(2)}</td>
+    <td><span class="badge ${status_class}">${o.status||'—'}</span></td>
+    <td class="mono" style="color:var(--dim)">${(o.created_at||'').slice(0,10)}</td>
+  </tr>`;
+}
+
+// ─── TICKER ───────────────────────────────────────────────────────────────────
+async function loadTicker() {
+  const data = await apiFetch('/api/signals');
+  if (!data || !data.signals) return;
+  const items = [...data.signals, ...data.signals]; // duplicate for seamless loop
+  document.getElementById('ticker-inner').innerHTML = items.map(s=>{
+    const chg = parseFloat(s.change_24h||0);
+    const cls = chg >= 0 ? 'up' : 'down';
+    const arrow = chg >= 0 ? '▲' : '▼';
+    return `<div class="tick-item">
+      <span class="tick-pair">${s.pair}</span>
+      <span class="tick-price">$${parseFloat(s.price||0).toLocaleString()}</span>
+      <span class="tick-change ${cls}">${arrow} ${Math.abs(chg).toFixed(2)}%</span>
+      <span class="tick-sig sig-${(s.signal||'').toLowerCase()}">${s.signal}</span>
+    </div>`;
+  }).join('');
+}
+
+// ─── SIGNALS ──────────────────────────────────────────────────────────────────
+async function loadSignals() {
+  const data = await apiFetch('/api/signals');
+  if (!data || !data.signals) return;
+
+  document.getElementById('signal-grid').innerHTML = data.signals.map(s=>{
+    const chg = parseFloat(s.change_24h||0);
+    const sig_cls = `sig-${(s.signal||'hold').toLowerCase()}`;
+    const bar_color = s.signal==='BUY' ? 'var(--green)' : s.signal==='SELL' ? 'var(--red)' : 'var(--yellow)';
+    return `<div class="signal-card">
+      <div class="signal-pair">${s.pair}</div>
+      <span class="signal-badge ${sig_cls}">${s.signal}</span>
+      <div class="signal-price">$${parseFloat(s.price||0).toLocaleString()}</div>
+      <div class="signal-change ${chg>=0?'up':'down'}">${chg>=0?'▲':'▼'} ${Math.abs(chg).toFixed(2)}%</div>
+      <div class="signal-meta">
+        <span>Conf <strong>${Math.round((s.confidence||0)*100)}%</strong></span>
+        <span>Score <strong>${s.fractal_score}</strong></span>
+      </div>
+      <div class="fractal-bar"><div class="fractal-fill" style="width:${s.fractal_score||0}%;background:${bar_color}"></div></div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('signals-table-body').innerHTML = data.signals.map(s=>{
+    const chg = parseFloat(s.change_24h||0);
+    return `<tr>
+      <td class="mono" style="font-weight:700">${s.pair}</td>
+      <td><span class="tick-sig sig-${(s.signal||'hold').toLowerCase()}">${s.signal}</span></td>
+      <td class="mono">${Math.round((s.confidence||0)*100)}%</td>
+      <td><div style="display:flex;align-items:center">${s.fractal_score}<div class="score-bar"><div class="score-fill" style="width:${s.fractal_score||0}%"></div></div></div></td>
+      <td class="mono">$${parseFloat(s.price||0).toLocaleString()}</td>
+      <td class="mono ${chg>=0?'up':'down'}">${chg>=0?'▲':'▼'} ${Math.abs(chg).toFixed(2)}%</td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── ORDERS ───────────────────────────────────────────────────────────────────
+async function loadOrders() {
+  const data = await apiFetch('/api/orders');
+  if (!data) return;
+  document.getElementById('orders-count').textContent = data.length + ' orders';
+  document.getElementById('orders-body').innerHTML =
+    data.map(o=>orderRow(o)).join('') ||
+    '<tr><td colspan="6" style="text-align:center;color:var(--dim);padding:20px">No orders yet</td></tr>';
+}
+
+// ─── LEADS ────────────────────────────────────────────────────────────────────
+async function loadLeads() {
+  const data = await apiFetch('/api/leads');
+  if (!data) return;
+  document.getElementById('leads-count').textContent = data.length + ' leads';
+  document.getElementById('leads-body').innerHTML = data.map(l=>{
+    const score = parseInt(l.score||0);
+    const score_class = score>=80?'badge-green':score>=60?'badge-gold':'badge-red';
+    return `<tr>
+      <td style="font-weight:600">${l.company||'—'}</td>
+      <td>${l.contact||'—'}</td>
+      <td class="mono" style="color:var(--dim)">${l.phone||'—'}</td>
+      <td><span class="badge ${score_class}">${score}</span>
+          <div class="score-bar"><div class="score-fill" style="width:${score}%"></div></div></td>
+      <td style="color:var(--dim);font-size:12px;max-width:200px">${l.context||'—'}</td>
+      <td><span class="badge badge-cyan">${l.status||'new'}</span></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--dim);padding:20px">No leads</td></tr>';
+}
+
+// ─── PRODUCTS ─────────────────────────────────────────────────────────────────
+async function loadProducts() {
+  const data = await apiFetch('/api/products');
+  if (!data) return;
+  const classes = ['p1','p2','p3','p4'];
+  document.getElementById('product-grid').innerHTML = data.map((p,i)=>`
+    <div class="product-card ${classes[i%4]}">
+      <div class="prod-badge">${p.badge||'NEW'}</div>
+      <div class="prod-name">${p.name}</div>
+      <div class="prod-tagline">${p.tagline}</div>
+      <div class="prod-price">$${p.price_aud} <span>AUD</span></div>
+      <ul class="prod-features">${(p.features||[]).map(f=>`<li>${f}</li>`).join('')}</ul>
+      <a class="btn-buy" href="${p.stripe_link||'#'}" target="_blank">BUY NOW — $${p.price_aud} AUD</a>
+    </div>
+  `).join('');
+}
+
+// ─── CHAT ─────────────────────────────────────────────────────────────────────
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const msg   = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  const msgs = document.getElementById('chat-messages');
+  msgs.innerHTML += `<div class="msg user"><div class="msg-label">YOU</div>${escHtml(msg)}</div>`;
+  msgs.innerHTML += `<div class="msg typing"><div class="typing-dots"><span></span><span></span><span></span></div></div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+
+  const data = await apiFetch('/api/chat').then ? null :
+    await fetch(API+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})})
+      .then(r=>r.json()).catch(()=>null);
+
+  // remove typing
+  const typing = msgs.querySelector('.typing');
+  if (typing) typing.remove();
+
+  const reply = data?.reply || 'FractalMesh AI is warming up — check backend connection.';
+  msgs.innerHTML += `<div class="msg assistant"><div class="msg-label">FRACTALMESH AI</div>${escHtml(reply)}</div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+// override apiFetch for chat (POST)
+document.addEventListener('DOMContentLoaded', ()=>{
+  document.getElementById('chat-input').addEventListener('keydown', e=>{
+    if (e.key==='Enter') sendChat();
+  });
+});
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const msg   = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  document.getElementById('chat-send').disabled = true;
+
+  const msgs = document.getElementById('chat-messages');
+  msgs.innerHTML += `<div class="msg user"><div class="msg-label">YOU</div>${escHtml(msg)}</div>`;
+  msgs.innerHTML += `<div class="msg typing" id="typing-indicator"><div class="typing-dots"><span></span><span></span><span></span></div></div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+
+  try {
+    const r = await fetch(API+'/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg}),
+    });
+    const data = await r.json();
+    document.getElementById('typing-indicator')?.remove();
+    msgs.innerHTML += `<div class="msg assistant"><div class="msg-label">FRACTALMESH AI</div>${escHtml(data.reply||'...')}</div>`;
+  } catch(e) {
+    document.getElementById('typing-indicator')?.remove();
+    msgs.innerHTML += `<div class="msg assistant"><div class="msg-label">FRACTALMESH AI</div>Backend not connected — start fm-pod on port 5058.</div>`;
+  }
+  msgs.scrollTop = msgs.scrollHeight;
+  document.getElementById('chat-send').disabled = false;
+}
+
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
+
+// ─── NFT ──────────────────────────────────────────────────────────────────────
+function drawFractal() {
+  const c  = document.getElementById('fractal-canvas');
+  if (!c) return;
+  c.width  = c.offsetWidth;
+  c.height = 280;
+  const ctx = c.getContext('2d');
+  // Mandelbrot-ish fractal
+  const w = c.width, h = c.height;
+  const img = ctx.createImageData(w, h);
+  const seed = Date.now();
+  for (let px=0; px<w; px++) {
+    for (let py=0; py<h; py++) {
+      let x0 = (px/w)*3.5-2.5, y0 = (py/h)*2-1;
+      let x=0, y=0, i=0;
+      while (x*x+y*y<=4 && i<80) {
+        [x,y] = [x*x-y*y+x0, 2*x*y+y0]; i++;
+      }
+      const idx = (py*w+px)*4;
+      const t = i/80;
+      img.data[idx]   = Math.floor(9*(1-t)*t*t*t*255);
+      img.data[idx+1] = Math.floor(15*(1-t)*(1-t)*t*t*255);
+      img.data[idx+2] = Math.floor(8.5*(1-t)*(1-t)*(1-t)*t*255);
+      img.data[idx+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  // Overlay grid lines
+  ctx.strokeStyle = 'rgba(0,210,255,0.08)';
+  ctx.lineWidth = 1;
+  for (let x=0;x<w;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
+  for (let y=0;y<h;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+}
+
+async function mintNFT() {
+  const wallet = document.getElementById('wallet-input').value.trim();
+  if (!wallet) { alert('Enter a Solana wallet address'); return; }
+  try {
+    const r = await fetch(API+'/api/nft/mint', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({wallet}),
+    });
+    const data = await r.json();
+    const el = document.getElementById('mint-result');
+    el.style.display = 'block';
+    el.textContent = `[✓] Queued: ${data.token_id} · Hash: ${data.fractal_hash} · 0.5 SOL · ~10 min`;
+    loadNFTGallery();
+  } catch(e) {
+    document.getElementById('mint-result').style.display='block';
+    document.getElementById('mint-result').style.color='var(--red)';
+    document.getElementById('mint-result').textContent='Backend not connected';
+  }
+}
+
+function drawMiniNFT(hash, canvas) {
+  const ctx = canvas.getContext('2d');
+  const w=canvas.width, h=canvas.height;
+  // seed-based fractal
+  let r=parseInt(hash.slice(0,2),16), g=parseInt(hash.slice(2,4),16), b=parseInt(hash.slice(4,6),16);
+  const img=ctx.createImageData(w,h);
+  for (let px=0;px<w;px++) for (let py=0;py<h;py++) {
+    let x0=(px/w)*3.5-2.5+(r/255-0.5)*0.5, y0=(py/h)*2-1+(g/255-0.5)*0.3;
+    let x=0,y=0,i=0;
+    while(x*x+y*y<=4&&i<40){[x,y]=[x*x-y*y+x0,2*x*y+y0];i++;}
+    const t=i/40, idx=(py*w+px)*4;
+    img.data[idx]  =Math.floor((r/255)*t*255);
+    img.data[idx+1]=Math.floor((g/255)*t*255);
+    img.data[idx+2]=Math.floor((b/255)*(1-t)*255);
+    img.data[idx+3]=255;
+  }
+  ctx.putImageData(img,0,0);
+}
+
+async function loadNFTGallery() {
+  const data = await apiFetch('/api/nft/gallery');
+  const gallery = document.getElementById('nft-gallery');
+  if (!data || !data.length) {
+    gallery.innerHTML = '<div style="color:var(--dim);font-family:var(--mono);font-size:11px">No mints yet — be the first!</div>';
+    return;
+  }
+  gallery.innerHTML = data.map(n=>
+    `<div class="nft-card">
+      <canvas class="nft-art" width="140" height="120" id="nft-${n.id}"></canvas>
+      <div class="nft-info">
+        <div class="nft-id">${n.token_id||'—'}</div>
+        <div class="nft-price">${n.price_sol||0.5} SOL</div>
+      </div>
+    </div>`
+  ).join('');
+  data.forEach(n=>{
+    const c=document.getElementById('nft-'+n.id);
+    if(c) drawMiniNFT(n.fractal_hash||'00aabbcc',c);
+  });
+}
+
+// ─── AI STUDIO ────────────────────────────────────────────────────────────────
+async function loadAIStudio() {
+  const data = await apiFetch('/api/ai-studio');
+  if (!data) return;
+  document.getElementById('ai-studio-body').innerHTML = `
+    <div style="margin-bottom:16px;font-family:var(--mono);font-size:11px;color:var(--dim)">
+      Project: <strong style="color:var(--text)">${data.project||'antigravity-auto-updater-dev'}</strong> &nbsp;·&nbsp;
+      Region:  <strong style="color:var(--text)">${data.region||'asia-southeast1'}</strong>
+    </div>
+    <div class="ai-links">
+      <a href="${data.ai_studio_app||'#'}" target="_blank" class="ai-link primary">AI Studio App →</a>
+      <a href="${data.pre_deployment||'#'}" target="_blank" class="ai-link secondary">Pre-Deploy →</a>
+      <a href="${data.dev_deployment||'#'}" target="_blank" class="ai-link tertiary">Dev Deploy →</a>
+      ${data.firebase_notes?`<a href="${data.firebase_notes}" target="_blank" class="ai-link tertiary">Firebase Notes →</a>`:''}
+    </div>
+    <div style="margin-top:20px">
+      <table class="fm-table">
+        <thead><tr><th>Endpoint</th><th>URL</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">ai_studio_app</td><td class="mono" style="font-size:10px;color:var(--dim)">${data.ai_studio_app||'—'}</td><td><span class="badge badge-cyan">LIVE</span></td></tr>
+          <tr><td class="mono">pre_deployment</td><td class="mono" style="font-size:10px;color:var(--dim)">${data.pre_deployment||'—'}</td><td><span class="badge badge-green">ONLINE</span></td></tr>
+          <tr><td class="mono">dev_deployment</td><td class="mono" style="font-size:10px;color:var(--dim)">${data.dev_deployment||'—'}</td><td><span class="badge badge-gold">STAGING</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--dim)">
+      Operator: ${data.operator||'Samuel James Hiotis | ABN 56628117363'}
+    </div>`;
+}
+
+// ─── SYSTEM ───────────────────────────────────────────────────────────────────
+async function loadSystem() {
+  // Check fm-pod health
+  const health = await apiFetch('/health');
+  const agents = [
+    {name:'fm-pod',      port:5058, ok: !!health},
+    {name:'fm-geosignal',port:5057, ok: false},
+    {name:'fm-trading',  port:null, ok: false},
+    {name:'fm-whitepaper',port:null,ok: false},
+  ];
+
+  // Check geosignal
+  try {
+    const gs = await fetch('http://localhost:5057/health',{signal:AbortSignal.timeout(3000)});
+    if (gs.ok) agents[1].ok = true;
+  } catch(_) {}
+
+  document.getElementById('agent-status').innerHTML = agents.map(a=>`
+    <div class="sys-item">
+      <div class="sys-dot ${a.ok?'green':'yellow'}"></div>
+      <div>
+        <div class="sys-name">${a.name}</div>
+        <div class="sys-port">${a.port?':'+a.port+' — '+(a.ok?'online':'checking...'):'background agent'}</div>
+      </div>
+    </div>`).join('');
+
+  // Audit log
+  const audit = await apiFetch('/api/audit');
+  if (audit) {
+    document.getElementById('audit-log').innerHTML = audit.map(a=>`
+      <div class="audit-item">
+        <span class="audit-time">${(a.created_at||'').replace('T',' ').slice(0,19)}</span>
+        <span class="audit-event">${a.event||'—'}</span>
+        <span class="audit-detail">${a.detail||'—'}</span>
+      </div>`).join('') || '<div style="color:var(--dim);padding:12px;font-family:var(--mono);font-size:11px">No events yet</div>';
+  }
+}
+
+// ─── BOOT ─────────────────────────────────────────────────────────────────────
+async function boot() {
+  await Promise.all([loadDashboard(), loadTicker()]);
+  // Auto-refresh every 30s
+  setInterval(loadDashboard, 30000);
+  setInterval(loadTicker, 30000);
+}
+
+boot();
+</script>
+</body>
+</html>
