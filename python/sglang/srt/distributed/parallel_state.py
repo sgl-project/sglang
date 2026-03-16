@@ -609,7 +609,11 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
-        if (
+
+        if is_in_piecewise_cuda_graph():
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            outplace_all_reduce_method = "pynccl"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
@@ -633,9 +637,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph():
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            outplace_all_reduce_method = "pynccl"
+
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,

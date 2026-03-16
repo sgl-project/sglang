@@ -35,7 +35,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
-    is_in_piecewise_cuda_graph,
 )
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -161,7 +160,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
-        aiter_dsv3_router_gemm,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -169,7 +167,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -1329,7 +1327,7 @@ class DeepseekV2AttentionMLA(
         #     llama_4_scaling=llama_4_scaling,
         # )
         # return self.forward_core(s)
-    
+
         self.zero_allocator = zero_allocator
         self.layer_scatter_modes = layer_scatter_modes
 

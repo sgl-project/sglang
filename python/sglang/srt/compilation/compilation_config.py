@@ -21,8 +21,11 @@ class CompilationConfig:
         capture_sizes: List[int],
         compiler: str = "eager",
         enable_debug_mode: bool = False,
+        capture_size_align: int = 1,
     ):
         self.traced_files = set()
+        if capture_size_align > 1:
+            capture_sizes = [s for s in capture_sizes if s % capture_size_align == 0]
         self.capture_sizes = capture_sizes
         self.compiler = compiler
         self.enable_debug_mode = enable_debug_mode

@@ -176,6 +176,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
+            capture_size_align=self.attn_tp_size,
         )
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.compile_config.add_split_op(
