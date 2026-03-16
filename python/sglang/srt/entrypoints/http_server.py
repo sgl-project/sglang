@@ -2165,7 +2165,7 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
+    tokenizer_manager, template_manager, port_args, scheduler_init_result, _ = (
         Engine._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=init_tokenizer_manager_func,

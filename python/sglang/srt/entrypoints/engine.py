@@ -98,6 +98,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class SchedulerInitResult:
     """Result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
+    scheduler_procs: List = dataclasses.field(default_factory=list)
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
 
@@ -185,6 +187,7 @@ class Engine(EngineBase):
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         ) = self._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -194,6 +197,7 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        self._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
@@ -594,6 +598,7 @@ class Engine(EngineBase):
 
         return SchedulerInitResult(
             scheduler_infos=scheduler_infos,
+            scheduler_procs=scheduler_procs,
             wait_for_ready=wait_for_ready,
             wait_for_completion=wait_for_completion,
         )
@@ -645,6 +650,7 @@ class Engine(EngineBase):
                     None,
                     port_args,
                     scheduler_init_result,
+                    None,
                 )
 
             launch_dummy_health_check_server(
@@ -657,6 +663,7 @@ class Engine(EngineBase):
                 None,
                 port_args,
                 scheduler_init_result,
+                None,
             )
 
         # Launch detokenizer process
@@ -687,15 +694,32 @@ class Engine(EngineBase):
             "max_req_input_len"
         ]
 
+        # Set up subprocess liveness watchdog to detect crashes
+        # (e.g., NCCL timeout causing C++ std::terminate() before Python can handle it)
+        processes = list(scheduler_init_result.scheduler_procs)
+        names = [f"scheduler_{i}" for i in range(len(processes))]
+        if detoken_proc is not None:
+            processes.append(detoken_proc)
+            names.append("detokenizer")
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=processes, process_names=names
+        )
+        subprocess_watchdog.start()
+
         return (
             tokenizer_manager,
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         )
 
     def shutdown(self):
         """Shutdown the engine"""
+        # Stop the subprocess watchdog before killing children to prevent
+        # false-positive crash detection during normal shutdown.
+        if hasattr(self, "_subprocess_watchdog") and self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):

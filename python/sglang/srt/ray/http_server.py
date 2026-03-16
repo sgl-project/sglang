@@ -44,7 +44,7 @@ def launch_server(
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
 
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
+    tokenizer_manager, template_manager, port_args, scheduler_init_result, _ = (
         RayEngine._launch_subprocesses(
             server_args,
             init_tokenizer_manager_func=init_tokenizer_manager_func,
