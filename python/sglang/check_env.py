@@ -50,7 +50,7 @@ PACKAGE_LIST = [
     "tiktoken",
     "anthropic",
     "litellm",
-    "decord2",
+    "torchcodec",
 ]
 
 

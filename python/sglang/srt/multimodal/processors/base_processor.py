@@ -210,6 +210,8 @@ class BaseMultimodalProcessor(ABC):
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
             "images_crop": Modality.IMAGE,
+            "has_local_crops": Modality.IMAGE,
+            "has_images": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
@@ -344,11 +346,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "xpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
-            elif processor.__class__.__name__ not in {
-                "Qwen2_5_VLProcessor",
-                "Qwen3VLProcessor",
-            }:
+            else:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                    npu_apply_qwen_image_preprocess_patch,
+                )
+
+                npu_apply_qwen_image_preprocess_patch()
                 kwargs["device"] = "npu"
 
         result = processor.__call__(
@@ -385,8 +389,7 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
-        # Lazy import because decord is not available on some arm platforms.
-        from decord import VideoReader, cpu
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
         # Before processing inputs
         if not image_data or len(image_data) == 0:
@@ -395,9 +398,8 @@ class BaseMultimodalProcessor(ABC):
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
-                # Estimate frames for the video
-                vr = VideoReader(path, ctx=cpu(0))
-                num_frames = len(vr)
+                decoder = VideoDecoderWrapper(path)
+                num_frames = len(decoder)
             else:
                 # For images, each contributes one frame
                 num_frames = 1

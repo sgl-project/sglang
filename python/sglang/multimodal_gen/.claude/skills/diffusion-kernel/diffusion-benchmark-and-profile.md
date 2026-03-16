@@ -15,28 +15,48 @@ The denoising loop latency — total DiT forward pass time across all inference 
 ## Prerequisites
 
 ```bash
-#!/usr/bin/env bash
-# Quick dependency check
-check() { "$@" &>/dev/null && echo "[OK]  $1" || echo "[MISS] $1"; }
-check "sglang"         python3 -c "import sglang"
-check "torch+CUDA"     python3 -c "import torch; assert torch.cuda.is_available()"
+ENV_PY=python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py
+ROOT=$(python3 "$ENV_PY" print-root)
+cd "$ROOT"
+python3 "$ENV_PY" check-write-access >/dev/null
+
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 1)
+
+ASSET_DIR=$(python3 "$ENV_PY" print-assets-dir --mkdir)
+BENCH_DIR=$(python3 "$ENV_PY" print-output-dir --kind benchmarks --mkdir)
+PROFILE_DIR=$(python3 "$ENV_PY" print-output-dir --kind profiles --mkdir)
+NCU_DIR=$(python3 "$ENV_PY" print-output-dir --kind ncu --mkdir)
+export PROFILE_DIR
+
+check() {
+  local label="$1"
+  shift
+  "$@" &>/dev/null && echo "[OK]  $label" || echo "[MISS] $label"
+}
+
+check "sglang" python3 -c "import sglang"
+check "torch+CUDA" python3 -c "import torch; assert torch.cuda.is_available()"
 check "torch.profiler" python3 -c "import torch.profiler"
 check "nsys (Level 2)" which nsys
-check "pandas"         python3 -c "import pandas"
-check "plotly"         python3 -c "import plotly"
+check "ncu (Level 3)" which ncu
+check "pandas" python3 -c "import pandas"
+check "plotly" python3 -c "import plotly"
 ```
 
 **Minimum for benchmarking**: `sglang`, `torch` with CUDA.
 **Level 1 profiling**: `torch.profiler` (bundled with torch).
 **Level 2 profiling**: `nsys`, `pandas`, `plotly` + `gputrc2graph.py` from the sglang repo.
+All commands below assume you are inside the configured diffusion container shell, already `cd`'d to the repo root derived from `sglang.__file__`, with `FLASHINFER_DISABLE_VERSION_CHECK=1` exported. Re-run `print-idle-gpus` before each perf command if GPU availability may have changed. For 8-GPU commands, request eight idle GPUs and export the comma-separated list to `CUDA_VISIBLE_DEVICES` first.
 
 Download input images required by some models:
 ```bash
-mkdir -p /workspace/gen_benchmark/figs
-wget -O /workspace/gen_benchmark/figs/cat.png \
+wget -O "${ASSET_DIR}/cat.png" \
   https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
-wget -O /workspace/gen_benchmark/figs/astronaut.jpg \
+wget -O "${ASSET_DIR}/astronaut.jpg" \
   https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
+wget -O "${ASSET_DIR}/mova_single_person.jpg" \
+  https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 ```
 
 ---
@@ -50,19 +70,20 @@ All commands include `--warmup` and `--enable-torch-compile` for real production
 For every benchmark run, always write a perf dump JSON:
 
 ```bash
-sglang generate ... --warmup --perf-dump-path <result>.json
+sglang generate ... --warmup --perf-dump-path "${BENCH_DIR}/<result>.json"
 ```
 
 Before/after comparison (outputs a Markdown table suitable for PR descriptions):
 
 ```bash
 # Baseline (on main branch or before changes)
-sglang generate ... --warmup --perf-dump-path baseline.json
+sglang generate ... --warmup --perf-dump-path "${BENCH_DIR}/baseline.json"
 
 # New (after changes)
-sglang generate ... --warmup --perf-dump-path new.json
+sglang generate ... --warmup --perf-dump-path "${BENCH_DIR}/new.json"
 
-python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+python3 python/sglang/multimodal_gen/benchmarks/compare_perf.py \
+  "${BENCH_DIR}/baseline.json" "${BENCH_DIR}/new.json"
 ```
 
 ### Qwen-Image-2512 (1024×1024, 50 steps)
@@ -81,7 +102,7 @@ sglang generate \
 sglang generate \
   --model-path=Qwen/Qwen-Image-Edit-2511 \
   '--prompt=Transform into anime style' '--negative-prompt= ' \
-  --image-path=/workspace/gen_benchmark/figs/cat.png \
+  --image-path="${ASSET_DIR}/cat.png" \
   --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
   --seed=42 --save-output --enable-torch-compile --warmup \
   --dit-cpu-offload false --text-encoder-cpu-offload false
@@ -118,6 +139,8 @@ sglang generate \
 
 ### Wan2.2-T2V-A14B 720P (8 GPUs, 81 frames, 40 steps)
 ```bash
+# Select eight idle GPUs first:
+# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 8)
 sglang generate \
   --model-path=Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon." \
@@ -135,12 +158,38 @@ sglang generate \
   --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
   --prompt "An astronaut hatching from an egg, on the surface of the moon..." \
   --negative-prompt "Bright tones, overexposed, static, blurred details..." \
-  --image-path=/workspace/gen_benchmark/figs/astronaut.jpg \
+  --image-path="${ASSET_DIR}/astronaut.jpg" \
   --num-frames 81 --720p --num-inference-steps 50 --guidance-scale 5.0 \
   --seed 42 --save-output \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --vae-cpu-offload false --text-encoder-cpu-offload false \
   --enable-torch-compile --warmup
+```
+
+### HunyuanVideo (848×480, 65 frames, 30 steps)
+```bash
+sglang generate \
+  --model-path=hunyuanvideo-community/HunyuanVideo \
+  --text-encoder-cpu-offload --pin-cpu-memory \
+  --prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window." \
+  --save-output --num-frames=65 --width=848 --height=480 \
+  --num-inference-steps=30 \
+  --warmup --enable-torch-compile
+```
+
+### MOVA-720p (4 GPUs, 193 frames, 24 steps)
+```bash
+# Select four idle GPUs first:
+# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
+sglang generate \
+  --model-path=OpenMOSS-Team/MOVA-720p \
+  --prompt="A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, \"I would also believe that this advance in AI recently wasn’t unexpected.\"" \
+  --image-path="${ASSET_DIR}/mova_single_person.jpg" \
+  --adjust-frames=false \
+  --num-gpus=4 --ring-degree=1 --ulysses-degree=4 \
+  --num-frames=193 --fps=24 \
+  --num-inference-steps=24 \
+  --enable-torch-compile --save-output --warmup
 ```
 
 **Key metrics** (all models): denoise latency ★, end-to-end latency, peak GPU memory.
@@ -158,7 +207,7 @@ Add `--log-level=info` and observe:
 ### Step 2: Profile with torch.profiler (Level 1)
 
 ```bash
-SGLANG_TORCH_PROFILER_DIR=/workspace/profiles \
+SGLANG_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
 sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
   --prompt="A futuristic cyberpunk city at night" \
@@ -211,7 +260,7 @@ with torch.profiler.record_function(f"dit_block_{idx}.norm"):
 
 ```bash
 # Pass A — collect nsys trace (skip warmup with --delay)
-nsys profile -t cuda -o /workspace/profiles/flux_dev -f true \
+nsys profile -t cuda -o "${PROFILE_DIR}/flux_dev" -f true \
   --trace-fork-before-exec=true --delay 120 --duration 60 \
   sglang generate \
     --model-path=black-forest-labs/FLUX.1-dev \
@@ -248,16 +297,16 @@ Create classification JSON at `examples/profiler/nsys_profile_tools/sglang_diffu
 
 Run analysis:
 ```bash
-cd examples/profiler/nsys_profile_tools
+cd "$ROOT/examples/profiler/nsys_profile_tools"
 python3 gputrc2graph.py \
-  --in_file /workspace/profiles/flux_dev.nsys-rep,sglang,diffusion,ELAPSED_SEC \
-  --out_dir /workspace/profiles/analysis \
+  --in_file "${PROFILE_DIR}/flux_dev.nsys-rep,sglang,diffusion,ELAPSED_SEC" \
+  --out_dir "${PROFILE_DIR}/analysis" \
   --title "FLUX.1-dev denoise kernel breakdown"
 
 # Read results
 python3 - << 'EOF'
 import pandas as pd
-df = pd.read_csv("/workspace/profiles/analysis/result.csv")
+df = pd.read_csv(f"{os.environ['PROFILE_DIR']}/analysis/result.csv")
 summary = df.groupby("Category")["Elapsed Time (sec)"].sum().sort_values(ascending=False)
 total = summary.sum()
 for cat, sec in summary.items():
@@ -296,7 +345,7 @@ EOF
 ncu --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 10 --launch-count 3 \
     --set full \
-    -o /workspace/ncu_reports/gated_residual \
+    -o "${NCU_DIR}/gated_residual" \
     sglang generate \
       --model-path=black-forest-labs/FLUX.1-dev \
       --prompt="test" --width=1024 --height=1024 \
@@ -305,48 +354,49 @@ ncu --kernel-name "_fused_gated_residual_add_kernel" \
 # 2. Profile all kernels in a short run (use few steps to limit time)
 ncu --launch-skip 50 --launch-count 200 \
     --set full \
-    -o /workspace/ncu_reports/all_kernels \
+    -o "${NCU_DIR}/all_kernels" \
     sglang generate \
       --model-path=black-forest-labs/FLUX.1-dev \
       --prompt="test" --width=1024 --height=1024 \
       --num-inference-steps=3 --seed=42
 
-# 3. For CUDA graph mode, use --graph-profiling=node to profile inside the graph
+# 3. For CUDA graph mode, keep --graph-profiling=node on the ncu side.
+# Note: `--enable-piecewise-cuda-graph` is a server flag, not a valid
+# `sglang generate` flag, so do not append it here.
 ncu --graph-profiling node \
     --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 5 --launch-count 3 \
     --set full \
-    -o /workspace/ncu_reports/gated_residual_cudagraph \
+    -o "${NCU_DIR}/gated_residual_cudagraph" \
     sglang generate \
       --model-path=black-forest-labs/FLUX.1-dev \
       --prompt="test" --width=1024 --height=1024 \
-      --num-inference-steps=5 --seed=42 \
-      --enable-piecewise-cuda-graph
+      --num-inference-steps=5 --seed=42
 ```
 
 #### Reading ncu results (CLI, no GUI needed)
 
 ```bash
 # Summary of all profiled kernels
-ncu --import /workspace/ncu_reports/gated_residual.ncu-rep --page raw --csv 2>/dev/null | head -50
+ncu --import "${NCU_DIR}/gated_residual.ncu-rep" --page raw --csv 2>/dev/null | head -50
 
 # Key metrics to extract:
-ncu --import /workspace/ncu_reports/gated_residual.ncu-rep \
+ncu --import "${NCU_DIR}/gated_residual.ncu-rep" \
     --page details --csv 2>/dev/null | python3 -c "
 import csv, sys
 reader = csv.DictReader(sys.stdin)
-key_metrics = [
-    'gpu__time_duration.avg',           # Kernel duration
-    'sm__throughput.avg.pct_of_peak_sustained_elapsed',  # SM utilization
-    'dram__throughput.avg.pct_of_peak_sustained_elapsed', # DRAM bandwidth util
-    'l1tex__throughput.avg.pct_of_peak_sustained_elapsed', # L1 throughput
-    'sm__warps_active.avg.pct_of_peak_sustained_active',  # Achieved occupancy
-    'launch__occupancy_limit_registers',   # Occupancy limiter
-    'launch__occupancy_limit_shared_mem',
-]
+key_metrics = {
+    'gpu__time_duration.avg': 'Duration',
+    'sm__throughput.avg.pct_of_peak_sustained_elapsed': 'Compute (SM) Throughput',
+    'dram__throughput.avg.pct_of_peak_sustained_elapsed': 'DRAM Throughput',
+    'l1tex__throughput.avg.pct_of_peak_sustained_elapsed': 'L1/TEX Cache Throughput',
+    'sm__warps_active.avg.pct_of_peak_sustained_active': 'Achieved Occupancy',
+    'launch__occupancy_limit_registers': 'Block Limit Registers',
+    'launch__occupancy_limit_shared_mem': 'Block Limit Shared Mem',
+}
 for row in reader:
     name = row.get('Metric Name', '')
-    if any(m in name for m in key_metrics):
+    if any(alias in name or metric in name for metric, alias in key_metrics.items()):
         print(f'{name:<60} {row.get(\"Metric Value\",\"\")}')
 "
 ```
@@ -368,17 +418,17 @@ for row in reader:
 # Profile baseline kernel
 ncu --kernel-name "vectorized_elementwise_kernel" \
     --launch-skip 10 --launch-count 3 --set full \
-    -o /workspace/ncu_reports/baseline ./program
+    -o "${NCU_DIR}/baseline" ./program
 
 # Profile optimized kernel
 ncu --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 10 --launch-count 3 --set full \
-    -o /workspace/ncu_reports/optimized ./program
+    -o "${NCU_DIR}/optimized" ./program
 
 # Compare key metrics
 for report in baseline optimized; do
   echo "=== $report ==="
-  ncu --import /workspace/ncu_reports/${report}.ncu-rep \
+  ncu --import "${NCU_DIR}/${report}.ncu-rep" \
       --page details --csv 2>/dev/null | grep -E "time_duration|throughput.*pct|occupancy"
 done
 ```

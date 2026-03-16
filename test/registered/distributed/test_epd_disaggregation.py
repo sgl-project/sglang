@@ -8,7 +8,8 @@ import grpc
 import zmq
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
-from sglang.srt.utils import get_zmq_socket_on_host, kill_process_tree
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket_on_host
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
