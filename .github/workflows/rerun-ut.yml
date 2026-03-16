@@ -9,9 +9,19 @@ on:
         required: true
         type: string
       runner_label:
-        description: "Runner label (e.g. '1-gpu-runner', '1-gpu-5090', '4-gpu-h100')"
+        description: "Runner label"
         required: true
-        type: string
+        type: choice
+        options:
+          - 1-gpu-runner
+          - 1-gpu-5090
+          - 2-gpu-runner
+          - 4-gpu-h100
+          - 4-gpu-a10
+          - 4-gpu-b200
+          - 8-gpu-h200
+          - 8-gpu-h20
+          - 8-gpu-b200
       pr_head_sha:
         description: "PR head SHA to checkout (for /rerun-ut on fork PRs)"
         required: false
