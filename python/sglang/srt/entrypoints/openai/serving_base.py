@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -12,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.iochain.base import IOChain, IOContext
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -21,6 +23,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-async-task slot for the current request's IOContext.
+# Each concurrent request gets its own slot via asyncio task-local storage.
+_iochain_ctx: ContextVar[Optional[IOContext]] = ContextVar("iochain_ctx", default=None)
+
 
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
@@ -28,6 +34,7 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self._iochain: Optional[IOChain] = None
         self.allowed_custom_labels = (
             set(
                 self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
@@ -211,20 +218,32 @@ class OpenAIServingBase(ABC):
         """Validate request"""
         pass
 
+    def set_iochain(self, chain: IOChain) -> None:
+        """
+        Attach an IOChain to this handler.
+
+        Called by the server at startup (see ``sglang.srt.iochain.loader``).
+        Can also be called in tests to inject a chain without subclassing.
+        """
+        self._iochain = chain
+
     async def _before_inference(
         self,
         request: OpenAIServingRequest,
         adapted_request: Any,
     ) -> None:
         """
-        Hook called after tokenisation, immediately before inference dispatch.
+        Ingress hook — called after tokenisation, immediately before inference.
 
-        No-op by default. Override (or mix in IOChainMixin) to inspect or act
-        on the incoming request without modifying any other serving logic.
-
-        For blocking checks (e.g. content policy), raise an exception here —
-        it will be caught by handle_request and returned as an error response.
+        Runs the IOChain ingress pipeline when a chain with filters is set.
+        A blocking filter may raise here to reject the request; the exception
+        is caught by ``handle_request`` and returned as an error response.
         """
+        if self._iochain is None or not self._iochain._filters:
+            return
+        ctx = self._iochain.make_context(request, adapted_request)
+        _iochain_ctx.set(ctx)
+        await self._iochain.run_ingress(ctx)
 
     async def _after_inference(
         self,
@@ -233,19 +252,22 @@ class OpenAIServingBase(ABC):
         response: Any,
     ) -> None:
         """
-        Hook called after a response is fully delivered to the client.
+        Egress hook — called after the response is fully delivered.
 
-        For non-streaming requests: ``response`` is the fully-built response
+        For non-streaming requests ``response`` is the complete response
         object (e.g. ``ChatCompletionResponse``).
 
-        For streaming requests: called after the last SSE chunk is sent;
-        ``response`` is ``None`` because no single response object exists.
-        Filters must guard with ``if ctx.response is not None`` when accessing
-        response-level fields such as ``usage``.
-
-        No-op by default. Override (or mix in IOChainMixin) to inspect or
-        record the outgoing response. Exceptions are propagated to the caller.
+        For streaming requests ``response`` is ``None`` — the response was
+        sent as SSE chunks. Filters must guard with
+        ``if ctx.response is not None`` when accessing response-level fields.
         """
+        if self._iochain is None or not self._iochain._filters:
+            return
+        ctx = _iochain_ctx.get()
+        if ctx is None:
+            return
+        ctx.response = response
+        await self._iochain.run_egress(ctx)
 
     def _wrap_streaming_egress(
         self,

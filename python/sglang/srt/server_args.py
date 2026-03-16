@@ -431,6 +431,9 @@ class ServerArgs:
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
 
+    # IOChain plugin filters loaded at startup
+    iochain_filters: List[str] = field(default_factory=list)
+
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
@@ -4147,6 +4150,20 @@ class ServerArgs:
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
+            "--iochain-filter",
+            dest="iochain_filters",
+            type=str,
+            action="append",
+            default=[],
+            metavar="MODULE:CLASS",
+            help="Load an IOFilter plugin at startup. "
+            "Specify as 'module.path:ClassName' "
+            "(e.g. 'mypackage.filters:ContentPolicy'). "
+            "May be repeated to load multiple filters in order. "
+            "Filters declared via the 'sglang.general_plugins' entry-point "
+            "group are discovered automatically without this flag.",
         )
 
         # Data parallelism

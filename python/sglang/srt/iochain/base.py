@@ -118,16 +118,18 @@ class IOChain:
 
     async def run_ingress(self, ctx: IOContext) -> None:
         for f in self._filters:
-            coro = _run_safe(f.on_request(ctx), type(f).__name__, "ingress")
             if f.blocking:
-                await coro
+                await f.on_request(ctx)
             else:
-                asyncio.create_task(coro)
+                asyncio.create_task(
+                    _run_safe(f.on_request(ctx), type(f).__name__, "ingress")
+                )
 
     async def run_egress(self, ctx: IOContext) -> None:
         for f in reversed(self._filters):
-            coro = _run_safe(f.on_response(ctx), type(f).__name__, "egress")
             if f.blocking:
-                await coro
+                await f.on_response(ctx)
             else:
-                asyncio.create_task(coro)
+                asyncio.create_task(
+                    _run_safe(f.on_response(ctx), type(f).__name__, "egress")
+                )

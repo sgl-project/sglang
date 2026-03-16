@@ -290,6 +290,11 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    # Load IOChain filter plugins (entry points + --iochain-filter CLI args)
+    from sglang.srt.iochain.loader import load_iochain
+
+    iochain = load_iochain(server_args)
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -326,6 +331,24 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.anthropic_serving = AnthropicServing(
         fast_api_app.state.openai_serving_chat
     )
+
+    # Wire IOChain into all OpenAI serving handlers (no-op if chain is empty)
+    if iochain._filters:
+        _iochain_handler_attrs = [
+            "openai_serving_completion",
+            "openai_serving_chat",
+            "openai_serving_embedding",
+            "openai_serving_classify",
+            "openai_serving_score",
+            "openai_serving_rerank",
+            "openai_serving_tokenize",
+            "openai_serving_detokenize",
+            "openai_serving_transcription",
+        ]
+        for attr in _iochain_handler_attrs:
+            handler = getattr(fast_api_app.state, attr, None)
+            if handler is not None:
+                handler.set_iochain(iochain)
 
     # Launch tool server
     tool_server = None
