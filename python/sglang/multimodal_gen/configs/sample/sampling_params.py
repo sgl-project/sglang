@@ -431,7 +431,7 @@ class SamplingParams:
 
         pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
 
-        if "wan" in pipeline_name_lower and (
+        if ("wan" in pipeline_name_lower or "helios" in pipeline_name_lower) and (
             self.enable_sequence_shard is None or self.enable_sequence_shard
         ):
             self.enable_sequence_shard = True
@@ -575,7 +575,9 @@ class SamplingParams:
         user_kwargs.pop("diffusers_kwargs", None)
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
-        sampling_params._merge_with_user_params(user_sampling_params)
+        sampling_params._merge_with_user_params(
+            user_sampling_params, explicit_fields=set(user_kwargs.keys())
+        )
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -641,7 +643,7 @@ class SamplingParams:
         parser.add_argument(
             "--negative-prompt",
             type=str,
-            default=SamplingParams.negative_prompt,
+            default=None,
             help="Negative text prompt for generation",
         )
         parser.add_argument(
@@ -928,16 +930,29 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        return {
+            attr: getattr(args, attr)
+            for attr in attrs
+            if hasattr(args, attr) and getattr(args, attr) is not None
+        }
 
     def output_file_path(self):
         if self.output_path is None:
             return None
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params: "SamplingParams"):
+    def _merge_with_user_params(
+        self,
+        user_params: "SamplingParams",
+        explicit_fields: set[str] | None = None,
+    ):
         """
         Merges parameters from a user-provided SamplingParams object.
+
+        Args:
+            explicit_fields: field names explicitly set by the user (e.g. from
+                CLI kwargs). These are always treated as user-modified even when
+                their value matches the base-class default.
         """
         if user_params is None:
             return
@@ -951,8 +966,9 @@ class SamplingParams:
             user_value = getattr(user_params, field_name)
             default_class_value = getattr(SamplingParams, field_name)
 
-            # A field is considered user-modified if its value is different from the default
-            is_user_modified = user_value != default_class_value
+            is_user_modified = user_value != default_class_value or (
+                explicit_fields is not None and field_name in explicit_fields
+            )
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
