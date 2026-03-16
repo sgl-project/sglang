@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
+
 def _wan_1_3b_coefficients(p: TeaCacheParams) -> list[float]:
     if p.use_ret_steps:
         # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L883
@@ -25,6 +26,7 @@ def _wan_1_3b_coefficients(p: TeaCacheParams) -> list[float]:
         1.37887774e-01,
     ]
 
+
 def _wan_14b_coefficients(p: TeaCacheParams) -> list[float]:
     if p.use_ret_steps:
         # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L885
@@ -37,6 +39,7 @@ def _wan_14b_coefficients(p: TeaCacheParams) -> list[float]:
         ]
     # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L892
     return [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404]
+
 
 @dataclass
 class WanT2V_1_3B_SamplingParams(SamplingParams):
@@ -100,6 +103,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
             teacache_thresh=0.20,
             use_ret_steps=False,
             coefficients_callback=_wan_14b_coefficients,
+            start_skipping=1,
             end_skipping=-2,
         )
     )
