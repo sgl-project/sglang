@@ -55,6 +55,8 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_id_regex = re.compile(
             r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$"
         )
+        self._inside_tool_call_block = False
+        self._ignore_post_block_whitespace = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -115,6 +117,9 @@ class KimiK2Detector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+        if self.bot_token in current_text:
+            self._inside_tool_call_block = True
+            self._ignore_post_block_whitespace = False
 
         # Check if we have a tool call (either the start token or individual tool call)
         has_tool_call = (
@@ -122,11 +127,22 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
+            contains_section_end_token = self.eot_token in current_text
             self._buffer = ""
-            for e_token in [self.eot_token, self.tool_call_end_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+            normal_text = current_text.replace(self.tool_call_end_token, "").replace(
+                self.eot_token, ""
+            )
+
+            if contains_section_end_token:
+                self._inside_tool_call_block = False
+                self._ignore_post_block_whitespace = True
+
+            if self._inside_tool_call_block or self._ignore_post_block_whitespace:
+                if not normal_text.strip():
+                    return StreamingParseResult(normal_text="")
+                self._ignore_post_block_whitespace = False
+
+            return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -193,7 +209,10 @@ class KimiK2Detector(BaseFormatDetector):
                             self.current_tool_id
                         ] += parsed_args_diff
 
-                    parsed_args = function_args.split("<|tool_call_end|>", 1)[0]
+                    contains_tool_call_end_token = (
+                        self.tool_call_end_token in function_args
+                    )
+                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
                     if _is_complete_json(parsed_args):
                         try:
                             parsed_args = json.loads(parsed_args)
@@ -202,6 +221,9 @@ class KimiK2Detector(BaseFormatDetector):
                             ] = parsed_args
                         except json.JSONDecodeError:
                             pass
+
+                        if not contains_tool_call_end_token:
+                            return StreamingParseResult(normal_text="", calls=calls)
 
                         # Find the end of the current tool call and remove only that part from buffer
                         tool_call_end_pattern = (
@@ -212,7 +234,14 @@ class KimiK2Detector(BaseFormatDetector):
                         )
                         if match:
                             # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
+                            remaining_text = current_text[match.end() :]
+                            if remaining_text.startswith(self.eot_token):
+                                remaining_text = remaining_text[len(self.eot_token) :]
+                                self._inside_tool_call_block = False
+                                if not remaining_text.strip():
+                                    self._ignore_post_block_whitespace = True
+                                    remaining_text = ""
+                            self._buffer = remaining_text
                         else:
                             self._buffer = ""
 

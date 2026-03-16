@@ -1024,8 +1024,10 @@ class TestKimiK2Detector(unittest.TestCase):
         ]
 
         tool_calls = []
+        normal_text = ""
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
 
@@ -1042,6 +1044,7 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(normal_text, "")
 
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
@@ -1056,8 +1059,10 @@ class TestKimiK2Detector(unittest.TestCase):
         ]
 
         tool_calls = []
+        normal_text = ""
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
 
@@ -1076,6 +1081,64 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
         self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
         self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
+        self.assertEqual(normal_text, "")
+
+    def test_tool_call_completion_waits_for_end_token(self):
+        """Test that a complete JSON payload does not finish the tool call before the end token."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(self.detector.current_tool_id, 0)
+        self.assertTrue(self.detector.current_tool_name_sent)
+        self.assertEqual(
+            self.detector._buffer,
+            '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}',
+        )
+
+    def test_streaming_tool_call_ignores_trailing_section_whitespace(self):
+        """Test that post-tool-call structural whitespace never becomes normal text."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+            " ",
+            " ",
+        ]
+
+        tool_calls = []
+        normal_text = ""
+        normal_text_chunks = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            normal_text_chunks.append(result.normal_text)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(normal_text, "")
+        self.assertEqual(normal_text_chunks[-3:], ["", "", ""])
+        self.assertEqual(self.detector._buffer, "")
+        self.assertEqual(self.detector.current_tool_id, 1)
 
     def test_tool_call_completion(self):
         """Test that the buffer and state are reset after a tool call is completed."""
