@@ -60,7 +60,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "sgl-fa4==4.0.5",
-  "sgl-kernel==0.3.21",
+  "sglang-kernel==0.4.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
