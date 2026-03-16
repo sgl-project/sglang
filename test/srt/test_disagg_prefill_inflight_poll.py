@@ -126,7 +126,9 @@ class TestOldCodeCrashes(unittest.TestCase):
         _, _, crashed = simulate_old_inflight_queue_logic(
             [req], [KVPoll.WaitingForInput], rids_to_check=["rid_3"]
         )
-        self.assertTrue(crashed, "Old code should crash on WaitingForInput in consensus")
+        self.assertTrue(
+            crashed, "Old code should crash on WaitingForInput in consensus"
+        )
 
 
 class TestFixedCodeHandlesTransientStates(unittest.TestCase):
