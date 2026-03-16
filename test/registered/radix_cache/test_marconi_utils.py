@@ -158,9 +158,10 @@ class TestGetLinearAttnFlops(unittest.TestCase):
 class TestGetMoeFlops(unittest.TestCase):
     def test_formula(self):
         seqlen, hidden, k, expert_int, shared_int = 10, 512, 2, 256, 128
+        # SwiGLU: up + gate + down = 3 matmuls × 2 = 6, same as dense MLP
         expected = (
-            4 * seqlen * hidden * expert_int * k
-            + 4 * seqlen * hidden * shared_int
+            6 * seqlen * hidden * expert_int * k
+            + 6 * seqlen * hidden * shared_int
         )
         self.assertEqual(
             get_moe_flops(seqlen, hidden, k, expert_int, shared_int), expected
@@ -169,7 +170,7 @@ class TestGetMoeFlops(unittest.TestCase):
     def test_includes_shared_expert(self):
         # shared-only FLOPs: set num_experts_per_tok=0 and check remaining == shared
         shared = get_moe_flops(10, 512, 0, 256, 128)
-        expected_shared = 4 * 10 * 512 * 128
+        expected_shared = 6 * 10 * 512 * 128
         self.assertEqual(shared, expected_shared)
 
     def test_zero_seqlen(self):
