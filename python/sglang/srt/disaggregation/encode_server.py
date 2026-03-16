@@ -43,14 +43,12 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
-    config_socket,
-    get_local_ip_auto,
-    get_zmq_socket,
     load_audio,
     load_image,
     load_video,
     random_uuid,
 )
+from sglang.srt.utils.network import config_socket, get_local_ip_auto, get_zmq_socket
 
 logger = logging.getLogger(__name__)
 

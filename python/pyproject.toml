@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.4", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.4",
+  "flashinfer_python==0.6.6", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.6",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -78,10 +78,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.1.27",
 
-  "smg-grpc-proto>=0.4.1",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
-  "grpcio-health-checking>=1.78.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [[tool.uv.index]]
@@ -144,6 +141,8 @@ test = [
   "parameterized",
   "peft",
   "pytest",
+  "pytest-cov",
+  "diff-cover",
   "sentence_transformers",
   "tabulate",
 ]
