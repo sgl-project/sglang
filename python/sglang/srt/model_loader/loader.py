@@ -113,6 +113,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
+from sglang.srt.layers.utils.common import PPMissingLayer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -1284,7 +1285,6 @@ class DummyModelLoader(BaseModelLoader):
                     self.load_config,
                     quant_config,
                 )
-            from sglang.srt.layers.utils.common import PPMissingLayer
             for _, module in model.named_modules():
                 
                 # PPMissingLayer overrides attribute access to always
@@ -1293,7 +1293,7 @@ class DummyModelLoader(BaseModelLoader):
                 # a crash: 
                 #   - module.is_weights_quantized() -> self() -> self.forward()
                 # PPMissingLayer.forward expects either args or kwargs
-                if type(module) is PPMissingLayer:
+                if isinstance(module, PPMissingLayer):
                     continue
 
                 quant_method = getattr(module, "quant_method", None)
