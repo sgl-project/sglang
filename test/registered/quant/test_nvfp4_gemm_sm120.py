@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=120, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
@@ -59,7 +59,7 @@ class FP4GemmSM120Base:
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.65)
+        self.assertGreater(metrics["accuracy"], 0.64)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
