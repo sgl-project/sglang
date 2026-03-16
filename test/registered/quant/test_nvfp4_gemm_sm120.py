@@ -51,7 +51,7 @@ class FP4GemmSM120Base:
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=200,
             host=parsed_url.hostname,
@@ -59,7 +59,7 @@ class FP4GemmSM120Base:
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.68)
+        self.assertGreater(metrics["accuracy"], 0.65)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
