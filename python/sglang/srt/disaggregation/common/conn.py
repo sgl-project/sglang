@@ -238,7 +238,7 @@ class CommonKVManager(BaseKVManager):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
-            host = NetworkAddress.parse(self.dist_init_addr).host
+            host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host

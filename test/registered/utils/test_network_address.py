@@ -179,23 +179,23 @@ class TestNetworkAddressParseErrors(unittest.TestCase):
             NetworkAddress.parse(":8000")
 
 
-class TestNetworkAddressFromParts(unittest.TestCase):
+class TestNetworkAddressBracketStripping(unittest.TestCase):
     def test_strip_brackets(self):
-        na = NetworkAddress.from_parts("[::1]", 8000)
+        na = NetworkAddress("[::1]", 8000)
         self.assertEqual(na.host, "::1")
         self.assertTrue(na.is_ipv6)
 
     def test_no_brackets(self):
-        na = NetworkAddress.from_parts("::1", 8000)
+        na = NetworkAddress("::1", 8000)
         self.assertEqual(na.host, "::1")
 
     def test_ipv4_passthrough(self):
-        na = NetworkAddress.from_parts("127.0.0.1", 30000)
+        na = NetworkAddress("127.0.0.1", 30000)
         self.assertEqual(na.host, "127.0.0.1")
         self.assertFalse(na.is_ipv6)
 
     def test_hostname_passthrough(self):
-        na = NetworkAddress.from_parts("myhost", 30000)
+        na = NetworkAddress("myhost", 30000)
         self.assertEqual(na.host, "myhost")
 
 
