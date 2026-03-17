@@ -309,5 +309,65 @@ class TestQwen35WithHiCache(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 
 
+class TestQwen35FP4Flashinfer(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN35_FP4_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                "4",
+                "--chunked-prefill-size",
+                "2048",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--mamba-track-interval",
+                "128",
+                "--mamba-ssm-dtype",
+                "bfloat16",
+                "--max-running-requests",
+                "128",
+                "--reasoning-parser",
+                "qwen3",
+                "--attention-backend",
+                "trtllm_mha",
+                "--quantization",
+                "modelopt_fp4",
+                "--linear-attn-decode-backend",
+                "flashinfer",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true,"num_threads": 64}',
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            model=self.model,
+            eval_name="gsm8k",
+            num_shots=5,
+            num_examples=200,
+            max_tokens=16000,
+            num_threads=128,
+            repeat=1,
+            temperature=0.6,
+            top_p=0.95,
+            top_k=20,
+            base_url=self.base_url,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(metrics["score"], 0.95)
+
+
 if __name__ == "__main__":
     unittest.main()
