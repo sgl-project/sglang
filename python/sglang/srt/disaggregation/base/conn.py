@@ -17,6 +17,9 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    draft_kv_data_ptrs: List[int]
+    draft_kv_data_lens: List[int]
+    draft_kv_item_lens: List[int]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -31,6 +34,7 @@ class KVArgs:
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
+    draft_kv_head_num: int
     page_size: int
     # for pp prefill
     pp_rank: int
@@ -57,6 +61,7 @@ class BaseKVManager(ABC):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ): ...
 
     @abstractmethod

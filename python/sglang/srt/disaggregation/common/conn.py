@@ -83,9 +83,11 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
+        self.is_draft_mla_backend = is_draft_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -480,9 +482,17 @@ class CommonKVReceiver(BaseKVReceiver):
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
-            if self.kv_mgr.is_mla_backend:
+
+            if self.kv_mgr.is_mla_backend and (
+                len(self.kv_mgr.kv_args.draft_kv_data_ptrs) == 0
+                or self.kv_mgr.is_draft_mla_backend
+            ):
+                # 1.MLA target model with non-draft
+                # 2.MLA target model with MLA draft
                 self.required_prefill_response_num = 1
             else:
+                # 1.non-MLA models
+                # 2.MLA target and MHA draft models
                 self.required_prefill_response_num = (
                     self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
                 )
@@ -552,7 +562,11 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if self.kv_mgr.is_mla_backend and (
+                                len(self.kv_mgr.kv_args.draft_kv_data_ptrs) == 0
+                                or self.kv_mgr.is_draft_mla_backend
+                            ):
+
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
@@ -561,6 +575,17 @@ class CommonKVReceiver(BaseKVReceiver):
                             else:
                                 # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
+                            # For MLA + MHA, except rank0 other ranks don't need to send MLA kv data
+                            if self.kv_mgr.is_mla_backend and (
+                                len(self.kv_mgr.kv_args.draft_kv_data_ptrs) > 0
+                                and not self.kv_mgr.is_draft_mla_backend
+                            ):
+                                bootstrap_info["is_send_target"] = bool(
+                                    target_tp_rank == self.target_tp_rank
+                                )
+                            else:
+                                bootstrap_info["is_send_target"] = True
+
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
                             )
