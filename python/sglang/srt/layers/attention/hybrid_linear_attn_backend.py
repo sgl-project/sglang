@@ -111,7 +111,6 @@ print("=" * 80)
 def _maybe_capture_ssm_state(
     ssm_states: torch.Tensor,
     cache_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
     layer_id: int,
     mode: str,
 ) -> None:
