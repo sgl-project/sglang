@@ -718,7 +718,10 @@ class Engine(EngineBase):
         """Shutdown the engine"""
         # Stop the subprocess watchdog before killing children to prevent
         # false-positive crash detection during normal shutdown.
-        if hasattr(self, "_subprocess_watchdog") and self._subprocess_watchdog is not None:
+        if (
+            hasattr(self, "_subprocess_watchdog")
+            and self._subprocess_watchdog is not None
+        ):
             self._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 

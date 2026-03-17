@@ -217,6 +217,4 @@ class SubprocessWatchdog:
                         return
                 self._stop_event.wait(self._interval)
         except Exception as e:
-            logger.error(
-                f"SubprocessWatchdog thread crashed: {e}", exc_info=True
-            )
+            logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
