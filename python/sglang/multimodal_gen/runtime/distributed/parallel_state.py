@@ -841,10 +841,4 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP = None
-    _SP = None
-    _DP = None
-    _CFG = None
-    _PP = None
-    _DIT = None
-    _VAE = None
+    _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
