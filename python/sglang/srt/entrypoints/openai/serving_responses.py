@@ -144,6 +144,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         function_tools = []
         for tool in request.tools:
             if tool.type == "function":
+                if not tool.name:
+                    logger.warning(
+                        f"Skipping function tool without function name definition: {tool}"
+                    )
+                    continue
                 function_tools.append(
                     Tool(
                         type="function",
@@ -311,9 +316,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
-                    print(f"context type: {type(context)} \n")
-                    print(f"use_harmony: {self.use_harmony} \n")
-                    print(f"sampling_params: {json.dumps(sampling_params)}\n")
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
                         input_ids=engine_prompt,
@@ -993,12 +995,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         new_chunk = current_text[len(simple_ctx_prev_text) :]
                         simple_ctx_prev_text = current_text
 
-                        print(f"current_text: {current_text}")
-                        print(f"new_chunk: {new_chunk}")
                         if reasoning_parser:
                             reasoning_content, new_chunk = reasoning_parser.parse_stream_chunk(new_chunk)
-                            print(f"reasoning_content: {reasoning_content}")
-                            print(f"content: {new_chunk} \n")
                             if reasoning_content:
                                 yield _send_event(
                                     openai_responses_types.ResponseReasoningTextDeltaEvent(
@@ -1085,9 +1083,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                             logprobs=[],
                                         )
                                     )
-
-                                print(f"new_chunk: {new_chunk}\n")
-                                print(f"tool_calls: {tool_calls}\n")
 
                                 # Emit function call events for detected tool calls
                                 for call_info in tool_calls:
@@ -1654,7 +1649,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             async for res in generator:
-                print(f"res: {res}")
                 context.append_output(res)
                 # NOTE(woosuk): The stop condition is handled by the engine.
                 yield context

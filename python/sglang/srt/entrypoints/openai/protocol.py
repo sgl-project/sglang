@@ -1324,7 +1324,7 @@ class PromptTokenUsageInfo(BaseModel):
     cached_tokens: int = 0
 
 class OutputTokenUsageInfo(BaseModel):
-    """Prompt token usage details."""
+    """Output token usage details."""
 
     reasoning_tokens: int = 0
 
