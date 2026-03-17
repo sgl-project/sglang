@@ -40,6 +40,11 @@ def slow_crash_worker(delay: float = 0.5):
     os._exit(42)
 
 
+def noop_worker():
+    """Exits immediately with code 0."""
+    pass
+
+
 class TestSubprocessWatchdog(unittest.TestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -54,7 +59,11 @@ class TestSubprocessWatchdog(unittest.TestCase):
             else:
                 original_kill(pid, sig)
 
-        self._patcher = unittest.mock.patch("os.kill", side_effect=mock_kill)
+        # Patch os.kill in the watchdog module so the mock is hit
+        # when _monitor_loop calls os.kill.
+        self._patcher = unittest.mock.patch(
+            "sglang.srt.utils.watchdog.os.kill", side_effect=mock_kill
+        )
         self._patcher.start()
 
     def tearDown(self):
@@ -120,13 +129,27 @@ class TestSubprocessWatchdog(unittest.TestCase):
         self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
-        proc = self._spawn(lambda: None)
+        proc = self._spawn(noop_worker)
         proc.join(timeout=2)
         self._watch(proc)
         time.sleep(0.3)
         self.assertFalse(
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
+        )
+
+    def test_stop_prevents_false_sigquit(self):
+        """After stop(), a crashing subprocess must NOT trigger SIGQUIT."""
+        proc = self._spawn(slow_crash_worker, args=(0.5,))
+        monitor = self._watch(proc, interval=0.05)
+        # Stop the watchdog before the subprocess crashes
+        monitor.stop()
+        # Wait for the crash to happen
+        proc.join(timeout=2)
+        time.sleep(0.3)
+        self.assertFalse(
+            self.sigquit_triggered.is_set(),
+            "SIGQUIT should not fire after watchdog is stopped",
         )
 
 
