@@ -1,8 +1,11 @@
+import logging
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -68,20 +71,35 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
 
-        # Embedding LoRA keeps weights unsharded and relies on the base
-        # output being all-reduced before adding the LoRA result. This is
-        # incompatible with input_scattered mode (DeepSeek-v2 MLA), where
-        # the base output is NOT all-reduced.
+        # Embedding LoRA with TP > 1 keeps weights fully replicated
+        # (unsharded) on every rank.  This works correctly because the
+        # base VocabParallelEmbedding all-reduces its output before the
+        # LoRA delta is added, but it means each rank holds the full
+        # LoRA A (rank, vocab_size) and LoRA B (embed_dim, rank) tensors,
+        # which may cause OOM on large vocabularies or high LoRA ranks.
+        #
+        # input_scattered mode (DeepSeek-v2 MLA) skips the base
+        # all-reduce, making the unsharded LoRA approach mathematically
+        # incorrect — a sharded LoRA kernel would be needed.
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
             from sglang.srt.layers.communicator import get_attn_tp_context
 
             if get_attn_tp_context().allow_input_scattered:
-                raise ValueError(
-                    "VocabParallelEmbeddingWithLoRA is not compatible with "
+                logger.warning(
+                    "VocabParallelEmbeddingWithLoRA with TP > 1 under "
                     "input_scattered mode (e.g., DeepSeek-v2 MLA with "
-                    "--enable-attn-tp-input-scattered). Please disable "
-                    "input_scattered or remove embed_tokens from LoRA "
-                    "target modules."
+                    "--enable-attn-tp-input-scattered) is not fully "
+                    "supported and may produce incorrect results. "
+                    "Consider disabling input_scattered or removing "
+                    "embed_tokens from LoRA target modules."
+                )
+            else:
+                logger.warning(
+                    "VocabParallelEmbeddingWithLoRA with TP > 1: LoRA "
+                    "weights are fully replicated (unsharded) on every "
+                    "rank, which increases memory usage. If you encounter "
+                    "OOM, consider implementing a sharded embedding LoRA "
+                    "kernel and the corresponding weight-slicing logic."
                 )
 
         self.output_offset = torch.tensor(
