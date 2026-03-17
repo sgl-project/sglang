@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import torch
@@ -11,9 +12,11 @@ from sglang.jit_kernel.nvfp4 import (
     scaled_fp4_experts_quant,
     scaled_fp4_quant,
 )
+from sglang.srt.utils import is_sm100_supported
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+_NVFP4_SUPPORTED = is_sm100_supported()
 
 
 def _round_up(x: int, y: int) -> int:
@@ -168,6 +171,8 @@ def _aot_cutlass_fp4_group_mm(case: dict[str, Any]) -> torch.Tensor:
 def _probe_legacy_aot_group_mm() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return False, "CUDA is not available."
+    if not _NVFP4_SUPPORTED:
+        return False, "NVFP4 benchmarks require sm100+ with CUDA 12.8+."
     try:
         import sgl_kernel  # noqa: F401
     except Exception as e:
@@ -243,6 +248,9 @@ def benchmark(total_tokens, n, k, num_experts, provider):
 
 
 if __name__ == "__main__":
+    if not _NVFP4_SUPPORTED:
+        print("[skip] NVFP4 blockwise MoE benchmark requires sm100+ with CUDA 12.8+.")
+        sys.exit(0)
     if not _AOT_GROUP_MM_AVAILABLE:
         print(
             f"[info] legacy AOT grouped_mm baseline unavailable: {_AOT_GROUP_MM_REASON}"

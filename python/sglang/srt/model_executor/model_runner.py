@@ -163,7 +163,6 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_cpu_ids_by_node,
-    get_local_ip_auto,
     init_custom_process_group,
     is_hip,
     is_host_cpu_arm64,
@@ -177,6 +176,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -672,9 +672,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine.initialize(
             local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
-        self.remote_instance_transfer_engine_session_id = (
-            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
-        )
+        self.remote_instance_transfer_engine_session_id = NetworkAddress(
+            local_ip, self.remote_instance_transfer_engine.get_rpc_port()
+        ).to_host_port_str()
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -774,9 +774,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if dist_init_method_override:
             dist_init_method = dist_init_method_override
         elif self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            na = NetworkAddress.parse(self.server_args.dist_init_addr)
+            dist_init_method = na.to_tcp()
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+            dist_init_method = NetworkAddress(
+                self.server_args.host or "127.0.0.1", self.dist_port
+            ).to_tcp()
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
@@ -808,6 +811,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -824,6 +828,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
+
+            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
+            # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
+            if self.server_args.pre_warm_nccl and (
+                self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
+            ):
+                warmup_start = time.perf_counter()
+                tp_group_handle = get_tp_group().device_group
+
+                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
+                dist.all_reduce(warmup_tensor, group=tp_group_handle)
+                torch.cuda.synchronize()
+
+                warmup_elapsed = time.perf_counter() - warmup_start
+                logger.info(
+                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
+                )
 
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -955,7 +978,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             if self.tp_rank == 0:
-                instance_ip = socket.gethostbyname(socket.gethostname())
+                instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
@@ -1099,34 +1122,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        if ElasticEPStateManager.instance() is not None:
-            # TODO: refactor the weights update when elastic ep
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            assert old_expert_location_metadata is not None
-            old_expert_location_metadata.update(
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-            )
+        p2p_missing_logical_experts = self.expert_location_updater.update(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
+
+        if len(p2p_missing_logical_experts) > 0:
+            # Load the missing expert weights from disk
+            if callable(getattr(self.model, "generate_weight_name_filter", None)):
+                # Filter and load only missing expert weights
+                weight_name_filter = self.model.generate_weight_name_filter(
+                    p2p_missing_logical_experts
+                )
+            else:
+                # Do a full reload from disk/DRAM
+                logger.info(
+                    "[Elastic EP] Model does not implement generate_weight_name_filter. "
+                    "Performing full weight reload."
+                )
+                weight_name_filter = None
+
             if (
                 self.expert_backup_client is not None
                 and self.expert_backup_client.use_backup
             ):
-                self.expert_backup_client.update_weights()
-                return
-
-            self.update_weights_from_disk(
-                self.server_args.model_path,
-                self.server_args.load_format,
-                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
-            )
-        else:
-            self.expert_location_updater.update(
-                self.model.routed_experts_weights_of_layer,
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-                nnodes=self.server_args.nnodes,
-                rank=self.tp_rank,
-            )
+                # Load the missing weights from the DRAM backup
+                self.expert_backup_client.update_weights(weight_name_filter)
+            else:
+                # Load the missing weights from disk
+                self.update_weights_from_disk(
+                    get_global_server_args().model_path,
+                    get_global_server_args().load_format,
+                    weight_name_filter=weight_name_filter,
+                )
 
     def update_weights_from_disk(
         self,
@@ -1225,9 +1256,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         success = False
         message = ""
         try:
+            na = NetworkAddress(master_address, group_port)
             self._weights_send_group[group_name] = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{group_port}",
+                init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
@@ -1235,9 +1267,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
-            message = (
-                f"Succeeded to init group through {master_address}:{group_port} group."
-            )
+            message = f"Succeeded to init group through {na.to_host_port_str()} group."
         except Exception as e:
             message = f"Failed to init group: {e}."
             logger.error(message)
@@ -1272,6 +1302,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.cuda.empty_cache()
         success = False
+        na = NetworkAddress(master_address, group_port)
         message = ""
         try:
             for _, weights in self.model.named_parameters():
@@ -1281,7 +1312,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     group=send_group,
                 )
             success = True
-            message = f"Succeeded to send weights through {master_address}:{group_port} {group_name}."
+            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:
             message = f"Failed to send weights: {e}."
             logger.error(message)
@@ -1324,9 +1355,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         try:
+            na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
@@ -2237,24 +2269,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_layers = []
         self.moe_fusions = []
         for layer in language_model.model.layers:
+            attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                    attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
-                    self.attention_layers.append(layer.self_attn.attn_mqa)
+                    attn_layer = layer.self_attn.attn_mqa
             # For hybrid model
             elif hasattr(layer, "attn"):
-                self.attention_layers.append(layer.attn)
+                attn_layer = layer.attn
             elif hasattr(layer, "linear_attn"):
                 if hasattr(layer.linear_attn, "attn"):
-                    self.attention_layers.append(layer.linear_attn.attn)
+                    attn_layer = layer.linear_attn.attn
                 else:
-                    self.attention_layers.append(layer.linear_attn)
+                    attn_layer = layer.linear_attn
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
-                    self.attention_layers.append(layer.attention.attn)
+                    attn_layer = layer.attention.attn
+            # For NemotronH and similar hybrid models using 'mixer' attribute
+            elif hasattr(layer, "mixer"):
+                if hasattr(layer.mixer, "attn"):
+                    attn_layer = layer.mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    # Mamba layer with split op support - store the layer itself
+                    attn_layer = layer
+
+            if attn_layer is not None:
+                self.attention_layers.append(attn_layer)
 
             moe_block = None
             moe_fusion = None
@@ -2269,6 +2312,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
                 moe_block = layer.moe.experts
                 moe_fusion = layer.moe
+            # For NemotronH MoE layers using 'mixer' attribute
+            if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
+                moe_block = layer.mixer.experts
+                moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
 
@@ -2544,6 +2591,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
             )
+
+        # Use precomputed SWA cache location
+        if forward_batch.out_cache_loc_swa is not None:
+            self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

@@ -653,14 +653,17 @@ class MoriEPMoE(DeepEPMoE):
 
         quant_type = QuantType.No
 
+        is_bf16_weights = self.w13_weight.dtype == torch.bfloat16
+
         if (
             not is_fp8_quant
             and dispatch_scale is not None
             and dispatch_a1.dtype != torch.float4_e2m1fn_x2
         ):
-            if is_quark_w4a4:
-                # W4A4 model with FP8 dispatch: must dequant FP8->BF16 first,
-                # because the FP4 per_1x32 quantization path needs BF16 input
+            if is_quark_w4a4 or is_bf16_weights:
+                # W4A4 or BF16 weights with FP8 dispatch: must dequant FP8->BF16 first.
+                # W4A4 needs BF16 input for the FP4 per_1x32 path;
+                # BF16 weights don't support quantized activations.
                 dispatch_a1 = upscale(
                     dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
                 )
@@ -671,10 +674,9 @@ class MoriEPMoE(DeepEPMoE):
                 quant_type = QuantType.per_128x128
 
         if dispatch_a1.dtype == torch.float4_e2m1fn_x2 and dispatch_scale is not None:
-            if is_fp8_quant:
-                # FP8 weights + FP4 dispatch is not supported by fused_moe kernels
-                # (no kernel for q_dtype_a=fp4x2, q_dtype_w=fp8).
-                # Must dequant FP4->BF16 first; fused_moe will re-quant to FP8 internally.
+            if is_fp8_quant or is_bf16_weights:
+                # FP8/BF16 weights + FP4 dispatch: no kernel supports fp4 act + fp8/bf16 weight.
+                # Must dequant FP4->BF16 first.
                 dispatch_a1 = upscale_mxfp4(
                     dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
                 )
@@ -747,7 +749,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+    if (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mooncake()
+        or get_moe_a2a_backend().is_nixl()
+    ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
@@ -763,10 +769,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         elif (
             quant_config is None
             or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "mxfp8"
             or quant_config.get_name() == "modelopt_fp8"
             or quant_config.get_name() == "compressed_tensors"
         ):
-            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
+            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
             return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():

@@ -35,22 +35,23 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
-    get_free_port,
     get_int_env_var,
     get_quantization_config,
+    human_readable_int,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -58,15 +59,14 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    is_valid_ipv6_address,
     json_list_type,
     nullable_str,
     parse_connector_type,
     torch_release,
-    wait_port_available,
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,7 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
@@ -179,6 +180,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -189,6 +191,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
     "mooncake",
+    "nixl",
     "mori",
     "ascend_fuseep",
     "flashinfer",
@@ -363,7 +366,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
-    stream_output: bool = False
+    incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
@@ -506,7 +509,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -528,7 +531,7 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
-    elastic_ep_backend: Literal[None, "mooncake"] = None
+    elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
@@ -611,6 +614,9 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    pre_warm_nccl: bool = dataclasses.field(
+        default_factory=lambda: is_hip()
+    )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -747,6 +753,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_xpu_backends()
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -767,6 +774,7 @@ class ServerArgs:
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
+        self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
 
         # Handle Hicache settings.
@@ -1023,6 +1031,15 @@ class ServerArgs:
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
 
+    def _handle_xpu_backends(self):
+        if self.device == "xpu":
+            if not self.disable_piecewise_cuda_graph:
+                logger.warning(
+                    "XPU platform does not support piecewise CUDA graph, ignoring --disable-piecewise-cuda-graph"
+                    " flag and disabling piecewise CUDA graph."
+                )
+            self.disable_piecewise_cuda_graph = True
+
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
         if self.enforce_piecewise_cuda_graph:
@@ -1045,8 +1062,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
-        if is_hip() or is_npu() or is_cpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1462,6 +1479,7 @@ class ServerArgs:
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        self.attn_cp_size = self.tp_size
 
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
@@ -1543,7 +1561,8 @@ class ServerArgs:
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                     and (
-                        self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                        self.quantization
+                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
                     )
                 ):
@@ -1816,15 +1835,19 @@ class ServerArgs:
                 "modelopt",
                 "modelopt_fp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
             ]:
                 assert model_config.hf_config.mlp_hidden_act == "relu2"
                 if model_config.quantization == "modelopt":
-                    self.quantization = (
-                        "modelopt_fp4"
-                        if model_config.hf_config.quantization_config["quant_algo"]
-                        == "NVFP4"
-                        else "modelopt_fp8"
-                    )
+                    quant_algo = model_config.hf_config.quantization_config[
+                        "quant_algo"
+                    ]
+                    if quant_algo == "MIXED_PRECISION":
+                        self.quantization = "modelopt_mixed"
+                    else:
+                        self.quantization = (
+                            "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
+                        )
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
@@ -2097,6 +2120,8 @@ class ServerArgs:
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "flashinfer" if is_flashinfer_available() else "triton"
         else:
@@ -2112,6 +2137,8 @@ class ServerArgs:
                     return "aiter"
                 else:
                     return "triton"
+            elif is_mps():
+                return "torch_native"
             else:
                 return "triton"
 
@@ -2388,6 +2415,15 @@ class ServerArgs:
         if is_hip():
             self.triton_attention_num_kv_splits = 16
 
+    def _handle_nccl_pre_warm(self):
+        # pre_warm_nccl is only used with CUDA or HIP hardware
+        if self.pre_warm_nccl and not (is_cuda() or is_hip()):
+            logger.warning(
+                "pre_warm_nccl is only applicable for CUDA or HIP hardware. "
+                "Ignoring pre_warm_nccl setting on current hardware."
+            )
+            self.pre_warm_nccl = False
+
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -2417,7 +2453,6 @@ class ServerArgs:
             assert (
                 self.tp_size % (self.dp_size * self.attn_cp_size) == 0
             ), "tp_size must be divisible by dp_size * attn_cp_size"
-            assert self.pp_size == 1, "PP is not supported with context parallelism"
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
@@ -2454,19 +2489,27 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2476,13 +2519,25 @@ class ServerArgs:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
+                "mxfp8",
                 "modelopt_fp8",
+                "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
@@ -2532,6 +2587,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "nixl":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
@@ -2596,9 +2657,10 @@ class ServerArgs:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
                     self.eplb_algorithm = "elasticity_aware"
-                assert (
-                    self.eplb_algorithm == "elasticity_aware"
-                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+                assert self.eplb_algorithm in [
+                    "elasticity_aware",
+                    "elasticity_aware_hierarchical",
+                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
@@ -2691,7 +2753,8 @@ class ServerArgs:
         if self.speculative_moe_runner_backend is None:
             self.speculative_moe_runner_backend = (
                 "auto"
-                if self.moe_runner_backend == "flashinfer_trtllm"
+                if self.moe_runner_backend
+                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
                 else self.moe_runner_backend
             )
         else:
@@ -2935,6 +2998,22 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
+        # Validate model type: only support Qwen models for now
+        hf_config = self.get_model_config().hf_config
+        model_arch = hf_config.architectures[0]
+        if (self.encoder_only or self.language_only) and model_arch not in [
+            "Qwen2VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2AudioForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+        ]:
+            raise ValueError(
+                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+            )
+
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
@@ -3032,6 +3111,11 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
                 )
+            if self.hicache_storage_backend is None:
+                raise ValueError(
+                    "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -3319,9 +3403,10 @@ class ServerArgs:
         )
         parser.add_argument(
             "--context-length",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--is-embedding",
@@ -3548,10 +3633,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--max-total-tokens",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-            "This option is typically used for development and debugging purposes.",
+            "This option is typically used for development and debugging purposes."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--chunked-prefill-size",
@@ -3573,9 +3659,10 @@ class ServerArgs:
         )
         parser.add_argument(
             "--max-prefill-tokens",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.max_prefill_tokens,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--schedule-policy",
@@ -3750,9 +3837,16 @@ class ServerArgs:
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
-            "--stream-output",
+            "--incremental-streaming-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action=DeprecatedStoreTrueAction,
+            dest="incremental_streaming_output",
+            new_flag="--incremental-streaming-output",
+            help="[Deprecated] Use --incremental-streaming-output instead.",
         )
         parser.add_argument(
             "--enable-streaming-session",
@@ -4625,8 +4719,8 @@ class ServerArgs:
             "--elastic-ep-backend",
             type=str,
             default=ServerArgs.elastic_ep_backend,
-            choices=["none", "mooncake"],
-            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
         )
         parser.add_argument(
             "--enable-elastic-expert-backup",
@@ -5016,6 +5110,11 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--pre-warm-nccl",
+            action="store_true",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -5556,10 +5655,7 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        if is_valid_ipv6_address(host):
-            return f"{scheme}://[{host}]:{self.port}"
-        else:
-            return f"{scheme}://{host}:{self.port}"
+        return NetworkAddress(host, self.port).to_url(scheme)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
@@ -5665,11 +5761,6 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
-
-        # torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
-        # causing extremely slow nn.Conv3d performance.
-        # TODO(yhyang201): Remove this check when sglang no longer uses torch 2.9.1.
-        self.check_torch_2_9_1_cudnn_compatibility()
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
@@ -5779,49 +5870,6 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
-    def check_torch_2_9_1_cudnn_compatibility(self):
-        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
-            return
-
-        if self.get_model_config().is_multimodal:
-            import torch
-
-            if torch_release[:3] == (2, 9, 1):
-                cudnn_version = None
-                try:
-                    cudnn_version = torch.backends.cudnn.version()
-                except Exception:
-                    cudnn_version = None
-                if cudnn_version is not None:
-                    version_float = float(str(cudnn_version)[:3]) / 100
-                    if version_float < 9.15:
-                        RED = "\033[91m"
-                        BOLD = "\033[1m"
-                        RESET = "\033[0m"
-                        msg = (
-                            f"{RED}{BOLD}"
-                            "CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
-                            "Issue:     There is a KNOWN BUG in PyTorch 2.9.1's `nn.Conv3d` implementation\n"
-                            "           when used with CuDNN versions older than 9.15. This can cause\n"
-                            "           SEVERE PERFORMANCE DEGRADATION and EXCESSIVE MEMORY USAGE.\n\n"
-                            "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
-                            "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
-                            "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
-                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"{RESET}"
-                        )
-                        raise RuntimeError(msg)
-                else:
-                    RED = "\033[91m"
-                    RESET = "\033[0m"
-                    logger.warning(
-                        f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
-                    )
-
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -5909,17 +5957,6 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
-
-                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
-                    # since it does not support these yet (TODO: implement embedding / lm_head support)
-                    if self.lora_backend == "csgmv":
-                        logger.warning(
-                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
-                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
-                            "To apply LoRA to these, use --lora-backend triton."
-                        )
-                        self.lora_target_modules.discard("embed_tokens")
-                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
@@ -6160,23 +6197,16 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-                port_num, host = configure_ipv6(server_args.dist_init_addr)
-                dist_init_addr = (host, str(port_num))
+                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             else:
-                dist_init_addr = server_args.dist_init_addr.split(":")
+                na = NetworkAddress.parse(server_args.dist_init_addr)
 
-            assert (
-                len(dist_init_addr) == 2
-            ), "please provide --dist-init-addr as host:port of head node"
-
-            dist_init_host, dist_init_port = dist_init_addr
-            dist_init_port = int(dist_init_port)
+            dist_init_host = na.host
+            dist_init_port = na.port
             port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
-            metrics_ipc_name = port_base + 3
+            metrics_port = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -6191,7 +6221,7 @@ class PortArgs:
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    wait_port_available(metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -6203,12 +6233,16 @@ class PortArgs:
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
-                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
+                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                scheduler_input_ipc_name=NetworkAddress(
+                    dist_init_host, scheduler_input_port
+                ).to_tcp(),
+                detokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, detokenizer_port
+                ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
+                metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 
@@ -6247,6 +6281,32 @@ class DeprecatedAction(argparse.Action):
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )
+
+
+class DeprecatedStoreTrueAction(argparse.Action):
+    """Deprecated flag that still stores True and prints a warning."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest,
+        new_flag=None,
+        nargs=0,
+        const=True,
+        default=False,
+        **kwargs,
+    ):
+        self.new_flag = new_flag
+        super().__init__(
+            option_strings, dest, nargs=nargs, const=const, default=default, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, True)
 
 
 def auto_choose_speculative_params(self: ServerArgs):

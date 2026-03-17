@@ -5,9 +5,10 @@ import pytest
 import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import scaled_fp4_quant, silu_and_mul
+from sgl_kernel import silu_and_mul
 from torch.nn import functional as F
 
+from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
