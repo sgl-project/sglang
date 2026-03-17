@@ -19,9 +19,9 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
+  "av",
   "build",
   "compressed-tensors",
-  "decord2",
   "datasets",
   "einops",
   "fastapi",
@@ -61,9 +61,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.3.3",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -71,14 +69,17 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
     "PyYAML==6.0.1",
     "cloudpickle",
-    "diffusers==0.36.0",
+    "diffusers==0.37.0",
     "imageio==2.36.0",
     "imageio-ffmpeg==0.5.1",
     "moviepy>=2.0.0",
     "opencv-python==4.10.0.84",
     "remote-pdb",
     "cache-dit==1.2.1",
-    "addict"
+    "addict",
+    "scikit-image==0.25.2",
+    "trimesh>=4.0.0",
+    "xatlas",
 ]
 
 tracing = [

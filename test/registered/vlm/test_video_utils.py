@@ -16,7 +16,8 @@ class DummyVideo:
     def __len__(self):
         return self._frames
 
-    def get_avg_fps(self):
+    @property
+    def avg_fps(self):
         return self._fps
 
 

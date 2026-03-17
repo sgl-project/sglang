@@ -26,6 +26,7 @@ class AccuracyTestParams:
     # Extended parameters for special evaluations (e.g., GPQA with thinking mode)
     thinking_mode: Optional[str] = None  # e.g., "deepseek-v3"
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
     repeat: Optional[int] = None
 
 
@@ -81,6 +82,7 @@ def _run_simple_eval(
     return_latency: bool = False,
     thinking_mode: Optional[str] = None,
     temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
     repeat: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
@@ -95,6 +97,7 @@ def _run_simple_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(
@@ -116,6 +119,9 @@ def _run_simple_eval(
 
         if temperature is not None:
             args.temperature = temperature
+
+        if top_p is not None:
+            args.top_p = top_p
 
         if repeat is not None:
             args.repeat = repeat
@@ -160,6 +166,7 @@ def _run_few_shot_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(
@@ -212,7 +219,13 @@ def run_accuracy_test(
     print(f"{'='*60}\n")
 
     # Run evaluation based on dataset type
-    if params.dataset == "gsm8k":
+    # Use few_shot_eval for gsm8k by default for backward compatibility.
+    # Use simple_eval when any extended params are set that few_shot_eval doesn't support.
+    has_extended_params = any(
+        getattr(params, field) is not None
+        for field in ("thinking_mode", "temperature", "top_p", "repeat")
+    )
+    if params.dataset == "gsm8k" and not has_extended_params:
         success, error, metrics = _run_few_shot_eval(
             model=model,
             base_url=base_url,
@@ -230,6 +243,7 @@ def run_accuracy_test(
             return_latency=params.return_latency,
             thinking_mode=params.thinking_mode,
             temperature=params.temperature,
+            top_p=params.top_p,
             repeat=params.repeat,
         )
 

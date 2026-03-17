@@ -54,13 +54,13 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
-      - name: Login to Docker Hub
+      - name: Login to Docker Hub (AMD)
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Build and Push
+      - name: Build and Push to rocm/sgl-dev
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
@@ -77,9 +77,21 @@ jobs:
           fi
 
           tag=v${version}-${rocm_tag}
+          echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
           docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to lmsysorg/sglang-daily
+        run: |
+          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-daily:${{ env.IMAGE_TAG }}
+          docker push lmsysorg/sglang-daily:${{ env.IMAGE_TAG }}
 
   # Temporarily disable docker cache seeding until performant storage is in place
   cache:

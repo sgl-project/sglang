@@ -24,6 +24,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    fused_moe_npu,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class XverseMLP(nn.Module):
@@ -147,6 +150,7 @@ class XverseMoE(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
             )
+        self.fused_moe_method = fused_moe if not is_npu() else fused_moe_npu
 
     def pack_params(self):
         w1 = []
@@ -175,7 +179,7 @@ class XverseMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.w1,
             self.w2,

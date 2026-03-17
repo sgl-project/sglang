@@ -9,8 +9,11 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -80,11 +83,13 @@ class ChunkCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
 
-    def inc_lock_ref(self, node: Any):
-        return 0
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+        return IncLockRefResult(delta=0)
 
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
-        return 0
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
+        return DecLockRefResult(delta=0)
 
     def protected_size(self):
         # NOTE: no protected size in chunk cache. Chunk cache's eviction is the same with request's lifecycle.
