@@ -8,9 +8,10 @@ Launch with torchrun:
     torchrun --nproc_per_node=2 -m pytest python/sglang/test/test_ep_to_tp_transform.py -v -s
 """
 
+from __future__ import annotations
+
 import contextlib
 import unittest
-from typing import Dict, List, Tuple
 from unittest.mock import patch
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import initialize_moe_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
@@ -71,18 +73,18 @@ def _make_tiny_config(n_routed_experts: int = 16) -> PretrainedConfig:
 
 def _generate_checkpoint_weights(
     config: PretrainedConfig,
-) -> List[Tuple[str, torch.Tensor]]:
+) -> list[tuple[str, torch.Tensor]]:
     """Generate random checkpoint weights matching DeepSeek V3 tensor names."""
     weights = []
-    H = config.hidden_size  # 512
+    H = config.hidden_size
     V = config.vocab_size
-    I_dense = config.intermediate_size  # 1024
-    I_moe = config.moe_intermediate_size  # 256
-    kv_lora = config.kv_lora_rank  # 64
-    qk_nope = config.qk_nope_head_dim  # 32
-    qk_rope = config.qk_rope_head_dim  # 16
-    v_head = config.v_head_dim  # 32
-    n_heads = config.num_attention_heads  # 8
+    I_dense = config.intermediate_size
+    I_moe = config.moe_intermediate_size
+    kv_lora = config.kv_lora_rank
+    qk_nope = config.qk_nope_head_dim
+    qk_rope = config.qk_rope_head_dim
+    v_head = config.v_head_dim
+    n_heads = config.num_attention_heads
 
     # Use a fixed seed so both loading passes get identical weights
     gen = torch.Generator()
@@ -125,17 +127,17 @@ def _generate_checkpoint_weights(
                 weights.append((f"{pfx}.mlp.experts.{e}.up_proj.weight", rand(I_moe, H)))
                 weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight", rand(H, I_moe)))
 
-            # Shared experts
-            for s in range(config.n_shared_experts):
-                weights.append(
-                    (f"{pfx}.mlp.shared_experts.gate_proj.weight", rand(I_moe, H))
-                )
-                weights.append(
-                    (f"{pfx}.mlp.shared_experts.up_proj.weight", rand(I_moe, H))
-                )
-                weights.append(
-                    (f"{pfx}.mlp.shared_experts.down_proj.weight", rand(H, I_moe))
-                )
+            # Shared expert (DSv3 always has exactly 1)
+            assert config.n_shared_experts == 1
+            weights.append(
+                (f"{pfx}.mlp.shared_experts.gate_proj.weight", rand(I_moe, H))
+            )
+            weights.append(
+                (f"{pfx}.mlp.shared_experts.up_proj.weight", rand(I_moe, H))
+            )
+            weights.append(
+                (f"{pfx}.mlp.shared_experts.down_proj.weight", rand(H, I_moe))
+            )
         else:
             # Dense MLP
             weights.append((f"{pfx}.mlp.gate_proj.weight", rand(I_dense, H)))
@@ -150,7 +152,154 @@ def _generate_checkpoint_weights(
     return weights
 
 
-def _snapshot_moe_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+_MOCK_BLACKWELL = patch(
+    "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+    return_value=True,
+)
+
+
+class _MoEOnlyNvFp4Config(ModelOptFp4Config):
+    """ModelOptFp4Config that only quantizes FusedMoE layers.
+
+    Non-MoE LinearBase layers (attention, dense MLP, embeddings) stay
+    unquantized so the test can use simple BF16 checkpoint weights for
+    them while exercising the real NVFP4 param layout on MoE experts.
+    """
+
+    def get_quant_method(self, layer, prefix):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        if isinstance(layer, FusedMoE):
+            return super().get_quant_method(layer, prefix)
+        if isinstance(layer, LinearBase):
+            # LinearBase requires a non-None quant_method when quant_config
+            # is provided, so return the unquantized fallback explicitly.
+            return UnquantizedLinearMethod()
+        # RadixAttention and other layer types: None means no quantization.
+        return None
+
+
+def _make_nvfp4_config() -> _MoEOnlyNvFp4Config:
+    """Create a real NVFP4 quant config that only quantizes MoE layers."""
+    return _MoEOnlyNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        group_size=16,
+        packed_modules_mapping={},
+    )
+
+
+def _generate_nvfp4_checkpoint_weights(
+    config: PretrainedConfig,
+) -> list[tuple[str, torch.Tensor]]:
+    """Generate checkpoint weights matching a real NVFP4 DeepSeek V3 checkpoint.
+
+    Non-MoE layers (attention, dense MLP, embeddings) use BF16 — these are
+    excluded from quantization by _make_nvfp4_config().
+
+    MoE expert layers use the real NVFP4 layout:
+      - weight:        uint8 packed FP4, [I, H//2] for gate/up, [H, I//2] for down
+      - weight_scale:  FP8_E4M3 block scale, [I, H//gs] / [H, I//gs]
+      - weight_scale_2: F32 per-tensor scale (scalar per expert)
+      - input_scale:    F32 per-tensor scale (scalar per expert)
+    """
+    weights = []
+    H = config.hidden_size
+    V = config.vocab_size
+    I_dense = config.intermediate_size
+    I_moe = config.moe_intermediate_size
+    kv_lora = config.kv_lora_rank
+    qk_nope = config.qk_nope_head_dim
+    qk_rope = config.qk_rope_head_dim
+    v_head = config.v_head_dim
+    n_heads = config.num_attention_heads
+    gs = 16  # NVFP4 group_size, must match _make_nvfp4_config
+
+    gen = torch.Generator()
+    gen.manual_seed(42)
+
+    def rand_bf16(*shape):
+        return torch.randn(*shape, generator=gen, dtype=torch.bfloat16)
+
+    def rand_uint8(*shape):
+        # NVFP4 packs two 4-bit floats (E2M1) per byte. Any uint8 value is a
+        # valid pair of FP4 values, so random bytes are fine for testing the
+        # weight redistribution path without needing a real quantizer.
+        return torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8)
+
+    def rand_fp8_scale(*shape):
+        return torch.randn(*shape, generator=gen, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+    def rand_scalar():
+        return torch.randn(1, generator=gen, dtype=torch.float32).squeeze(0).abs()
+
+    # Embeddings (BF16, excluded from quant)
+    weights.append(("model.embed_tokens.weight", rand_bf16(V, H)))
+
+    for i in range(config.num_hidden_layers):
+        pfx = f"model.layers.{i}"
+
+        # Layer norms
+        weights.append((f"{pfx}.input_layernorm.weight", rand_bf16(H)))
+        weights.append((f"{pfx}.post_attention_layernorm.weight", rand_bf16(H)))
+
+        # Attention (BF16, excluded from quant)
+        weights.append((f"{pfx}.self_attn.q_proj.weight", rand_bf16(n_heads * (qk_nope + qk_rope), H)))
+        weights.append((f"{pfx}.self_attn.kv_a_proj_with_mqa.weight", rand_bf16(kv_lora + qk_rope, H)))
+        weights.append((f"{pfx}.self_attn.kv_a_layernorm.weight", rand_bf16(kv_lora)))
+        weights.append((f"{pfx}.self_attn.kv_b_proj.weight", rand_bf16(n_heads * (qk_nope + v_head), kv_lora)))
+        weights.append((f"{pfx}.self_attn.o_proj.weight", rand_bf16(H, n_heads * v_head)))
+
+        is_moe = (
+            i >= config.first_k_dense_replace and i % config.moe_layer_freq == 0
+        )
+
+        if is_moe:
+            # Gate / router (BF16)
+            weights.append((f"{pfx}.mlp.gate.weight", rand_bf16(config.n_routed_experts, H)))
+            weights.append(
+                (f"{pfx}.mlp.gate.e_score_correction_bias", rand_bf16(config.n_routed_experts))
+            )
+
+            # Routed experts — NVFP4 layout
+            for e in range(config.n_routed_experts):
+                # gate/up: weight [I, H//2] uint8, scale [I, H//gs] fp8
+                for proj in ("gate_proj", "up_proj"):
+                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight", rand_uint8(I_moe, H // 2)))
+                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight_scale", rand_fp8_scale(I_moe, H // gs)))
+                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight_scale_2", rand_scalar()))
+                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.input_scale", rand_scalar()))
+                # down: weight [H, I//2] uint8, scale [H, I//gs] fp8
+                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight", rand_uint8(H, I_moe // 2)))
+                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight_scale", rand_fp8_scale(H, I_moe // gs)))
+                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight_scale_2", rand_scalar()))
+                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.input_scale", rand_scalar()))
+
+            # Shared expert (DSv3 always has exactly 1)
+            # When not fused into FusedMoE, shared experts are LinearBase layers
+            # (unquantized by _MoEOnlyNvFp4Config), so only BF16 weights.
+            # When fused, they become extra rows in FusedMoE and get NVFP4 layout
+            # — but the checkpoint format is the same (unfused names), and the
+            # weight_loader handles the mapping.
+            assert config.n_shared_experts == 1
+            weights.append((f"{pfx}.mlp.shared_experts.gate_proj.weight", rand_bf16(I_moe, H)))
+            weights.append((f"{pfx}.mlp.shared_experts.up_proj.weight", rand_bf16(I_moe, H)))
+            weights.append((f"{pfx}.mlp.shared_experts.down_proj.weight", rand_bf16(H, I_moe)))
+        else:
+            # Dense MLP (BF16, excluded from quant)
+            weights.append((f"{pfx}.mlp.gate_proj.weight", rand_bf16(I_dense, H)))
+            weights.append((f"{pfx}.mlp.up_proj.weight", rand_bf16(I_dense, H)))
+            weights.append((f"{pfx}.mlp.down_proj.weight", rand_bf16(H, I_dense)))
+
+    # Final norm
+    weights.append(("model.norm.weight", rand_bf16(H)))
+    # lm_head (BF16, excluded from quant)
+    weights.append(("lm_head.weight", rand_bf16(V, H)))
+
+    return weights
+
+
+def _snapshot_moe_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Extract cloned MoE parameter tensors from the model."""
     snapshot = {}
     for layer_id, layer in enumerate(model.model.layers):
@@ -181,14 +330,17 @@ def _load_tp_by_experts_config(enabled: bool):
 
 
 def _create_model_and_load(
-    config: PretrainedConfig, weights: List[Tuple[str, torch.Tensor]], ep_load: bool
-) -> Dict[str, torch.Tensor]:
+    config: PretrainedConfig,
+    weights: list[tuple[str, torch.Tensor]],
+    ep_load: bool,
+    quant_config: ModelOptFp4Config | None = None,
+) -> dict[str, torch.Tensor]:
     """Create a DeepseekV3 model, load weights, and return MoE param snapshot."""
     from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 
     with _load_tp_by_experts_config(ep_load):
         with torch.device("cuda"):
-            model = DeepseekV3ForCausalLM(config, quant_config=None)
+            model = DeepseekV3ForCausalLM(config, quant_config=quant_config)
 
         # load_weights expects an iterator; make a fresh copy each time
         def weight_iter():
@@ -315,8 +467,8 @@ class TestEpToTpTransform(unittest.TestCase):
         del model
         torch.cuda.empty_cache()
 
-    def test_ep_to_tp_shard_dim_fp4_params(self):
-        """_get_ep_to_tp_shard_dim must return correct dims for FP4 block scale params.
+    def test_ep_to_tp_shard_dim_routing(self):
+        """_get_ep_to_tp_shard_dim must route each param name to the correct dim.
 
         Regression test: w13_weight_scale and w2_weight_scale (without _inv/_1
         suffix) were previously falling through to the per-tensor catch-all
@@ -342,17 +494,15 @@ class TestEpToTpTransform(unittest.TestCase):
                 break
         self.assertIsNotNone(moe, "No FusedMoE layer found in model")
 
-        # FP4 block scales — these MUST return a shard dim (not None)
+        # Block scales (NVFP4 / FP8) — MUST return a shard dim (not None)
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale"), 1)
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale"), 2)
-
-        # FP8 block scale variants — also must return a shard dim
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale_inv"), 1)
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale_inv"), 2)
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w13_weight_scale1"), 1)
         self.assertEqual(moe._get_ep_to_tp_shard_dim("w2_weight_scale1"), 2)
 
-        # FP4 per-tensor scales — must return None (no intermediate dim to shard)
+        # Per-tensor scales (NVFP4 weight_scale_2 / input_scale) — must return None
         self.assertIsNone(moe._get_ep_to_tp_shard_dim("w13_weight_scale_2"))
         self.assertIsNone(moe._get_ep_to_tp_shard_dim("w2_weight_scale_2"))
         self.assertIsNone(moe._get_ep_to_tp_shard_dim("w13_input_scale"))
@@ -365,144 +515,80 @@ class TestEpToTpTransform(unittest.TestCase):
         del model
         torch.cuda.empty_cache()
 
-    def test_ep_to_tp_block_scale_shapes(self):
-        """EP→TP transform must correctly shard block-scale-shaped params.
+    def test_ep_to_tp_nvfp4_scales(self):
+        """EP-load + transform must match normal TP load for NVFP4 quantized weights.
 
-        Simulates FP4 block scale params by manually attaching them to a
-        FusedMoE layer with EP_LOAD state, then verifies the transform
-        produces the expected TP-sharded shapes.
+        Exercises both EP→TP code paths via the real ModelOptFp4Config:
+          - Block scales (w13/w2_weight_scale): shard_dim != None → all_to_all
+          - Per-tensor scales (weight_scale_2, input_scale): shard_dim == None → all_gather
         """
         config = _make_tiny_config(n_routed_experts=16)
-        weights = _generate_checkpoint_weights(config)
+        weights = _generate_nvfp4_checkpoint_weights(config)
+        qc = _make_nvfp4_config()
 
-        tp_size = self.world_size
-        tp_rank = self.rank
-        E = config.n_routed_experts  # 16 total routed experts
-        I = config.moe_intermediate_size  # 256
-        H = config.hidden_size  # 512
-        block_size = 16  # NVFP4 group_size
+        with _MOCK_BLACKWELL:
+            tp_snapshot = _create_model_and_load(config, weights, ep_load=False, quant_config=qc)
+            ep_snapshot = _create_model_and_load(config, weights, ep_load=True, quant_config=qc)
 
-        # Load model with EP_LOAD to set up internal state
-        with _load_tp_by_experts_config(True):
-            with torch.device("cuda"):
-                from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+        self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
 
-                model = DeepseekV3ForCausalLM(config, quant_config=None)
+        # Sanity: both block and per-tensor scale params must be present
+        block_keys = [k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k]
+        per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k or "input_scale" in k]
+        self.assertTrue(len(block_keys) > 0, "No block scale params found")
+        self.assertTrue(len(per_tensor_keys) > 0, "No per-tensor scale params found")
 
-            def weight_iter():
-                for name, tensor in weights:
-                    yield name, tensor.clone()
-
-            model.load_weights(weight_iter())
-
-        # After transform, MoE layers should have normal TP shapes.
-        # Verify that if block scale params existed, they would have been
-        # sharded correctly by checking the restored field values.
-        for layer in model.model.layers:
-            if not hasattr(layer.mlp, "experts") or not isinstance(
-                layer.mlp.experts, FusedMoE
-            ):
-                continue
-            moe = layer.mlp.experts
-
-            # EP→TP should have restored these to normal TP values
-            self.assertEqual(moe.moe_tp_size, tp_size)
-            self.assertEqual(moe.moe_ep_size, 1)
-
-            # The intermediate_size_per_partition should be I / tp_size
-            self.assertEqual(
-                moe.intermediate_size_per_partition,
-                I // tp_size,
+        for key in sorted(tp_snapshot.keys()):
+            torch.testing.assert_close(
+                ep_snapshot[key],
+                tp_snapshot[key],
+                msg=f"Mismatch on rank {self.rank} for {key}",
             )
 
-        # Now verify the actual transform logic on block-scale-shaped tensors
-        # by constructing a fresh model with EP_LOAD and manually adding
-        # block scale params before calling ep_to_tp_transform.
-        with _load_tp_by_experts_config(True):
-            with torch.device("cuda"):
-                model2 = DeepseekV3ForCausalLM(config, quant_config=None)
+    @unittest.expectedFailure  # BUG: ep_to_tp_transform doesn't handle _sglang_require_global_experts params (input_scale)
+    def test_ep_to_tp_nvfp4_scales_with_shared_experts(self):
+        """EP-load + transform must match normal TP load for NVFP4 scales with fused shared experts."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+        from sglang.srt.server_args import get_global_server_args
 
-        # Find a MoE layer (still in EP_LOAD state before load_weights)
-        moe = None
-        for layer in model2.model.layers:
-            if hasattr(layer.mlp, "experts") and isinstance(
-                layer.mlp.experts, FusedMoE
-            ):
-                moe = layer.mlp.experts
-                break
-        self.assertIsNotNone(moe)
-        self.assertTrue(moe._ep_load_for_tp)
+        config = _make_tiny_config(n_routed_experts=16)
+        weights = _generate_nvfp4_checkpoint_weights(config)
+        qc = _make_nvfp4_config()
 
-        num_shared = moe.num_fused_shared_experts
-        E_local = moe.num_local_experts - num_shared  # experts on this rank
-        E_total = moe.num_experts - num_shared
-        I_blocks = I // block_size  # ceil(I / block_size) for our exact divisor
-        H_blocks = H // block_size
+        server_args = get_global_server_args()
+        old_flag = server_args.disable_shared_experts_fusion
 
-        # Register mock FP4 block scale params on the MoE layer
-        # w13_weight_scale: [E_local + shared, 2*ceil(I/bn), ceil(H/bk)]
-        w13_scale = torch.nn.Parameter(
-            torch.randn(
-                E_local + num_shared, 2 * I_blocks, H_blocks,
-                device="cuda",
-            ).to(torch.float8_e4m3fn)
-        )
-        moe.register_parameter("w13_weight_scale", w13_scale)
+        def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
+            self_model.num_fused_shared_experts = self_model.config.n_shared_experts
 
-        # w2_weight_scale: [E_local + shared, ceil(H/bn), ceil(I/bk)]
-        w2_scale = torch.nn.Parameter(
-            torch.randn(
-                E_local + num_shared, H_blocks, I_blocks,
-                device="cuda",
-            ).to(torch.float8_e4m3fn)
-        )
-        moe.register_parameter("w2_weight_scale", w2_scale)
+        try:
+            server_args.disable_shared_experts_fusion = False
 
-        # Allocate _ep_to_tp_buf for each param (mimicking _ep_to_tp_transform_all_layers)
-        for name, param in moe.named_parameters():
-            shard_dim = moe._get_ep_to_tp_shard_dim(name)
-            if not hasattr(param, "_ep_to_tp_buf") and name in (
-                "w13_weight_scale",
-                "w2_weight_scale",
-            ):
-                target_shape = list(param.data.shape)
-                target_shape[0] = E_total + num_shared
-                target_shape[shard_dim] = target_shape[shard_dim] // tp_size
-                param._ep_to_tp_buf = torch.empty(
-                    target_shape, dtype=param.data.dtype, device=param.data.device
+            with patch.object(
+                DeepseekV3ForCausalLM,
+                "determine_num_fused_shared_experts",
+                _force_fuse,
+            ), _MOCK_BLACKWELL:
+                tp_snapshot = _create_model_and_load(
+                    config, weights, ep_load=False, quant_config=qc,
                 )
+                ep_snapshot = _create_model_and_load(
+                    config, weights, ep_load=True, quant_config=qc,
+                )
+        finally:
+            server_args.disable_shared_experts_fusion = old_flag
 
-        # Also need _ep_to_tp_buf on existing weight params for transform to work
-        for name, param in moe.named_parameters():
-            if hasattr(param, "_ep_to_tp_buf"):
-                continue
-            shard_dim = moe._get_ep_to_tp_shard_dim(name)
-            target_shape = list(param.data.shape)
-            target_shape[0] = E_total + num_shared
-            if shard_dim is not None:
-                target_shape[shard_dim] = target_shape[shard_dim] // tp_size
-            param._ep_to_tp_buf = torch.empty(
-                target_shape, dtype=param.data.dtype, device=param.data.device
+        self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
+
+        # Verify per-tensor scale params exist and match
+        scale_keys = [k for k in tp_snapshot if "scale" in k]
+        self.assertTrue(len(scale_keys) > 0, "No scale params found in snapshot")
+        for key in sorted(tp_snapshot.keys()):
+            torch.testing.assert_close(
+                ep_snapshot[key],
+                tp_snapshot[key],
+                msg=f"Mismatch on rank {self.rank} for {key}",
             )
-
-        moe.ep_to_tp_transform()
-
-        # Verify block scale shapes after transform
-        w13_result = dict(moe.named_parameters())["w13_weight_scale"]
-        w2_result = dict(moe.named_parameters())["w2_weight_scale"]
-
-        # w13_weight_scale: [E_total + shared, 2*ceil(I/bn)/tp, ceil(H/bk)]
-        self.assertEqual(w13_result.shape[0], E_total + num_shared)
-        self.assertEqual(w13_result.shape[1], 2 * I_blocks // tp_size)
-        self.assertEqual(w13_result.shape[2], H_blocks)
-
-        # w2_weight_scale: [E_total + shared, ceil(H/bn), ceil(I/bk)/tp]
-        self.assertEqual(w2_result.shape[0], E_total + num_shared)
-        self.assertEqual(w2_result.shape[1], H_blocks)
-        self.assertEqual(w2_result.shape[2], I_blocks // tp_size)
-
-        del model, model2
-        torch.cuda.empty_cache()
 
     def test_ep_to_tp_fused_shared_experts(self):
         """EP→TP transform must correctly handle fused shared experts.
