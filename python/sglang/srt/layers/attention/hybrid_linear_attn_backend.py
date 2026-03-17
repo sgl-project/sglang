@@ -102,6 +102,8 @@ logger = logging.getLogger(__name__)
 
 _ssm_capture_dir = os.environ.get("SGLANG_CAPTURE_SSM_STATE")
 _ssm_capture_counter: dict = {}
+if _ssm_capture_dir:
+    logger.info(f"SSM state capture enabled, saving to {_ssm_capture_dir}")
 
 
 def _maybe_capture_ssm_state(
