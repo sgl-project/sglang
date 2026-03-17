@@ -294,7 +294,16 @@ jobs:
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
