@@ -204,9 +204,14 @@ class SubprocessWatchdog:
             self._thread = None
 
     def _monitor_loop(self) -> None:
-        while not self._stop_event.wait(self._interval):
-            if self._check_processes():
-                return
+        try:
+            while not self._stop_event.wait(self._interval):
+                if self._check_processes():
+                    return
+        except Exception as e:
+            logger.error(
+                f"SubprocessWatchdog thread crashed: {e}", exc_info=True
+            )
 
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
