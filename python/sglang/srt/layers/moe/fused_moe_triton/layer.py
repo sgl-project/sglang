@@ -623,6 +623,9 @@ class FusedMoE(torch.nn.Module):
 
         The caller must provide a pre-allocated buffer ``_ep_to_tp_buf`` on each
         parameter that needs transformation (sized for the all_to_all output).
+        Each buffer is cloned into the parameter and then deleted, so the same
+        buffer may be reused across layers — but not across parameters within a
+        single call (each parameter must have its own buffer for the duration).
         """
         if not self._ep_load_for_tp:
             return
@@ -645,6 +648,11 @@ class FusedMoE(torch.nn.Module):
             if getattr(param, "_sglang_require_global_experts", False):
                 del param._ep_to_tp_buf
                 continue
+
+            assert "input_scale" not in name, (
+                f"input_scale param {name} reached ep_to_tp_transform without "
+                "_sglang_require_global_experts=True"
+            )
 
             data = param.data  # [num_routed_local + shared, ...]
 
@@ -760,8 +768,8 @@ class FusedMoE(torch.nn.Module):
             return 1 if is_triton else 2
         elif "w13_weight_bias" in param_name:
             return 1  # [E, 2*I]
-        elif "weight_scale_2" in param_name or "input_scale" in param_name:
-            # Per-tensor scales (FP4 _scale_2, input_scale): no intermediate dim, just gather
+        elif "weight_scale_2" in param_name:
+            # Per-tensor scales: scalar per expert, no intermediate dim
             return None
         elif "w13_weight_scale" in param_name:
             # Block scale: [E, 2*ceil(I/bn), ceil(H/bk)] — shard dim 1
