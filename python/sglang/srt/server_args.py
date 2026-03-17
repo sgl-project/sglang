@@ -589,6 +589,10 @@ class ServerArgs:
     offload_num_in_group: int = 1
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
+    # Offload parameter name filters.
+    # If set, only parameters whose names contain one of these substrings will be offloaded.
+    # Example: --offload-param-names "w13_weight" "w2_weight"
+    offload_param_names: Optional[List[str]] = None
 
     # Scoring configuration
     # Delimiter token ID used to combine Query and Items into a single sequence for multi-item scoring.
@@ -5013,6 +5017,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
+        )
+        parser.add_argument(
+            "--offload-param-names",
+            type=str,
+            nargs="+",
+            default=ServerArgs.offload_param_names,
+            help="List of substrings to filter which parameters are offloaded. "
+            "If not set, all parameters in the selected layers are offloaded.",
         )
 
         # Args for multi-item-scoring

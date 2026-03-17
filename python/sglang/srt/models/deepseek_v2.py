@@ -91,7 +91,6 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -1814,30 +1813,6 @@ class DeepseekV2Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
-            offloader_kwargs=dict(
-                submodule_accessor=lambda layer: (
-                    layer.mlp.experts
-                    if isinstance(layer.mlp, DeepseekV2MoE)
-                    else layer.mlp
-                ),
-                whitelist_param_names_creator=lambda module: (
-                    [
-                        "w13_weight",
-                        "w2_weight",
-                        # only for nvfp4
-                        *(
-                            [
-                                "w13_blockscale_swizzled",
-                                "w2_blockscale_swizzled",
-                            ]
-                            if hasattr(module, "w13_blockscale_swizzled")
-                            else []
-                        ),
-                    ]
-                    if isinstance(module, FusedMoE)
-                    else []
-                ),
-            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

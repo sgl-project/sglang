@@ -809,8 +809,14 @@ class CudaGraphRunner:
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
+        # Sync offloader before capturing graph to avoid unjoined work
+        from sglang.srt.utils.offloader import get_offloader
+
+        get_offloader().sync_prev_onload()
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
+            # Join any prefetches started during forward
+            get_offloader().join_after_forward()
         return out
 
     def _create_device_graph(self):
