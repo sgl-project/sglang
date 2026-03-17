@@ -2726,11 +2726,13 @@ def _fused_metadata_kernel_general(
     if page_size == 1:
         col_idx = col_offsets
     else:
-        col_idx = col_offsets << SHIFT   # faster than multiplication for power-of-two
+        col_idx = col_offsets << SHIFT  # faster than multiplication for power-of-two
 
     # Load page indices from req_to_token
     rt_offsets = row_offset + col_idx * req_to_token_stride_1
-    page_index = tl.load(req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg")
+    page_index = tl.load(
+        req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
+    )
 
     # Compute page_table
     if page_size == 1:
@@ -2743,12 +2745,19 @@ def _fused_metadata_kernel_general(
     tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
 
     if use_swa:
-        swa_slot = tl.load(full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0, mask=mask, other=0, cache_modifier=".cg")
+        swa_slot = tl.load(
+            full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0,
+            mask=mask,
+            other=0,
+            cache_modifier=".cg",
+        )
         if page_size == 1:
             swa_val = swa_slot
         else:
             swa_val = swa_slot >> SHIFT
-        swa_offsets = i * swa_page_table_stride_0 + col_offsets * swa_page_table_stride_1
+        swa_offsets = (
+            i * swa_page_table_stride_0 + col_offsets * swa_page_table_stride_1
+        )
         tl.store(swa_page_table + swa_offsets, swa_val, mask=mask, cache_modifier=".cg")
 
 
@@ -2805,7 +2814,9 @@ def _fused_metadata_kernel_ps1_no_swa(
 
     # page_size = 1: col_idx = col_offsets
     rt_offsets = row_offset + col_offsets * req_to_token_stride_1
-    page_index = tl.load(req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg")
+    page_index = tl.load(
+        req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
+    )
 
     # page_table = page_index // 1 = page_index
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
@@ -2868,13 +2879,23 @@ def normal_decode_set_metadata(
             grid = (batch_size, num_blocks_j)
 
         _fused_metadata_kernel_ps1_no_swa[grid](
-            seq_lens, seq_lens_stride_0,
-            req_to_token, req_to_token_stride_0, req_to_token_stride_1,
-            req_pool_indices, req_pool_indices_stride_0,
-            cache_seqlens_int32, cache_seqlens_int32_stride_0,
-            cu_seqlens_k, cu_seqlens_k_stride_0,
-            page_table, page_table_stride_0, page_table_stride_1,
-            batch_size, max_seq_pages, seq_len_delta,
+            seq_lens,
+            seq_lens_stride_0,
+            req_to_token,
+            req_to_token_stride_0,
+            req_to_token_stride_1,
+            req_pool_indices,
+            req_pool_indices_stride_0,
+            cache_seqlens_int32,
+            cache_seqlens_int32_stride_0,
+            cu_seqlens_k,
+            cu_seqlens_k_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            batch_size,
+            max_seq_pages,
+            seq_len_delta,
             BLOCK_COLS=BLOCK_COLS,
             num_warps=8,
             num_stages=3,
@@ -2888,7 +2909,9 @@ def normal_decode_set_metadata(
             swa_page_table_stride_0 = swa_page_table.stride(0)
             swa_page_table_stride_1 = swa_page_table.stride(1)
             # Extract the full_to_swa_index_mapping from token_to_kv_pool
-            full_to_swa_mapping = token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+            full_to_swa_mapping = (
+                token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+            )
             full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
         else:
             # Dummy tensors (not used)
@@ -2909,15 +2932,30 @@ def normal_decode_set_metadata(
             grid = (batch_size, num_blocks_j)
 
         _fused_metadata_kernel_general[grid](
-            seq_lens, seq_lens_stride_0,
-            req_to_token, req_to_token_stride_0, req_to_token_stride_1,
-            req_pool_indices, req_pool_indices_stride_0,
-            cache_seqlens_int32, cache_seqlens_int32_stride_0,
-            cu_seqlens_k, cu_seqlens_k_stride_0,
-            page_table, page_table_stride_0, page_table_stride_1,
-            swa_page_table, swa_page_table_stride_0, swa_page_table_stride_1,
-            full_to_swa_mapping, full_to_swa_mapping_stride_0,
-            batch_size, max_seq_pages, page_size, seq_len_delta, use_swa,
+            seq_lens,
+            seq_lens_stride_0,
+            req_to_token,
+            req_to_token_stride_0,
+            req_to_token_stride_1,
+            req_pool_indices,
+            req_pool_indices_stride_0,
+            cache_seqlens_int32,
+            cache_seqlens_int32_stride_0,
+            cu_seqlens_k,
+            cu_seqlens_k_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            swa_page_table,
+            swa_page_table_stride_0,
+            swa_page_table_stride_1,
+            full_to_swa_mapping,
+            full_to_swa_mapping_stride_0,
+            batch_size,
+            max_seq_pages,
+            page_size,
+            seq_len_delta,
+            use_swa,
             shift,
             BLOCK_COLS=BLOCK_COLS,
             num_warps=4,

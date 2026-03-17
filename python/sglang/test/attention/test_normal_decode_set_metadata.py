@@ -13,7 +13,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import normal_decode_set_metadata
+from sglang.srt.layers.attention.flashattention_backend import (
+    normal_decode_set_metadata,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,8 +70,11 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         """Create test data for normal_decode_set_metadata."""
         # Random sequence lengths for each batch
         seq_lens = torch.randint(
-            max_seq_len // 2, max_seq_len + 1, (batch_size,),
-            dtype=torch.int64, device=self.device
+            max_seq_len // 2,
+            max_seq_len + 1,
+            (batch_size,),
+            dtype=torch.int64,
+            device=self.device,
         )
 
         # Calculate max_seq_pages
@@ -77,11 +82,15 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         max_seq_pages = (max_len + seq_len_delta + page_size - 1) // page_size
 
         # Create req_pool_indices (maps batch index to pool index)
-        req_pool_indices = torch.arange(batch_size, dtype=torch.int32, device=self.device)
+        req_pool_indices = torch.arange(
+            batch_size, dtype=torch.int32, device=self.device
+        )
 
         # Create strided_indices for page table indexing
         if page_size == 1:
-            strided_indices = torch.arange(max_seq_len * 2, dtype=torch.int32, device=self.device)
+            strided_indices = torch.arange(
+                max_seq_len * 2, dtype=torch.int32, device=self.device
+            )
         else:
             strided_indices = torch.arange(
                 0, max_seq_len * 2, page_size, dtype=torch.int32, device=self.device
@@ -91,13 +100,16 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         pool_size = batch_size
         max_tokens = max_seq_len * 2
         req_to_token = torch.randint(
-            0, 10000, (pool_size, max_tokens),
-            dtype=torch.int32, device=self.device
+            0, 10000, (pool_size, max_tokens), dtype=torch.int32, device=self.device
         )
 
         # Output tensors (to be filled by the function)
-        cache_seqlens_int32 = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
-        cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        cache_seqlens_int32 = torch.zeros(
+            batch_size, dtype=torch.int32, device=self.device
+        )
+        cu_seqlens_k = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=self.device
+        )
         page_table = torch.zeros(
             (batch_size, max_seq_pages + 10), dtype=torch.int32, device=self.device
         )
@@ -129,15 +141,19 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
     def _create_swa_kv_pool(self, size: int, page_size: int):
         """Create a mock SWA KV pool for testing that inherits from SWAKVPool."""
+
         # Create a minimal mock that inherits from SWAKVPool to pass isinstance check
         class MinimalSWAKVPool(SWAKVPool):
             def __init__(self, size, device):
                 # Don't call super().__init__() to avoid complex initialization
                 # Just set the minimal attributes needed for the test
-                self.full_to_swa_index_mapping = torch.arange(size, dtype=torch.int32, device=device)
+                self.full_to_swa_index_mapping = torch.arange(
+                    size, dtype=torch.int32, device=device
+                )
                 # Add some randomness to simulate real SWA mapping
                 self.full_to_swa_index_mapping = (
-                    self.full_to_swa_index_mapping + torch.randint(0, 100, (size,), device=device)
+                    self.full_to_swa_index_mapping
+                    + torch.randint(0, 100, (size,), device=device)
                 ) % size
                 self.device = device
 
@@ -147,8 +163,14 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
         return MinimalSWAKVPool(size, self.device)
 
-    def _run_test(self, batch_size: int, max_seq_len: int, page_size: int,
-                  has_swa: bool = False, seq_len_delta: int = 0):
+    def _run_test(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        page_size: int,
+        has_swa: bool = False,
+        seq_len_delta: int = 0,
+    ):
         """Run a single test configuration."""
         # Create test data
         test_data = self._create_test_data(
@@ -197,24 +219,26 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
         # Compare results
         self.assertTrue(
-            torch.equal(test_data["cache_seqlens_int32"], ref_data["cache_seqlens_int32"]),
-            f"cache_seqlens_int32 mismatch. Expected:\n{ref_data['cache_seqlens_int32']}\nGot:\n{test_data['cache_seqlens_int32']}"
+            torch.equal(
+                test_data["cache_seqlens_int32"], ref_data["cache_seqlens_int32"]
+            ),
+            f"cache_seqlens_int32 mismatch. Expected:\n{ref_data['cache_seqlens_int32']}\nGot:\n{test_data['cache_seqlens_int32']}",
         )
 
         self.assertTrue(
             torch.equal(test_data["cu_seqlens_k"], ref_data["cu_seqlens_k"]),
-            f"cu_seqlens_k mismatch. Expected:\n{ref_data['cu_seqlens_k']}\nGot:\n{test_data['cu_seqlens_k']}"
+            f"cu_seqlens_k mismatch. Expected:\n{ref_data['cu_seqlens_k']}\nGot:\n{test_data['cu_seqlens_k']}",
         )
 
         self.assertTrue(
             torch.equal(test_data["page_table"], ref_data["page_table"]),
-            f"page_table mismatch at bs={batch_size}, page_size={page_size}"
+            f"page_table mismatch at bs={batch_size}, page_size={page_size}",
         )
 
         if has_swa:
             self.assertTrue(
                 torch.equal(test_data["swa_page_table"], ref_data["swa_page_table"]),
-                f"swa_page_table mismatch at bs={batch_size}, page_size={page_size}"
+                f"swa_page_table mismatch at bs={batch_size}, page_size={page_size}",
             )
 
     # Test cases for page_size=1 (uses specialized kernel _fused_metadata_kernel_ps1_no_swa)
@@ -232,7 +256,9 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
     def test_page_size_1_with_seq_len_delta(self):
         """Test with page_size=1 and seq_len_delta > 0."""
-        self._run_test(batch_size=8, max_seq_len=200, page_size=1, has_swa=False, seq_len_delta=5)
+        self._run_test(
+            batch_size=8, max_seq_len=200, page_size=1, has_swa=False, seq_len_delta=5
+        )
 
     # Test cases for page_size > 1 (uses general kernel _fused_metadata_kernel_general)
     def test_page_size_16_small_batch(self):
@@ -253,7 +279,9 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
     def test_page_size_64_with_seq_len_delta(self):
         """Test with page_size=64 and seq_len_delta > 0."""
-        self._run_test(batch_size=8, max_seq_len=512, page_size=64, has_swa=False, seq_len_delta=3)
+        self._run_test(
+            batch_size=8, max_seq_len=512, page_size=64, has_swa=False, seq_len_delta=3
+        )
 
     # Test cases with Sliding Window Attention (SWA)
     def test_page_size_16_with_swa(self):
@@ -266,7 +294,9 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
     def test_page_size_64_with_swa_and_delta(self):
         """Test with page_size=64, SWA, and seq_len_delta."""
-        self._run_test(batch_size=8, max_seq_len=400, page_size=64, has_swa=True, seq_len_delta=2)
+        self._run_test(
+            batch_size=8, max_seq_len=400, page_size=64, has_swa=True, seq_len_delta=2
+        )
 
     # Edge cases
     def test_batch_size_1(self):
@@ -298,7 +328,10 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         )
 
         # Verify no crashes and basic properties
-        self.assertEqual(test_data["cache_seqlens_int32"].sum().item(), test_data["seq_lens"].sum().item())
+        self.assertEqual(
+            test_data["cache_seqlens_int32"].sum().item(),
+            test_data["seq_lens"].sum().item(),
+        )
 
     def test_power_of_two_page_sizes(self):
         """Test various power-of-2 page sizes."""
@@ -315,14 +348,19 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         max_seq_len = 512
         page_size = 64
 
-        test_data = self._create_test_data(batch_size, max_seq_len, page_size, has_swa=False)
+        test_data = self._create_test_data(
+            batch_size, max_seq_len, page_size, has_swa=False
+        )
 
         # Manually set varied sequence lengths
         test_data["seq_lens"] = torch.tensor(
             [10, 50, 100, 200, 300, 450, 500, 512],
-            dtype=torch.int64, device=self.device
+            dtype=torch.int64,
+            device=self.device,
         )
-        test_data["max_seq_pages"] = (test_data["seq_lens"].max().item() + page_size - 1) // page_size
+        test_data["max_seq_pages"] = (
+            test_data["seq_lens"].max().item() + page_size - 1
+        ) // page_size
 
         # Run both implementations
         ref_data = {
@@ -361,8 +399,14 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             None,
         )
 
-        self.assertTrue(torch.equal(test_data["cache_seqlens_int32"], ref_data["cache_seqlens_int32"]))
-        self.assertTrue(torch.equal(test_data["cu_seqlens_k"], ref_data["cu_seqlens_k"]))
+        self.assertTrue(
+            torch.equal(
+                test_data["cache_seqlens_int32"], ref_data["cache_seqlens_int32"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(test_data["cu_seqlens_k"], ref_data["cu_seqlens_k"])
+        )
         self.assertTrue(torch.equal(test_data["page_table"], ref_data["page_table"]))
 
 
