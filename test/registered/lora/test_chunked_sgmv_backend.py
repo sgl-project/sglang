@@ -5,17 +5,27 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.triton_ops import (
+    chunked_embedding_lora_a_forward,
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
-from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.lora_utils import (
+    reference_embedding_lora_a_shrink,
+    reference_sgmv_expand,
+    reference_sgmv_shrink,
+)
 
 CHUNK_SIZE = 16
+
+register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
 
 
 def reset_kernel_cache():
@@ -100,6 +110,7 @@ class TestChunkedSGMV(unittest.TestCase):
         self.dtype = torch.float16
         self.input_dim = 2560  # Hidden dimension
         self.max_seq_len = 1024
+        self.vocab_size = 32000  # Vocabulary size for embedding tests
 
         # LoRA configurations: name -> (rank, output_q, output_k, output_v)
         self.lora_configs = {
@@ -285,6 +296,42 @@ class TestChunkedSGMV(unittest.TestCase):
 
         return stacked
 
+    def create_embedding_lora_a_weights(self, lora_ranks: torch.Tensor) -> torch.Tensor:
+        """Create LoRA A weights for embedding lookup.
+
+        Args:
+            lora_ranks: Tensor of ranks for each LoRA adapter
+
+        Returns:
+            Tensor of shape (num_loras, max_rank, vocab_size)
+        """
+        lora_ranks_cpu = lora_ranks.cpu().numpy()
+        num_loras = len(lora_ranks_cpu)
+        max_rank = int(lora_ranks_cpu.max()) if num_loras > 0 else 0
+
+        if max_rank == 0:
+            return torch.empty(
+                num_loras, 0, self.vocab_size, dtype=self.dtype, device=self.device
+            )
+
+        weights = torch.zeros(
+            num_loras, max_rank, self.vocab_size, dtype=self.dtype, device=self.device
+        )
+
+        for i, rank in enumerate(lora_ranks_cpu):
+            if rank > 0:
+                weights[i, :rank, :] = torch.randn(
+                    rank, self.vocab_size, dtype=self.dtype, device=self.device
+                )
+
+        return weights
+
+    def create_test_input_ids(self, total_tokens: int) -> torch.Tensor:
+        """Create random token IDs for embedding test."""
+        return torch.randint(
+            0, self.vocab_size, (total_tokens,), dtype=torch.int64, device=self.device
+        )
+
     def create_test_batch(
         self,
         batch_composition: BatchComposition,
@@ -459,6 +506,36 @@ class TestChunkedSGMV(unittest.TestCase):
 
                 torch.testing.assert_close(
                     chunked_shrink, reference_shrink, rtol=self.RTOL, atol=self.ATOL
+                )
+
+                # Test chunked embedding LoRA A forward
+                # Create embedding-specific LoRA A weights with shape (num_loras, rank, vocab_size)
+                embedding_lora_a = self.create_embedding_lora_a_weights(
+                    batch_info.lora_ranks
+                )
+
+                # Create input_ids (token indices) instead of hidden states
+                total_tokens = x.shape[0]
+                input_ids = self.create_test_input_ids(total_tokens)
+
+                chunked_shrink_embeddings = chunked_embedding_lora_a_forward(
+                    input_ids, embedding_lora_a, batch_info, self.vocab_size
+                )
+
+                reference_shrink_embeddings = reference_embedding_lora_a_shrink(
+                    input_ids,
+                    embedding_lora_a,
+                    lora_assignments_tensor,
+                    seq_lengths_tensor,
+                    lora_ranks_tensor,
+                    self.vocab_size,
+                )
+                torch.testing.assert_close(
+                    chunked_shrink_embeddings,
+                    reference_shrink_embeddings,
+                    rtol=self.RTOL,
+                    atol=self.ATOL,
+                    msg=f"Shrink test embedding loRA A operation failed for batch_size={batch_size}",
                 )
 
     def test_expand_basic(self):
@@ -642,6 +719,105 @@ class TestChunkedSGMV(unittest.TestCase):
                     lora_assignments,
                     f"decode skewed batch_size={batch_size}",
                 )
+
+
+class TestLmHeadPruningConsistency(unittest.TestCase):
+    """Verify get_lm_head_pruned_lens (LoRA) stays consistent with
+    LogitsProcessor._get_pruned_states (logits_processor).
+
+    If this test fails, it likely means one side was changed without
+    updating the other. See cross-references in both functions.
+    """
+
+    def _make_mock_forward_batch(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        class MockForwardBatch:
+            pass
+
+        batch = MockForwardBatch()
+        batch.forward_mode = forward_mode
+        batch.batch_size = len(extend_seq_lens_cpu)
+        batch.return_logprob = return_logprob
+        batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+        batch.extend_logprob_start_lens_cpu = logprob_start_lens_cpu
+        return batch
+
+    def _count_pruned_states_tokens(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        """Call _get_pruned_states and return the number of output tokens."""
+        total_tokens = sum(extend_seq_lens_cpu)
+        hidden_states = torch.zeros(total_tokens, 4)
+
+        logits_meta = LogitsMetadata(
+            forward_mode=forward_mode,
+            extend_return_logprob=return_logprob,
+            extend_seq_lens=torch.tensor(extend_seq_lens_cpu, dtype=torch.int64),
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=logprob_start_lens_cpu,
+        )
+
+        # _get_pruned_states does not use self, so pass None
+        result = LogitsProcessor._get_pruned_states(
+            None, hidden_states, None, None, logits_meta
+        )
+        pruned_states = result[0]
+        return pruned_states.shape[0]
+
+    def _assert_consistency(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        mock_batch = self._make_mock_forward_batch(
+            forward_mode,
+            extend_seq_lens_cpu,
+            return_logprob,
+            logprob_start_lens_cpu,
+        )
+        pruned_lens = get_lm_head_pruned_lens(mock_batch)
+
+        actual_count = self._count_pruned_states_tokens(
+            forward_mode,
+            extend_seq_lens_cpu,
+            return_logprob,
+            logprob_start_lens_cpu,
+        )
+
+        if pruned_lens is None:
+            expected_count = sum(extend_seq_lens_cpu)
+        else:
+            expected_count = sum(pruned_lens)
+
+        self.assertEqual(
+            expected_count,
+            actual_count,
+            f"get_lm_head_pruned_lens expects {expected_count} tokens, "
+            f"but _get_pruned_states produces {actual_count}. "
+            f"These functions must stay in sync — see their cross-reference comments.",
+        )
+
+    def test_extend_no_logprob(self):
+        self._assert_consistency(ForwardMode.EXTEND, [4, 5, 6])
+
+    def test_extend_with_logprob(self):
+        self._assert_consistency(
+            ForwardMode.EXTEND,
+            [4, 5, 6],
+            return_logprob=True,
+            logprob_start_lens_cpu=[0, 5, 3],
+        )
 
 
 if __name__ == "__main__":
