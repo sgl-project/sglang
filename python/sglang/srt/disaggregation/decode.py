@@ -356,7 +356,28 @@ class DecodePreallocQueue:
             if _is_fake_transfer(req, self.scheduler.server_args):
                 self._create_receiver_and_enqueue(req, 0)
                 return
-            self.pending_reqs.append(req)
+
+            # Ensure prefill parallel info is cached before resolving dp rank
+            bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+            if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
+                error_message = f"Could not fetch prefill parallel info from bootstrap server {bootstrap_addr}"
+                logger.error(error_message)
+                prepare_abort(
+                    req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                self.scheduler.stream_output([req], req.return_logprob)
+                return
+
+            # Fast path: if dp rank is already resolvable, skip pending queue
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                self._create_receiver_and_enqueue(req, prefill_dp_rank)
+            else:
+                self.pending_reqs.append(req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
@@ -505,25 +526,7 @@ class DecodePreallocQueue:
         remaining = []
 
         for bootstrap_addr, reqs in addr_to_reqs.items():
-            # If a request is following the bootstrap room,
-            # we need get the prefill info before resolving the prefill_dp_ranks
-            # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-            # so we need to ensure the parallel info before resolving it.
-            if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-                error_message = f"Could not fetch prefill parallel info from bootstrap server {bootstrap_addr}"
-                logger.error(error_message)
-                for req in reqs:
-                    prepare_abort(
-                        req,
-                        error_message,
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    if self.scheduler.enable_metrics:
-                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                    self.scheduler.stream_output([req], req.return_logprob)
-                continue
-
-            need_query = []
+            need_query: List[Req] = []
             for req in reqs:
                 prefill_dp_rank = self._resolve_prefill_dp_rank(req)
                 if prefill_dp_rank is not None:
