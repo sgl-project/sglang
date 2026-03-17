@@ -25,15 +25,26 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    NSAIndexerHostPool,
     NSATokenToKVPoolHost,
+    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -70,9 +81,10 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.use_nsa_pool_controller = isinstance(self.kv_cache, NSATokenToKVPool)
 
         if (
-            isinstance(self.kv_cache, NSATokenToKVPool)
+            self.use_nsa_pool_controller
             and server_args.hicache_storage_backend == "mooncake"
             and server_args.hicache_mem_layout
             not in ["page_first", "page_first_direct"]
@@ -139,22 +151,62 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            enable_storage_metrics=self.enable_storage_metrics,
-        )
+        if self.use_nsa_pool_controller:
+            if server_args.hicache_storage_backend not in (None, "file", "mooncake"):
+                raise ValueError(
+                    "NSA pool-based HiCache only supports file and mooncake storage backends."
+                )
+            self.nsa_indexer_host_pool = NSAIndexerHostPool(self.token_to_kv_pool_host)
+            self.host_pool_group = HostPoolGroup(
+                [
+                    PoolEntry(
+                        name=PoolName.KV,
+                        host_pool=self.token_to_kv_pool_host,
+                        device_pool=self.kv_cache,
+                        layer_mapper=lambda layer_id: layer_id,
+                        is_primary_index_anchor=True,
+                    ),
+                    PoolEntry(
+                        name=PoolName.NSA,
+                        host_pool=self.nsa_indexer_host_pool,
+                        device_pool=self.kv_cache,
+                        layer_mapper=lambda layer_id: layer_id,
+                    ),
+                ]
+            )
+            self.cache_controller = HybridCacheController(
+                params.token_to_kv_pool_allocator,
+                self.host_pool_group,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
+        else:
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -273,6 +325,11 @@ class HiRadixCache(RadixCache):
         prefetch/backup paths. Caller must ensure there are no running/queued
         requests to avoid races.
         """
+        if self.use_nsa_pool_controller and storage_backend not in ("file", "mooncake"):
+            return (
+                False,
+                "NSA pool-based HiCache only supports file and mooncake storage backends.",
+            )
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
@@ -354,12 +411,15 @@ class HiRadixCache(RadixCache):
             )
 
         try:
-            self.cache_controller.attach_storage_backend(
+            attach_kwargs = dict(
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
             )
+            if self.use_nsa_pool_controller:
+                attach_kwargs["host_pools"] = self.host_pool_group.entries
+            self.cache_controller.attach_storage_backend(**attach_kwargs)
         except Exception as e:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
@@ -678,7 +738,11 @@ class HiRadixCache(RadixCache):
         )
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys
+            node.host_value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
+            extra_pools=self.nsa_archive_transfers(node),
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -1223,6 +1287,10 @@ class HiRadixCache(RadixCache):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
+        if self.use_nsa_pool_controller:
+            min_completed_tokens = (
+                self.cache_controller.get_usable_prefetch_token_count(operation)
+            )
         if self.tp_world_size > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
             completed_tokens_tensor = torch.tensor(
@@ -1352,7 +1420,12 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            extra_pools=self.nsa_prefetch_transfers(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -1361,6 +1434,55 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+
+    def nsa_backup_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.use_nsa_pool_controller:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.NSA,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+                use_anchor_host_indices=True,
+                use_anchor_device_indices=True,
+            )
+        ]
+
+    def nsa_archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
+        if not self.use_nsa_pool_controller or not node.hash_value:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.NSA,
+                keys=node.hash_value,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+                use_anchor_host_indices=True,
+                use_anchor_device_indices=True,
+            )
+        ]
+
+    def nsa_prefetch_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.use_nsa_pool_controller:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.NSA,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+                use_anchor_host_indices=True,
+                use_anchor_device_indices=True,
+            )
+        ]
+
+    def nsa_restore_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.use_nsa_pool_controller:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.NSA,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+                use_anchor_host_indices=True,
+                use_anchor_device_indices=True,
+            )
+        ]
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value

@@ -37,8 +37,11 @@ class TestNixlUnified(unittest.TestCase):
         self.storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
+            pp_rank=0,
+            pp_size=1,
             is_mla_model=False,
-            is_page_first_layout=False,
+            enable_storage_metrics=False,
+            layout="layer_first",
             model_name="test_model",
         )
 

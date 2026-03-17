@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from enum import Enum
+from typing import Any, List, Literal, Optional
 
 import torch
 
@@ -11,6 +14,12 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _pool_name_key(pool_name: PoolName | str | None) -> Optional[str]:
+    if pool_name is None:
+        return None
+    return pool_name.value if isinstance(pool_name, Enum) else str(pool_name)
 
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
@@ -21,24 +30,16 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
 
     for t in token_ids:
         if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
             for elem in t:
                 hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
         else:
-            # Regular mode: single integer token
             hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
 
 
 def hash_str_to_int64(hash_str: str) -> int:
-    """Convert SHA256 hex string to signed 64-bit integer for events.
-
-    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
-    """
-    # Take first 16 hex chars to get 64-bit value
     uint64_val = int(hash_str[:16], 16)
-    # Convert to signed int64 range [-2^63, 2^63-1]
     if uint64_val >= 2**63:
         return uint64_val - 2**64
     return uint64_val
@@ -52,7 +53,7 @@ class HiCacheStorageConfig:
     pp_size: int
     is_mla_model: bool
     enable_storage_metrics: bool
-    is_page_first_layout: bool
+    layout: Literal["layer_first", "page_first", "page_first_direct", "page_head"]
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
@@ -65,17 +66,86 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
-class HiCacheStorage(ABC):
-    """
-    HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
-    It abstracts the underlying storage mechanism, allowing different implementations to be used.
-    """
+class PoolName(str, Enum):
+    KV = "kv"
+    MAMBA = "mamba"
+    NSA = "nsa"
 
-    # todo, the page size of storage backend does not have to be the same as the same as host memory pool
+
+class PoolHitPolicy(str, Enum):
+    ALL_PAGES = "all_pages"
+    TRAILING_PAGES = "trailing_pages"
+
+
+@dataclass
+class PoolTransfer:
+    name: PoolName
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    keys: Optional[List[str]] = None
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    use_anchor_host_indices: bool = False
+    use_anchor_device_indices: bool = False
+
+
+@dataclass
+class PoolTransferResult:
+    kv_hit_pages: int
+    extra_pool_hit_pages: dict[str, int]
+
+    @classmethod
+    def empty(cls) -> "PoolTransferResult":
+        return cls(0, {})
+
+    @staticmethod
+    def _count_consecutive_true(results: List[bool]) -> int:
+        for i, ok in enumerate(results):
+            if not ok:
+                return i
+        return len(results)
+
+    def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
+        self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
+
+    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
+        for name, rs in results.items():
+            self.extra_pool_hit_pages[name] = self.extra_pool_hit_pages.get(name, 0) + (
+                self._count_consecutive_true(rs)
+            )
+
+
+class HiCacheStorage(ABC):
     _NSA_INDEXER_SUFFIX = "__nsa_idx"
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        raise NotImplementedError()
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        raise NotImplementedError()
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        raise NotImplementedError()
 
     def batch_get_v1(
         self,
@@ -83,10 +153,6 @@ class HiCacheStorage(ABC):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """
-        Retrieve values for multiple keys.
-        Returns a list of booleans indicating success for each key.
-        """
         pass
 
     def batch_set_v1(
@@ -95,10 +161,6 @@ class HiCacheStorage(ABC):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """
-        Store multiple key-value pairs.
-        Returns a list of booleans indicating success for each key.
-        """
         pass
 
     @abstractmethod
@@ -108,13 +170,8 @@ class HiCacheStorage(ABC):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        """
-        Retrieve the value associated with the given key.
-        Returns None if the key does not exist.
-        """
         pass
 
-    # TODO: Deprecate
     @abstractmethod
     def batch_get(
         self,
@@ -122,10 +179,6 @@ class HiCacheStorage(ABC):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None] | int:
-        """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
-        """
         pass
 
     @abstractmethod
@@ -136,13 +189,8 @@ class HiCacheStorage(ABC):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        """
-        Store the value associated with the given key.
-        Returns True if the operation was successful, False otherwise.
-        """
         pass
 
-    # TODO: Deprecate
     @abstractmethod
     def batch_set(
         self,
@@ -151,31 +199,17 @@ class HiCacheStorage(ABC):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        """
-        Store multiple key-value pairs.
-        Returns True if all operations were successful, False otherwise.
-        """
         pass
 
     @abstractmethod
     def exists(self, key: str) -> bool:
-        """
-        Check if the key exists in the storage.
-        Returns True if the key exists, False otherwise.
-        """
         pass
 
-    # TODO: Use a finer-grained return type (e.g., List[bool])
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        """
-        Check if the keys exist in the storage.
-        return the number of consecutive existing keys from the start.
-        Can be overridden by subclasses for more efficient implementation.
-        """
-        for i in range(len(keys)):
-            if not self.exists(keys[i]):
+        for i, key in enumerate(keys):
+            if not self.exists(key):
                 return i
         return len(keys)
 
@@ -186,35 +220,7 @@ class HiCacheStorage(ABC):
         return None
 
 
-class NSAExtraStorageMixin(ABC):
-    @abstractmethod
-    def batch_get_extra(
-        self,
-        keys: List[str],
-        buffers: List[torch.Tensor],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        pass
-
-    @abstractmethod
-    def batch_set_extra(
-        self,
-        keys: List[str],
-        buffers: List[torch.Tensor],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        pass
-
-    @abstractmethod
-    def batch_exists_extra(
-        self,
-        keys: List[str],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> int:
-        pass
-
-
-class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
+class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -234,10 +240,23 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
 
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
-            logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+            logger.info("Created HiCacheFile storage directory at %s", self.file_path)
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _component_key(self, key: str, pool_name: PoolName | str | None = None) -> str:
+        pool_name_key = _pool_name_key(pool_name)
+        if pool_name_key in (None, "__default__", PoolName.KV.value):
+            return self._get_suffixed_key(key)
+        if pool_name_key == PoolName.NSA.value:
+            return self._get_suffixed_key(f"{key}{self._NSA_INDEXER_SUFFIX}")
+        return self._get_suffixed_key(f"{key}.{pool_name_key}")
+
+    def _component_path(self, key: str, pool_name: PoolName | str | None = None) -> str:
+        return os.path.join(
+            self.file_path, f"{self._component_key(key, pool_name)}.bin"
+        )
 
     def get(
         self,
@@ -245,8 +264,7 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        tensor_path = self._component_path(key)
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -255,7 +273,7 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
                     raise IOError(f"Short read for {key}")
             return target_location
         except FileNotFoundError:
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning("Failed to fetch %s from HiCacheFile storage.", key)
             return None
 
     def batch_get(
@@ -279,16 +297,15 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         if self.exists(key):
-            logger.debug(f"Key {key} already exists. Skipped.")
+            logger.debug("Key %s already exists. Skipped.", key)
             return True
 
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        tensor_path = self._component_path(key)
         try:
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
             return True
         except Exception as e:
-            logger.error(f"Failed to save tensor {key}: {e}")
+            logger.error("Failed to save tensor %s: %s", key, e)
             return False
 
     def batch_set(
@@ -303,45 +320,135 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
                 return False
         return True
 
-    def batch_get_extra(
-        self,
-        keys: List[str],
-        buffers: List[torch.Tensor],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        results = []
-        for key, buffer in zip(keys, buffers):
-            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
-            results.append(self.get(extra_key, target_location=buffer) is not None)
-        return results
-
-    def batch_set_extra(
-        self,
-        keys: List[str],
-        buffers: List[torch.Tensor],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        results = []
-        for key, buffer in zip(keys, buffers):
-            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
-            results.append(self.set(extra_key, value=buffer))
-        return results
-
-    def batch_exists_extra(
-        self,
-        keys: List[str],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> int:
-        for i, key in enumerate(keys):
-            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
-            if not self.exists(extra_key):
-                return i
-        return len(keys)
-
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
+        return os.path.exists(self._component_path(key))
+
+    def _has_component(self, key: str, pool_name: PoolName | str | None = None) -> bool:
+        return os.path.exists(self._component_path(key, pool_name))
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = next(
+            (
+                i
+                for i, key in enumerate(keys)
+                if not self._has_component(key, PoolName.KV)
+            ),
+            len(keys),
+        )
+
+        hit_count: dict[str, int] = {PoolName.KV.value: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            name = transfer.name
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = next(
+                    (
+                        i
+                        for i in range(kv_pages)
+                        if not self._has_component(keys[i], name)
+                    ),
+                    kv_pages,
+                )
+            else:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = 0
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        self._has_component(keys[i], name)
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[_pool_name_key(name)] = boundary
+            final_pages = min(final_pages, boundary)
+
+        if pool_transfers:
+            logger.info(
+                "HiCacheFile batch_exists_v2: kv_pages=%s final_pages=%s hit_count=%s first_key=%s last_key=%s",
+                kv_pages,
+                final_pages,
+                hit_count,
+                keys[0] if keys else None,
+                keys[final_pages - 1] if final_pages > 0 else None,
+            )
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _log_key(self, pool_name: PoolName | str, key: str) -> str:
+        pool_name_key = _pool_name_key(pool_name)
+        if pool_name_key == PoolName.KV.value:
+            return key
+        if pool_name_key == PoolName.NSA.value:
+            return f"{key}{self._NSA_INDEXER_SUFFIX}"
+        return f"{key}.{pool_name_key}"
+
+    def _read_page(self, pool_name, key: str, host_pool, page_offset: int) -> bool:
+        storage_key = self._log_key(pool_name, key)
+        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        if data_page is None:
+            return False
+        host_pool.set_from_flat_data_page(page_offset, data_page)
+        return True
+
+    def _write_page(self, pool_name, key: str, host_pool, page_offset: int) -> bool:
+        storage_key = self._log_key(pool_name, key)
+        data_page = host_pool.get_data_page(page_offset, flat=True)
+        return self.set(storage_key, data_page)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            transfer_name = _pool_name_key(transfer.name)
+            host_pool = self.registered_pools[transfer_name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "%s indices length mismatch for %s: expected %s, got %s",
+                    op_fn.__name__,
+                    transfer.name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[transfer_name] = [False] * len(keys)
+                continue
+
+            results[transfer_name] = [
+                op_fn(
+                    transfer.name,
+                    key,
+                    host_pool,
+                    host_indices[i * page_size].item(),
+                )
+                for i, key in enumerate(keys)
+            ]
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        return self._batch_io_v2(transfers, self._read_page)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        return self._batch_io_v2(transfers, self._write_page)
 
     def clear(self) -> bool:
         try:
@@ -352,5 +459,5 @@ class HiCacheFile(NSAExtraStorageMixin, HiCacheStorage):
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
         except Exception as e:
-            logger.error(f"Failed to clear HiCacheFile storage: {e}")
+            logger.error("Failed to clear HiCacheFile storage: %s", e)
             return False

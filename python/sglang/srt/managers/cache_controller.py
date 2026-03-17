@@ -24,7 +24,6 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    NSAExtraStorageMixin,
 )
 
 if TYPE_CHECKING:
@@ -42,7 +41,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import NSATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -280,7 +278,6 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
-        self.nsa_extra_supported = False
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
@@ -489,15 +486,6 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
-            self.nsa_extra_supported = (
-                isinstance(self.storage_backend, NSAExtraStorageMixin)
-                and isinstance(self.mem_pool_host, NSATokenToKVPoolHost)
-                and self.mem_pool_host.layout in ["page_first", "page_first_direct"]
-            )
-            if self.nsa_extra_supported:
-                self.page_get_func = self._page_get_nsa_extra
-                self.page_set_func = self._page_set_nsa_extra
-
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -530,7 +518,6 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
-            self.nsa_extra_supported = False
             raise
 
     def detach_storage_backend(self):
@@ -583,7 +570,6 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
-        self.nsa_extra_supported = False
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -627,7 +613,7 @@ class HiCacheController:
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
             enable_storage_metrics=self.enable_storage_metrics,
-            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            layout=self.mem_pool_host.layout,
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
@@ -882,42 +868,8 @@ class HiCacheController:
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    def _get_nsa_extra_buffers(
-        self, host_indices: torch.Tensor, num_pages: Optional[int] = None
-    ) -> List[torch.Tensor]:
-        if num_pages is not None:
-            host_indices = host_indices[: num_pages * self.page_size]
-        return self.mem_pool_host.get_indexer_page_views(host_indices)
-
     def _storage_hit_page_num(self, batch_hashes, extra_info=None) -> int:
-        hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
-        if self.nsa_extra_supported:
-            hit_page_num = min(
-                hit_page_num,
-                self.storage_backend.batch_exists_extra(batch_hashes, extra_info),
-            )
-        return hit_page_num
-
-    def _page_get_nsa_extra(
-        self, operation, hash_values, host_indices, extra_info=None
-    ):
-        kv_pages = self._kv_get_pages(hash_values, host_indices, extra_info)
-        if kv_pages == 0:
-            return
-        buffers = self._get_nsa_extra_buffers(host_indices, kv_pages)
-        results = self.storage_backend.batch_get_extra(
-            hash_values[:kv_pages], buffers, extra_info
-        )
-        idx_pages = self._count_consecutive_true(results)
-        completed_pages = min(kv_pages, idx_pages)
-        operation.increment(completed_pages * self.page_size)
-
-    def _page_set_nsa_extra(self, hash_values, host_indices, extra_info=None) -> bool:
-        if not self._kv_set_pages(hash_values, host_indices, extra_info):
-            return False
-        buffers = self._get_nsa_extra_buffers(host_indices)
-        results = self.storage_backend.batch_set_extra(hash_values, buffers, extra_info)
-        return all(results)
+        return self.storage_backend.batch_exists(batch_hashes, extra_info)
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):

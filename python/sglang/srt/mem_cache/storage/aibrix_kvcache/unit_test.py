@@ -29,8 +29,11 @@ class AIBrixKVCacheStorageTest:
         config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
             is_mla_model=False,
-            is_page_first_layout=True,
+            enable_storage_metrics=False,
+            layout="page_first",
             model_name="test",
         )
         for page_size in range(1, 3):

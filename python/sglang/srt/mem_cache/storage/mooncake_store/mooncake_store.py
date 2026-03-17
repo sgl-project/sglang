@@ -15,12 +15,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    NSAExtraStorageMixin,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     HostKVCache,
     HostTensorAllocator,
-    NSATokenToKVPoolHost,
 )
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
@@ -28,6 +30,10 @@ DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
 logger = logging.getLogger(__name__)
+
+
+def _pool_name_key(pool_name) -> str:
+    return pool_name.value if hasattr(pool_name, "value") else str(pool_name)
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -279,7 +285,7 @@ class MooncakeBaseStore:
             )
 
 
-class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
+class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
@@ -488,26 +494,28 @@ class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
             "page_first_direct",
             "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
-        buffer = self.mem_pool_host.kv_buffer
-        try:
-            super().register_buffer(buffer)
-        except TypeError as err:
-            logger.error("Failed to register buffer to Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Register Buffer Error.") from err
-
-        if isinstance(self.mem_pool_host, NSATokenToKVPoolHost):
+        for buffer in self.mem_pool_host.get_register_buffers():
             try:
-                super().register_buffer(self.mem_pool_host.index_k_with_scale_buffer)
+                super().register_buffer(buffer)
             except TypeError as err:
-                logger.error(
-                    "Failed to register NSA indexer buffer to Mooncake Store: %s", err
-                )
-                raise TypeError(
-                    "Mooncake Store Register NSA Indexer Buffer Error."
-                ) from err
+                logger.error("Failed to register buffer to Mooncake Store: %s", err)
+                raise TypeError("Mooncake Store Register Buffer Error.") from err
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        super().register_mem_host_pool_v2(host_pool, _pool_name_key(host_pool_name))
+        for buffer in host_pool.get_register_buffers():
+            try:
+                super().register_buffer(buffer)
+            except TypeError as err:
+                logger.error(
+                    "Failed to register pool buffer to Mooncake Store for %s: %s",
+                    host_pool_name,
+                    err,
+                )
+                raise TypeError("Mooncake Store Register Pool Buffer Error.") from err
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -622,25 +630,6 @@ class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
 
         return self._batch_postprocess(get_results, is_set_operate=False)
 
-    def batch_get_extra(
-        self,
-        keys: List[str],
-        buffers: List[torch.Tensor],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        if len(keys) == 0:
-            return []
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
-        key_strs = self._get_extra_keys_for_nsa(keys)
-        buffer_ptrs = [buf.data_ptr() for buf in buffers]
-        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
-        return [res > 0 for res in get_results]
-
     def batch_set_v1(
         self,
         keys: List[str],
@@ -688,42 +677,177 @@ class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
 
         return self._batch_postprocess(set_results, is_set_operate=True)
 
-    def batch_set_extra(
+    def _apply_extra_backend_tag(self, keys: List[str]) -> List[str]:
+        if self.extra_backend_tag is None:
+            return keys
+        prefix = self.extra_backend_tag
+        return [f"{prefix}_{key}" for key in keys]
+
+    def _get_pool_keys(self, pool_name, keys: List[str]) -> List[str]:
+        pool_name_key = _pool_name_key(pool_name)
+        tagged_keys = self._apply_extra_backend_tag(keys)
+        if pool_name_key == PoolName.KV.value:
+            return tagged_keys
+        if pool_name_key == PoolName.NSA.value:
+            return self._get_extra_keys_for_nsa(tagged_keys)
+
+        if self.is_mla_backend:
+            suffix = self.mla_suffix
+        else:
+            suffix = self.mha_suffix
+        if suffix:
+            return [f"{key}_{suffix}_{pool_name_key}" for key in tagged_keys]
+        return [f"{key}_{pool_name_key}" for key in tagged_keys]
+
+    def _batch_exists_for_pool(self, pool_name, keys: List[str]) -> int:
+        query_keys = self._get_pool_keys(pool_name, keys)
+        exist_result = self._batch_exist(query_keys)
+        for i, status in enumerate(exist_result):
+            if status != 1:
+                return i
+        return len(query_keys)
+
+    def batch_exists_v2(
         self,
         keys: List[str],
-        buffers: List[torch.Tensor],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        if len(keys) == 0:
-            return []
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
-        key_strs = self._get_extra_keys_for_nsa(keys)
-        exist_result = self._batch_exist(key_strs)
+    ):
+        kv_hit_pages = self.batch_exists(keys, extra_info)
+        hit_count: dict[str, int] = (
+            {PoolName.KV.value: kv_hit_pages} if kv_hit_pages else {}
+        )
+        final_pages = kv_hit_pages
 
-        set_keys = []
-        set_indices = []
-        set_results = [-1] * len(key_strs)
-        for i in range(len(key_strs)):
-            if exist_result[i] != 1:
-                set_keys.append(key_strs[i])
-                set_indices.append(i)
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            pool_name = _pool_name_key(transfer.name)
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = self._batch_exists_for_pool(
+                    transfer.name, keys[:kv_hit_pages]
+                )
             else:
-                set_results[i] = 0
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = 0
+                for prefix_len in range(kv_hit_pages, 0, -1):
+                    trailing_keys = keys[max(0, prefix_len - trailing) : prefix_len]
+                    if self._batch_exists_for_pool(transfer.name, trailing_keys) == len(
+                        trailing_keys
+                    ):
+                        boundary = prefix_len
+                        break
+            hit_count[pool_name] = boundary
+            final_pages = min(final_pages, boundary)
 
-        if len(set_keys) > 0:
-            set_buffer_ptrs = [buffers[i].data_ptr() for i in set_indices]
-            set_buffer_sizes = [
-                buffers[i].numel() * buffers[i].element_size() for i in set_indices
-            ]
-            put_results = self._put_batch_zero_copy_impl(
-                set_keys, set_buffer_ptrs, set_buffer_sizes
+        return PoolTransferResult(
+            kv_hit_pages=final_pages,
+            extra_pool_hit_pages=hit_count,
+        )
+
+    def _transfer_meta_v2(self, transfer: PoolTransfer):
+        pool_name = _pool_name_key(transfer.name)
+        host_pool = self.registered_pools[pool_name]
+        host_indices = transfer.host_indices
+        keys = transfer.keys or []
+        if host_indices is None:
+            raise ValueError(f"host_indices is required for {pool_name}")
+
+        if pool_name == PoolName.KV.value:
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                self._apply_extra_backend_tag(keys), host_indices
             )
-            for i in range(len(set_indices)):
-                set_results[set_indices[i]] = put_results[i]
+            return host_pool, key_strs, buffer_ptrs, buffer_sizes, None
 
-        return [res == 0 for res in set_results]
+        if hasattr(host_pool, "get_page_buffer_meta"):
+            key_strs = self._get_pool_keys(transfer.name, keys)
+            buffer_ptrs, buffer_sizes = host_pool.get_page_buffer_meta(host_indices)
+            return host_pool, key_strs, buffer_ptrs, buffer_sizes, None
+
+        stage_pages = [
+            host_pool.get_data_page(
+                host_indices[i * host_pool.page_size].item(), flat=True
+            )
+            for i in range(len(keys))
+        ]
+        for page in stage_pages:
+            super().register_buffer(page)
+        key_strs = self._get_pool_keys(transfer.name, keys)
+        buffer_ptrs = [page.data_ptr() for page in stage_pages]
+        buffer_sizes = [page.numel() * page.element_size() for page in stage_pages]
+        return host_pool, key_strs, buffer_ptrs, buffer_sizes, stage_pages
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            pool_name = _pool_name_key(transfer.name)
+            host_pool, key_strs, buffer_ptrs, buffer_sizes, stage_pages = (
+                self._transfer_meta_v2(transfer)
+            )
+            get_results = self._get_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+            if pool_name == PoolName.KV.value:
+                results[pool_name] = self._batch_postprocess(
+                    get_results, is_set_operate=False
+                )
+                continue
+
+            pool_results = [res > 0 for res in get_results]
+            if stage_pages is not None:
+                for i, ok in enumerate(pool_results):
+                    if not ok:
+                        break
+                    host_pool.set_from_flat_data_page(
+                        transfer.host_indices[i * host_pool.page_size].item(),
+                        stage_pages[i],
+                    )
+            results[pool_name] = pool_results
+        return results
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            pool_name = _pool_name_key(transfer.name)
+            _host_pool, key_strs, buffer_ptrs, buffer_sizes, _stage_pages = (
+                self._transfer_meta_v2(transfer)
+            )
+            exist_result = self._batch_exist(key_strs)
+            set_keys = []
+            set_buffer_ptrs = []
+            set_buffer_sizes = []
+            set_indices = []
+            set_results = [-1] * len(key_strs)
+            for i in range(len(key_strs)):
+                if exist_result[i] != 1:
+                    set_keys.append(key_strs[i])
+                    set_buffer_ptrs.append(buffer_ptrs[i])
+                    set_buffer_sizes.append(buffer_sizes[i])
+                    set_indices.append(i)
+                else:
+                    set_results[i] = 0
+            if set_keys:
+                put_results = self._put_batch_zero_copy_impl(
+                    set_keys, set_buffer_ptrs, set_buffer_sizes
+                )
+                for i, idx in enumerate(set_indices):
+                    set_results[idx] = put_results[i]
+
+            if pool_name == PoolName.KV.value:
+                results[pool_name] = self._batch_postprocess(
+                    set_results, is_set_operate=True
+                )
+            else:
+                results[pool_name] = [res == 0 for res in set_results]
+        return results
 
     def set(
         self,
@@ -851,10 +975,7 @@ class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        keys = self._apply_extra_backend_tag(keys)
 
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
@@ -878,19 +999,6 @@ class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage, MooncakeBaseStore):
             if exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
-
-    def batch_exists_extra(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> int:
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
-        query_keys = self._get_extra_keys_for_nsa(keys)
-        exist_result = self._batch_exist(query_keys)
-        for i in range(len(query_keys)):
-            if exist_result[i] != 1:
-                return i
-        return len(query_keys)
 
     def close(self):
         return

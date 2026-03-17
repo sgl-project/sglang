@@ -155,8 +155,11 @@ if __name__ == "__main__":
             is_mla_model=False,
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            enable_storage_metrics=False,
             model_name=None,
-            is_page_first_layout=True,
+            layout="page_first",
         )
     )
     test_batch_operation(
@@ -164,8 +167,11 @@ if __name__ == "__main__":
             is_mla_model=True,
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            enable_storage_metrics=False,
             model_name=None,
-            is_page_first_layout=True,
+            layout="page_first",
         )
     )
     test_batch_operation(
@@ -173,8 +179,11 @@ if __name__ == "__main__":
             is_mla_model=False,
             tp_rank=1,
             tp_size=4,
+            pp_rank=0,
+            pp_size=1,
+            enable_storage_metrics=False,
             model_name=None,
-            is_page_first_layout=True,
+            layout="page_first",
         )
     )
     test_batch_operation(
@@ -182,8 +191,11 @@ if __name__ == "__main__":
             is_mla_model=True,
             tp_rank=3,
             tp_size=8,
+            pp_rank=0,
+            pp_size=1,
+            enable_storage_metrics=False,
             model_name=None,
-            is_page_first_layout=True,
+            layout="page_first",
         )
     )
     logger.info(f"✅ All tests passed")

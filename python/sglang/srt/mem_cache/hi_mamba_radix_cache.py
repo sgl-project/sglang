@@ -12,23 +12,31 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
-    DecLockRefResult,
     EvictParams,
     EvictResult,
-    IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.mamba_radix_cache import (
+    LRUList,
     MambaRadixCache,
     TreeNode,
     get_last_access_time,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
+    MambaPoolHost,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+    PoolEntry,
+)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     compute_node_hash_values,
@@ -42,6 +50,41 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class HostLRUList(LRUList):
+    def __init__(self):
+        super().__init__(mamba=True)
+        self.prv = "host_mamba_prev"
+        self.nxt = "host_mamba_next"
+        setattr(self.head, self.nxt, self.tail)
+        setattr(self.tail, self.prv, self.head)
+
+    def reset_node_mru(self, node):
+        assert node.id in self.cache, f"Resetting node {node.id=} not in host mamba lru"
+        assert (
+            node.mamba_host_value is not None
+        ), f"Resetting host mamba tombstone node in lru list: {node.id=}"
+        self._remove_node(node)
+        self._add_node(node)
+
+    def insert_mru(self, node):
+        assert (
+            node.mamba_host_value is not None
+        ), f"Inserting host mamba tombstone node in lru list: {node.id=}"
+        assert (
+            node.id not in self.cache
+        ), f"Inserting node {node.id=} already in host mamba lru list"
+        self.cache[node.id] = node
+        self._add_node(node)
+
+    def remove_node(self, node: TreeNode):
+        assert node.id in self.cache, f"Removing node {node.id=} not in host mamba lru"
+        assert (
+            node.mamba_host_value is not None
+        ), f"Removing host mamba tombstone node from lru list: {node.id=}"
+        del self.cache[node.id]
+        self._remove_node(node)
 
 
 class HiMambaRadixCache(MambaRadixCache):
@@ -65,19 +108,82 @@ class HiMambaRadixCache(MambaRadixCache):
             bind_to_closest_numa_node_cuda()
 
         self.page_size = params.page_size
-        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(self.hybrid_kv_cache, HybridLinearKVPool):
+            raise ValueError(
+                "HiMambaRadixCache requires HybridLinearKVPool for hybrid SSM models."
+            )
+        if not isinstance(params.req_to_token_pool, HybridReqToTokenPool):
+            raise ValueError(
+                "HiMambaRadixCache requires HybridReqToTokenPool for hybrid SSM models."
+            )
 
-        if isinstance(kvcache, HybridLinearKVPool):
-            kvcache = kvcache.full_kv_pool
-        self.kvcache = kvcache
+        self.hybrid_model_layer_ids: list[int] = []
+        full_layer_ids = sorted(
+            self.hybrid_kv_cache.full_attention_layer_id_mapping.keys()
+        )
+        mamba_layer_ids = sorted(params.req_to_token_pool.mamba_map.keys())
+        self.hybrid_model_layer_ids = sorted(set(full_layer_ids) | set(mamba_layer_ids))
+        self.transfer_layer_num = len(self.hybrid_model_layer_ids)
+        self.hybrid_kv_cache.set_model_layer_id_mapping(self.hybrid_model_layer_ids)
+        params.req_to_token_pool.set_model_layer_id_mapping(self.hybrid_model_layer_ids)
 
-        self.full_kv_pool_host = MHATokenToKVPoolHost(
+        self.kvcache = self.hybrid_kv_cache.full_kv_pool
+        kv_host_pool_cls = (
+            MLATokenToKVPoolHost
+            if self.hybrid_kv_cache.use_mla
+            else MHATokenToKVPoolHost
+        )
+        self.full_kv_pool_host = kv_host_pool_cls(
             self.kvcache,
             server_args.hicache_ratio,
             server_args.hicache_size,
             params.page_size,
             server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+        )
+        self.mamba_pool_host = MambaPoolHost(
+            params.req_to_token_pool.mamba_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+
+        full_layer_mapping = dict(self.hybrid_kv_cache.full_attention_layer_id_mapping)
+        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+
+        def kv_layer_mapper(model_layer_local_id: int) -> Optional[int]:
+            if not 0 <= model_layer_local_id < len(self.hybrid_model_layer_ids):
+                return None
+            return full_layer_mapping.get(
+                self.hybrid_model_layer_ids[model_layer_local_id]
+            )
+
+        def mamba_layer_mapper(model_layer_local_id: int) -> Optional[int]:
+            if not 0 <= model_layer_local_id < len(self.hybrid_model_layer_ids):
+                return None
+            return mamba_layer_mapping.get(
+                self.hybrid_model_layer_ids[model_layer_local_id]
+            )
+
+        self.host_pool_group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name="kv",
+                    host_pool=self.full_kv_pool_host,
+                    device_pool=self.kvcache,
+                    layer_mapper=kv_layer_mapper,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name="mamba",
+                    host_pool=self.mamba_pool_host,
+                    device_pool=params.req_to_token_pool.mamba_pool,
+                    layer_mapper=mamba_layer_mapper,
+                    host_evict_fn=self.evict_mamba_host,
+                    device_evict_fn=self.evict_mamba,
+                ),
+            ]
         )
 
         self.tp_group = params.tp_cache_group
@@ -104,9 +210,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
+        self.cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
-            self.full_kv_pool_host,
+            self.host_pool_group,
             params.page_size,
             self.tp_group,
             load_cache_event=self.load_cache_event,
@@ -118,6 +224,10 @@ class HiMambaRadixCache(MambaRadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            transfer_layer_num=self.transfer_layer_num,
+        )
+        params.req_to_token_pool.register_layer_transfer_counter(
+            self.cache_controller.layer_done_counter
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -145,6 +255,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.evictable_full_device_leaves: set[TreeNode] = set()
         self.evictable_full_host_leaves: set[TreeNode] = set()
+        self.mamba_host_lru_list = HostLRUList()
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -153,8 +264,10 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def reset(self) -> None:
         TreeNode.counter = 0
+        self._flush_pending_storage_backups_before_reset()
         self.cache_controller.reset()
         self.full_kv_pool_host.clear()
+        self.mamba_pool_host.clear()
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
@@ -162,33 +275,60 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
+        self.mamba_host_lru_list = HostLRUList()
+        logger.info(
+            "HiMambaRadixCache reset completed: host_kv_available=%s host_mamba_available=%s",
+            self.full_kv_pool_host.available_size(),
+            self.mamba_pool_host.available_size(),
+        )
         super().reset()
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # If mamba host slot already exists, refresh its LRU position.
+        if node.mamba_value is not None and node.mamba_host_value is not None:
+            if self.mamba_host_lru_list.in_list(node):
+                self.mamba_host_lru_list.reset_node_mru(node)
+
+        extra_pools = self.backup_transfers(node)
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
+            extra_pools=extra_pools,
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
+                extra_pools=extra_pools,
             )
         if host_indices is not None:
             node.host_value = host_indices
+            if extra_pools is not None:
+                self.backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+            if extra_pools is not None:
+                logger.info(
+                    "HiCache mamba offload prepared for node %s: kv_tokens=%s mamba_states=%s",
+                    node.id,
+                    len(node.host_value),
+                    (
+                        len(node.mamba_host_value)
+                        if node.mamba_host_value is not None
+                        else 0
+                    ),
+                )
         else:
             return 0
 
         return len(host_indices)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
         """Load full KV back from host."""
         last_hit_node = node
@@ -201,33 +341,51 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             ancestor_node = node
 
-        result = self.inc_lock_ref(ancestor_node)
-        delta = result.delta
+        mamba_restore_nodes = []
+        if last_hit_node.mamba_backuped and last_hit_node.mamba_evicted:
+            mamba_restore_nodes.append(last_hit_node)
 
-        full_host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if (len(full_host_indices) < self.load_back_threshold) or (
-            len(full_host_indices) > mem_quota + delta
-            if mem_quota is not None
-            else False
+        delta = self.inc_lock_ref(ancestor_node)
+
+        if nodes_to_load:
+            full_host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        else:
+            full_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+
+        if len(full_host_indices) > 0 and (
+            (len(full_host_indices) < self.load_back_threshold)
+            or (
+                len(full_host_indices) > mem_quota + delta
+                if mem_quota is not None
+                else False
+            )
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancestor_node)
             return None
 
+        mamba_pools = self.restore_transfers(last_hit_node, mamba_restore_nodes, req)
         full_device_indices = self.cache_controller.load(
             host_indices=full_host_indices,
             node_id=last_hit_node.id,
+            extra_pools=mamba_pools,
         )
         if full_device_indices is None:
             self.evict(EvictParams(num_tokens=len(full_host_indices)))
+            mamba_pools = self.restore_transfers(
+                last_hit_node, mamba_restore_nodes, req
+            )
             full_device_indices = self.cache_controller.load(
                 host_indices=full_host_indices,
                 node_id=last_hit_node.id,
+                extra_pools=mamba_pools,
             )
         self.dec_lock_ref(ancestor_node)
         if full_device_indices is None:
             # no sufficient GPU memory to load back KV caches
             return None
+
+        self.restore_commit(mamba_restore_nodes, mamba_pools)
 
         offset = 0
         for n in nodes_to_load:
@@ -237,15 +395,14 @@ class HiMambaRadixCache(MambaRadixCache):
 
             self.full_lru_list.insert_mru(n)
             self.full_evictable_size_ += n_len
-
-            if n.mamba_value is not None:
-                if self.mamba_lru_list.in_list(n):
-                    self.mamba_lru_list.reset_node_mru(n)
-                else:
-                    self.mamba_lru_list.insert_mru(n)
-                    self.mamba_evictable_size_ += len(n.mamba_value)
-
             self._update_leaf_status(n)
+
+        for n in mamba_restore_nodes:
+            if self.mamba_lru_list.in_list(n):
+                self.mamba_lru_list.reset_node_mru(n)
+            else:
+                self.mamba_lru_list.insert_mru(n)
+                self.mamba_evictable_size_ += len(n.mamba_value)
 
         self._update_leaf_status(ancestor_node)
 
@@ -259,16 +416,25 @@ class HiMambaRadixCache(MambaRadixCache):
         last_node: TreeNode,
         host_hit_length: int,
         mem_quota: Optional[int] = None,
+        req=None,
     ):
-        if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+        if last_node.evicted or (
+            last_node.mamba_value is None and last_node.mamba_host_value is not None
+        ):
+            loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
                 return loading_values, last_node
 
-            while last_node.evicted:
+            while last_node is not self.root_node and (
+                last_node.evicted
+                or (
+                    last_node.mamba_value is None
+                    and last_node.mamba_host_value is not None
+                )
+            ):
                 last_node = last_node.parent
 
         return (
@@ -343,9 +509,6 @@ class HiMambaRadixCache(MambaRadixCache):
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
 
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
-
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
@@ -399,28 +562,119 @@ class HiMambaRadixCache(MambaRadixCache):
                 return
         self.evictable_full_host_leaves.add(node)
 
-    def _evict_to_host(self, node: TreeNode) -> int:
-        """Evict full KV to host. Mamba stays on device. Returns num evicted."""
-        num_full = len(node.value)
+    def _free_gpu_mamba(self, node: TreeNode) -> int:
+        """Free GPU mamba on a node. Returns num mamba tokens freed."""
+        if node.mamba_value is None:
+            return 0
+        mamba_num = len(node.mamba_value)
+        self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+        if node.mamba_lock_ref > 0:
+            self.mamba_protected_size_ -= mamba_num
+            node.mamba_lock_ref = 0
+        else:
+            self.mamba_evictable_size_ -= mamba_num
+        if self.mamba_lru_list.in_list(node):
+            self.mamba_lru_list.remove_node(node)
+        node.mamba_value = None
+        return mamba_num
 
-        if not node.backuped:
-            if self.cache_controller.write_policy == "write_back":
-                self.write_backup(node, write_back=True)
-                self.writing_check(write_back=True)
+    def _evict_to_host(self, node: TreeNode) -> Tuple[int, int]:
+        """Evict a backuped device node to host: free GPU KV + GPU mamba.
+
+        Node stays in the tree as evicted+backuped.
+        Caller must ensure node.backuped is True before calling.
+        Returns (full_num_evicted, mamba_num_evicted).
+        """
+        assert not node.evicted, f"_evict_to_host on already-evicted node, {node.id=}"
+        assert node.backuped, f"_evict_to_host on non-backuped node, {node.id=}"
+
+        num_full = len(node.value)
 
         self.cache_controller.evict_device(node.value)
         self.full_evictable_size_ -= num_full
         if self.full_lru_list.in_list(node):
             self.full_lru_list.remove_node(node)
 
+        mamba_num = self._free_gpu_mamba(node)
+
         node.value = None
         self._update_leaf_status(node)
         self._update_full_device_leaf_status(node.parent)
-        return num_full
+        return num_full, mamba_num
+
+    def _evict_regular_leaf(self, node: TreeNode) -> Tuple[int, int]:
+        """Evict a non-backuped device leaf: free GPU KV + mamba, delete from tree.
+
+        Used in write_through when a node was never backed up.
+        Returns (full_num_evicted, mamba_num_evicted).
+        """
+        assert not node.evicted, f"_evict_regular on already-evicted node, {node.id=}"
+        assert not node.backuped, f"_evict_regular on backuped node, {node.id=}"
+        assert len(node.children) == 0, f"_evict_regular on non-leaf, {node.id=}"
+
+        num_full = len(node.value)
+
+        self.cache_controller.evict_device(node.value)
+        self.full_evictable_size_ -= num_full
+        if self.full_lru_list.in_list(node):
+            self.full_lru_list.remove_node(node)
+
+        mamba_num = self._free_gpu_mamba(node)
+
+        if node.mamba_host_value is not None:
+            if self.mamba_host_lru_list.in_list(node):
+                self.mamba_host_lru_list.remove_node(node)
+            self.mamba_pool_host.free(node.mamba_host_value)
+            node.mamba_host_value = None
+
+        node.value = None
+        self._discard_from_leaf_sets(node)
+
+        parent = node.parent
+        key = self.get_child_key_fn(node.key)
+        v = parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
+        self._update_leaf_status(parent)
+        self._iteratively_delete_tombstone_leaf(node)
+        return num_full, mamba_num
+
+    def _evict_host_leaf_node(self, x: TreeNode) -> int:
+        """Evict a host-resident leaf: free host KV + host mamba, delete from tree, cascade.
+
+        Returns num host KV tokens evicted.
+        """
+        assert x.evicted, f"host leaf not evicted, {x.id=}"
+        assert x.backuped, f"host leaf not backuped, {x.id=}"
+        assert x.mamba_value is None, f"host leaf has GPU mamba, {x.id=}"
+        assert (
+            x.host_ref_counter == 0
+        ), f"host leaf in use, {x.id=} {x.host_ref_counter=}"
+
+        full_num_evicted = self.cache_controller.evict_host(x.host_value)
+        x.host_value = None
+
+        if x.mamba_host_value is not None:
+            if self.mamba_host_lru_list.in_list(x):
+                self.mamba_host_lru_list.remove_node(x)
+            self.mamba_pool_host.free(x.mamba_host_value)
+            x.mamba_host_value = None
+
+        self._discard_from_leaf_sets(x)
+        parent = x.parent
+        key = self.get_child_key_fn(x.key)
+        v = parent.children.pop(key, None)
+        assert v == x, f"parent does not have child key, {key}"
+
+        self._update_leaf_status(parent)
+        self._iteratively_delete_tombstone_leaf(x)
+
+        return full_num_evicted
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         """Remove a tombstone leaf from the tree and free HiCache resources."""
         assert node.mamba_value is None, f"node has mamba value, {node.id=}"
+        assert node.mamba_host_value is None, f"node has mamba host value, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         parent = node.parent
         key = self.get_child_key_fn(node.key)
@@ -449,6 +703,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 break
             if node.parent.mamba_value is not None:
                 break
+            if node.parent.mamba_host_value is not None:
+                break
             if node.parent.full_lock_ref > 0 or node.parent.mamba_lock_ref > 0:
                 break
 
@@ -466,6 +722,22 @@ class HiMambaRadixCache(MambaRadixCache):
             node = parent
 
         return node, full_num_evicted, mamba_num_evicted
+
+    def _evict_device_leaf(self, x: TreeNode) -> Tuple[int, int]:
+        """Evict a device leaf node, choosing the right strategy:
+
+        - backuped: demote to host via _evict_to_host (node stays in tree)
+        - not backuped + write_back: write_backup first, then demote
+        - not backuped + write_through: _evict_regular_leaf (delete from tree)
+        """
+        if not x.backuped:
+            if self.cache_controller.write_policy == "write_back":
+                self.write_backup(x, write_back=True)
+                self.writing_check(write_back=True)
+                return self._evict_to_host(x)
+            else:
+                return self._evict_regular_leaf(x)
+        return self._evict_to_host(x)
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -485,15 +757,16 @@ class HiMambaRadixCache(MambaRadixCache):
                 if x not in self.evictable_full_device_leaves:
                     continue
 
-                evicted_full = self._evict_to_host(x)
+                evicted_full, evicted_mamba = self._evict_device_leaf(x)
                 full_num_evicted += evicted_full
+                mamba_num_evicted += evicted_mamba
 
                 parent = x.parent
                 if parent in self.evictable_full_device_leaves:
                     heapq.heappush(eviction_heap, (parent.last_access_time, parent))
 
         if params.mamba_num > 0:
-            mamba_num_evicted = self.evict_mamba(params.mamba_num)
+            mamba_num_evicted += self.evict_mamba(params.mamba_num)
 
         return EvictResult(
             num_tokens_evicted=full_num_evicted,
@@ -501,27 +774,7 @@ class HiMambaRadixCache(MambaRadixCache):
         )
 
     def evict_host(self, num_tokens: int):
-        if self.enable_storage:
-            host_leaves = list(self.evictable_full_host_leaves)
-            heap = [(n.last_access_time, n) for n in host_leaves]
-            heapq.heapify(heap)
-
-            num_evicted = 0
-            while num_evicted < num_tokens and heap:
-                _, x = heapq.heappop(heap)
-                if x not in self.evictable_full_host_leaves:
-                    continue
-
-                num_evicted += self.cache_controller.evict_host(x.host_value)
-                x.host_value = None
-
-                self.evictable_full_host_leaves.discard(x)
-                self._update_full_host_leaf_status(x.parent)
-                if x.parent in self.evictable_full_host_leaves:
-                    heapq.heappush(heap, (x.parent.last_access_time, x.parent))
-            return
-
-        # Non-L3 path: evict host leaves and clean up tree
+        """Evict host-resident leaf nodes: free host KV + mamba, delete from tree, cascade."""
         heap = [(n.last_access_time, n) for n in self.evictable_full_host_leaves]
         heapq.heapify(heap)
 
@@ -531,28 +784,50 @@ class HiMambaRadixCache(MambaRadixCache):
             if x not in self.evictable_full_host_leaves:
                 continue
 
-            num_evicted += self.cache_controller.evict_host(x.host_value)
-            x.host_value = None
+            num_evicted += self._evict_host_leaf_node(x)
 
-            if x.mamba_value is not None:
-                if self.mamba_lru_list.in_list(x):
-                    self.mamba_lru_list.remove_node(x)
-                    self.mamba_evictable_size_ -= len(x.mamba_value)
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-                x.mamba_value = None
+            if x.parent in self.evictable_full_host_leaves:
+                heapq.heappush(heap, (x.parent.last_access_time, x.parent))
 
-            self.evictable_full_host_leaves.discard(x)
+    def evict_mamba_host(self, num_mamba_hosts: int) -> int:
+        """Evict host mamba states.
 
-            parent = x.parent
-            child_key = self.get_child_key_fn(x.key)
-            v = parent.children.pop(child_key, None)
-            assert v == x, f"parent does not have child key, {x.id=}"
+        Internal host node: free host mamba only (tombstone).
+        Host leaf node: same as Full host evict — _evict_host_leaf_node frees
+                        host KV + mamba, deletes from tree, cascades.
+        """
+        if self.disable or num_mamba_hosts <= 0:
+            return 0
 
-            self._update_leaf_status(parent)
-            if parent in self.evictable_full_host_leaves:
-                heapq.heappush(heap, (parent.last_access_time, parent))
+        x = self.mamba_host_lru_list.get_lru_no_lock()
+        num_evicted = 0
+        while num_evicted < num_mamba_hosts and self.mamba_host_lru_list.in_list(x):
+            x_next = self.mamba_host_lru_list.get_prev_no_lock(x)
+            if x.host_ref_counter > 0:
+                x = x_next
+                continue
+
+            if x in self.evictable_full_host_leaves:
+                # Host leaf: evict host KV + mamba, delete from tree
+                self._evict_host_leaf_node(x)
+                num_evicted += 1
+            else:
+                # Internal host node: free host mamba only (tombstone)
+                self.mamba_host_lru_list.remove_node(x)
+                self.mamba_pool_host.free(x.mamba_host_value)
+                x.mamba_host_value = None
+                num_evicted += 1
+
+            x = x_next
+        return num_evicted
 
     def evict_mamba(self, mamba_num: int) -> int:
+        """Evict mamba states.
+
+        Internal node: tombstone — free GPU mamba only, KV stays on GPU.
+        Leaf node: same as Full evict — _evict_to_host moves KV+mamba to host,
+                   node stays in tree, then cascade tombstone parent device leaves.
+        """
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -562,64 +837,25 @@ class HiMambaRadixCache(MambaRadixCache):
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use, {x.id=}"
+            assert (
+                not x.evicted
+            ), f"evicted node should not be in mamba_lru_list, {x.id=}"
 
-            if x.evicted:
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-                mamba_num_evicted += len(x.mamba_value)
+            if len(x.children) > 0:
+                # Internal: free GPU mamba only, KV stays on GPU (tombstone)
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
-                self.mamba_lru_list.remove_node(x)
-                self.mamba_evictable_size_ -= len(x.mamba_value)
-                x.mamba_value = None
-
-                if len(x.children) == 0:
-                    self._delete_tombstone_leaf(x)
-                    _, _, cascade_mamba = self._iteratively_delete_tombstone_leaf(x)
-                    mamba_num_evicted += cascade_mamba
-            elif len(x.children) > 0:
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
-                x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 self.mamba_lru_list.remove_node(x)
                 self._tombstone_internal_node(x)
             else:
+                # Leaf: evict KV + mamba atomically
                 assert (
                     x.full_lock_ref == 0
                 ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=}"
 
-                if not x.backuped:
-                    if self.cache_controller.write_policy == "write_back":
-                        self.write_backup(x, write_back=True)
-                        self.writing_check(write_back=True)
-
-                self.cache_controller.evict_device(x.value)
-                self.full_evictable_size_ -= len(x.value)
-
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-                mamba_num_evicted += len(x.mamba_value)
-
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
-                if self.full_lru_list.in_list(x):
-                    self.full_lru_list.remove_node(x)
-                self.mamba_lru_list.remove_node(x)
-                self.mamba_evictable_size_ -= len(x.mamba_value)
-
-                if x.backuped:
-                    self.cache_controller.evict_host(x.host_value)
-                    x.host_value = None
-
-                x.value = None
-                x.mamba_value = None
-
-                self._discard_from_leaf_sets(x)
-
-                parent = x.parent
-                child_key = self.get_child_key_fn(x.key)
-                v = parent.children.pop(child_key, None)
-                assert v == x, f"parent does not have child key, {x.id=}"
-
-                self._update_leaf_status(parent)
-                _, _, cascade_mamba = self._iteratively_delete_tombstone_leaf(x)
-                mamba_num_evicted += cascade_mamba
+                _, mamba_evicted = self._evict_device_leaf(x)
+                mamba_num_evicted += mamba_evicted
 
                 if not self.mamba_lru_list.in_list(x_next):
                     x_next = self.mamba_lru_list.get_lru_no_lock()
@@ -630,6 +866,11 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _unevict_node(self, node: TreeNode, fresh_value: torch.Tensor):
         """Restore an evicted node with fresh device KV from the request."""
+        assert node.evicted, f"_unevict_node on non-evicted node, {node.id=}"
+        # invariant: evicted => no GPU mamba
+        assert (
+            node.mamba_value is None
+        ), f"evicted node should not have GPU mamba, {node.id=}"
         n = len(fresh_value)
 
         node.value = fresh_value.clone()
@@ -654,7 +895,6 @@ class HiMambaRadixCache(MambaRadixCache):
         value,
         mamba_value,
         chunked: bool = False,
-        prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
@@ -685,11 +925,12 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = new_node
 
             if node.evicted:
+                # Unevicted nodes take ownership of the request's KV pages.
+                # Do NOT count them in total_prefix_length, otherwise
+                # cache_finished_req / cache_unfinished_req will free those
+                # pages even though the tree now references them.
                 self._unevict_node(node, value[:prefix_len])
             else:
-                if prev_prefix_len < total_prefix_length + prefix_len:
-                    start = max(0, prev_prefix_len - total_prefix_length)
-                    self.token_to_kv_pool_allocator.free(value[start:prefix_len])
                 total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 
@@ -783,7 +1024,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if child.evicted and not child.backuped:
                 break
 
-            if node.mamba_value is not None:
+            if node.mamba_value is not None or node.mamba_backuped:
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -802,11 +1043,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        if node.mamba_value is not None:
+        if node.mamba_value is not None or node.mamba_backuped:
             best_value_len = len(value)
             best_last_node = node
 
-        deepest_node = node
+        deepest_node = best_last_node
         return value, best_last_node, best_value_len, deepest_node
 
     def _match_post_processor(
@@ -849,33 +1090,26 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             mamba_branching_seqlen = None
 
-        # last_device_node & host_hit_length: from best_last_node (mamba boundary)
         host_hit_length = 0
         last_device_node = best_last_node
-        while last_device_node.evicted:
+        while last_device_node is not self.root_node and last_device_node.evicted:
             host_hit_length += len(last_device_node.host_value)
             last_device_node = last_device_node.parent
 
         last_host_node = best_last_node
-
-        # last_host_backup_node: from deepest_node, find backuped ancestor
-        last_host_backup_node = deepest_node
-        while (
-            last_host_backup_node is not self.root_node
-            and not last_host_backup_node.backuped
-        ):
-            last_host_backup_node = last_host_backup_node.parent
+        while last_host_node is not self.root_node and not last_host_node.backuped:
+            last_host_node = last_host_node.parent
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                if dst_index is None:
-                    self.inc_lock_ref(mamba_node)
-                    self.evict_mamba(1)
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(mamba_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
+                dst_index = self._alloc_with_evict(
+                    self.req_to_token_pool.mamba_pool,
+                    1,
+                    self.evict_mamba,
+                    lock_node=mamba_node,
+                    error_message="Can not alloc mamba cache",
+                )
                 src_index = mamba_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
@@ -894,7 +1128,7 @@ class HiMambaRadixCache(MambaRadixCache):
             device_indices=value,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
-            last_host_backup_node=last_host_backup_node,
+            last_host_backup_node=last_host_node,
             host_hit_length=host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
@@ -995,9 +1229,9 @@ class HiMambaRadixCache(MambaRadixCache):
             return
         super().sanity_check()
 
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+    def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         if self.disable:
-            return IncLockRefResult(delta=0)
+            return 0
 
         delta = 0
         if node.mamba_value is not None:
@@ -1021,13 +1255,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.evictable_full_device_leaves.discard(node)
             node.full_lock_ref += 1
             node = node.parent
-        return IncLockRefResult(delta=delta)
+        return delta
 
-    def dec_lock_ref(
-        self, node: TreeNode, params: Optional[DecLockRefParams] = None
-    ) -> DecLockRefResult:
+    def dec_lock_ref(self, node: TreeNode):
         if self.disable:
-            return DecLockRefResult(delta=0)
+            return 0
 
         delta = 0
 
@@ -1053,7 +1285,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.full_lock_ref == 0:
                 self._update_full_device_leaf_status(node)
             node = node.parent
-        return DecLockRefResult(delta=delta)
+        return delta
 
     # ---- L3 Support ----
 
@@ -1183,6 +1415,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 prefetch_threshold=prefetch_threshold,
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
+                host_pools=self.host_pool_group.entries,
             )
         except Exception as e:
             logger.exception(
@@ -1219,6 +1452,14 @@ class HiMambaRadixCache(MambaRadixCache):
             self.storage_metrics_collector = None
         return True, "Detached HiCache storage backend successfully."
 
+    def prefetch_abort(self, pool_transfers: Optional[list[PoolTransfer]]) -> None:
+        """Free any allocated mamba host slots on prefetch abort/revoke."""
+        for transfer in pool_transfers or []:
+            if transfer.name == "mamba":
+                if transfer.host_indices is not None:
+                    self.mamba_pool_host.free(transfer.host_indices)
+                break
+
     def _force_release_pending_storage_ops(self):
         cc = self.cache_controller
 
@@ -1235,6 +1476,12 @@ class HiMambaRadixCache(MambaRadixCache):
                 except Exception:
                     logger.exception(
                         "Failed to free host indices for prefetch %s", req_id
+                    )
+                try:
+                    self.prefetch_abort(getattr(_operation, "pool_transfers", None))
+                except Exception:
+                    logger.exception(
+                        "Failed to release mamba host indices for prefetch %s", req_id
                     )
                 try:
                     self._release_host_node(last_host_node)
@@ -1295,7 +1542,8 @@ class HiMambaRadixCache(MambaRadixCache):
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
-                    last_host_node, token_ids, _, _ = info
+                    last_host_node, token_ids, _, operation = info
+                    self.prefetch_abort(operation.pool_transfers)
                     self._release_host_node(last_host_node)
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
@@ -1498,12 +1746,13 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
-
+        extra_pools = self.archive_transfers(node)
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
             node.hash_value,
             prefix_keys,
+            extra_pools=extra_pools,
         )
         self.ongoing_backup[operation_id] = node
         self._protect_host_node(node)
@@ -1528,15 +1777,36 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         self._protect_host_node(last_host_node)
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        host_indices = self._alloc_with_evict(
+            self.cache_controller.mem_pool_host,
+            prefetch_length,
+            self.evict_host,
+        )
         if host_indices is None:
             self._release_host_node(last_host_node)
             return
+        extra_pools = None
+        prepared = self.prefetch_prepare(new_input_tokens, last_hash)
+        if prefetch_length > 0 and prepared is None:
+            self.cache_controller.mem_pool_host.free(host_indices)
+            self._release_host_node(last_host_node)
+            return
+        if prepared is not None:
+            _, extra_pools = prepared
+        if extra_pools is not None:
+            logger.info(
+                "HiCache mamba prefetch scheduled for request %s: kv_hit_pages=%s mamba_states=%s",
+                req_id,
+                prefetch_length // self.page_size,
+                1,
+            )
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -1577,6 +1847,11 @@ class HiMambaRadixCache(MambaRadixCache):
             min_completed_tokens = completed_tokens_tensor.item()
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        mamba_host_indices = None
+        for transfer in operation.pool_transfers or []:
+            if transfer.name == "mamba":
+                mamba_host_indices = transfer.host_indices
+                break
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
@@ -1585,9 +1860,17 @@ class HiMambaRadixCache(MambaRadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            mamba_host_indices,
+            operation.pool_storage_result,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        mamba_loaded = self.prefetch_commit(
+            operation.pool_transfers,
+            matched_length,
+            min_completed_tokens,
+            operation.pool_storage_result,
+        )
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
@@ -1600,11 +1883,24 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        if loaded_from_storage > 0 and operation.pool_transfers:
+            logger.info(
+                "HiCache mamba prefetch completed for request %s: prefetched_tokens=%s mamba_states=%s",
+                req_id,
+                loaded_from_storage,
+                int(mamba_loaded),
+            )
 
         return True
 
     def _insert_helper_host(
-        self, node: TreeNode, key: RadixKey, host_value, hash_value
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        host_value,
+        hash_value,
+        mamba_host_value: Optional[torch.Tensor] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ):
         node.last_access_time = get_last_access_time()
         if len(key) == 0:
@@ -1614,6 +1910,10 @@ class HiMambaRadixCache(MambaRadixCache):
 
         matched_length = 0
         host_value_inserted = False
+        final_mamba_node: Optional[TreeNode] = None
+        has_mamba = pool_storage_result is None or (
+            pool_storage_result.extra_pool_hit_pages.get("mamba", 0) >= 1
+        )
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1624,6 +1924,8 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.evicted and not node.backuped:
                 node.host_value = host_value[:prefix_len].clone()
                 host_value_inserted = True
+                if prefix_len == len(key):
+                    final_mamba_node = node
                 self._update_full_host_leaf_status(node)
                 if node.parent is not None:
                     self._update_full_host_leaf_status(node.parent)
@@ -1654,8 +1956,13 @@ class HiMambaRadixCache(MambaRadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            final_mamba_node = new_node
             self._update_full_host_leaf_status(new_node)
             self._update_full_host_leaf_status(node)
+        if final_mamba_node is not None and mamba_host_value is not None and has_mamba:
+            final_mamba_node.mamba_host_value = mamba_host_value.clone()
+            if not self.mamba_host_lru_list.in_list(final_mamba_node):
+                self.mamba_host_lru_list.insert_mru(final_mamba_node)
         return matched_length
 
     def release_aborted_request(self, rid: str):
@@ -1674,4 +1981,215 @@ class HiMambaRadixCache(MambaRadixCache):
         self._release_host_node(last_host_node)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
+        self.prefetch_abort(operation.pool_transfers)
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+    def _flush_pending_storage_backups_before_reset(self) -> None:
+        if not self.enable_storage:
+            return
+
+        self.writing_check(write_back=True)
+        deadline = time.monotonic() + 30.0
+        last_log_time = 0.0
+        while time.monotonic() < deadline:
+            self.drain_storage_control_queues()
+            backup_qsize = self.cache_controller.backup_queue.qsize()
+            ack_backup_qsize = self.cache_controller.ack_backup_queue.qsize()
+            ongoing_backup = len(self.ongoing_backup)
+            ongoing_write = len(self.ongoing_write_through)
+            if (
+                backup_qsize == 0
+                and ack_backup_qsize == 0
+                and ongoing_backup == 0
+                and ongoing_write == 0
+            ):
+                return
+            time.sleep(0.05)
+
+        logger.warning(
+            "Timed out waiting for HiCache storage backups to drain before reset: "
+            "ongoing_write=%s ongoing_backup=%s backup_queue=%s ack_backup_queue=%s",
+            len(self.ongoing_write_through),
+            len(self.ongoing_backup),
+            self.cache_controller.backup_queue.qsize(),
+            self.cache_controller.ack_backup_queue.qsize(),
+        )
+
+    def _alloc_with_evict(
+        self,
+        pool,
+        size: int,
+        evict_fn,
+        lock_node: Optional[TreeNode] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[torch.Tensor]:
+        indices = pool.alloc(size)
+        if indices is None:
+            if lock_node is not None:
+                self.inc_lock_ref(lock_node)
+            evict_fn(size)
+            indices = pool.alloc(size)
+            if lock_node is not None:
+                self.dec_lock_ref(lock_node)
+        if indices is None and error_message is not None:
+            raise RuntimeError(error_message)
+        return indices
+
+    def _last_page_index(self, token_count: int) -> Optional[int]:
+        if token_count <= 0:
+            return None
+        return token_count // self.page_size - 1
+
+    def backup_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
+        """PoolTransfers for D→H backup: mamba device → mamba host."""
+        if node.mamba_value is None:
+            return None
+        return [
+            PoolTransfer(
+                name="mamba",
+                host_indices=node.mamba_host_value,
+                device_indices=node.mamba_value,
+            )
+        ]
+
+    def backup_commit(self, node: TreeNode, transfers: list[PoolTransfer]) -> None:
+        """After D→H backup succeeds: store auto-allocated mamba host indices into node."""
+        if not transfers:
+            return
+        mamba_host = transfers[0].host_indices
+        if node.mamba_host_value is None and mamba_host is not None:
+            node.mamba_host_value = mamba_host
+            self.mamba_host_lru_list.insert_mru(node)
+
+    def archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
+        """PoolTransfers for H→Storage archive (write_backup_storage)."""
+        mamba_host_value = getattr(node, "mamba_host_value", None)
+        if mamba_host_value is None or not node.hash_value:
+            return None
+        return [
+            PoolTransfer(
+                name="mamba",
+                host_indices=mamba_host_value,
+                keys=[node.hash_value[-1]],
+                hit_policy="trailing_pages",
+            )
+        ]
+
+    def prefetch_prepare(
+        self,
+        token_ids: List[int],
+        last_hash: Optional[str],
+    ) -> Optional[tuple[torch.Tensor, list[PoolTransfer]]]:
+        """Alloc mamba host slot and build PoolTransfers for Storage→H prefetch.
+
+        Returns (host_handle, transfers) so the caller can track the allocation,
+        or None if allocation fails (caller should cancel the prefetch).
+        """
+        if not token_ids:
+            return None
+        mamba_host_index = self._alloc_with_evict(
+            self.mamba_pool_host, 1, self.evict_mamba_host
+        )
+        if mamba_host_index is None:
+            return None
+        last_page_hash = last_hash
+        for start in range(0, len(token_ids), self.page_size):
+            last_page_hash = self.cache_controller.get_hash_str(
+                token_ids[start : start + self.page_size], last_page_hash
+            )
+        transfers = [
+            PoolTransfer(
+                name="mamba",
+                host_indices=mamba_host_index,
+                keys=[last_page_hash],
+                hit_policy="trailing_pages",
+            )
+        ]
+        return mamba_host_index, transfers
+
+    def restore_transfers(
+        self,
+        last_hit_node: TreeNode,
+        nodes_to_restore: list[TreeNode],
+        req,
+    ) -> Optional[list[PoolTransfer]]:
+        """PoolTransfers for H→D restore (load_back)."""
+        mamba_host_list: list[torch.Tensor] = []
+        for node in nodes_to_restore:
+            if not node.mamba_backuped:
+                continue
+            mamba_host_list.append(node.mamba_host_value)
+
+        transfers: list[PoolTransfer] = []
+        # Transfer from host to node's device mamba space
+        if mamba_host_list:
+            transfers.append(
+                PoolTransfer(
+                    name="mamba",
+                    host_indices=torch.cat(mamba_host_list),
+                    device_indices=None,  # will be allocated by cache_controller
+                )
+            )
+
+        # Transfer from host to request's device mamba space
+        if (
+            req is not None
+            and last_hit_node in nodes_to_restore
+            and last_hit_node.mamba_host_value is not None
+        ):
+            if req.mamba_pool_idx is None:
+                req.mamba_pool_idx = self._alloc_with_evict(
+                    self.req_to_token_pool.mamba_pool,
+                    len(last_hit_node.mamba_host_value),
+                    self.evict_mamba,
+                    lock_node=last_hit_node,
+                    error_message="Can not alloc request mamba cache for host load back",
+                )[0]
+            transfers.append(
+                PoolTransfer(
+                    name="mamba",
+                    host_indices=last_hit_node.mamba_host_value,
+                    device_indices=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        return transfers if transfers else None
+
+    def restore_commit(
+        self,
+        extra_nodes: list[TreeNode],
+        transfers: Optional[list[PoolTransfer]],
+    ) -> None:
+        """After H→D restore succeeds: write back controller-allocated mamba device indices."""
+        if not extra_nodes or not transfers or transfers[0].device_indices is None:
+            return
+        mamba_device = transfers[0].device_indices
+        offset = 0
+        for n in extra_nodes:
+            n_len = len(n.mamba_host_value)
+            n.mamba_value = mamba_device[offset : offset + n_len].clone()
+            offset += n_len
+
+    def prefetch_commit(
+        self,
+        pool_transfers: Optional[list[PoolTransfer]],
+        matched_length: int,
+        min_completed_tokens: int,
+        result: PoolTransferResult,
+    ) -> bool:
+        """After Storage→H prefetch completes: free mamba host slot if not inserted into tree.
+
+        Returns True if a mamba state was successfully loaded into the radix tree.
+        """
+        mamba_host_indices = None
+        for transfer in pool_transfers or []:
+            if transfer.name == "mamba":
+                mamba_host_indices = transfer.host_indices
+                break
+        if mamba_host_indices is None:
+            return False
+        # mamba covers the entire prefix as a single page; loaded means >= 1 page hit.
+        mamba_loaded = result.extra_pool_hit_pages.get("mamba", 0) >= 1
+        if matched_length == min_completed_tokens or not mamba_loaded:
+            self.mamba_pool_host.free(mamba_host_indices)
+        return mamba_loaded

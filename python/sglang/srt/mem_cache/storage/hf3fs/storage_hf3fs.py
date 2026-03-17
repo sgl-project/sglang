@@ -168,7 +168,7 @@ class HiCacheHF3FS(HiCacheStorage):
         dtype: torch.dtype,
         metadata_client: Hf3fsMetadataInterface,
         is_mla_model: bool = False,
-        is_page_first_layout: bool = False,
+        layout: str = "layer_first",
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
     ):
@@ -183,7 +183,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.dtype = dtype
         self.metadata_client = metadata_client
         self.is_mla_model = is_mla_model
-        self.is_page_first_layout = is_page_first_layout
+        self.layout = layout
         self.enable_storage_metrics = enable_storage_metrics
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
@@ -254,10 +254,10 @@ class HiCacheHF3FS(HiCacheStorage):
 
         use_mock_client = False
         if storage_config is not None:
-            rank, is_mla_model, is_page_first_layout = (
+            rank, is_mla_model, layout = (
                 storage_config.tp_rank,
                 storage_config.is_mla_model,
-                storage_config.is_page_first_layout,
+                storage_config.layout,
             )
 
             if storage_config.extra_config is not None:
@@ -265,10 +265,10 @@ class HiCacheHF3FS(HiCacheStorage):
                     "use_mock_hf3fs_client", False
                 )
         else:
-            rank, is_mla_model, is_page_first_layout = (
+            rank, is_mla_model, layout = (
                 0,
                 False,
-                False,
+                "layer_first",
             )
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
@@ -288,7 +288,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 client_timeout=5,
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
-                is_page_first_layout=is_page_first_layout,
+                layout=layout,
                 use_mock_client=use_mock_client,
             )
 
@@ -339,7 +339,7 @@ class HiCacheHF3FS(HiCacheStorage):
             dtype=dtype,
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
-            is_page_first_layout=is_page_first_layout,
+            layout=layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
         )
