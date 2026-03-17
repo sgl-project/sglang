@@ -42,7 +42,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 
 import numpy as np
-import orjson
 import requests
 import uvicorn
 import uvloop
@@ -173,6 +172,11 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.json_response import (
+    SGLangORJSONResponse,
+    dumps_json,
+    orjson_response,
+)
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -666,7 +670,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
-@app.api_route("/generate", methods=["POST", "PUT"])
+@app.api_route(
+    "/generate",
+    methods=["POST", "PUT"],
+    response_class=SGLangORJSONResponse,
+)
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -676,15 +684,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                    ) + b"\n\n"
+                    yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                ) + b"\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -697,12 +701,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return Response(
-                content=orjson.dumps(
-                    ret, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                ),
-                media_type="application/json",
-            )
+            return orjson_response(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
@@ -1617,12 +1616,22 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
 
 ##### Ollama-compatible API endpoints #####
 
+_ollama_root_route = os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE")
+if _ollama_root_route is not None:
 
-@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-async def ollama_root():
-    """Ollama-compatible root endpoint for health check."""
-    return "Ollama is running"
+    @app.get(_ollama_root_route)
+    @app.head(_ollama_root_route)
+    async def ollama_root():
+        """Ollama-compatible root endpoint."""
+        return "Ollama is running"
+
+else:
+
+    @app.get("/")
+    @app.head("/")
+    async def sglang_root():
+        """Default root endpoint."""
+        return "SGLang is running"
 
 
 @app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))

@@ -7,6 +7,12 @@ description: Guide for achieving optimal performance with SGLang-Diffusion. Cove
 
 Use this guide when a user asks how to speed up diffusion inference, reduce latency, lower VRAM usage, or tune SGLang-Diffusion for production.
 
+Before running any `sglang generate` command below inside the diffusion container:
+- derive the repo root from `python3 -c "import os, sglang; print(os.path.abspath(os.path.join(os.path.dirname(sglang.__file__), '..', '..')))"` and `cd` there
+- export `FLASHINFER_DISABLE_VERSION_CHECK=1`
+- verify the repo is writable if you expect perf dumps or outputs
+- choose idle GPU(s) first; reuse `diffusion-kernel/scripts/diffusion_skill_env.py` when doing perf work
+
 Reference: [SGLang-Diffusion Advanced Optimizations Blog](https://lmsys.org/blog/2026-02-16-sglang-diffusion-advanced-optimizations/)
 
 ---

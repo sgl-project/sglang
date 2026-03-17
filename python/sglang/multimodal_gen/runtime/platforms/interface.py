@@ -380,6 +380,11 @@ class Platform:
         """Whether to enable DIT layerwise offload by default on the current platform."""
         return True
 
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Apply platform-specific optimizations to VAE after loading."""
+        return vae
+
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_obj_by_qualname(attention_cls_str)
