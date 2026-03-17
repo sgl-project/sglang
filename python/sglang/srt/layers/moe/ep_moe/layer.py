@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
-from sglang.srt.layers.moe.rocm_moe_utils import upscale
+from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -529,13 +529,11 @@ class NpuFuseEPMoE(DeepEPMoE):
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        cpu_w13 = layer.w13_weight.transpose(1, 2).cpu()
-        w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
-        w13 = npu_format_cast(w13)
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
+        layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
 
-        w2 = npu_format_cast(layer.w2_weight)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
         w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
         w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
@@ -655,11 +653,36 @@ class MoriEPMoE(DeepEPMoE):
 
         quant_type = QuantType.No
 
-        if not is_fp8_quant and dispatch_scale is not None:
-            dispatch_a1 = upscale(
-                dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
-            )
-            dispatch_scale = None
+        if (
+            not is_fp8_quant
+            and dispatch_scale is not None
+            and dispatch_a1.dtype != torch.float4_e2m1fn_x2
+        ):
+            if is_quark_w4a4:
+                # W4A4 model with FP8 dispatch: must dequant FP8->BF16 first,
+                # because the FP4 per_1x32 quantization path needs BF16 input
+                dispatch_a1 = upscale(
+                    dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
+                )
+                dispatch_scale = None
+            else:
+                # Non-W4A4 model with FP8 dispatch: pass FP8 hidden_states + scale
+                # directly to fused_moe, avoiding unnecessary dequant->requant round-trip
+                quant_type = QuantType.per_128x128
+
+        if dispatch_a1.dtype == torch.float4_e2m1fn_x2 and dispatch_scale is not None:
+            if is_fp8_quant:
+                # FP8 weights + FP4 dispatch is not supported by fused_moe kernels
+                # (no kernel for q_dtype_a=fp4x2, q_dtype_w=fp8).
+                # Must dequant FP4->BF16 first; fused_moe will re-quant to FP8 internally.
+                dispatch_a1 = upscale_mxfp4(
+                    dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
+                )
+                dispatch_scale = None
+            elif quant_type == QuantType.No:
+                # Skip upscale_mxfp4: pass FP4 hidden_states + scale directly to fused_moe
+                # fused_moe with QuantType.per_1x32 can accept pre-quantized fp4x2 input
+                quant_type = QuantType.per_1x32
 
         if is_quark_w4a4:
             if hasattr(torch, "float4_e2m1fn_x2"):
@@ -679,7 +702,10 @@ class MoriEPMoE(DeepEPMoE):
             if hasattr(self, "w2_weight_scale_inv"):
                 w2_scale = self.w2_weight_scale_inv
 
-            quant_type = QuantType.per_128x128
+            # Only set per_128x128 if quant_type was not already set by
+            # a prior dispatch path (e.g. FP4 dispatch sets per_1x32)
+            if quant_type == QuantType.No:
+                quant_type = QuantType.per_128x128
 
         # [KK TODO] should to call the apply of quant method to handle fused moe
         hidden_states = fused_moe(
@@ -721,7 +747,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+    if (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mooncake()
+        or get_moe_a2a_backend().is_nixl()
+    ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
@@ -737,10 +767,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         elif (
             quant_config is None
             or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "mxfp8"
             or quant_config.get_name() == "modelopt_fp8"
             or quant_config.get_name() == "compressed_tensors"
         ):
-            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
+            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
             return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():

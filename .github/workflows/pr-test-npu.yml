@@ -64,6 +64,7 @@ jobs:
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
@@ -92,19 +93,35 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Run registered test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite per-commit-1-npu-a2 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
       - name: Run test
         timeout-minutes: 60
@@ -136,13 +153,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -176,13 +196,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
@@ -216,13 +239,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
@@ -254,13 +280,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
@@ -273,6 +302,7 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
@@ -288,6 +318,49 @@ jobs:
     runs-on: linux-aarch64-a3-16
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
+
+  multimodal-gen-test-8-npu-a3:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: linux-aarch64-a3-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -312,11 +385,11 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
+          python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu

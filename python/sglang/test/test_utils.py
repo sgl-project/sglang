@@ -38,11 +38,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
     is_cuda,
-    is_port_available,
     is_xpu,
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
@@ -1090,6 +1090,7 @@ def get_benchmark_args(
         gsp_num_turns=gsp_num_turns,
         header=header,
         max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 
@@ -2055,6 +2056,7 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 
 class CustomTestCase(unittest.TestCase):
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:

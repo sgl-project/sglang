@@ -67,7 +67,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
-    _launch_subprocesses,
+    Engine,
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
@@ -1617,12 +1617,22 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
 
 ##### Ollama-compatible API endpoints #####
 
+_ollama_root_route = os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE")
+if _ollama_root_route is not None:
 
-@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-async def ollama_root():
-    """Ollama-compatible root endpoint for health check."""
-    return "Ollama is running"
+    @app.get(_ollama_root_route)
+    @app.head(_ollama_root_route)
+    async def ollama_root():
+        """Ollama-compatible root endpoint."""
+        return "Ollama is running"
+
+else:
+
+    @app.get("/")
+    @app.head("/")
+    async def sglang_root():
+        """Default root endpoint."""
+        return "SGLang is running"
 
 
 @app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
@@ -1756,12 +1766,16 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
+    ssl_verify = server_args.ssl_verify()
+
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/model_info", timeout=5, headers=headers)
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1850,6 +1864,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 json=json_data,
                 headers=headers,
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -1878,6 +1893,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 timeout=(
                     warmup_timeout if warmup_timeout > 0 else 1800
                 ),  # because of deep gemm precache is very long if not precache.
+                verify=ssl_verify,
             )
             if res.status_code == 200:
                 logger.info(
@@ -1952,39 +1968,19 @@ def _wait_weights_ready():
     )
 
 
-def launch_server(
+def _setup_and_run_http_server(
     server_args: ServerArgs,
-    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
-    run_scheduler_process_func: Callable = run_scheduler_process,
-    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    tokenizer_manager,
+    template_manager,
+    port_args: PortArgs,
+    scheduler_infos: List[Dict],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    """Set up global state, configure middleware, and run uvicorn.
+
+    Called by launch_server after subprocesses have been launched.
     """
-    Launch SRT (SGLang Runtime) Server.
-
-    The SRT server consists of an HTTP server and an SRT engine.
-
-    - HTTP server: A FastAPI server that routes requests to the engine.
-    - The engine consists of three components:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
-    Note:
-    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
-    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
-    """
-    # Launch subprocesses
-    tokenizer_manager, template_manager, scheduler_infos, port_args = (
-        _launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
-    )
-
     # Parse info got from the schedulers
     remote_instance_transfer_engine_info = (
         parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
@@ -2046,18 +2042,66 @@ def launch_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
+        if server_args.ssl_certfile:
+            logger.info(
+                f"SSL enabled: certfile={server_args.ssl_certfile}, "
+                f"keyfile={server_args.ssl_keyfile}"
+            )
+
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
-            # Default case, one tokenizer process
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-            )
+            if server_args.enable_ssl_refresh:
+                # Use Config/Server API for access to the SSLContext.
+                config = uvicorn.Config(
+                    app,
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+                config.load()  # Creates the SSLContext
+
+                from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
+
+                server = uvicorn.Server(config)
+
+                async def _run_with_ssl_refresh():
+                    refresher = SSLCertRefresher(
+                        config.ssl,
+                        server_args.ssl_keyfile,
+                        server_args.ssl_certfile,
+                        server_args.ssl_ca_certs,
+                    )
+                    logger.info("SSL certificate auto-refresh enabled.")
+                    try:
+                        await server.serve()
+                    finally:
+                        refresher.stop()
+
+                import asyncio
+
+                asyncio.run(_run_with_ssl_refresh())
+            else:
+                # Default case, one tokenizer process
+                uvicorn.run(
+                    app,
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
         else:
             # Multiple tokenizer and http processes
             from uvicorn.config import LOGGING_CONFIG
@@ -2069,17 +2113,74 @@ def launch_server(
             }
             monkey_patch_uvicorn_multiprocessing()
 
+            if server_args.enable_ssl_refresh:
+                logger.warning(
+                    "--enable-ssl-refresh is not supported with multiple "
+                    "tokenizer workers (--tokenizer-worker-num > 1). "
+                    "SSL refresh will be disabled."
+                )
+
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
                 host=server_args.host,
                 port=server_args.port,
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
+                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
+                ssl_keyfile=server_args.ssl_keyfile,
+                ssl_certfile=server_args.ssl_certfile,
+                ssl_ca_certs=server_args.ssl_ca_certs,
+                ssl_keyfile_password=server_args.ssl_keyfile_password,
             )
     finally:
         if server_args.tokenizer_worker_num > 1:
-            multi_tokenizer_args_shm.unlink()
-            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+            if _global_state is not None:
+                _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def launch_server(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server.
+
+    The SRT server consists of an HTTP server and an SRT engine.
+
+    - HTTP server: A FastAPI server that routes requests to the engine.
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """
+    # Launch subprocesses
+    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
+        Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        )
+    )
+
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result.scheduler_infos,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )

@@ -9,11 +9,6 @@ on:
       version:
         description: "Version to build (without v prefix, e.g., 0.5.8)"
         required: true
-      flashinfer_version:
-        description: "FlashInfer version (default: 0.6.3)"
-        required: false
-        default: "0.6.3"
-
 jobs:
   publish-x86:
     if: github.repository == 'sgl-project/sglang'
@@ -72,7 +67,6 @@ jobs:
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
@@ -125,7 +119,6 @@ jobs:
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \

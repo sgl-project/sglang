@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
     MoriEPDispatcher,
+    NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -416,8 +417,10 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
-        forward_modes = partial_global_info[:, 1].tolist()
+        # Perform only one Device-to-Host (D2H) memory copy
+        cpu_data = partial_global_info[:, :2].cpu()
+        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
+        forward_modes = cpu_data[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -1033,6 +1036,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_mori():
             self._inners = [
                 MoriEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nixl():
+            self._inners = [
+                NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

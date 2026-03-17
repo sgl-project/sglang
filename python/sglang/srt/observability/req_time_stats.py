@@ -184,17 +184,6 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
-    # mini lb
-    MINI_LB_LAUNCH = RequestStageConfig(
-        "mini_lb_launch",
-        level=1,
-    )
-
-    WAIT_PD_FINISH = RequestStageConfig(
-        "wait_pd_finish",
-        level=2,
-    )
-
     # other
     ANONYMOUS = RequestStageConfig("")
 
@@ -547,6 +536,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     decode_transfer_queue_entry_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
 
+    # bootstrap sub-phase tracking (PD disagg)
+    bootstrap_done_time: float = 0.0
+
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
@@ -778,6 +770,70 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         self.trace_ctx.abort()
 
+    def compute_and_observe_kv_transfer_metrics(
+        self,
+        num_tokens: int,
+        page_size: int,
+        bytes_per_page_all_layers: int,
+    ) -> Optional[dict]:
+        """Compute KV transfer metrics and observe them via the metrics collector.
+
+        Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
+        """
+        from sglang.srt.disaggregation.utils import kv_to_page_num
+
+        result = {}
+
+        # Transfer latency, size, and speed
+        if self.prefill_transfer_queue_entry_time > 0 and self.completion_time > 0:
+            transfer_latency_s = (
+                self.completion_time - self.prefill_transfer_queue_entry_time
+            )
+            latency_ms = transfer_latency_s * 1000
+
+            num_pages = kv_to_page_num(num_tokens, page_size)
+            total_bytes = bytes_per_page_all_layers * num_pages
+            total_mb = total_bytes / (1024 * 1024)
+            self.transfer_total_mb = total_mb
+
+            speed_gb_s = 0.0
+            if transfer_latency_s > 0:
+                speed_gb_s = (total_mb / 1024) / transfer_latency_s
+                self.transfer_speed_gb_s = speed_gb_s
+
+            result["latency_ms"] = latency_ms
+            result["total_mb"] = total_mb
+            result["speed_gb_s"] = speed_gb_s
+
+            if self.enable_metrics:
+                self.metrics_collector.observe_kv_transfer_metrics(
+                    latency_ms=latency_ms,
+                    total_mb=total_mb,
+                    speed_gb_s=speed_gb_s,
+                )
+
+        # Bootstrap and alloc durations
+        if (
+            self.prefill_bootstrap_queue_entry_time > 0
+            and self.bootstrap_done_time > 0
+            and self.wait_queue_entry_time > 0
+        ):
+            bootstrap_ms = (
+                self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+            ) * 1000
+            alloc_ms = (self.wait_queue_entry_time - self.bootstrap_done_time) * 1000
+
+            result["bootstrap_ms"] = bootstrap_ms
+            result["alloc_ms"] = alloc_ms
+
+            if self.enable_metrics:
+                self.metrics_collector.observe_kv_transfer_bootstrap(
+                    bootstrap_ms=bootstrap_ms,
+                    alloc_ms=alloc_ms,
+                )
+
+        return result if result else None
+
     def set_quick_finish_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
@@ -829,6 +885,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
 
+    def set_bootstrap_done_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.bootstrap_done_time == 0.0:
+            self.bootstrap_done_time = ts
+
     def set_decode_prebuilt_finish_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
@@ -866,7 +928,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
-            bootstrap_duration = (
+            bootstrap_queue_duration = (
                 self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
             )
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
@@ -875,13 +937,33 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
                     assert (
-                        bootstrap_duration >= 0
+                        bootstrap_queue_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                    ), f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+
+            # Break down bootstrap_queue_duration into sub-phases
+            if self.bootstrap_done_time > 0:
+                bootstrap_duration = (
+                    self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+                )
+                alloc_wait_duration = (
+                    self.wait_queue_entry_time - self.bootstrap_done_time
+                )
+                if SGLANG_TEST_REQUEST_TIME_STATS:
+                    assert (
+                        bootstrap_duration >= 0 and alloc_wait_duration >= 0
+                    ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                bootstrap_breakdown = (
+                    f"= bootstrap({self.format_duration(bootstrap_duration)}) "
+                    f"+ alloc_wait({self.format_duration(alloc_wait_duration)}); "
+                )
+            else:
+                bootstrap_breakdown = ""
 
             return (
-                f"bootstrap_queue_duration({self.format_duration(bootstrap_duration)}) "
+                f"bootstrap_queue_duration({self.format_duration(bootstrap_queue_duration)}) "
+                f"{bootstrap_breakdown}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
@@ -909,8 +991,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         and forward_duration >= 0
                     ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
 
+            # Break down prealloc_duration into sub-phases
+            if self.bootstrap_done_time > 0:
+                bootstrap_duration = (
+                    self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+                )
+                alloc_wait_duration = (
+                    self.decode_transfer_queue_entry_time - self.bootstrap_done_time
+                )
+                if SGLANG_TEST_REQUEST_TIME_STATS:
+                    assert (
+                        bootstrap_duration >= 0 and alloc_wait_duration >= 0
+                    ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                prealloc_breakdown = (
+                    f"= bootstrap({self.format_duration(bootstrap_duration)}) "
+                    f"+ alloc_wait({self.format_duration(alloc_wait_duration)}); "
+                )
+            else:
+                prealloc_breakdown = ""
+
             return (
                 f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
+                f"{prealloc_breakdown}"
                 f"transfer_duration={self.format_duration(transfer_duration)}; "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "

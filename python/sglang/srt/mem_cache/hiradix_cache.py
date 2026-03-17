@@ -15,8 +15,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -39,6 +42,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
@@ -133,6 +137,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            enable_storage_metrics=self.enable_storage_metrics,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -815,9 +820,9 @@ class HiRadixCache(RadixCache):
         """
         return RadixKey(token_ids=list(token_ids))
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -829,11 +834,13 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -849,7 +856,7 @@ class HiRadixCache(RadixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -1009,7 +1016,8 @@ class HiRadixCache(RadixCache):
             ancester_node = node
 
         # protect the ancestor nodes from eviction
-        delta = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancester_node)
+        delta = result.delta
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
@@ -1043,7 +1051,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)]
+            node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
@@ -1085,6 +1093,9 @@ class HiRadixCache(RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         return self.cache_controller.start_loading()
+
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()
@@ -1298,6 +1309,11 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        new_input_tokens = (
+            convert_to_bigram_key(new_input_tokens)
+            if self.is_eagle
+            else new_input_tokens
+        )
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
@@ -1466,7 +1482,7 @@ class HiRadixCache(RadixCache):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len]
+                    node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)

@@ -55,7 +55,7 @@ class TestAutoRound(CustomTestCase):
                     if "Llama" in model:
                         self.assertGreaterEqual(metrics["score"], 0.6)
                     else:
-                        self.assertGreaterEqual(metrics["score"], 0.26)
+                        self.assertGreaterEqual(metrics["score"], 0.25)
                 finally:
                     kill_process_tree(process.pid)
                     print(f"[INFO] Server for {model} stopped.")

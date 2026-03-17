@@ -88,6 +88,28 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Result of an inc_lock_ref operation."""
+
+    delta: Optional[int] = None
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Parameters for dec_lock_ref operation."""
+
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of an dec_lock_ref operation."""
+
+    delta: Optional[int] = None
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -97,6 +119,7 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
+        last_host_backup_node: The deepest backuped node for prefetch from storage.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -107,8 +130,10 @@ class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
+    last_host_backup_node: Any = None
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    cache_protected_len: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -155,11 +180,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         pass
 
     def evictable_size(self):
@@ -201,6 +228,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def flush_write_through_acks(self) -> None:
+        """Release lock_ref on radix-tree nodes whose write-through has completed.
+
+        Lightweight operation that only processes finished write acks.
+        No-op for caches without hierarchical write-through support.
+        """
+        pass
 
     def check_hicache_events(self) -> Any:
         """

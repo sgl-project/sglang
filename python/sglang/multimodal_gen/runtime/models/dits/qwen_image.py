@@ -16,7 +16,8 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
-    fuse_scale_shift_gate_select01_kernel,
+    fuse_layernorm_scale_shift_gate_select01_kernel,
+    fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -26,13 +27,11 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_layernorm_only,
     apply_qk_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    RowParallelLinear,
+    ReplicatedLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -45,15 +44,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-_is_cuda = current_platform.is_cuda()
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -87,109 +82,6 @@ def _get_qkv_projections(
             txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
-
-
-class GELU(nn.Module):
-    r"""
-    GELU activation function with tanh approximation support with `approximate="tanh"`.
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        approximate (`str`, *optional*, defaults to `"none"`): If `"tanh"`, use tanh approximation.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict.
-    """
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        approximate: str = "none",
-        bias: bool = True,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj" if prefix else "",
-        )
-        self.approximate = approximate
-
-    def forward(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        return F.gelu(hidden_states[0], approximate=self.approximate)
-
-
-class FeedForward(nn.Module):
-    r"""
-    A feed-forward layer.
-
-    Parameters:
-        dim (`int`): The number of channels in the input.
-        dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
-        mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: Optional[int] = None,
-        mult: int = 4,
-        activation_fn: str = "geglu",
-        inner_dim=None,
-        bias: bool = True,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        if activation_fn == "gelu":
-            act_fn = GELU(dim, inner_dim, bias=bias, quant_config=None, prefix=prefix)
-        if activation_fn == "gelu-approximate":
-            act_fn = GELU(
-                dim,
-                inner_dim,
-                approximate="tanh",
-                bias=bias,
-                quant_config=None,
-                prefix=prefix,
-            )
-        else:
-            raise NotImplementedError(
-                f"activation_fn '{activation_fn}' is not supported."
-            )
-
-        self.net = nn.ModuleList([])
-        self.net.append(act_fn)
-        self.net.append(nn.Identity())
-        self.net.append(
-            RowParallelLinear(
-                inner_dim,
-                dim_out,
-                bias=True,
-                input_is_parallel=True,
-                quant_config=None,
-            )
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -624,27 +516,9 @@ class QwenImageCrossAttention(nn.Module):
             )
         else:
             # Use separate Q/K/V projections for non-quantized models
-            self.to_q = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_q",
-            )
-            self.to_k = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_k",
-            )
-            self.to_v = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_v",
-            )
+            self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+            self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+            self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -662,51 +536,25 @@ class QwenImageCrossAttention(nn.Module):
                 )
             else:
                 # Use separate Q/K/V projections for non-quantized models
-                self.add_q_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_q_proj",
+                self.add_q_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
-                self.add_k_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_k_proj",
+                self.add_k_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
-                self.add_v_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_v_proj",
+                self.add_v_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ColumnParallelLinear(
-                self.inner_dim,
-                self.dim,
-                bias=out_bias,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_add_out",
-            )
+            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ColumnParallelLinear(
-                    self.inner_dim,
-                    self.dim,
-                    bias=out_bias,
-                    gather_output=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.to_out.0",
-                )
+                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
             )
         else:
             self.to_out = None
@@ -724,6 +572,7 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.AITER,
+                AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
@@ -848,13 +697,8 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ColumnParallelLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                gather_output=True,
-                quant_config=mod_quant_config,
-                prefix=f"{prefix}.img_mod",
+            nn.Linear(
+                dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNormScaleShift(
@@ -877,13 +721,8 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ColumnParallelLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                gather_output=True,
-                quant_config=mod_quant_config,
-                prefix=f"{prefix}.txt_mod",
+            nn.Linear(
+                dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.txt_norm1 = LayerNormScaleShift(
@@ -919,15 +758,11 @@ class QwenImageTransformerBlock(nn.Module):
                 dim=dim,
                 dim_out=dim,
                 activation_fn="gelu-approximate",
-                quant_config=quant_config,
-                prefix=f"{prefix}.img_mlp",
             )
             self.txt_mlp = FeedForward(
                 dim=dim,
                 dim_out=dim,
                 activation_fn="gelu-approximate",
-                quant_config=quant_config,
-                prefix=f"{prefix}.txt_mlp",
             )
 
         if nunchaku_enabled:
@@ -969,18 +804,38 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if _is_cuda:
-                if is_scale_residual:
-                    x = gate_x * x + residual_x
-                    residual_out = x
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if not index.is_contiguous():
-                    index = index.contiguous()
-                # TODO: fuse norm with above select01 kernel, workaround now
-                x = apply_layernorm_only(x, norm_module)
-                x, gate_result = fuse_scale_shift_gate_select01_kernel(
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if not index.is_contiguous():
+                index = index.contiguous()
+            if is_scale_residual:
+                if not residual_x.is_contiguous():
+                    residual_x = residual_x.contiguous()
+                if not gate_x.is_contiguous():
+                    gate_x = gate_x.contiguous()
+                x, residual_out, gate_result = (
+                    fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+                        x,
+                        residual=residual_x,
+                        residual_gate=gate_x,
+                        weight=getattr(norm_module.norm, "weight", None),
+                        bias=getattr(norm_module.norm, "bias", None),
+                        scale0=scale0.contiguous(),
+                        shift0=shift0.contiguous(),
+                        gate0=gate0.contiguous(),
+                        scale1=scale1.contiguous(),
+                        shift1=shift1.contiguous(),
+                        gate1=gate1.contiguous(),
+                        index=index,
+                        eps=norm_module.eps,
+                    )
+                )
+                return x, residual_out, gate_result
+            else:
+                x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
                     x,
+                    weight=getattr(norm_module.norm, "weight", None),
+                    bias=getattr(norm_module.norm, "bias", None),
                     scale0=scale0.contiguous(),
                     shift0=shift0.contiguous(),
                     gate0=gate0.contiguous(),
@@ -988,32 +843,9 @@ class QwenImageTransformerBlock(nn.Module):
                     shift1=shift1.contiguous(),
                     gate1=gate1.contiguous(),
                     index=index,
+                    eps=norm_module.eps,
                 )
-                if is_scale_residual:
-                    return x, residual_out, gate_result
-                else:
-                    return x, gate_result
-            else:
-                mask = (index == 0).unsqueeze(-1)
-                shift_result = torch.where(
-                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
-                )
-                scale_result = torch.where(
-                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
-                )
-                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-                if is_scale_residual:
-                    modulated, residual_out = norm_module(
-                        residual=residual_x,
-                        x=x,
-                        gate=gate_x,
-                        shift=shift_result,
-                        scale=scale_result,
-                    )
-                    return modulated, residual_out, gate_result
-                else:
-                    modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-                    return modulated, gate_result
+                return x, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
@@ -1040,11 +872,11 @@ class QwenImageTransformerBlock(nn.Module):
         temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        modulate_index: Optional[List[int]] = None,
+        modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod[1](temb_img_silu)[0]  # [B, 6*dim]
-        txt_mod_params = self.txt_mod[1](temb_txt_silu)[0]  # [B, 6*dim]
+        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         if (
             self.quant_config is not None
@@ -1107,7 +939,7 @@ class QwenImageTransformerBlock(nn.Module):
             gate_x=img_gate1,
             residual_x=hidden_states,
         )
-        img_mlp_output = self.img_mlp(img_modulated2)[0]
+        img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
@@ -1123,7 +955,7 @@ class QwenImageTransformerBlock(nn.Module):
             scale=txt_scale2,
         )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)[0]
+        txt_mlp_output = self.txt_mlp(txt_modulated2)
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)

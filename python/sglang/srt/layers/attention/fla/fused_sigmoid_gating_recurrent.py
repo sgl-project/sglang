@@ -4,8 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.utils import input_guard
-
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -22,8 +20,21 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     h0_source,
     h0_indices,
     cu_seqlens,
+    # Parameters for target_verify support (unused for decode)
+    intermediate_states_buffer,
+    intermediate_state_indices,
+    cache_steps,
+    retrieve_parent_token_ptr,
+    stride_retrieve_parent_token_seq: tl.constexpr,
+    stride_retrieve_parent_token_token: tl.constexpr,
+    # ================================================
     scale,
     T,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_b,
+    NP2_T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -35,6 +46,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    # Optional flags for target_verify support (default False for decode)
+    DISABLE_STATE_UPDATE: tl.constexpr = False,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -57,10 +72,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    p_b = b + bos * HV + i_hv
+    p_q = q + bos * stride_q + i_h * K + o_k
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
@@ -84,12 +99,49 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[None, :] * K
+                + o_k[:, None]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    # Preload tree attention data if needed
+    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+        token_indices = tl.arange(0, NP2_T)
+        mask_retrieve = token_indices < T
+        retrieve_parent_token_base = (
+            retrieve_parent_token_ptr
+            + (i_n * stride_retrieve_parent_token_seq)
+            + token_indices * stride_retrieve_parent_token_token
+        )
+        parent_idx_tokens = tl.load(
+            retrieve_parent_token_base, mask=mask_retrieve, other=0
+        )
+
+    # Prepare intermediate state cache index if enabled
+    cache_idx = -1
+    if CACHE_INTERMEDIATE_STATES:
+        cache_idx = tl.load(intermediate_state_indices + i_n)
+
+    step_idx = 0
     for _ in range(0, T):
+        # Tree attention: load parent's cached state
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            # step_idx == 0 uses b_h from USE_INITIAL_STATE
+            if step_idx != 0 and cache_idx >= 0:
+                parent_step_idx = tl.sum(
+                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                )
+                step_offset = parent_step_idx * HV * K * V
+                cache_ptr = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + step_offset
+                    + i_hv * K * V
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+
         # Load inputs
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -99,8 +151,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute sigmoid gating
         # Load gating parameters
         b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+        if IS_KDA:
+            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+        else:
+            b_a = tl.load(p_a).to(tl.float32)
+            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
@@ -142,29 +198,48 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
+        # Cache intermediate states if enabled
+        if CACHE_INTERMEDIATE_STATES:
+            if cache_idx >= 0:
+                step_offset = step_idx * HV * K * V
+                cache_ptr = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + step_offset
+                    + i_hv * K * V
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+
+        step_idx += 1
+
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q
+        p_k += stride_k
+        p_v += stride_v
+        p_b += stride_b
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+        if IS_KDA:
+            p_a += HV * K
+        else:
+            p_a += HV
 
     # Store final state back to h0_source with bounds checking
-    if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
-            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+    if not DISABLE_STATE_UPDATE:
+        if USE_INITIAL_STATE:
+            idx = tl.load(h0_indices + i_n)
+            if idx >= 0:
+                p_h0 = (
+                    h0_source
+                    + idx * HV * K * V
+                    + i_hv * K * V
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -181,13 +256,28 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
+    # Optional parameters for target_verify support
+    disable_state_update: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
     This function uses a single fused kernel that combines both sigmoid gating computation
     and the recurrent delta rule update for better performance.
+
+    Supports both decode and target_verify modes:
+    - decode: standard single-step update with state write-back
+    - target_verify: multi-step with intermediate state caching, optional tree attention,
+                     and optional state update disable
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
+    stride_q = q.stride()[1]
+    stride_k = k.stride()[1]
+    stride_v = v.stride()[1]
+    stride_b = b.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
@@ -202,6 +292,17 @@ def fused_sigmoid_gating_delta_rule_update(
         assert scale > 0, "scale must be positive"
 
     o = q.new_empty(NK, *v.shape)
+
+    # Prepare retrieve_parent_token strides
+    if retrieve_parent_token is not None:
+        stride_retrieve_parent_token_seq = retrieve_parent_token.stride(0)
+        stride_retrieve_parent_token_token = retrieve_parent_token.stride(1)
+    else:
+        stride_retrieve_parent_token_seq = 0
+        stride_retrieve_parent_token_token = 0
+
+    NP2_T = triton.next_power_of_2(T)
+
     grid = (NK, NV, N * HV)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
@@ -218,8 +319,19 @@ def fused_sigmoid_gating_delta_rule_update(
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
+        cache_steps=0 if cache_steps is None else cache_steps,
+        retrieve_parent_token_ptr=retrieve_parent_token,
+        stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
+        stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
         T=T,
+        stride_q=stride_q,
+        stride_k=stride_k,
+        stride_v=stride_v,
+        stride_b=stride_b,
+        NP2_T=NP2_T,
         B=B,
         H=H,
         HV=HV,
@@ -231,6 +343,9 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        DISABLE_STATE_UPDATE=disable_state_update,
+        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

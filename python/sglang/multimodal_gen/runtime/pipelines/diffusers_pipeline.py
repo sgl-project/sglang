@@ -54,7 +54,7 @@ class DiffusersExecutionStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Execute the diffusers pipeline."""
 
-        kwargs = self._build_pipeline_kwargs(batch, server_args)
+        kwargs = self._build_pipeline_kwargs(batch)
 
         # Filter kwargs to only those supported by the pipeline, warn about ignored args
         kwargs, _ = self._filter_pipeline_kwargs(kwargs)
@@ -82,8 +82,8 @@ class DiffusersExecutionStage(PipelineStage):
         return batch
 
     def _filter_pipeline_kwargs(
-        self, kwargs: dict, *, strict: bool = False
-    ) -> tuple[dict, list[str]]:
+        self, kwargs: dict[str, Any], *, strict: bool = False
+    ) -> tuple[dict[str, Any], list[str]]:
         """Filter kwargs to those accepted by the pipeline's __call__.
 
         Args:
@@ -130,10 +130,7 @@ class DiffusersExecutionStage(PipelineStage):
     def _extract_output(self, output: Any) -> torch.Tensor | None:
         """Extract tensor output from pipeline result."""
         for attr in ["images", "frames", "video", "sample", "pred_original_sample"]:
-            if not hasattr(output, attr):
-                continue
-
-            data = getattr(output, attr)
+            data = getattr(output, attr, None)
             if data is None:
                 continue
 
@@ -166,7 +163,7 @@ class DiffusersExecutionStage(PipelineStage):
                 tensor = tensor.permute(0, 4, 1, 2, 3)
             return tensor
 
-        if hasattr(data, "mode"):  # PIL Image
+        if isinstance(data, Image.Image):
             return T.ToTensor()(data)
 
         if isinstance(data, list) and len(data) > 0:
@@ -183,7 +180,7 @@ class DiffusersExecutionStage(PipelineStage):
             data = first
             first = data[0]
 
-        if hasattr(first, "mode"):  # PIL images
+        if isinstance(first, Image.Image):
             tensors = [T.ToTensor()(img) for img in data]
             stacked = torch.stack(tensors)
             if len(tensors) > 1:
@@ -259,7 +256,7 @@ class DiffusersExecutionStage(PipelineStage):
 
         return output
 
-    def _build_pipeline_kwargs(self, batch: Req, server_args: ServerArgs) -> dict:
+    def _build_pipeline_kwargs(self, batch: Req) -> dict[str, Any]:
         """Build kwargs dict for diffusers pipeline call."""
         kwargs = {}
 
@@ -316,7 +313,7 @@ class DiffusersExecutionStage(PipelineStage):
             component = getattr(self.diffusers_pipe, attr, None)
             if component is not None:
                 try:
-                    return next(component.parameters()).device
+                    return str(next(component.parameters()).device)
                 except StopIteration:
                     pass
         return current_platform.device_type
@@ -378,12 +375,15 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.memory_usages: dict[str, float] = {}
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
+        self._cache_dit_enabled = False
 
         logger.info("Loading diffusers pipeline from %s", model_path)
         self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
         self._detect_pipeline_type()
 
-    def _load_diffusers_pipeline(self, model_path: str, server_args: ServerArgs) -> Any:
+    def _load_diffusers_pipeline(
+        self, model_path: str, server_args: ServerArgs
+    ) -> DiffusionPipeline:
         """Load the diffusers pipeline.
 
         Optimizations applied:
@@ -408,14 +408,10 @@ class DiffusersPipeline(ComposedPipelineBase):
         }
 
         # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
-        config = server_args.pipeline_config
-        if config is not None:
-            quant_config = getattr(config, "quantization_config", None)
-            if quant_config is not None:
-                load_kwargs["quantization_config"] = quant_config
-                logger.info(
-                    "Using quantization config: %s", type(quant_config).__name__
-                )
+        quant_config = getattr(server_args.pipeline_config, "quantization_config", None)
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+            logger.info("Using quantization config: %s", type(quant_config).__name__)
 
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
@@ -455,43 +451,83 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        pipe = pipe.to(get_local_torch_device())
+        # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        any_offload = (
+            server_args.dit_cpu_offload
+            or server_args.text_encoder_cpu_offload
+            or server_args.image_encoder_cpu_offload
+            or server_args.vae_cpu_offload
+        )
+        if any_offload:
+            device = get_local_torch_device()
+            gpu_id = device.index if device.index is not None else 0
+            pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+            logger.info(
+                "Enabled model CPU offload for diffusers pipeline (gpu_id=%d)", gpu_id
+            )
+        else:
+            pipe = pipe.to(get_local_torch_device())
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
         # Apply cache-dit acceleration if configured
         pipe = self._apply_cache_dit(pipe, server_args)
+        # Apply torch.compile if enabled and supported
+        pipe = self._apply_torch_compile(pipe, server_args)
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
-    def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
+    def _apply_vae_optimizations(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> None:
         """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
         config = server_args.pipeline_config
-        if config is None:
-            return
 
         # VAE slicing: decode latents slice-by-slice for lower peak memory
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-slicing
-        if getattr(config, "vae_slicing", False):
-            if hasattr(pipe, "enable_vae_slicing"):
+        if config.vae_slicing:
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+                logger.info("Enabled VAE slicing for lower memory usage")
+            elif hasattr(pipe, "enable_vae_slicing"):
                 pipe.enable_vae_slicing()
                 logger.info("Enabled VAE slicing for lower memory usage")
+            else:
+                logger.warning(
+                    "VAE slicing is not available: neither "
+                    "`pipe.vae.enable_slicing()` nor `pipe.enable_vae_slicing()` was found."
+                )
 
         # VAE tiling: decode latents tile-by-tile for large images
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-tiling
-        if getattr(config, "vae_tiling", False):
-            if hasattr(pipe, "enable_vae_tiling"):
+        if config.vae_tiling:
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling()
+                logger.info("Enabled VAE tiling for large image support")
+            elif hasattr(pipe, "enable_vae_tiling"):
                 pipe.enable_vae_tiling()
                 logger.info("Enabled VAE tiling for large image support")
+            else:
+                logger.warning(
+                    "VAE tiling is not available: neither "
+                    "`pipe.vae.enable_tiling()` nor `pipe.enable_vae_tiling()` was found."
+                )
 
-    def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
+    def _apply_attention_backend(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> None:
         """Apply attention backend setting from pipeline config or server_args.
 
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
         backend = server_args.attention_backend
+
+        if backend is None:
+            backend = getattr(
+                server_args.pipeline_config, "diffusers_attention_backend", None
+            )
 
         if backend is None:
             return
@@ -526,7 +562,9 @@ class DiffusersPipeline(ComposedPipelineBase):
                         e,
                     )
 
-    def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
+    def _apply_cache_dit(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> DiffusionPipeline:
         """Enable cache-dit for diffusers pipeline if configured."""
         cache_dit_config = server_args.cache_dit_config
         if not cache_dit_config:
@@ -562,30 +600,78 @@ class DiffusersPipeline(ComposedPipelineBase):
             raise
 
         logger.info("Enabled cache-dit for diffusers pipeline")
+        self._cache_dit_enabled = True
+        return pipe
+
+    def _apply_torch_compile(self, pipe: Any, server_args: ServerArgs) -> Any:
+        """Apply torch.compile to the pipeline if configured and supported."""
+        if not server_args.enable_torch_compile:
+            return pipe
+
+        # check if the pipeline has 'transformer' or 'unet' components which are
+        # typically the most expensive parts to compile. 'transformer_2' for some
+        # video pipelines, e.g, Wan 2.2 series, also check for that.
+        compilable_components = ["transformer", "transformer_2", "unet"]
+        if not any(hasattr(pipe, comp) for comp in compilable_components):
+            logger.warning(
+                "Pipeline does not have 'transformer' or 'unet' components. "
+                "torch.compile may not provide significant benefits and could increase latency."
+            )
+            return pipe
+
+        if self._cache_dit_enabled:
+            try:
+                import cache_dit
+
+                if hasattr(cache_dit, "set_compile_configs"):
+                    cache_dit.set_compile_configs()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to set torch_compile configs for cache-dit: {e}"
+                )
+
+        for comp in compilable_components:
+            if hasattr(pipe, comp):
+                try:
+                    component = getattr(pipe, comp)
+                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
+                    # modules which can significantly reduce compilation time for large models
+                    # with repeated blocks.
+                    if isinstance(component, torch.nn.Module) and hasattr(
+                        component, "compile"
+                    ):
+                        # Prefer in-place compilation if supported. According to PyTorch documentation:
+                        # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
+                        component.compile()
+                    else:
+                        compiled_component = torch.compile(component)
+                        setattr(pipe, comp, compiled_component)
+                    logger.info(
+                        f"Applied torch.compile to {comp} component of the pipeline"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply torch.compile to {comp}: {e}")
+
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        """
-        Determine the dtype to use for model loading.
-        """
         dtype = (
             torch.bfloat16
             if torch.get_device_module().is_bf16_supported()
             else torch.float16
         )
 
-        if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
-            dit_precision = server_args.pipeline_config.dit_precision
-            if dit_precision == "fp16":
-                dtype = torch.float16
-            elif dit_precision == "bf16":
-                dtype = torch.bfloat16
-            elif dit_precision == "fp32":
-                dtype = torch.float32
+        dit_precision = server_args.pipeline_config.dit_precision
+        if dit_precision == "fp16":
+            dtype = torch.float16
+        elif dit_precision == "bf16":
+            dtype = torch.bfloat16
+        elif dit_precision == "fp32":
+            dtype = torch.float32
 
         return dtype
 
-    def _detect_pipeline_type(self):
+    def _detect_pipeline_type(self) -> None:
         """Detect if this is an image or video pipeline."""
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
@@ -603,14 +689,14 @@ class DiffusersPipeline(ComposedPipelineBase):
         """Skip sglang's module loading - diffusers handles it."""
         return {"diffusers_pipeline": self.diffusers_pipe}
 
-    def create_pipeline_stages(self, server_args: ServerArgs):
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         """Create the execution stage wrapping the diffusers pipeline."""
         self.add_stage(
-            DiffusersExecutionStage(self.diffusers_pipe), "diffusers_execution"
+            stage_name="diffusers_execution",
+            stage=DiffusersExecutionStage(self.diffusers_pipe),
         )
 
-    def initialize_pipeline(self, server_args: ServerArgs):
-        """Initialize the pipeline."""
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
         pass
 
     def post_init(self) -> None:
@@ -621,9 +707,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.initialize_pipeline(self.server_args)
         self.create_pipeline_stages(self.server_args)
 
-    def add_stage(
-        self, stage: PipelineStage, stage_name: str | None = None
-    ) -> "DiffusersPipeline":
+    def add_stage(self, stage_name: str, stage: PipelineStage) -> None:
         """Add a stage to the pipeline."""
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)

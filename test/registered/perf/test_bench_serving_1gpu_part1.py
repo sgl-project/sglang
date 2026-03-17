@@ -141,9 +141,6 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
-    @unittest.skip(
-        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 removed from HuggingFace"
-    )
     def test_lora_online_latency(self):
         if is_in_amd_ci():
             pass
@@ -159,9 +156,6 @@ class TestBenchServing1GPUPart1(CustomTestCase):
             self.assertLess(res["median_e2e_latency_ms"], 2400)
             self.assertLess(res["median_ttft_ms"], 58)
 
-    @unittest.skip(
-        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 removed from HuggingFace"
-    )
     def test_lora_online_latency_with_concurrent_adapter_updates(self):
         if is_in_amd_ci():
             pass
@@ -247,14 +241,14 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--lora-paths",
-                "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                "nvidia/llama-3.1-nemoguard-8b-topic-control",
                 "--max-lora-rank",
                 "256",
             ],
             dataset_name="random",
             random_input_len=256,
             random_output_len=256,
-            lora_name=["Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"],
+            lora_name=["nvidia/llama-3.1-nemoguard-8b-topic-control"],
             background_task=background_task,
         )
 
