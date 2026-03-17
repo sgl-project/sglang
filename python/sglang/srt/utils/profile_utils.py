@@ -176,9 +176,15 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
             return int(value.sum().item())
         return sum(value)
 
-    prefix_sum = _sum_lens(batch.prefix_lens)
-    extend_sum = _sum_lens(batch.extend_lens)
     seq_sum = _sum_lens(batch.seq_lens)
+    if forward_mode is not None and forward_mode.is_decode():
+        # prefix_lens and extend_lens are not refreshed in prepare_for_decode
+        # and carry stale values from the last extend/mixed iteration.
+        prefix_sum = 0
+        extend_sum = 0
+    else:
+        prefix_sum = _sum_lens(batch.prefix_lens)
+        extend_sum = _sum_lens(batch.extend_lens)
     return (
         f"{stage}_context_{num_ctx_requests}({num_ctx_tokens})_generation_"
         f"{num_gen_requests}({num_gen_tokens})_prefix_numtokens_{prefix_sum}"
