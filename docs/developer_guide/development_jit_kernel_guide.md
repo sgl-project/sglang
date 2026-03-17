@@ -257,3 +257,6 @@ from sglang.jit_kernel.add_constant import add_constant
 ```
 
 For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/tests/test_add_constant.py).
+
+## Acknowledgements
+The JIT kernel framework is inspired by the design of [FlashInfer](https://github.com/flashinfer-ai/flashinfer), particularly its approach to JIT compilation and flexible kernel abstractions. We thank the FlashInfer Team.
