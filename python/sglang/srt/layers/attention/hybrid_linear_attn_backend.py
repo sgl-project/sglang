@@ -111,6 +111,7 @@ print("=" * 80)
 def _maybe_capture_ssm_state(
     ssm_states: torch.Tensor,
     cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
     layer_id: int,
     mode: str,
 ) -> None:
@@ -126,7 +127,7 @@ def _maybe_capture_ssm_state(
     if torch.cuda.is_current_stream_capturing():
         return
     real_indices = cache_indices[cache_indices >= 0]
-    print(f"[SSM_CAPTURE] layer={layer_id} mode={mode} cache_indices={cache_indices.tolist()} real={real_indices.tolist()}")
+    # print(f"[SSM_CAPTURE] layer={layer_id} mode={mode} cache_indices={cache_indices.tolist()} real={real_indices.tolist()}")
     key = (layer_id, mode)
     step = _ssm_capture_counter.get(key, 0)
     _ssm_capture_counter[key] = step + 1
