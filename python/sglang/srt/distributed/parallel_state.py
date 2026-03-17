@@ -698,6 +698,31 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + RMSNorm + FP8 per-token quant.
+
+        Returns (out_fp8, residual_out, scale_out) or None if unavailable.
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        if hasattr(ca_comm, "fused_allreduce_rmsnorm_quant"):
+            try:
+                return ca_comm.fused_allreduce_rmsnorm_quant(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                pass
+
+        return None
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:

@@ -73,10 +73,12 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
+    is_hip,
 )
 
 _is_cuda = is_cuda()
@@ -93,6 +95,8 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -768,6 +772,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(
+            torch, "float8_e4m3fnuz", None
+        ):
+            quant_format = "fp8_e4m3fnuz"
+        else:
+            quant_format = ""
 
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -775,6 +785,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=quant_format,
                 **kwargs,
             )
         )
