@@ -163,7 +163,7 @@ class StorageBackendFactory:
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
-            backend = backend_class(storage_config)
+            backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)

@@ -27,6 +27,12 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
 
-    # For SWAChunkCache
+    pp_rank: int = 0
+    pp_size: int = 1
+
+    chunked_prefill_size: Optional[int] = None
+
     sliding_window_size: Optional[int] = None
-    attention_chunk_size: Optional[int] = None
+
+    # Time-to-live for cache entries in seconds. If None, TTL is disabled.
+    cache_ttl_seconds: Optional[float] = None

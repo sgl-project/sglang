@@ -1,5 +1,6 @@
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -7,7 +8,64 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class ScoreResult:
+    scores: List[List[float]]
+    prompt_tokens: int
+
+
 class TokenizerManagerMultiItemMixin:
+    async def score_prompts(
+        self,
+        prompts: Union[str, List[str], List[List[int]]],
+        label_token_ids: List[int],
+        apply_softmax: bool = False,
+        request: Optional[Any] = None,
+    ) -> ScoreResult:
+        """
+        Score probabilities of specified token IDs after each *full prompt*.
+
+        This is a thin wrapper over `score_request` that treats `prompts` as
+        already-composed inputs (i.e., no query/item concatenation needed).
+
+        Args:
+            prompts: A single prompt string, a list of prompt strings, or a list of
+                pre-tokenized prompt token ID sequences.
+            label_token_ids: Token IDs to compute probabilities for.
+            apply_softmax: Whether to normalize probabilities using softmax.
+            request: Optional FastAPI request object.
+
+        Returns:
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
+        """
+        # Text prompts
+        if isinstance(prompts, str) or (
+            isinstance(prompts, list) and (not prompts or isinstance(prompts[0], str))
+        ):
+            return await self.score_request(
+                query="",
+                items=prompts,  # type: ignore[arg-type]
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=False,
+                request=request,
+            )
+
+        # Tokenized prompts
+        if isinstance(prompts, list) and (not prompts or isinstance(prompts[0], list)):
+            return await self.score_request(
+                query=[],
+                items=prompts,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=False,
+                request=request,
+            )
+
+        raise ValueError("Invalid prompts type for score_prompts.")
+
     def _initialize_multi_item_delimiter_text(self):
         """Initialize multi-item delimiter text from token ID after tokenizer is loaded."""
         if (
@@ -59,7 +117,7 @@ class TokenizerManagerMultiItemMixin:
         label_token_ids: List[int],
         apply_softmax: bool,
         batch_request=None,
-    ) -> List[List[float]]:
+    ) -> ScoreResult:
         """
         Process results from multi-item scoring request.
         Extracts logprobs at delimiter positions from input_token_ids_logprobs.
@@ -72,17 +130,22 @@ class TokenizerManagerMultiItemMixin:
             batch_request: The original batch request containing input sequence
 
         Returns:
-            List of score lists, one for each item
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
-        single_result = results[0] if isinstance(results, list) else results
+        result = results[0] if isinstance(results, list) else results
+        meta_info = result.get("meta_info", {})
 
         # For multi-item scoring, logprobs are in input_token_ids_logprobs
-        input_logprobs = single_result["meta_info"].get("input_token_ids_logprobs", [])
+        input_logprobs = meta_info.get("input_token_ids_logprobs", [])
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+        request_id = meta_info.get("id", "<unknown>")
 
         if not input_logprobs:
             raise RuntimeError(
-                f"input_token_ids_logprobs is empty for multi-item scoring request {single_result['meta_info'].get('id', '<unknown>')}. "
-                "This indicates token_ids_logprobs were not computed properly for Mutil Item Scoring."
+                f"input_token_ids_logprobs is empty for multi-item scoring request {request_id}. "
+                "This indicates token_ids_logprobs were not computed properly for Multi-Item Scoring."
             )
 
         scores = []
@@ -94,7 +157,7 @@ class TokenizerManagerMultiItemMixin:
             raise RuntimeError(
                 f"Expected {expected_logprobs_count} input_token_ids_logprobs for multi-item scoring "
                 f"with {num_items} items, but got {len(input_logprobs)}. "
-                f"Request ID: {single_result['meta_info'].get('id', '<unknown>')}"
+                f"Request ID: {request_id}"
             )
 
         # Skip the first delimiter (between query and first item) and process remaining delimiter positions
@@ -113,11 +176,11 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores
+        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
     def _process_single_item_scoring_results(
         self, results: Any, label_token_ids: List[int], apply_softmax: bool
-    ) -> List[List[float]]:
+    ) -> ScoreResult:
         """
         Process results from single-item scoring request.
         Single-item scoring results are stored in output_token_ids_logprobs.
@@ -128,13 +191,17 @@ class TokenizerManagerMultiItemMixin:
             apply_softmax: Whether to apply softmax normalization
 
         Returns:
-            List of score lists, one for each result
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         scores = []
+        prompt_tokens = 0
 
         for result in results:
             # For single-item scoring, logprobs are in output_token_ids_logprobs
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+            prompt_tokens += result["meta_info"].get("prompt_tokens", 0)
 
             if not output_logprobs or len(output_logprobs) == 0:
                 raise RuntimeError(
@@ -150,7 +217,7 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores
+        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
     async def score_request(
         self,
@@ -160,7 +227,7 @@ class TokenizerManagerMultiItemMixin:
         apply_softmax: bool = False,
         item_first: bool = False,
         request: Optional[Any] = None,
-    ) -> List[List[float]]:
+    ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
 
@@ -184,10 +251,17 @@ class TokenizerManagerMultiItemMixin:
             request: Optional FastAPI request object
 
         Returns:
-            List of lists containing probabilities for each item and each label token
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
+
+        if items is None:
+            raise ValueError("items must be provided")
+        if not items:
+            return ScoreResult(scores=[], prompt_tokens=0)
 
         if self.tokenizer is not None:
             vocab_size = self.tokenizer.vocab_size
@@ -309,3 +383,23 @@ class TokenizerManagerMultiItemMixin:
             ]
 
         return score_list
+
+    def _extract_logprobs_for_tokens(
+        self, logprobs_data: List, label_token_ids: List[int]
+    ) -> Dict[int, float]:
+        """
+        Extract logprobs for specified token IDs from logprobs data.
+
+        Args:
+            logprobs_data: List of (logprob, token_id, text) tuples
+            label_token_ids: Token IDs to extract logprobs for
+
+        Returns:
+            Dictionary mapping token_id to logprob
+        """
+        logprobs = {}
+        if logprobs_data:
+            for logprob, token_id, _ in logprobs_data:
+                if token_id in label_token_ids:
+                    logprobs[token_id] = logprob
+        return logprobs

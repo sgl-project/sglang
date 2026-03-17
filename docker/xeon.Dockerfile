@@ -4,10 +4,6 @@ SHELL ["/bin/bash", "-c"]
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
 ARG VER_SGLANG=main
 
-ARG VER_TORCH=2.9.0
-ARG VER_TORCHVISION=0.24.0
-ARG VER_TRITON=3.5.0
-
 RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
@@ -31,7 +27,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     source $HOME/.local/bin/env && \
     uv venv --python 3.12
 
-RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchvision"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "triton"\nurl = "https://download.pytorch.org/whl/cpu"' > .venv/uv.toml
+RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchvision"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchaudio"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "triton"\nurl = "https://download.pytorch.org/whl/cpu"' > .venv/uv.toml
 
 ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
@@ -44,7 +40,6 @@ RUN source $HOME/.local/bin/env && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
-    uv pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} triton==${VER_TRITON} --force-reinstall && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .

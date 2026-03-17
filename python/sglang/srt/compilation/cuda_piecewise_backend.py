@@ -140,11 +140,6 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        # Skip CUDA graphs if this entry doesn't use them OR
-        # if we're supposed to skip them globally
-        # skip_cuda_graphs = get_forward_context().skip_cuda_graphs
-        # if not entry.use_cudagraph or skip_cuda_graphs:
-        #     return entry.runnable(*args)
         if is_in_pcg_torch_compile():
             return entry.runnable(*args)
 
@@ -172,7 +167,9 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
                 stream = get_pcg_capture_stream()
-                assert stream is not None, "PCG capture stream is not set"
+                assert (
+                    stream is not None
+                ), "PCG capture stream is not set, please check if runtime recompilation happened"
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)

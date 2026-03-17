@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -154,6 +155,8 @@ class TestKvEvents(CustomTestCase):
                 pass
 
         finally:
+            sub.close()
+            context.term()
             kill_process_tree(process.pid)
 
     def test_kv_events_attn_dp(self):
@@ -175,7 +178,7 @@ class TestKvEvents(CustomTestCase):
 
         # Launch sglang server with DP attention enabled
         process = popen_launch_server(
-            "silence09/DeepSeek-R1-Small-2layers",
+            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[

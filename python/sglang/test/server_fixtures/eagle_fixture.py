@@ -4,10 +4,11 @@ import time
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -24,8 +25,8 @@ PROMPTS = [
 
 
 class EagleServerBase(CustomTestCase):
-    target_model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    target_model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     spec_algo = "EAGLE"
     spec_steps = 5
     spec_topk = 8
@@ -36,20 +37,23 @@ class EagleServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.target_model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                f"--speculative-algorithm={cls.spec_algo}",
-                f"--speculative-draft-model-path={cls.draft_model}",
-                f"--speculative-num-steps={cls.spec_steps}",
-                f"--speculative-eagle-topk={cls.spec_topk}",
-                f"--speculative-num-draft-tokens={cls.spec_tokens}",
-                f"--mem-fraction-static={cls.mem_fraction_static}",
-            ]
-            + cls.extra_args,
-        )
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+            cls.process = popen_launch_server(
+                cls.target_model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    f"--speculative-algorithm={cls.spec_algo}",
+                    f"--speculative-draft-model-path={cls.draft_model}",
+                    f"--speculative-num-steps={cls.spec_steps}",
+                    f"--speculative-eagle-topk={cls.spec_topk}",
+                    f"--speculative-num-draft-tokens={cls.spec_tokens}",
+                    f"--mem-fraction-static={cls.mem_fraction_static}",
+                ]
+                + cls.extra_args,
+            )
 
     @classmethod
     def tearDownClass(cls):

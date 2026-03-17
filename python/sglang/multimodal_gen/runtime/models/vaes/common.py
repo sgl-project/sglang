@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -20,7 +21,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 
 
-class ParallelTiledVAE(ABC):
+class ParallelTiledVAE(ABC, nn.Module):
     tile_sample_min_height: int
     tile_sample_min_width: int
     tile_sample_min_num_frames: int
@@ -33,6 +34,7 @@ class ParallelTiledVAE(ABC):
     use_parallel_tiling: bool
 
     def __init__(self, config: VAEConfig, **kwargs) -> None:
+        super().__init__()
         self.config = config
         self.tile_sample_min_height = config.tile_sample_min_height
         self.tile_sample_min_width = config.tile_sample_min_width
@@ -44,10 +46,6 @@ class ParallelTiledVAE(ABC):
         self.use_tiling = config.use_tiling
         self.use_temporal_tiling = config.use_temporal_tiling
         self.use_parallel_tiling = config.use_parallel_tiling
-
-    def to(self, device) -> "ParallelTiledVAE":
-        # TODO: implement this
-        return self
 
     @property
     def device(self):
@@ -613,7 +611,9 @@ class DiagonalGaussianDistribution:
         return x
 
     def kl(
-        self, other: Optional["DiagonalGaussianDistribution"] = None
+        self,
+        other: Optional["DiagonalGaussianDistribution"] = None,
+        dims: tuple[int, ...] = (1, 2, 3),
     ) -> torch.Tensor:
         if self.deterministic:
             return torch.Tensor([0.0])
@@ -621,7 +621,7 @@ class DiagonalGaussianDistribution:
             if other is None:
                 return 0.5 * torch.sum(
                     torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=[1, 2, 3],
+                    dim=dims,
                 )
             else:
                 return 0.5 * torch.sum(
@@ -630,7 +630,7 @@ class DiagonalGaussianDistribution:
                     - 1.0
                     - self.logvar
                     + other.logvar,
-                    dim=[1, 2, 3],
+                    dim=dims,
                 )
 
     def nll(

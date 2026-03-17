@@ -4,18 +4,20 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=200, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):
@@ -41,12 +43,9 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         cls.short_context_prompt = "The capital of France is"
 
         # Test prompt longer than window size
-        cls.long_context_prompt = (
-            """
+        cls.long_context_prompt = """
         Once upon a time, there was a mountain. In the mountain, there was a temple. In the temple, there was an old monk telling a story. The story was:
-        """
-            * 100
-        )
+        """ * 100
         cls.long_context_prompt += "\nNow, summarize the story in one sentence:"
 
     def _test_mmlu(self):
@@ -61,7 +60,10 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         metrics = run_eval(args)
         print(f"MMLU metrics with sliding window: {metrics}")
 
-        self.assertGreaterEqual(metrics["score"], 0.60)
+        if is_in_amd_ci():
+            self.assertGreaterEqual(metrics["score"], 0.55)
+        else:
+            self.assertGreaterEqual(metrics["score"], 0.60)
 
     def _test_short_context_generation(self):
         response = requests.post(

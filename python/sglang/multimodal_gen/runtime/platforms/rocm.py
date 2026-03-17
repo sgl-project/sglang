@@ -7,6 +7,9 @@ This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
 
+from functools import lru_cache
+from typing import Any
+
 import torch
 
 import sglang.multimodal_gen.envs as envs
@@ -30,6 +33,10 @@ class RocmPlatform(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
@@ -39,6 +46,7 @@ class RocmPlatform(Platform):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
 
@@ -62,17 +70,34 @@ class RocmPlatform(Platform):
         return float(torch.cuda.max_memory_allocated(device))
 
     @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+        free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_gpu_memory = float(tensor.item())
+
+        return free_gpu_memory / (1 << 30)
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
-        )
-
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -83,15 +108,22 @@ class RocmPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
-                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
-                    "Falling back to Torch SDPA backend.",
+                    "AITer backend works best with fp16/bf16 inputs but got dtype=%s. "
+                    "Proceeding with AITer anyway.",
                     dtype,
                 )
-                # TODO: need to compare triton with sdpa as an alternative backend
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
+            if dtype in (torch.float16, torch.bfloat16):
+                logger.info("Using AITER Sage backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
+            else:
+                logger.warning(
+                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    dtype,
+                )
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -149,3 +181,50 @@ class RocmPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Replace nn.GroupNorm with AITer GroupNorm for improved ROCm VAE performance."""
+        if not envs.SGLANG_USE_ROCM_VAE:
+            return vae
+        try:
+            from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
+
+            count = cls._replace_groupnorm(vae, AiterGroupNorm)
+            if count > 0:
+                logger.info(
+                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
+                    count,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to apply AITer GroupNorm to VAE.",
+                exc_info=True,
+            )
+        return vae
+
+    @staticmethod
+    def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
+        count = 0
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.GroupNorm) and child.affine:
+                replacement = aiter_gn_cls(
+                    num_groups=child.num_groups,
+                    num_channels=child.num_channels,
+                    eps=child.eps,
+                    affine=True,
+                    device=child.weight.device,
+                    dtype=child.weight.dtype,
+                )
+                replacement.weight = child.weight
+                replacement.bias = child.bias
+                setattr(module, name, replacement)
+                count += 1
+            else:
+                count += RocmPlatform._replace_groupnorm(child, aiter_gn_cls)
+        return count
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """ROCm performs better without DIT layerwise offload on Wan."""
+        return False

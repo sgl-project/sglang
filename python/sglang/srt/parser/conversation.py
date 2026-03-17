@@ -510,11 +510,11 @@ def chat_template_exists(template_name: str) -> bool:
 
 
 def generate_embedding_convs(
-    texts: List[str], images: List[str], template_name: str
+    texts: List[str], images: List[str], videos: List[str], template_name: str
 ) -> List[Conversation]:
     conv_template = chat_templates[template_name].copy()
     convs = []
-    for text, image in zip(texts, images):
+    for text, image, video in zip(texts, images, videos):
         conv = Conversation(
             name=conv_template.name,
             system_template=conv_template.system_template,
@@ -544,6 +544,8 @@ def generate_embedding_convs(
                 else conv.image_token
             )
             real_content += image_token
+        if video is not None:
+            real_content += conv.video_token
         if text is not None:
             real_content += text
         conv.append_message(conv.roles[0], real_content)
@@ -1025,6 +1027,23 @@ register_conv_template(
     )
 )
 
+# Whisper speech-to-text template
+# Whisper uses special tokens: <|startoftranscript|>, <|en|>, <|transcribe|>, etc.
+# Audio features are processed by encoder separately, not inserted into text
+# The decoder start tokens (task, language) should be set via generation config
+register_conv_template(
+    Conversation(
+        name="whisper",
+        system_template="",
+        system_message="",
+        roles=("", ""),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="",
+        stop_str=["<|endoftext|>"],
+        audio_token="",  # Empty - audio is handled by encoder, not as text token
+    )
+)
+
 MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
     "deepseek_vl_v2": "deepseek-vl2",
@@ -1034,6 +1053,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmo": "minicpmo",
     "deepseek-ocr": "deepseek-ocr",
     "paddleocr_vl": "paddle-ocr",
+    "whisper": "whisper",
 }
 
 
@@ -1125,5 +1145,13 @@ def match_deepseek_ocr(model_path: str):
 def match_paddle_ocr(model_path: str):
     if "paddleocr" in model_path.lower():
         return "paddle-ocr"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_whisper(model_path: str):
+    if "whisper" in model_path.lower():
+        return "whisper"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)

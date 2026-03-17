@@ -21,6 +21,7 @@ def broadcast_pyobj(
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
+
     device = torch.device(
         current_platform.device_type if not force_cpu_device else "cpu"
     )

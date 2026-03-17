@@ -35,6 +35,7 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -57,7 +58,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = in_channels
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             in_channels,
             hidden_size,
             kernel_size=kernel_size,
@@ -212,6 +213,8 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x is 2-D: (num_patches, C * T * P * P)
+        # Reshape to 5-D for Conv3dLayer, then flatten back.
         x = x.view(
             -1,
             self.in_channels,
@@ -219,8 +222,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x).view(-1, self.hidden_size)
-        return x
+        return self.proj(x).view(-1, self.hidden_size)
 
 
 class Glm4vPatchMerger(nn.Module):
@@ -514,6 +516,10 @@ class Glm4vVisionModel(nn.Module):
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
 
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
+
         # x.shape: (s, b, d) where b=1 for vision processing
         # transformers
         x = x.unsqueeze(1)
@@ -754,8 +760,6 @@ class Glm4vForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
-            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

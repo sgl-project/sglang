@@ -10,6 +10,7 @@ This module contains implementations of image encoding stages for diffusion pipe
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
@@ -63,7 +64,18 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    def load_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            device = get_local_torch_device()
+            self.move_to_device(device)
+
+    def offload_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            self.move_to_device("cpu")
+
     def move_to_device(self, device):
+        if self.server_args.use_fsdp_inference:
+            return
         fields = [
             "image_processor",
             "image_encoder",
@@ -86,76 +98,100 @@ class ImageEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode the prompt into image encoder hidden states.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded prompt embeddings.
         """
 
         if batch.condition_image is None:
             return batch
         cuda_device = get_local_torch_device()
-        self.move_to_device(cuda_device)
 
-        image = batch.condition_image
+        self.load_model()
 
         image_processor_kwargs = (
             server_args.pipeline_config.prepare_image_processor_kwargs(batch)
         )
+        per_prompt_images = image_processor_kwargs.pop("per_prompt_images", None)
+        texts = image_processor_kwargs.pop("text", None)
 
-        image_inputs = self.image_processor(
-            images=image, return_tensors="pt", **image_processor_kwargs
-        ).to(cuda_device)
-        if self.image_encoder:
-            # if an image encoder is provided
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.image_encoder(
-                    **image_inputs,
-                    **server_args.pipeline_config.image_encoder_extra_args,
+        if per_prompt_images is None:
+            per_prompt_images = [batch.condition_image]
+            texts = [None] if texts is None else texts
+
+        all_prompt_embeds = []
+        all_neg_prompt_embeds = []
+
+        for idx, prompt_images in enumerate(per_prompt_images):
+            if not prompt_images:
+                continue
+
+            cur_kwargs = image_processor_kwargs.copy()
+            if texts and idx < len(texts):
+                cur_kwargs["text"] = [texts[idx]]
+
+            image_inputs = self.image_processor(
+                images=prompt_images, return_tensors="pt", **cur_kwargs
+            ).to(cuda_device)
+
+            if self.image_encoder:
+                # if an image encoder is provided
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    outputs = self.image_encoder(
+                        **image_inputs,
+                        **server_args.pipeline_config.image_encoder_extra_args,
+                    )
+                    image_embeds = server_args.pipeline_config.postprocess_image(
+                        outputs
+                    )
+                batch.image_embeds.append(image_embeds)
+            elif self.text_encoder:
+                # if a text encoder is provided, e.g. Qwen-Image-Edit
+                # 1. neg prompt embeds
+                if batch.do_classifier_free_guidance:
+                    neg_image_processor_kwargs = (
+                        server_args.pipeline_config.prepare_image_processor_kwargs(
+                            batch, neg=True
+                        )
+                    )
+                    neg_image_processor_kwargs.pop("per_prompt_images", None)
+                    neg_texts = neg_image_processor_kwargs.pop("text", None)
+                    if neg_texts and idx < len(neg_texts):
+                        neg_image_processor_kwargs["text"] = [neg_texts[idx]]
+                    neg_image_inputs = self.image_processor(
+                        images=prompt_images,
+                        return_tensors="pt",
+                        **neg_image_processor_kwargs,
+                    ).to(cuda_device)
+
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    outputs = self.text_encoder(
+                        input_ids=image_inputs.input_ids,
+                        attention_mask=image_inputs.attention_mask,
+                        pixel_values=image_inputs.pixel_values,
+                        image_grid_thw=image_inputs.image_grid_thw,
+                        output_hidden_states=True,
+                    )
+                    if batch.do_classifier_free_guidance:
+                        neg_outputs = self.text_encoder(
+                            input_ids=neg_image_inputs.input_ids,
+                            attention_mask=neg_image_inputs.attention_mask,
+                            pixel_values=neg_image_inputs.pixel_values,
+                            image_grid_thw=neg_image_inputs.image_grid_thw,
+                            output_hidden_states=True,
+                        )
+
+                all_prompt_embeds.append(
+                    self.encoding_qwen_image_edit(outputs, image_inputs)
                 )
-                image_embeds = server_args.pipeline_config.postprocess_image(outputs)
+                if batch.do_classifier_free_guidance:
+                    all_neg_prompt_embeds.append(
+                        self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                    )
 
-            batch.image_embeds.append(image_embeds)
-        elif self.text_encoder:
-            # if a text encoder is provided, e.g. Qwen-Image-Edit
-            # 1. neg prompt embeds
-            neg_image_processor_kwargs = (
-                server_args.pipeline_config.prepare_image_processor_kwargs(
-                    batch, neg=True
-                )
-            )
+        if all_prompt_embeds:
+            batch.prompt_embeds.append(torch.cat(all_prompt_embeds, dim=0))
+        if all_neg_prompt_embeds:
+            batch.negative_prompt_embeds.append(torch.cat(all_neg_prompt_embeds, dim=0))
 
-            neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(get_local_torch_device())
-
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.text_encoder(
-                    input_ids=image_inputs.input_ids,
-                    attention_mask=image_inputs.attention_mask,
-                    pixel_values=image_inputs.pixel_values,
-                    image_grid_thw=image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
-                neg_outputs = self.text_encoder(
-                    input_ids=neg_image_inputs.input_ids,
-                    attention_mask=neg_image_inputs.attention_mask,
-                    pixel_values=neg_image_inputs.pixel_values,
-                    image_grid_thw=neg_image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
-            batch.prompt_embeds.append(
-                self.encoding_qwen_image_edit(outputs, image_inputs)
-            )
-
-            batch.negative_prompt_embeds.append(
-                self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
-            )
-
-        self.move_to_device("cpu")
+        self.offload_model()
 
         return batch
 
@@ -188,6 +224,13 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
+    def load_model(self):
+        self.vae = self.vae.to(get_local_torch_device())
+
+    def offload_model(self):
+        if self.server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
+
     def forward(
         self,
         batch: Req,
@@ -195,21 +238,13 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode pixel representations into latent space.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded outputs.
         """
 
         if batch.condition_image is None:
             return batch
 
+        self.load_model()
         num_frames = batch.num_frames
-
-        self.vae = self.vae.to(get_local_torch_device())
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
@@ -218,6 +253,10 @@ class ImageVAEEncodingStage(PipelineStage):
             images = [images]
 
         all_image_latents = []
+        prepare_condition_image_latent_ids = getattr(
+            server_args.pipeline_config, "prepare_condition_image_latent_ids", None
+        )
+        condition_latents = [] if callable(prepare_condition_image_latent_ids) else None
         for image in images:
             image = self.preprocess(
                 image,
@@ -264,9 +303,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 #     self.vae.enable_parallel()
                 if not vae_autocast_enabled:
                     video_condition = video_condition.to(vae_dtype)
-                encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                     video_condition
                 )
+                # for auto_encoder from diffusers
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
             generator = batch.generator
             if generator is None:
@@ -275,7 +317,7 @@ class ImageVAEEncodingStage(PipelineStage):
             sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
 
             latent_condition = self.retrieve_latents(
-                encoder_output, generator, sample_mode=sample_mode
+                latent_dist, generator, sample_mode=sample_mode
             )
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae
@@ -299,16 +341,19 @@ class ImageVAEEncodingStage(PipelineStage):
             latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
 
+            if condition_latents is not None:
+                condition_latents.append(latent_condition)
+
             image_latent = server_args.pipeline_config.postprocess_image_latent(
                 latent_condition, batch
             )
             all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
-        self.maybe_free_model_hooks()
+        if condition_latents is not None:
+            prepare_condition_image_latent_ids(condition_latents, batch)
 
-        self.vae.to("cpu")
-
+        self.offload_model()
         return batch
 
     def retrieve_latents(

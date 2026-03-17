@@ -760,7 +760,7 @@ class HunyuanVideoDecoder3D(nn.Module):
         return hidden_states
 
 
-class AutoencoderKLHunyuanVideo(nn.Module, ParallelTiledVAE):
+class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
     Introduced in [HunyuanVideo](https://huggingface.co/papers/2412.03603).

@@ -14,7 +14,7 @@ use crate::routers::{
 };
 
 /// Client acquisition stage: Get gRPC clients from selected workers
-pub struct ClientAcquisitionStage;
+pub(crate) struct ClientAcquisitionStage;
 
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {

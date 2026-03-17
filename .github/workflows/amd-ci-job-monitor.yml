@@ -1,0 +1,149 @@
+name: AMD CI Job Monitor
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  pull_request:
+    paths:
+      - '.github/workflows/amd-ci-job-monitor.yml'
+      - 'scripts/ci/query_job_status.py'
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Time window in hours'
+        required: false
+        default: '24'
+        type: string
+      job_filter:
+        description: 'Job name filter (leave empty for all AMD jobs)'
+        required: false
+        type: string
+
+jobs:
+  # Single job filter mode
+  custom-report:
+    name: Custom Job Report
+    if: ${{ inputs.job_filter }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Generate Custom Job Report
+        timeout-minutes: 30
+        run: |
+          python scripts/ci/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ inputs.job_filter }}" \
+            --workflow "pr-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --summary
+
+  # Parse workflow files to get job names dynamically
+  parse-workflows:
+    name: Parse Workflow Jobs
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    outputs:
+      pr_jobs: ${{ steps.parse.outputs.pr_jobs }}
+      nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Parse workflow files
+        id: parse
+        run: |
+          # Parse pr-test-amd.yml and extract job names (exclude utility jobs)
+          # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
+          pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
+          echo "PR jobs: $pr_jobs"
+
+          # Parse nightly-test-amd.yml and extract job names (exclude utility jobs)
+          # Excluded: check-all-jobs
+          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
+            grep -v -E '^(check-all-jobs)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
+          echo "Nightly jobs: $nightly_jobs"
+
+  # PR CI reports using dynamic matrix
+  pr-ci-reports:
+    name: PR - ${{ matrix.job_name }}
+    needs: parse-workflows
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_jobs) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Generate Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "pr-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --summary
+
+  # Nightly AMD test reports using dynamic matrix
+  nightly-reports:
+    name: Nightly - ${{ matrix.job_name }}
+    needs: parse-workflows
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_jobs) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Generate Nightly Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "nightly-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --summary

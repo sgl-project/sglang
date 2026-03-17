@@ -6,21 +6,20 @@ import random
 import threading
 import time
 from datetime import datetime
-from typing import Optional
 
-import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import (
-    RequestFuncOutput,
-    get_tokenizer,
-    remove_prefix,
-    sample_random_requests,
+from sglang.bench_serving import RequestFuncOutput
+from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer
+from sglang.test.kits.cache_hit_kit import (
+    async_request_openai_chat_completions,
+    async_request_sglang_generate,
+    gen_payload,
+    gen_payload_openai,
 )
-
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
 
 def parse_args():
@@ -133,6 +132,24 @@ def parse_args():
         default="",
         help="Tag of a certain run in the log file",
     )
+    parser.add_argument(
+        "--min-rounds",
+        type=int,
+        default=0,
+        help="Min rounds per client (0 = use --num-rounds)",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=0,
+        help="Max rounds per client (0 = use --num-rounds)",
+    )
+    parser.add_argument(
+        "--range-ratio",
+        type=float,
+        default=1.0,
+        help="Length variation ratio for prompts and outputs (1.0 = no variation, 0.5 = 50%% variation)",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--lora-path",
@@ -140,96 +157,15 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--api-format",
+        type=str,
+        default="sglang",
+        choices=["sglang", "openai"],
+        help="API format to use: 'sglang' for native /generate endpoint, "
+        "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
+    )
     return parser.parse_args()
-
-
-async def async_request_sglang_generate(
-    payload,
-    url,
-    pbar: Optional[tqdm] = None,
-):
-    """
-    Sends a streaming request to the server. Gathers text token-by-token.
-    """
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {}
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        output = RequestFuncOutput()
-
-        try:
-            async with session.post(url=url, json=payload, headers=headers) as response:
-                if response.status == 200:
-                    prompt_tokens = 0
-                    cached_tokens = 0
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            if data["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-                                    prompt_tokens = (data.get("meta_info") or {}).get(
-                                        "prompt_tokens", 0
-                                    )
-                                    cached_tokens = (data.get("meta_info") or {}).get(
-                                        "cached_tokens", 0
-                                    )
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text = data["text"]
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.prompt_len = prompt_tokens
-                    output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception as e:
-            output.success = False
-            output.error = str(e)
-            print(f"Request failed: {e}")
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
-def gen_payload(prompt, output_len, lora_path=""):
-    payload = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": 0.0,
-            "max_new_tokens": output_len,
-            "ignore_eos": True,
-        },
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "lora_path": lora_path,
-        "return_logprob": False,
-        "logprob_start_len": -1,
-    }
-    return payload
 
 
 def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
@@ -274,66 +210,159 @@ class ReadyQueue:
 
 class WorkloadGenerator:
     def __init__(self, args):
-        # Construct the base URL for requests
-        self.url = f"http://{args.host}:{args.port}/generate"
+        self.api_format = args.api_format
+        self.model_path = args.model_path
+
+        # Construct the base URL and select request/payload functions
+        if self.api_format == "openai":
+            self.url = f"http://{args.host}:{args.port}/v1/chat/completions"
+            self.request_func = async_request_openai_chat_completions
+        else:
+            self.url = f"http://{args.host}:{args.port}/generate"
+            self.request_func = async_request_sglang_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
         self.request_rate = args.request_rate
         self.start_time = None
         self.finished_time = None
+        self.lora_path = args.lora_path
 
         self.sent_requests = 0
         self.completed_requests = 0
 
-        self.candidate_inputs = sample_random_requests(
+        # Resolve per-client round counts
+        min_rounds = args.min_rounds
+        max_rounds = args.max_rounds
+        if min_rounds == 0 and max_rounds == 0:
+            # Backward compat: all clients use --num-rounds
+            min_rounds = args.num_rounds
+            max_rounds = args.num_rounds
+        elif min_rounds == 0:
+            min_rounds = max_rounds
+        elif max_rounds == 0:
+            max_rounds = min_rounds
+        if min_rounds < 1:
+            raise ValueError(f"--min-rounds must be >= 1, got {min_rounds}")
+        if min_rounds > max_rounds:
+            raise ValueError(
+                f"--min-rounds ({min_rounds}) must be <= --max-rounds ({max_rounds})"
+            )
+
+        self.min_rounds = min_rounds
+        self.max_rounds = max_rounds
+
+        if min_rounds == max_rounds:
+            # All clients have the same round count; skip randint to preserve random state
+            self.client_total_rounds = [min_rounds] * args.num_clients
+        else:
+            self.client_total_rounds = [
+                random.randint(min_rounds, max_rounds) for _ in range(args.num_clients)
+            ]
+
+        # clients_per_round[r] = number of clients participating in round r
+        self.clients_per_round = [
+            sum(1 for t in self.client_total_rounds if t > r) for r in range(max_rounds)
+        ]
+        self.total_requests = sum(self.client_total_rounds)
+
+        range_ratio = args.range_ratio
+
+        # Use return_text=False to get token ids instead of text
+        first_round_samples = sample_random_requests(
             input_len=args.request_length,
             output_len=args.output_length,
             num_prompts=args.num_clients,
-            range_ratio=1.0,
+            range_ratio=range_ratio,
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
+            return_text=False,
         )
-        self.candidate_inputs = [i.prompt for i in self.candidate_inputs]
+        # Store per-sample output_len for first round
+        first_round_output_lens = [row.output_len for row in first_round_samples]
+        # r.prompt is now List[int] when return_text=False
+        self.candidate_inputs = [list(i.prompt) for i in first_round_samples]
 
         if args.sub_question_input_length != 0:
             sub_question_input_length = args.sub_question_input_length
         else:
             sub_question_input_length = args.request_length
 
+        num_sub_questions = sum(max(t - 1, 0) for t in self.client_total_rounds)
+
         self.sub_question_inputs = sample_random_requests(
             input_len=sub_question_input_length,
             output_len=args.output_length,
-            num_prompts=args.num_clients * max(args.num_rounds - 1, 1),
-            range_ratio=1.0,
+            num_prompts=max(num_sub_questions, 1),
+            range_ratio=range_ratio,
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
+            return_text=False,
         )
 
-        init_requests = [
-            (
-                i,
-                gen_payload(
-                    self.candidate_inputs[i], args.output_length, args.lora_path
-                ),
-            )
-            for i in range(args.num_clients)
-        ]
-        self.client_records = {
-            i: {"round": 0, "history": init_requests[i][1]["text"]}
-            for i in range(args.num_clients)
-        }
+        if self.api_format == "openai":
+            # OpenAI mode: history is a messages list for /v1/chat/completions
+            initial_messages = {
+                i: [
+                    {
+                        "role": "user",
+                        "content": self.tokenizer.decode(self.candidate_inputs[i]),
+                    }
+                ]
+                for i in range(args.num_clients)
+            }
+            init_requests = [
+                (
+                    i,
+                    gen_payload_openai(
+                        initial_messages[i],
+                        first_round_output_lens[i],
+                        self.model_path,
+                    ),
+                )
+                for i in range(args.num_clients)
+            ]
+            self.client_records = {
+                i: {
+                    "round": 0,
+                    "history": initial_messages[i],
+                    "total_rounds": self.client_total_rounds[i],
+                }
+                for i in range(args.num_clients)
+            }
+        else:
+            # SGLang mode: history is List[int] (token ids)
+            init_requests = [
+                (
+                    i,
+                    gen_payload(
+                        self.candidate_inputs[i],
+                        first_round_output_lens[i],
+                        args.lora_path,
+                    ),
+                )
+                for i in range(args.num_clients)
+            ]
+            self.client_records = {
+                i: {
+                    "round": 0,
+                    "history": list(self.candidate_inputs[i]),
+                    "total_rounds": self.client_total_rounds[i],
+                }
+                for i in range(args.num_clients)
+            }
         self.ready_queue = ReadyQueue(
             init_requests=init_requests, policy=args.ready_queue_policy
         )
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=args.num_clients * args.num_rounds)
+        self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
+            "itl": [],
             "latency": [],
             "prompt_len": [],
             "cached_tokens": [],
@@ -342,7 +371,7 @@ class WorkloadGenerator:
         self.enable_round_barrier = args.enable_round_barrier
         if self.enable_round_barrier:
             # Add round-specific metrics while preserving the original structure
-            for i in range(args.num_rounds):
+            for i in range(self.max_rounds):
                 self.performance_metrics[f"round_{i}"] = {
                     "ttft": [],
                     "latency": [],
@@ -352,19 +381,23 @@ class WorkloadGenerator:
                 }
         self.num_clients = args.num_clients
 
-        self.num_rounds = args.num_rounds
+        self.num_rounds = self.max_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
 
     async def handle_request(self, item):
+        client_id, payload = item
         try:
-            client_id, payload = item
-            response = await async_request_sglang_generate(payload, self.url, self.pbar)
+            response = await self.request_func(payload, self.url, self.pbar)
             if self.pbar.n == self.pbar.total:
                 self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
         except Exception as e:
-            print(f"Request failed: {e}")
+            print(f"Request failed for client {client_id}: {e}")
+            failed_response = RequestFuncOutput()
+            failed_response.success = False
+            failed_response.error = str(e)
+            self.response_queue.put((client_id, failed_response))
 
     def request_sender(self):
         async def request_loop():
@@ -401,17 +434,31 @@ class WorkloadGenerator:
 
     def response_handler(self):
         next_round_reqs = []
+        current_barrier_round = 0
+        barrier_round_completed = 0
         while True:
             try:
                 client_id, response = self.response_queue.get(
                     timeout=10
                 )  # Block until response is available
                 if not response.success:
-                    raise ValueError(f"Request failed with error: {response.error}")
-                self.client_records[client_id]["history"] += response.generated_text
+                    print(f"Request failed for client {client_id}: {response.error}")
+                    self.completed_requests += 1
+                    continue
+                # Extend history with response
+                if self.api_format == "openai":
+                    if response.generated_text:
+                        self.client_records[client_id]["history"].append(
+                            {"role": "assistant", "content": response.generated_text}
+                        )
+                else:
+                    self.client_records[client_id]["history"].extend(
+                        response.output_ids
+                    )
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
@@ -434,27 +481,59 @@ class WorkloadGenerator:
                     ].append(response.generated_len)
                 self.completed_requests += 1
 
-                if self.client_records[client_id]["round"] < self.num_rounds:
-                    # append new request to client's history
-                    self.client_records[client_id][
-                        "history"
-                    ] += self.sub_question_inputs.pop().prompt
-                    new_req = (
-                        client_id,
-                        gen_payload(
-                            self.client_records[client_id]["history"],
-                            self.output_length,
-                            args.lora_path,
-                        ),
-                    )
+                client_total = self.client_records[client_id]["total_rounds"]
+                if self.client_records[client_id]["round"] < client_total:
+                    sub_q = self.sub_question_inputs.pop()
+                    if self.api_format == "openai":
+                        # Append sub-question as a new user message
+                        sub_q_text = self.tokenizer.decode(list(sub_q.prompt))
+                        self.client_records[client_id]["history"].append(
+                            {"role": "user", "content": sub_q_text}
+                        )
+                        new_req = (
+                            client_id,
+                            gen_payload_openai(
+                                self.client_records[client_id]["history"],
+                                sub_q.output_len,
+                                self.model_path,
+                            ),
+                        )
+                    else:
+                        # Append sub-question token ids to client's history
+                        sub_q_ids = list(sub_q.prompt)
+                        self.client_records[client_id]["history"].extend(sub_q_ids)
+                        new_req = (
+                            client_id,
+                            gen_payload(
+                                self.client_records[client_id]["history"],
+                                sub_q.output_len,
+                                self.lora_path,
+                            ),
+                        )
                     if self.enable_round_barrier:
                         next_round_reqs.append(new_req)
-                        if len(next_round_reqs) == self.num_clients:
-                            for req in next_round_reqs:
-                                self.ready_queue.append(req)
-                            next_round_reqs = []
                     else:
                         self.ready_queue.append(new_req)
+
+                # Barrier logic: release next round when all clients for
+                # current barrier round have completed
+                if (
+                    self.enable_round_barrier
+                    and current_barrier_round < self.max_rounds
+                ):
+                    barrier_round_completed += 1
+                    expected = self.clients_per_round[current_barrier_round]
+                    if barrier_round_completed == expected:
+                        print(
+                            f"\n  Barrier: round {current_barrier_round} complete "
+                            f"({expected} clients), releasing {len(next_round_reqs)} "
+                            f"requests for round {current_barrier_round + 1}"
+                        )
+                        for req in next_round_reqs:
+                            self.ready_queue.append(req)
+                        next_round_reqs = []
+                        current_barrier_round += 1
+                        barrier_round_completed = 0
             except queue.Empty:
                 if self.pbar.n == self.pbar.total:
                     break
@@ -475,6 +554,23 @@ class WorkloadGenerator:
         self.pbar.close()
 
         duration = self.finished_time - self.start_time
+        sorted_ttft = sorted(self.performance_metrics["ttft"])
+        sorted_latency = sorted(self.performance_metrics["latency"])
+        sorted_itl = sorted(self.performance_metrics["itl"])
+        sorted_prompt_len = sorted(self.performance_metrics["prompt_len"])
+        sorted_output_len = sorted(self.performance_metrics["generated_len"])
+
+        def percentile(sorted_vals, q):
+            if not sorted_vals:
+                return 0.0
+            idx = int(q * len(sorted_vals))
+            if idx >= len(sorted_vals):
+                idx = len(sorted_vals) - 1
+            return sorted_vals[idx]
+
+        def max_or_zero(sorted_vals):
+            return sorted_vals[-1] if sorted_vals else 0.0
+
         performance_data = {
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
@@ -491,22 +587,32 @@ class WorkloadGenerator:
                     if self.performance_metrics["generated_len"]
                     else 0.0
                 ),
+                "p90_prompt_len": percentile(sorted_prompt_len, 0.9),
+                "p99_prompt_len": percentile(sorted_prompt_len, 0.99),
+                "p90_output_len": percentile(sorted_output_len, 0.9),
+                "p99_output_len": percentile(sorted_output_len, 0.99),
                 "average_ttft": sum(self.performance_metrics["ttft"])
                 / len(self.performance_metrics["ttft"]),
-                "p90_ttft": sorted(self.performance_metrics["ttft"])[
-                    int(0.9 * len(self.performance_metrics["ttft"]))
-                ],
-                "median_ttft": sorted(self.performance_metrics["ttft"])[
-                    len(self.performance_metrics["ttft"]) // 2
-                ],
+                "p90_ttft": percentile(sorted_ttft, 0.9),
+                "p99_ttft": percentile(sorted_ttft, 0.99),
+                "median_ttft": percentile(sorted_ttft, 0.5),
+                "max_ttft": max_or_zero(sorted_ttft),
+                "average_itl": (
+                    sum(self.performance_metrics["itl"])
+                    / len(self.performance_metrics["itl"])
+                    if self.performance_metrics["itl"]
+                    else 0.0
+                ),
+                "p90_itl": percentile(sorted_itl, 0.9),
+                "p99_itl": percentile(sorted_itl, 0.99),
+                "median_itl": percentile(sorted_itl, 0.5),
+                "max_itl": max_or_zero(sorted_itl),
                 "average_latency": sum(self.performance_metrics["latency"])
                 / len(self.performance_metrics["latency"]),
-                "p90_latency": sorted(self.performance_metrics["latency"])[
-                    int(0.9 * len(self.performance_metrics["latency"]))
-                ],
-                "median_latency": sorted(self.performance_metrics["latency"])[
-                    len(self.performance_metrics["latency"]) // 2
-                ],
+                "p90_latency": percentile(sorted_latency, 0.9),
+                "p99_latency": percentile(sorted_latency, 0.99),
+                "median_latency": percentile(sorted_latency, 0.5),
+                "max_latency": max_or_zero(sorted_latency),
                 "input_token_throughput": sum(self.performance_metrics["prompt_len"])
                 / duration,
                 "output_token_throughput": sum(
@@ -524,7 +630,7 @@ class WorkloadGenerator:
         }
         if self.enable_round_barrier:
             performance_data["round"] = {}
-            for round_num in range(args.num_rounds):
+            for round_num in range(self.num_rounds):
                 round_key = f"round_{round_num}"
                 round_metrics = self.performance_metrics[round_key]
                 performance_data["round"][round_key] = {
@@ -552,14 +658,35 @@ class WorkloadGenerator:
         print(
             f"  Average Output Length: {performance_data['summary']['average_output_len']:.2f} tokens"
         )
+        print(
+            f"  P90 Prompt Length: {performance_data['summary']['p90_prompt_len']:.0f} tokens"
+        )
+        print(
+            f"  P99 Prompt Length: {performance_data['summary']['p99_prompt_len']:.0f} tokens"
+        )
+        print(
+            f"  P90 Output Length: {performance_data['summary']['p90_output_len']:.0f} tokens"
+        )
+        print(
+            f"  P99 Output Length: {performance_data['summary']['p99_output_len']:.0f} tokens"
+        )
         print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
         print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
+        print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
+        print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
+        print(f"  Average ITL: {performance_data['summary']['average_itl']:.4f}")
+        print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.4f}")
+        print(f"  P99 ITL: {performance_data['summary']['p99_itl']:.4f}")
+        print(f"  Median ITL: {performance_data['summary']['median_itl']:.4f}")
+        print(f"  Max ITL: {performance_data['summary']['max_itl']:.4f}")
         print(
             f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
         )
         print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
+        print(f"  P99 latency: {performance_data['summary']['p99_latency']:.2f}")
         print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
+        print(f"  Max latency: {performance_data['summary']['max_latency']:.2f}")
         print(
             f"  Input token throughput: {performance_data['summary']['input_token_throughput']:.2f} tokens per second"
         )
@@ -582,10 +709,12 @@ class WorkloadGenerator:
                         avg_ttft = round_data["average_ttft"]
                         cache_hit_rate = round_data["cache_hit_rate"]
                         request_count = round_data["request_count"]
+                        clients_in_round = self.clients_per_round[round_num]
                         print(
                             f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s, "
                             f"Cache Hit Rate = {cache_hit_rate:.6f} "
-                            f"({request_count} requests)"
+                            f"({request_count} requests, "
+                            f"{clients_in_round} clients)"
                         )
                     else:
                         print(f"  Round {round_num}: No requests completed")
