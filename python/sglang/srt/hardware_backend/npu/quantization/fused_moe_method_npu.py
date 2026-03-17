@@ -520,7 +520,6 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 topk_ids=topk_ids,
                 top_k=topk_ids.shape[1],
             )
-            return StandardCombineInput(hidden_states=output)
         # decode
         else:
             output = npu_fused_experts_w8a8_decode(
