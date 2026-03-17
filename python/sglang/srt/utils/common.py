@@ -292,7 +292,7 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
@@ -344,7 +344,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -633,7 +633,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
