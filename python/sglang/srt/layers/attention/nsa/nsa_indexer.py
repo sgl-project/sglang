@@ -538,11 +538,15 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
-        seq_len_sum = forward_batch.seq_lens_sum
-        max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
+        # In CP round-robin-split, page tables may be filtered by metadata. The KV
+        # gather inputs must use the same filtered batch view to stay aligned.
+        seq_lens = metadata.get_seqlens_int32()
+        seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = int(seq_lens.sum().item())
+        max_seq_len = int(seq_lens_cpu.max().item()) if len(seq_lens_cpu) != 0 else 0
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
-            forward_batch.seq_lens,
+            seq_lens,
             block_tables,
             seq_len_sum,
             max_seq_len,
