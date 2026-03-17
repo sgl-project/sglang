@@ -13,7 +13,10 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -841,6 +844,9 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             .to(cuda_device, dtype)
         )
 
+        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+
+
     def enable_tiling(
         self,
         tile_sample_min_height: Optional[int] = None,
@@ -956,13 +962,22 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         return posterior
 
-    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+    def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
+        if self.use_parallel_decode and get_sp_world_size() > 1:
+            num_frame = z.shape[2]
+            num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
+            decoded = ParallelTiledVAE.parallel_tiled_decode(self, z)[:, :, :num_sample_frames]
+            return DecoderOutput(sample=decoded)
+
+        return DecoderOutput(sample=self._decode(z))
+
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
 
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
-            return self.tiled_decode(z, return_dict=return_dict)
+            return self.tiled_decode(z)
 
         self.clear_cache()
         x = self.post_quant_conv(z)
@@ -976,10 +991,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         out = torch.clamp(out, min=-1.0, max=1.0)
         self.clear_cache()
-        if not return_dict:
-            return (out,)
-
-        return DecoderOutput(sample=out)
+        return out
 
     def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         r"""
@@ -996,10 +1008,13 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 returned.
         """
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
+            decoded_slices = [
+                self._decode_with_parallel_dispatch(z_slice).sample
+                for z_slice in z.split(1)
+            ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z).sample
+            decoded = self._decode_with_parallel_dispatch(z).sample
 
         return decoded
 
@@ -1085,19 +1100,15 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
         return enc
 
-    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
+    def tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
         r"""
         Decode a batch of images using a tiled decoder.
 
         Args:
             z (`torch.Tensor`): Input batch of latent vectors.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
 
         Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
+            `torch.Tensor`: The decoded images.
         """
         _, _, num_frames, height, width = z.shape
         sample_height = height * self.spatial_compression_ratio
@@ -1133,8 +1144,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         for i, row in enumerate(rows):
             result_row = []
             for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
                 if i > 0:
                     tile = self.blend_v(rows[i - 1][j], tile, blend_height)
                 if j > 0:
@@ -1142,11 +1151,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 result_row.append(tile[:, :, :, : self.tile_sample_stride_height, : self.tile_sample_stride_width])
             result_rows.append(torch.cat(result_row, dim=-1))
 
-        dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
-
-        if not return_dict:
-            return (dec,)
-        return DecoderOutput(sample=dec)
+        return torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
 
     def forward(
         self,
