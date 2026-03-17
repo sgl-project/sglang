@@ -314,7 +314,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | `none` | `none`, `deepep`, `mooncake`, `mori`, `nixl`, `ascend_fuseep`|
 | `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_trtllm_routed`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
 | `--flashinfer-mxfp4-moe-precision` | Choose the computation precision of flashinfer mxfp4 moe | `default` | `default`, `bf16` |
-| `--flashinfer-allreduce-fusion-backend` | Enable FlashInfer allreduce fusion (fused allreduce + Residual + RMSNorm) and choose backend. When not set, the feature is disabled. Options: `auto` (choose best), `trtllm` (SM90/100, single-node only), `mnnvl` (SM100, single/multi-node). Backend support table (SM100/SM90, single/multi-node) is in `sglang.srt.layers.flashinfer_comm_fusion`. | `None` | `auto`, `trtllm`, `mnnvl` |
+| `--enable-flashinfer-allreduce-fusion` | Enable FlashInfer allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
 | `--enable-aiter-allreduce-fusion` | Enable aiter allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | `auto` | `normal`, `low_latency`, `auto` |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | `0` | Type: int |
@@ -563,7 +563,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-flashinfer-trtllm-moe` | NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead. | `None` | N/A |
 | `--enable-triton-kernel-moe` | NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead. | `None` | N/A |
 | `--enable-flashinfer-mxfp4-moe` | NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead. | `None` | N/A |
-| `--enable-flashinfer-allreduce-fusion` | NOTE: --enable-flashinfer-allreduce-fusion is deprecated. Please set `--flashinfer-allreduce-fusion-backend=auto` instead. | `None` | N/A |
 | `--crash-on-nan` | Crash the server on nan logprobs. | `False` | Type: str |
 | `--hybrid-kvcache-ratio` | Mix ratio in [0,1] between uniform and hybrid kv buffers (0.0 = pure uniform: swa_size / full_size = 1)(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length) | `None` | Optional[float] |
 | `--load-watch-interval` | The interval of load watching in seconds. | `0.1` | Type: float |
