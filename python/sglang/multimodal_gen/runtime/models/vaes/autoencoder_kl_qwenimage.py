@@ -1144,6 +1144,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         for i, row in enumerate(rows):
             result_row = []
             for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
                 if i > 0:
                     tile = self.blend_v(rows[i - 1][j], tile, blend_height)
                 if j > 0:
