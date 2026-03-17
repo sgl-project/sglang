@@ -16,33 +16,13 @@ from .base_config import QuantizationConfig, QuantizeMethodBase
 
 logger = init_logger(__name__)
 
-SVDQ_W4A4_LAYER_PATTERNS = [
-    "attn.to_qkv",
-    "attn.to_out",
-    "attn.add_qkv_proj",
-    "attn.to_add_out",
-    "img_mlp",
-    "txt_mlp",
-]
-
-AWQ_W4A16_LAYER_PATTERNS = [
-    "img_mod",
-    "txt_mod",
-]
-
-SKIP_QUANTIZATION_PATTERNS = [
-    "norm",
-    "embed",
-    "rotary",
-    "pos_embed",
-]
-
 
 @lru_cache(maxsize=1)
 def is_nunchaku_available() -> bool:
     try:
         import nunchaku  # noqa
 
+        logger.debug("Nunchaku package detected")
         return True
     except Exception:
         return False
@@ -60,14 +40,16 @@ class NunchakuConfig(QuantizationConfig):
         rank: SVD low-rank dimension for absorbing outliers
         group_size: Quantization group size (automatically set based on precision)
         act_unsigned: Use unsigned activation quantization
-        quantized_model_path: Path to pre-quantized model weights (.safetensors)
+        transformer_weights_path: Path to pre-quantized transformer weights (.safetensors)
+        model_cls: DiT model class that provides quantization rules via get_nunchaku_quant_rules()
     """
 
-    precision: str = "int4"  # "int4" or "nvfp4"
+    precision: str = "int4"
     rank: int = 32
     group_size: Optional[int] = None
     act_unsigned: bool = False
-    quantized_model_path: Optional[str] = None
+    transformer_weights_path: Optional[str] = None
+    model_cls: Optional[type] = None
 
     @classmethod
     def get_name(cls) -> str:
@@ -93,21 +75,33 @@ class NunchakuConfig(QuantizationConfig):
             rank=int(config.get("rank", 32)),
             group_size=config.get("group_size"),
             act_unsigned=bool(config.get("act_unsigned", False)),
-            quantized_model_path=config.get("quantized_model_path"),
+            transformer_weights_path=config.get("transformer_weights_path"),
         )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         if not isinstance(layer, LinearBase):
             return None
 
-        for pattern in SKIP_QUANTIZATION_PATTERNS:
+        # get quantization rules from model class
+        quant_rules = self._get_quant_rules()
+
+        # priority: skip > awq_w4a16 > svdq_w4a4 > default
+        skip_patterns = quant_rules.get("skip", [])
+        for pattern in skip_patterns:
             if pattern in prefix.lower():
                 return None
 
-        for pattern in SVDQ_W4A4_LAYER_PATTERNS:
+        awq_patterns = quant_rules.get("awq_w4a16", [])
+        for pattern in awq_patterns:
+            if pattern in prefix:
+                from ..nunchaku_linear import NunchakuAWQLinearMethod
+
+                return NunchakuAWQLinearMethod(group_size=64)
+
+        svdq_patterns = quant_rules.get("svdq_w4a4", [])
+        for pattern in svdq_patterns:
             if pattern in prefix:
                 from ..nunchaku_linear import NunchakuSVDQLinearMethod
 
@@ -117,14 +111,7 @@ class NunchakuConfig(QuantizationConfig):
                     act_unsigned=self.act_unsigned,
                 )
 
-        for pattern in AWQ_W4A16_LAYER_PATTERNS:
-            if pattern in prefix:
-                from ..nunchaku_linear import NunchakuAWQLinearMethod
-
-                return NunchakuAWQLinearMethod(
-                    group_size=64,
-                )
-
+        # default: apply svdq_w4a4 to all remaining linear layers
         from ..nunchaku_linear import NunchakuSVDQLinearMethod
 
         return NunchakuSVDQLinearMethod(
@@ -132,6 +119,13 @@ class NunchakuConfig(QuantizationConfig):
             rank=self.rank,
             act_unsigned=self.act_unsigned,
         )
+
+    def _get_quant_rules(self) -> dict[str, list[str]]:
+        if self.model_cls is not None and hasattr(
+            self.model_cls, "get_nunchaku_quant_rules"
+        ):
+            return self.model_cls.get_nunchaku_quant_rules()
+        return {}
 
     def __post_init__(self):
         if self.group_size is None:
@@ -164,7 +158,7 @@ class NunchakuConfig(QuantizationConfig):
             "rank": self.rank,
             "group_size": self.group_size,
             "act_unsigned": self.act_unsigned,
-            "quantized_model_path": self.quantized_model_path,
+            "transformer_weights_path": self.transformer_weights_path,
         }
 
     @classmethod

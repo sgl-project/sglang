@@ -7,10 +7,22 @@
 from typing import Optional
 
 import torch
-from sgl_kernel import causal_conv1d_fwd
-from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
 from .causal_conv1d_triton import PAD_SLOT_ID
+
+try:
+    from sgl_kernel import causal_conv1d_fwd
+    from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
+
+    torch.ops.sgl_kernel.causal_conv1d_update
+    _USE_TRITON = False
+except (ImportError, AttributeError):
+    from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
+    from .causal_conv1d_triton import (
+        causal_conv1d_update as _causal_conv1d_update_triton,
+    )
+
+    _USE_TRITON = True
 
 
 def causal_conv1d_fn(
@@ -54,6 +66,25 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
+    if _USE_TRITON:
+        seq_lens_cpu = (
+            (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
+            if query_start_loc is not None
+            else [x.shape[-1]]
+        )
+        return _causal_conv1d_fn_triton(
+            x,
+            weight,
+            bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            **kwargs,
+        )
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
     if x.stride(-1) != 1:
@@ -106,6 +137,17 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    if _USE_TRITON:
+        return _causal_conv1d_update_triton(
+            x,
+            conv_state,
+            weight,
+            bias=bias,
+            activation=activation,
+            cache_seqlens=cache_seqlens,
+            conv_state_indices=conv_state_indices,
+            pad_slot_id=pad_slot_id,
+        )
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError(
             f"activation must be None, silu, or swish, actual: {activation}"

@@ -28,6 +28,9 @@ class FakeKVManager(BaseKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
+    def register_to_bootstrap(self):
+        pass
+
 
 class FakeKVSender(BaseKVSender):
     def __init__(

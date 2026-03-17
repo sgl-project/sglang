@@ -41,7 +41,6 @@ class TestKimiLinearPiecewiseCudaGraph(CustomTestCase):
                 "--tp",
                 "2",
                 "--trust-remote-code",
-                "--enable-piecewise-cuda-graph",
             ],
         )
 

@@ -4,6 +4,8 @@ import pytest
 import torch
 import triton
 
+from sglang.jit_kernel.utils import get_ci_test_range
+
 
 def sglang_jit_rmsnorm(input: torch.Tensor, weight: torch.Tensor) -> None:
     from sglang.jit_kernel.norm import rmsnorm
@@ -19,7 +21,11 @@ def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor) -> None:
 
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-HIDDEN_SIZE_LIST = [512, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
+HIDDEN_SIZE_LIST = get_ci_test_range(
+    [512, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
+    [512, 2048, 8192],
+)
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -38,4 +44,4 @@ def test_rmsnorm(batch_size: int, hidden_size: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])

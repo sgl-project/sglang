@@ -75,15 +75,10 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
-_is_cuda = is_cuda()
 _is_npu = is_npu()
-
-
-if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
 
 class GptOssConfig(PretrainedConfig):

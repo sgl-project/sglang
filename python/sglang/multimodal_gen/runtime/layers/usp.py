@@ -70,38 +70,36 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    seq_dim = 1 if head_dim == 2 else 2
 
-    # Bring to canonical [b, h, s, d]
-    if head_dim == 1 and seq_dim == 2:
-        x_c = x
-    else:
-        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+    # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
+    if head_dim == 1:
+        b, h_global, s_local, d = x.shape
+        # Shape transition: [b, h_global, s_local, d] -> [h_global, b, s_local, d]
+        permute_order = (1, 0, 2, 3)
+    else:  # head_dim == 2
+        b, s_local, h_global, d = x.shape
+        # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
+        permute_order = (2, 0, 1, 3)
 
-    b, h, s, d = x_c.shape
     assert (
-        h % world_size == 0
-    ), f"h ({h}) must be divisible by world_size ({world_size})"
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
 
-    # [b, h, s_local, d] -> [h, b, s_local, d]
-    x_c = x_c.permute(1, 0, 2, 3).contiguous()
-    # all-to-all along h
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h_local, s, d]
-    x_c = (
-        x_c.reshape(world_size, h // world_size, b, -1, d)
-        .permute(2, 1, 0, 3, 4)
-        .reshape(b, h // world_size, -1, d)
-    )
+    h_local, s_global = h_global // world_size, s_local * world_size
 
-    if head_dim == 1 and seq_dim == 2:
-        return x_c
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, h_local, b, s_local, d)
 
-    # Map back to original ordering, preserving head/seq positions
-    new_order = [0, None, None, 3]
-    new_order[head_dim] = 1
-    new_order[seq_dim] = 2
-    return x_c.permute(tuple(new_order)).contiguous()
+    # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    if head_dim == 1:
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+    else:  # head_dim == 2
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+
+    return x
 
 
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
@@ -128,37 +126,36 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    seq_dim = 1 if head_dim == 2 else 2
 
-    # Bring to canonical [b, h, s, d]
-    if head_dim == 1 and seq_dim == 2:
-        x_c = x
-    else:
-        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+    # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
+    if head_dim == 1:
+        b, h_local, s_global, d = x.shape
+        # Shape transition: [b, h_local, s_global, d] -> [s_global, b, h_local, d]
+        permute_order = (2, 0, 1, 3)
+    else:  # head_dim == 2
+        b, s_global, h_local, d = x.shape
+        # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
+        permute_order = (1, 0, 2, 3)
 
-    b, h, s, d = x_c.shape
     assert (
-        s % world_size == 0
-    ), f"s ({s}) must be divisible by world_size ({world_size})"
+        s_global % world_size == 0
+    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
 
-    # [b, h_local, s, d] -> [s, b, h_local, d]
-    x_c = x_c.permute(2, 0, 1, 3).contiguous()
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h, s_local, d]
-    x_c = (
-        x_c.reshape(world_size, s // world_size, b, -1, d)
-        .permute(2, 0, 3, 1, 4)
-        .reshape(b, -1, s // world_size, d)
-    )
+    s_local, h_global = s_global // world_size, h_local * world_size
 
-    if head_dim == 1 and seq_dim == 2:
-        return x_c
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, s_local, b, h_local, d)
 
-    # Map back to original ordering, preserving head/seq positions
-    new_order = [0, None, None, 3]
-    new_order[head_dim] = 1
-    new_order[seq_dim] = 2
-    return x_c.permute(tuple(new_order)).contiguous()
+    # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
+    if head_dim == 1:
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, world_size, h_local, s_local, d]
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
+    else:  # head_dim == 2
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
+
+    return x
 
 
 def ring_attn(

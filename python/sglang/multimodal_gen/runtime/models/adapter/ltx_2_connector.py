@@ -34,7 +34,7 @@ def apply_split_rotary_emb(
         # The cos/sin batch dim may only be broadcastable, so take batch size from x
         b = x.shape[0]
         _, h, t, _ = cos.shape
-        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        x = x.reshape(b, t, h, -1).transpose(1, 2)
         needs_reshape = True
 
     # Split last dim (2*r) into (d=2, r)
@@ -46,7 +46,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()  # Explicitly upcast to float
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -63,7 +63,7 @@ def apply_split_rotary_emb(
     out = out.reshape(*out.shape[:-2], last)
 
     if needs_reshape:
-        out = out.swapaxes(1, 2).reshape(b, t, -1)
+        out = out.transpose(1, 2).reshape(b, t, -1)
 
     out = out.to(dtype=x_dtype)
     return out
@@ -232,6 +232,7 @@ class LTX2RotaryPosEmbed1d(nn.Module):
         batch_size: int,
         pos: int,
         device: Union[str, torch.device],
+        dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Get 1D position ids
         grid_1d = torch.arange(pos, dtype=torch.float32, device=device)
@@ -297,6 +298,9 @@ class LTX2RotaryPosEmbed1d(nn.Module):
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
 
+        if dtype is not None:
+            cos_freqs = cos_freqs.to(dtype)
+            sin_freqs = sin_freqs.to(dtype)
         return cos_freqs, sin_freqs
 
 
@@ -460,7 +464,9 @@ class LTX2ConnectorTransformer1d(nn.Module):
             attention_mask = torch.zeros_like(attention_mask)
 
         # 2. Calculate 1D RoPE positional embeddings
-        rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device)
+        rotary_emb = self.rope(
+            batch_size, seq_len, device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:

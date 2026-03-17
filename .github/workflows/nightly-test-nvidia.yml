@@ -325,7 +325,7 @@ jobs:
         run: |
           cd test
           rm -rf performance_profiles_text_models/
-          python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error --timeout-per-file 3600
 
       - name: Publish traces to storage repo
         env:
@@ -384,7 +384,7 @@ jobs:
         run: |
           cd test
           rm -rf performance_profiles_vlms/
-          python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 3600
 
       - name: Publish traces to storage repo
         env:

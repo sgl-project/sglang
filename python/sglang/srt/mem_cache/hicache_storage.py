@@ -51,8 +51,11 @@ class HiCacheStorageConfig:
     pp_rank: int
     pp_size: int
     is_mla_model: bool
+    enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    tp_lcm_size: Optional[int] = None
+    should_split_heads: bool = False
     extra_config: Optional[dict] = None
 
 
