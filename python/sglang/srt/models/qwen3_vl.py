@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
 )
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -139,7 +140,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,

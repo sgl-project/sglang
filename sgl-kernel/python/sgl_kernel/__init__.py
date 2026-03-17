@@ -18,8 +18,6 @@ from sgl_kernel.attention import (
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
-    FusedSetKVBufferArg,
-    apply_rope_with_cos_sin_cache_inplace,
     concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
@@ -41,7 +39,6 @@ from sgl_kernel.expert_specialization import (
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
-    cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
@@ -51,15 +48,11 @@ from sgl_kernel.gemm import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
-    scaled_fp4_grouped_quant,
-    scaled_fp4_quant,
-    sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_8bit,
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
-    silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.kvcacheio import (
@@ -75,7 +68,7 @@ from sgl_kernel.mamba import (
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
 )
-from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
+from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     fp8_blockwise_scaled_grouped_mm,

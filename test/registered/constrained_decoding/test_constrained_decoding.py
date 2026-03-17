@@ -2,9 +2,9 @@ import unittest
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -49,22 +49,22 @@ class ServerWithGrammar(CustomTestCase):
 
 class TestXGrammarBackend(
     ServerWithGrammar,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     backend = "xgrammar"
 
 
-class TestOutlinesBackend(ServerWithGrammar, TestJSONConstrainedMixin):
+class TestOutlinesBackend(ServerWithGrammar, JSONConstrainedMixin):
     backend = "outlines"
 
 
 class TestLLGuidanceBackend(
     ServerWithGrammar,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     backend = "llguidance"
 
