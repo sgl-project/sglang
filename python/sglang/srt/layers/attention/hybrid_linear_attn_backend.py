@@ -123,6 +123,8 @@ def _maybe_capture_ssm_state(
     """
     if _ssm_capture_dir is None:
         return
+    if torch.cuda.is_current_stream_capturing():
+        return
     key = (layer_id, mode)
     step = _ssm_capture_counter.get(key, 0)
     _ssm_capture_counter[key] = step + 1
