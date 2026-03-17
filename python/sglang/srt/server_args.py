@@ -513,9 +513,6 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
-    flashinfer_allreduce_fusion_backend: Optional[
-        Literal["auto", "trtllm", "mnnvl"]
-    ] = None
     enable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -899,18 +896,6 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
-
-        # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
-        if (
-            self.enable_flashinfer_allreduce_fusion
-            and self.flashinfer_allreduce_fusion_backend is None
-        ):
-            logger.warning(
-                "--enable-flashinfer-allreduce-fusion is deprecated. "
-                "Please use --flashinfer-allreduce-fusion-backend=auto instead."
-            )
-            self.flashinfer_allreduce_fusion_backend = "auto"
-        self.enable_flashinfer_allreduce_fusion = False
 
         if self.enable_nan_detection:
             logger.warning(
@@ -1661,7 +1646,7 @@ class ServerArgs:
             if is_blackwell_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
                 if not self.enable_dp_attention and self.nnodes == 1:
-                    self.flashinfer_allreduce_fusion_backend = "auto"
+                    self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
                     )
@@ -1995,15 +1980,16 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # FlashInfer allreduce fusion: auto-enable when single-node (any SM90/100) or multi-node + Blackwell.
-        # See sglang.srt.layers.flashinfer_comm_fusion for backend support table (TRT-LLM vs MNNVL, SM90/100, single/multi-node).
+        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
         is_h20_device = (
             device_name and "H20" in device_name and "H200" not in device_name
         )
         if (
-            self.flashinfer_allreduce_fusion_backend is None
+            not self.enable_flashinfer_allreduce_fusion
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -2015,11 +2001,11 @@ class ServerArgs:
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
+            and self.nnodes == 1
             and not is_h20_device
-            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
-            self.flashinfer_allreduce_fusion_backend = "auto"
+            self.enable_flashinfer_allreduce_fusion = True
 
     def _handle_mamba_radix_cache(
         self,
@@ -4637,20 +4623,9 @@ class ServerArgs:
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
-            "--flashinfer-allreduce-fusion-backend",
-            type=str,
-            choices=["auto", "trtllm", "mnnvl"],
-            default=None,
-            help="Enable FlashInfer allreduce fusion and choose backend. When not set, the feature is disabled. "
-            "Options: 'auto' (choose best), 'trtllm' (SM90/100, single-node only), 'mnnvl' (SM100, single/multi-node). "
-            "Fuses allreduce with Residual + RMSNorm for supported MoE models.",
-        )
-        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--flashinfer-allreduce-fusion-backend=auto",
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",
@@ -5783,14 +5758,6 @@ class ServerArgs:
             "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
             f"Invalid value: '{self.served_model_name}'"
         )
-
-        # FlashInfer allreduce fusion: mnnvl backend requires Blackwell (SM100)
-        if self.flashinfer_allreduce_fusion_backend == "mnnvl":
-            if not is_sm100_supported():
-                raise ValueError(
-                    "FlashInfer allreduce fusion backend 'mnnvl' is only supported on Blackwell GPUs (SM100). "
-                    "On Hopper (SM90) or other architectures, use --flashinfer-allreduce-fusion-backend=trtllm or --flashinfer-allreduce-fusion-backend=auto instead."
-                )
 
         # Check LoRA
         self.check_lora_server_args()
