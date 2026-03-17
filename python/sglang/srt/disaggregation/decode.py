@@ -84,6 +84,11 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
     )
 
 
+def _bootstrap_addr(req: Req) -> str:
+    # FIXME: make a property of a req
+    return f"{req.bootstrap_host}:{req.bootstrap_port}"
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -265,6 +270,8 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
+        self._ensure_retry_count: Dict[str, int] = {}
+        self._max_ensure_retries: int = 30  # scheduling cycles
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -357,22 +364,7 @@ class DecodePreallocQueue:
                 self._create_receiver_and_enqueue(req, 0)
                 return
 
-            # Ensure prefill parallel info is cached before resolving dp rank
-            bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
-            if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-                error_message = f"Could not fetch prefill parallel info from bootstrap server {bootstrap_addr}"
-                logger.error(error_message)
-                prepare_abort(
-                    req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                self.scheduler.stream_output([req], req.return_logprob)
-                return
-
-            # Fast path: if dp rank is already resolvable, skip pending queue
+            # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             if prefill_dp_rank is not None:
                 self._create_receiver_and_enqueue(req, prefill_dp_rank)
@@ -383,9 +375,7 @@ class DecodePreallocQueue:
         if req.disagg_prefill_dp_rank is not None:
             return req.disagg_prefill_dp_rank
 
-        bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
-
-        prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         if prefill_info is None:
             return None
 
@@ -407,7 +397,7 @@ class DecodePreallocQueue:
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
             prefill_dp_rank=prefill_dp_rank,
         )
@@ -511,6 +501,45 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _abort_reqs(self, reqs: List[Req], error_msg: str) -> None:
+        """Abort requests and stream error output."""
+        logger.error(error_msg)
+        for req in reqs:
+            prepare_abort(req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            if self.scheduler.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            self.scheduler.stream_output([req], req.return_logprob)
+
+    def _ensure_prefill_info(
+        self, addr_to_reqs: Dict[str, List[Req]]
+    ) -> Tuple[Dict[str, List[Req]], List[Req]]:
+        """Non-blocking ensure parallel info for each addr.
+        Returns (ready_addrs, remaining_reqs)."""
+        ready: Dict[str, List[Req]] = {}
+        remaining: List[Req] = []
+
+        for bootstrap_addr, reqs in addr_to_reqs.items():
+            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+                if bootstrap_addr in self._ensure_retry_count:
+                    del self._ensure_retry_count[bootstrap_addr]
+                ready[bootstrap_addr] = reqs
+                continue
+
+            count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
+            self._ensure_retry_count[bootstrap_addr] = count
+
+            if count >= self._max_ensure_retries:
+                self._abort_reqs(
+                    reqs,
+                    f"Could not fetch prefill parallel info from {bootstrap_addr} "
+                    f"after {count} attempts",
+                )
+                del self._ensure_retry_count[bootstrap_addr]
+            else:
+                remaining.extend(reqs)
+
+        return ready, remaining
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
@@ -519,13 +548,15 @@ class DecodePreallocQueue:
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[Req]] = {}
         for req in self.pending_reqs:
-            addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+            addr = _bootstrap_addr(req)
             addr_to_reqs.setdefault(addr, []).append(req)
 
-        resolved = []
-        remaining = []
+        # Pass 1: ensure parallel info for each addr
+        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-        for bootstrap_addr, reqs in addr_to_reqs.items():
+        # Pass 2: resolve dp rank for addrs whose info is available
+        resolved = []
+        for bootstrap_addr, reqs in ready_addrs.items():
             need_query: List[Req] = []
             for req in reqs:
                 prefill_dp_rank = self._resolve_prefill_dp_rank(req)
@@ -535,8 +566,6 @@ class DecodePreallocQueue:
                     need_query.append(req)
 
             if need_query:
-                from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-
                 rooms = [req.bootstrap_room for req in need_query]
                 room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
                     bootstrap_addr, rooms

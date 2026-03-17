@@ -55,7 +55,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
 
-    # Pre-computed rank mapping (set by ensure_parallel_info on decode side)
+    # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
     target_cp_ranks: Optional[List[int]] = None
@@ -192,26 +192,13 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def ensure_parallel_info(
-        self, bootstrap_addr: str, max_retries: int = 5, retry_interval: float = 1.0
-    ) -> bool:
-        """Fetch and cache prefill parallel info and rank mapping if not yet available.
-        Returns True if info is available (cached or freshly fetched).
-        Retries with backoff if the prefill server hasn't registered yet.
-        """
+    def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+        """Single non-blocking attempt to fetch and cache prefill parallel info.
+        Returns True if info is available (cached or freshly fetched)."""
         if bootstrap_addr in self.prefill_info_table:
             return True
-        info = None
-        for attempt in range(max_retries):
-            info = self._fetch_prefill_server_info(bootstrap_addr)
-            if info is not None:
-                break
-            if attempt < max_retries - 1:
-                logger.info(
-                    f"Prefill server info not available from {bootstrap_addr}, "
-                    f"retrying ({attempt + 1}/{max_retries})..."
-                )
-                time.sleep(retry_interval)
+
+        info = self._fetch_prefill_server_info(bootstrap_addr)
         if info is None:
             return False
 
@@ -525,7 +512,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = None
             return
 
-        # Read pre-computed rank mapping from prefill_info (computed in ensure_parallel_info)
+        # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
