@@ -9,6 +9,7 @@ IS_CI = (
 )
 import triton
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
 
 # CI environment uses simplified parameters
@@ -56,8 +57,7 @@ def benchmark(batch_size, provider):
         topk_weights = torch.rand(batch_size, topk, dtype=dtype, device=device)
         return down_output, output, src2dst, topk_ids, topk_weights
 
-    quantiles = [0.5, 0.2, 0.8]
-
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "triton":
         d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
 
@@ -76,8 +76,8 @@ def benchmark(batch_size, provider):
                 block_size,
             )
 
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            run_triton, quantiles=quantiles
+        ms, min_ms, max_ms = run_bench(
+            run_triton, use_cuda_graph=True, quantiles=quantiles
         )
 
     else:

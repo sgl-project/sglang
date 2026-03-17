@@ -13,6 +13,8 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm
 
+from sglang.benchmark.bench_utils import run_bench
+
 # CI environment uses simplified parameters
 if IS_CI:
     num_tokens_vals = [1]  # Only test 1 value in CI
@@ -48,8 +50,6 @@ def benchmark(num_tokens, impl):
     mat_a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda").contiguous()
     mat_b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda").transpose(0, 1)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if impl == "torch":
 
         def runner():
@@ -60,7 +60,8 @@ def benchmark(num_tokens, impl):
         def runner():
             dsv3_fused_a_gemm(mat_a, mat_b)
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(runner, use_cuda_graph=True, quantiles=quantiles)
 
     def tflops(t_ms):
         flops = 2 * M * K * N

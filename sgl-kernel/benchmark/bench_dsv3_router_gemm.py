@@ -13,6 +13,8 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_router_gemm
 
+from sglang.benchmark.bench_utils import run_bench
+
 # CI environment uses simplified parameters
 if IS_CI:
     num_tokens_vals = [1]  # Only test 1 value in CI
@@ -63,8 +65,6 @@ def benchmark_bf16_output(num_tokens, impl):
     mat_a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda").contiguous()
     mat_b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda").contiguous()
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if impl == "torch-256" or impl == "torch-384":
 
         def runner():
@@ -75,7 +75,8 @@ def benchmark_bf16_output(num_tokens, impl):
         def runner():
             dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.bfloat16)
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(runner, use_cuda_graph=True, quantiles=quantiles)
 
     def tflops(t_ms):
         flops = 2 * M * K * N
@@ -125,8 +126,6 @@ def benchmark_float_output(num_tokens, impl):
     mat_a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda").contiguous()
     mat_b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda").contiguous()
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if impl == "torch-256" or impl == "torch-384":
 
         def runner():
@@ -137,7 +136,8 @@ def benchmark_float_output(num_tokens, impl):
         def runner():
             dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.float32)
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(runner, use_cuda_graph=True, quantiles=quantiles)
 
     def tflops(t_ms):
         flops = 2 * M * K * N
