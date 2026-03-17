@@ -47,6 +47,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -2306,6 +2307,44 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
 
 
 def pyspy_dump_schedulers():
