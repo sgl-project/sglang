@@ -72,7 +72,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-amd64-framework.txt
 
@@ -134,7 +134,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-arm64-framework.txt
 

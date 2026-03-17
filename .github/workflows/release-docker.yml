@@ -98,7 +98,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu129-framework.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-amd64-framework.txt
 
@@ -120,7 +120,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu129-runtime.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-amd64-runtime.txt
 
@@ -142,7 +142,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu130-framework.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-amd64-framework.txt
 
@@ -164,7 +164,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu130-runtime.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-amd64-runtime.txt
 
@@ -241,7 +241,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu129-framework.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-arm64-framework.txt
 
@@ -263,7 +263,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu129-runtime.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-arm64-runtime.txt
 
@@ -285,7 +285,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu130-framework.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-arm64-framework.txt
 
@@ -306,7 +306,7 @@ jobs:
             --no-cache \
             .
 
-          DIGEST=$(jq -r '."containerimage.digest"' /tmp/metadata-cu130-runtime.json)
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-arm64-runtime.txt
 
