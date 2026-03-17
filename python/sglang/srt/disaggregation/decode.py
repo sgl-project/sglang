@@ -445,7 +445,10 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
 
             # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            if self.scheduler.server_args.disaggregation_decode_enable_offload_kvcache:
+                req.load_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
 
         self.retracted_queue = [
             entry
