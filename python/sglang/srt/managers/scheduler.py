@@ -201,7 +201,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_numa_node,
-    get_zmq_socket,
     is_mps,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -217,6 +216,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1237,7 +1237,7 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with CudaStreamContext(self.schedule_stream):
+        with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
     @DynamicGradMode()
@@ -2145,6 +2145,9 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2168,9 +2171,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2336,6 +2336,8 @@ class Scheduler(
             self.is_mixed_chunk
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
+            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
+            and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
@@ -2359,6 +2361,11 @@ class Scheduler(
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
+
+        # Eagerly release lock_ref on completed write-through nodes so they
+        # become evictable, improving batch scheduling headroom.
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
