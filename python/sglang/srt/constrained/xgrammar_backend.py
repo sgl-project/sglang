@@ -29,10 +29,10 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
     GrammarStats,
+    InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
@@ -113,8 +113,6 @@ class XGrammarGrammar(BaseGrammarObject):
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
-            self.apply_vocab_mask_cpu(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -124,15 +122,17 @@ class XGrammarGrammar(BaseGrammarObject):
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
             override_stop_tokens=self.override_stop_tokens,
         )
+        if grammar_stats := self.grammar_stats:
+            grammar_stats = dataclasses.replace(
+                grammar_stats, is_cache_hit=True, tree_traversal_time=[]
+            )
         return XGrammarGrammar(
             matcher,
             self.vocab_size,
             self.ctx,
             self.override_stop_tokens,
             self.key_string,
-            dataclasses.replace(
-                self.grammar_stats, is_cache_hit=True, tree_traversal_time=[]
-            ),
+            grammar_stats,
         )
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
@@ -254,7 +254,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             grammar_stats,
         )
 
-    def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
+    def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         try:
             if key_string == "$$ANY$$":
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
@@ -266,26 +266,26 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
-    def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
+    def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
-    def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
+    def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
+    def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             # TODO(dark): it's REALLY stupid to construct object from string and decode it again
             structural_tag = json.loads(key_string)
@@ -311,7 +311,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )

@@ -9,12 +9,14 @@ from sglang.jit_kernel.awq_marlin_repack import (
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
-try:
-    from sgl_kernel import awq_marlin_repack as aot_awq_marlin_repack
 
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+def _has_aot_awq_marlin_repack() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "awq_marlin_repack") and hasattr(
+        torch.ops.sgl_kernel.awq_marlin_repack, "default"
+    )
+
+
+AOT_AVAILABLE = _has_aot_awq_marlin_repack()
 
 
 def awq_pack(
@@ -58,7 +60,9 @@ def test_awq_marlin_repack_jit_vs_aot(num_bits, k_tiles, n_tiles, group_size):
     q_w_awq = awq_pack(q_w, num_bits, size_k, size_n)
 
     out_jit = jit_awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
-    out_aot = aot_awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
+    out_aot = torch.ops.sgl_kernel.awq_marlin_repack.default(
+        q_w_awq, size_k, size_n, num_bits
+    )
 
     torch.cuda.synchronize()
 
