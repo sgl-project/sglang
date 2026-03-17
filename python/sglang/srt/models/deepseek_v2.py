@@ -281,6 +281,7 @@ class MoEGate(nn.Module):
                 elif _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
+                    "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
