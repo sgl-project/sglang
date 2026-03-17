@@ -72,6 +72,9 @@ from sglang.srt.entrypoints.engine import (
     run_detokenizer_process,
     run_scheduler_process,
 )
+from sglang.srt.entrypoints.engine_info_bootstrap import (
+    ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
+)
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
     OllamaGenerateRequest,
@@ -199,6 +202,7 @@ class _GlobalState:
     #         )
     # }
     remote_instance_transfer_engine_info: Optional[Dict] = None
+    engine_info_bootstrap_port: Optional[int] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -1030,6 +1034,21 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
+    # Try bootstrap server first (preferred path for transfer engine info)
+    bootstrap_port = _global_state.engine_info_bootstrap_port
+    if bootstrap_port is not None:
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{bootstrap_port}/get_transfer_engine_info",
+                params={"rank": rank},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+
+    # Fallback to old _global_state path for backward compat
     if (
         _global_state.remote_instance_transfer_engine_info is None
         or len(_global_state.remote_instance_transfer_engine_info) == 0
@@ -1966,6 +1985,7 @@ def _setup_and_run_http_server(
     scheduler_infos: List[Dict],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    engine_info_bootstrap_port: Optional[int] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
@@ -1991,6 +2011,7 @@ def _setup_and_run_http_server(
                 template_manager=template_manager,
                 scheduler_info=scheduler_infos[0],
                 remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+                engine_info_bootstrap_port=engine_info_bootstrap_port,
             )
         )
 
@@ -2177,6 +2198,13 @@ def launch_server(
         )
     )
 
+    # Determine bootstrap port if bootstrap server was started
+    engine_info_bootstrap_port = None
+    if scheduler_init_result.engine_info_bootstrap is not None:
+        engine_info_bootstrap_port = (
+            server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
+        )
+
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,
@@ -2185,4 +2213,5 @@ def launch_server(
         scheduler_init_result.scheduler_infos,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
+        engine_info_bootstrap_port=engine_info_bootstrap_port,
     )

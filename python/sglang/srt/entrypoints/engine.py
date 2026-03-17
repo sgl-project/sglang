@@ -48,6 +48,9 @@ import zmq
 
 from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
+from sglang.srt.entrypoints.engine_info_bootstrap import (
+    ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
+)
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -114,6 +117,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
+    engine_info_bootstrap: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -196,11 +200,19 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         self.port_args = port_args
-        self.remote_instance_transfer_engine_info = (
-            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_init_result.scheduler_infos
+        self.engine_info_bootstrap = scheduler_init_result.engine_info_bootstrap
+        if self.engine_info_bootstrap is not None:
+            # Use bootstrap server as the source of transfer engine info
+            self.remote_instance_transfer_engine_info = (
+                self.engine_info_bootstrap.transfer_engine_info
             )
-        )
+        else:
+            # Fallback: parse from scheduler infos (backward compat)
+            self.remote_instance_transfer_engine_info = (
+                parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                    scheduler_init_result.scheduler_infos
+                )
+            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -612,6 +624,7 @@ class Engine(EngineBase):
 
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
+            engine_info_bootstrap is stored on scheduler_init_result if started.
         """
         # Configure global environment
         configure_logger(server_args)
@@ -623,10 +636,28 @@ class Engine(EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        # Start the engine info bootstrap server before schedulers launch
+        engine_info_bootstrap = None
+        if (
+            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            and server_args.node_rank == 0
+        ):
+            from sglang.srt.entrypoints.engine_info_bootstrap import (
+                EngineInfoBootstrapServer,
+            )
+
+            bootstrap_port = server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
+            engine_info_bootstrap = EngineInfoBootstrapServer(
+                host="0.0.0.0", port=bootstrap_port
+            )
+
         # Launch scheduler processes
         scheduler_init_result = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
+
+        # Attach bootstrap server reference to scheduler_init_result for later access
+        scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
 
         if (
             server_args.enable_elastic_expert_backup

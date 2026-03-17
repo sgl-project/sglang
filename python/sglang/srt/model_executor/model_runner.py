@@ -514,6 +514,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model, self.remote_instance_transfer_engine
             )
 
+        # Register transfer engine info with the bootstrap server
+        if (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and self.remote_instance_transfer_engine is not None
+            and self.remote_instance_transfer_engine_weight_info is not None
+        ):
+            self._register_to_engine_info_bootstrap()
+
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
@@ -675,6 +683,71 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.remote_instance_transfer_engine_session_id = (
             f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
+        )
+
+    def _register_to_engine_info_bootstrap(self):
+        """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
+
+        The bootstrap server runs on node_rank==0. For multi-node setups, the
+        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
+        """
+        import requests as http_requests
+
+        from sglang.srt.entrypoints.engine_info_bootstrap import (
+            ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
+        )
+
+        # Determine bootstrap server host
+        if self.server_args.nnodes > 1 and self.server_args.dist_init_addr is not None:
+            # Multi-node: bootstrap server is on the head node (node_rank==0)
+            # dist_init_addr format is "host:port"
+            bootstrap_host = self.server_args.dist_init_addr.rsplit(":", 1)[0]
+            # Handle IPv6 bracket notation
+            if bootstrap_host.startswith("[") and bootstrap_host.endswith("]"):
+                bootstrap_host = bootstrap_host[1:-1]
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
+        url = f"http://{bootstrap_host}:{bootstrap_port}/register_engine_info"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "transfer_engine_info": {
+                "session_id": self.remote_instance_transfer_engine_session_id,
+                "weights_info_dict": self.remote_instance_transfer_engine_weight_info,
+            },
+        }
+
+        max_retries = 30
+        for attempt in range(max_retries):
+            try:
+                resp = http_requests.put(url, json=payload, timeout=5)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                        f"with bootstrap server at {bootstrap_host}:{bootstrap_port}"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"Bootstrap registration attempt {attempt + 1}/{max_retries} "
+                        f"failed with status {resp.status_code}: {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Bootstrap registration attempt {attempt + 1}/{max_retries} "
+                    f"failed: {e}"
+                )
+
+            if attempt < max_retries - 1:
+                import time
+
+                time.sleep(1)
+
+        logger.error(
+            f"Failed to register transfer engine info for tp_rank={self.tp_rank} "
+            f"after {max_retries} attempts"
         )
 
     def model_specific_adjustment(self):
