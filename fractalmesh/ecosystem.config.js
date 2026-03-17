@@ -1,4 +1,4 @@
-// FractalMesh PM2 Ecosystem — v401.6
+// FractalMesh PM2 Ecosystem — v401.6 + Synthwave Empire v4.1
 // Samuel James Hiotis | ABN 56628117363 | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
 
@@ -107,6 +107,46 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/rf-bridge-error.log`,
             out_file:   `${ROOT}/logs/rf-bridge-out.log`,
+        },
+
+        // ── AI DJ (Synthwave Empire) ──────────────────────────────────
+        {
+            name:              'fm-ai-dj',
+            script:            `${process.env.HOME}/synthwave/ai_dj.py`,
+            interpreter:       '/usr/bin/python3',
+            watch:             false,
+            autorestart:       true,
+            max_restarts:      50,
+            restart_delay:     8000,
+            max_memory_restart:'100M',
+            env_production: {
+                PYTHONUNBUFFERED: '1',
+                DJ_INTERVAL:      '600',
+                DJ_MODEL:         'mistralai/mistral-7b-instruct:free',
+                NODE_ENV:         'production',
+            },
+            error_file: `${process.env.HOME}/.fm_logs/ai_dj_err.log`,
+            out_file:   `${process.env.HOME}/.fm_logs/ai_dj_out.log`,
+            time:       true,
+        },
+
+        // ── NFT MINTER (Synthwave Empire) ─────────────────────────────
+        {
+            name:              'fm-nft-minter',
+            script:            `${process.env.HOME}/synthwave/nft_minter.py`,
+            interpreter:       '/usr/bin/python3',
+            watch:             false,
+            autorestart:       true,
+            max_restarts:      50,
+            restart_delay:     15000,
+            max_memory_restart:'80M',
+            env_production: {
+                PYTHONUNBUFFERED: '1',
+                NODE_ENV:         'production',
+            },
+            error_file: `${process.env.HOME}/.fm_logs/nft_minter_err.log`,
+            out_file:   `${process.env.HOME}/.fm_logs/nft_minter_out.log`,
+            time:       true,
         },
 
         // ── DASHBOARD (serve static) ──────────────────────────────────
