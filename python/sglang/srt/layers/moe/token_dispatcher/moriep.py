@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
@@ -170,9 +171,31 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     }
 
 
+@lru_cache(maxsize=4)
+def _get_mori_dispatch_quant_flags(is_nextn=False):
+    fp8_var, fp4_var = "SGLANG_MORI_FP8_DISP", "SGLANG_MORI_FP4_DISP"
+    if is_nextn and (
+        "SGLANG_MORI_NEXTN_FP8_DISP" in os.environ
+        or "SGLANG_MORI_NEXTN_FP4_DISP" in os.environ
+    ):
+        fp8_var, fp4_var = "SGLANG_MORI_NEXTN_FP8_DISP", "SGLANG_MORI_NEXTN_FP4_DISP"
+
+    fp8_dispatch = get_bool_env_var(fp8_var, "False")
+    fp4_dispatch = get_bool_env_var(fp4_var, "False")
+
+    if fp8_dispatch and fp4_dispatch:
+        logger.warning(
+            f"Both {fp8_var} and {fp4_var} are set to True. "
+            f"Using {fp4_var} and ignoring {fp8_var}."
+        )
+        fp8_dispatch = False
+
+    return fp8_dispatch, fp4_dispatch
+
+
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def init_mori_op(
     group,
     router_topk,
@@ -182,6 +205,8 @@ def init_mori_op(
     params_dtype,
     num_max_dispatch_tokens_per_rank,
     deepep_mode,
+    fp8_dispatch,
+    fp4_dispatch,
 ):
 
     import mori
@@ -211,17 +236,39 @@ def init_mori_op(
     block_num = cfg.block_num
     rdma_block_num = cfg.rdma_block_num
 
+    hidden_dim = hidden_size
+    scale_dim = 1
+    data_type = fp8_dtype
+    scale_type_size = torch.float32.itemsize
+
+    if fp8_dispatch:
+        scale_dim = hidden_size // 128
+    elif fp4_dispatch:
+        # FP4 kernel still takes the original hidden size and do quantization internally, so hidden_dim is not reduced. The reason is that for FP4 quantization, we need to keep the original hidden size to calculate the quantization scale correctly. don't use packed hidden size for FP4 kernel.
+        hidden_dim = hidden_size
+        scale_dim = hidden_size // 32
+        data_type = torch.float4_e2m1fn_x2
+        scale_type_size = torch.float8_e8m0fnu.itemsize
+
+        if mode == EpMode.INTRA_NODE:
+            if num_max_dispatch_tokens_per_rank < 128:
+                block_num = 225
+                warp_num_per_block = 5
+            else:
+                block_num = 256
+                warp_num_per_block = 16
+
+    combine_quant_type = "none"
+    if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
+        combine_quant_type = "fp8_direct_cast"
+
     mori_config = mori.ops.EpDispatchCombineConfig(
         rank=rank,
         world_size=world_size,
-        data_type=fp8_dtype,
-        hidden_dim=hidden_size,
-        scale_dim=(
-            hidden_size // 128
-            if get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-            else 1
-        ),
-        scale_type_size=torch.float32.itemsize,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
         max_token_type_size=params_dtype.itemsize,
         max_num_inp_token_per_rank=num_max_dispatch_tokens_per_rank,
         num_experts_per_rank=num_local_experts,
@@ -232,6 +279,7 @@ def init_mori_op(
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
         num_qp_per_pe=2,
+        quant_type=combine_quant_type,
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     return mori_op
@@ -270,6 +318,7 @@ class _MoriEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        is_nextn: bool = False,
     ):
         try:
             import mori  # noqa: F401
@@ -283,6 +332,8 @@ class _MoriEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.is_nextn = is_nextn
+        self.fp8_dispatch, self.fp4_dispatch = _get_mori_dispatch_quant_flags(is_nextn)
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
@@ -297,6 +348,8 @@ class _MoriEPDispatcherImplBase:
             self.params_dtype,
             self.num_max_dispatch_tokens_per_rank,
             self.deepep_mode,
+            self.fp8_dispatch,
+            self.fp4_dispatch,
         )
 
         self.quant_config: Optional[dict] = None
@@ -346,7 +399,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.async_finish = async_finish
         self.quant_config = {}
         # [kk TODO] need to support mxfp4 type
-        self.quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
@@ -378,17 +432,15 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_ids,
         previous_event,
     ):
-        num_token = hidden_states.shape[0]
+        num_tokens = hidden_states.shape[0]
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-
-        if fp8_dispatch:
+        if self.fp8_dispatch:
             # FP8 quant
-            if num_token > 0:
+            if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
-                hidden_states, scale = self.quant_func(
+                hidden_states, scale = self.fp8_quant_func(
                     hidden_states, quant_dtype=fp8_dtype
                 )
             else:
@@ -398,6 +450,22 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 scale = torch.empty(
                     (0, self.hidden_size // 128),
                     dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+        elif self.fp4_dispatch:
+            # FP4 quant
+            if num_tokens > 0:
+                hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
+            else:
+                hidden_states = torch.empty(
+                    (0, self.hidden_size // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // 32),
+                    dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
 
@@ -571,7 +639,8 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.quant_config = {}
-        self.quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
 
     def dispatch_a(
         self,
@@ -589,13 +658,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-
-        if fp8_dispatch:
+        if self.fp8_dispatch:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
-                hidden_states, scale = self.quant_func(
+                hidden_states, scale = self.fp8_quant_func(
                     hidden_states, quant_dtype=fp8_dtype
                 )
             else:
@@ -605,6 +672,22 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                 scale = torch.empty(
                     (0, self.hidden_size // 128),
                     dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+        elif self.fp4_dispatch:
+            # FP4 quant
+            if num_tokens > 0:
+                hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
+            else:
+                hidden_states = torch.empty(
+                    (0, self.hidden_size // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // 32),
+                    dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
 
@@ -746,6 +829,7 @@ class MoriEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        is_nextn: bool = False,
     ):
         super().__init__()
 
@@ -760,6 +844,7 @@ class MoriEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            is_nextn=is_nextn,
         )
 
         if self.deepep_mode.enable_low_latency():

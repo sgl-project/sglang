@@ -18,8 +18,9 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 
 ## Two rules of thumb (must follow)
 
-1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS / FlashInfer / DeepGEMM (or similarly heavy stacks), implement it in `sgl-kernel/`.
-2. **Lightweight kernels go to `python/sglang/jit_kernel`.** If it is small, has few dependencies, and benefits from rapid iteration, implement it as a JIT kernel instead.
+1. **Prefer `python/sglang/jit_kernel` first** when the kernel does **not** depend on CUTLASS or another large C++ project. This is the default path for lightweight kernels that benefit from rapid iteration.
+2. **Prefer `sgl-kernel`** when the kernel **does** depend on CUTLASS or another large C++ project, or when it should be part of the AOT wheel / torch op registration flow.
+3. **Exception**: if the dependency is `flashinfer`, or CUTLASS that is already provided through `flashinfer`, the kernel can still be implemented as `jit_kernel`.
 
 In addition, every new kernel must ship with:
 
@@ -156,39 +157,50 @@ csrc/elementwise/scale.cu
 
 ## Step 5: Expose a Python API under `sgl-kernel/python/sgl_kernel/`
 
-In `sgl-kernel/python/sgl_kernel/__init__.py`, add:
+Prefer following the existing module organization first. For elementwise kernels, the usual pattern is:
+
+- implement the Python wrapper in `sgl-kernel/python/sgl_kernel/elementwise.py`
+- then re-export it from `sgl-kernel/python/sgl_kernel/__init__.py`
+
+For example, in `sgl-kernel/python/sgl_kernel/elementwise.py`, add:
 
 ```python
-from torch.ops import sgl_kernel as _ops
+import torch
 
-def scale(out: torch.Tensor, input: torch.Tensor, factor: float) -> None:
+def scale(
+    input: torch.Tensor,
+    factor: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
-    Element-wise scale: out = input * factor (in-place into out).
+    Element-wise scale: out = input * factor.
 
     Supported dtypes: torch.float16, torch.bfloat16, torch.float32.
 
     Parameters
     ----------
-    out    : pre-allocated CUDA output tensor (same shape/dtype as input)
     input  : CUDA input tensor
     factor : scale factor (float)
+    out    : optional pre-allocated CUDA output tensor (same shape/dtype as input)
     """
-    _ops.scale(out, input, factor)
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.scale.default(out, input, factor)
+    return out
 ```
 
-Or export it from the existing module organisation — follow the pattern already used by similar ops in `__init__.py`.
+Then re-export it from `sgl-kernel/python/sgl_kernel/__init__.py` following the existing import style used by other kernels.
 
 ---
 
 ## Step 6: Write tests (required)
 
 Create `sgl-kernel/tests/test_scale.py`:
-
 ```python
 import pytest
+
 import torch
 import sgl_kernel
-
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("size", [128, 1024, 4096, 65536])
@@ -197,7 +209,8 @@ def test_scale_correctness(dtype, size, factor):
     input = torch.randn(size, dtype=dtype, device="cuda")
     out   = torch.empty_like(input)
 
-    sgl_kernel.scale(out, input, factor)
+    result = sgl_kernel.scale(input, factor, out=out)
+    assert result is out
 
     expected = input * factor
     rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-2, 1e-2)
@@ -208,24 +221,18 @@ def test_scale_shape_mismatch():
     input = torch.randn(128, dtype=torch.float16, device="cuda")
     out   = torch.empty(256, dtype=torch.float16, device="cuda")
     with pytest.raises(RuntimeError, match="same shape"):
-        sgl_kernel.scale(out, input, 2.0)
+        sgl_kernel.scale(input, 2.0, out=out)
 
 
 def test_scale_cpu_input():
     input = torch.randn(128, dtype=torch.float16)  # CPU
     out   = torch.empty_like(input)
     with pytest.raises(RuntimeError, match="CUDA"):
-        sgl_kernel.scale(out, input, 2.0)
+        sgl_kernel.scale(input, 2.0, out=out)
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
-```
-
-Run:
-
-```bash
-pytest sgl-kernel/tests/test_scale.py -q
 ```
 
 ---
@@ -279,7 +286,7 @@ def benchmark(dtype, size, provider):
     factor = 2.0
 
     if provider == "sglang":
-        fn = lambda: sgl_kernel.scale(out, input, factor)
+        fn = lambda: sgl_kernel.scale(input, factor, out=out)
     else:
         fn = lambda: torch_scale(input, factor)
 
@@ -293,15 +300,9 @@ if __name__ == "__main__":
     benchmark.run(print_data=True)
 ```
 
-Run:
-
-```bash
-python sgl-kernel/benchmark/bench_scale.py
-```
-
 ---
 
-## Step 8: Build and validate
+## Step 8: Build
 
 Build:
 
@@ -317,7 +318,11 @@ cd sgl-kernel
 make build -j1 MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
-Validate:
+---
+
+## Step 9: Validate
+
+After building successfully, run the test and benchmark:
 
 ```bash
 pytest sgl-kernel/tests/test_scale.py -q
@@ -352,7 +357,8 @@ sgl-kernel/csrc/elementwise/scale.cu          # NEW: CUDA kernel + launcher
 sgl-kernel/include/sgl_kernel_ops.h           # MODIFIED: C++ declaration
 sgl-kernel/csrc/common_extension.cc           # MODIFIED: schema + dispatch registration
 sgl-kernel/CMakeLists.txt                     # MODIFIED: add source file (alphabetical)
-sgl-kernel/python/sgl_kernel/__init__.py      # MODIFIED: export Python API
+sgl-kernel/python/sgl_kernel/elementwise.py   # MODIFIED: Python wrapper
+sgl-kernel/python/sgl_kernel/__init__.py      # MODIFIED: re-export Python API
 sgl-kernel/tests/test_scale.py                # NEW: tests
 sgl-kernel/benchmark/bench_scale.py           # NEW: benchmark
 ```

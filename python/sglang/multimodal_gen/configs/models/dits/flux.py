@@ -23,6 +23,15 @@ class FluxArchConfig(DiTArchConfig):
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
+    exclude_lora_layers: list[str] = field(
+        default_factory=lambda: [
+            "time_guidance_embed.timestep_embedder.linear_1",
+            "time_guidance_embed.timestep_embedder.linear_2",
+            "time_guidance_embed.guidance_embedder.linear_1",
+            "time_guidance_embed.guidance_embedder.linear_2",
+        ]
+    )
+
     # nunchaku checkpoint uses different weight names; map to sglang flux layout
     param_names_mapping: dict = field(
         default_factory=lambda: {

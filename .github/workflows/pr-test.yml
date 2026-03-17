@@ -96,6 +96,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Show test partition assignments
+        continue-on-error: true
+        run: python3 test/show_partitions.py
+
       - name: Determine run mode
         id: run-mode
         run: |
@@ -245,7 +249,7 @@ jobs:
           # Use kernel-build runner only when sgl_kernel changes are detected AND we're not in target_stage mode
           # (target_stage skips wheel builds, so we can't use custom kernels)
           # Use API-based detection (filter-api) for target_stage mode, otherwise use dorny/paths-filter (filter)
-          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}"
+          sgl_kernel="${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}"
           target_stage="${{ inputs.target_stage }}"
           if [[ "$sgl_kernel" == "true" && -z "$target_stage" ]]; then
             echo "b200_runner=4-gpu-b200-kernel" >> $GITHUB_OUTPUT
@@ -332,48 +336,13 @@ jobs:
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Wait for stage-a-test-1 to complete
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
         id: wait
-        uses: actions/github-script@v7
         with:
-          script: |
-            const maxWaitMinutes = 240;
-            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
-            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
-
-            for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: context.runId,
-                per_page: 100,
-              });
-
-              const stageAJob = jobs.find(job => job.name === 'stage-a-test-1');
-
-              if (stageAJob) {
-                console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
-
-                if (stageAJob.status === 'completed') {
-                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped') {
-                    core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
-                    return;
-                  } else {
-                    core.setOutput('result', 'failure');
-                    core.setFailed(`stage-a-test-1 ${stageAJob.conclusion}`);
-                    return;
-                  }
-                }
-              } else {
-                console.log('stage-a-test-1 job not found yet');
-              }
-
-              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-            }
-
-            core.setFailed('Timeout waiting for stage-a-test-1');
-            core.setOutput('result', 'timeout');
+          stage-name: stage-a
+          jobs: '["stage-a-test-1", "stage-a-cpu-only"]'
+          max-wait-minutes: '240'
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
@@ -392,88 +361,19 @@ jobs:
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Wait for stage-b jobs to complete
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
         id: wait
-        uses: actions/github-script@v7
         with:
-          script: |
-            const maxWaitMinutes = 480;
-            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
-            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
-
-            // Stage-b jobs to wait for
-            const stageBJobs = [
-              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },              // partitions 0-7
-              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 14 },             // partitions 0-13
-              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 4 },              // partitions 0-3
-              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 },
-            ];
-            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);  // 27 total
-
-            // Helper to match job names exactly (prefix alone or prefix + " (N)" for matrix jobs)
-            const matchesPrefix = (jobName, prefix) => {
-              return jobName === prefix || jobName.startsWith(prefix + ' (');
-            };
-
-            for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: context.runId,
-                per_page: 100,
-              });
-
-              let allCompleted = true;
-              let anyFailed = false;
-              let failedJobs = [];
-              let completedCount = 0;
-              let totalCount = 0;
-
-              for (const { prefix, expectedCount } of stageBJobs) {
-                const matchingJobs = jobs.filter(job => matchesPrefix(job.name, prefix));
-
-                // Check existing jobs for failures first (fail fast)
-                for (const job of matchingJobs) {
-                  totalCount++;
-                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
-
-                  if (job.status !== 'completed') {
-                    allCompleted = false;
-                  } else {
-                    completedCount++;
-                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
-                      anyFailed = true;
-                      failedJobs.push(job.name);
-                    }
-                  }
-                }
-
-                if (matchingJobs.length < expectedCount) {
-                  console.log(`${prefix}: found ${matchingJobs.length}/${expectedCount} jobs (waiting for more)`);
-                  allCompleted = false;
-                }
-              }
-
-              console.log(`Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})`);
-
-              // Fail fast if any jobs failed (don't wait for all jobs to be created)
-              if (anyFailed) {
-                core.setOutput('result', 'failure');
-                core.setFailed(`Stage-b jobs failed: ${failedJobs.join(', ')}`);
-                return;
-              }
-
-              if (allCompleted && totalCount >= totalExpectedJobs) {
-                core.setOutput('result', 'success');
-                return;
-              }
-
-              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-            }
-
-            core.setFailed('Timeout waiting for stage-b jobs');
-            core.setOutput('result', 'timeout');
+          stage-name: stage-b
+          jobs: |
+            [
+              {"prefix": "stage-b-test-small-1-gpu", "expected_count": 8},
+              {"prefix": "stage-b-test-large-1-gpu", "expected_count": 14},
+              {"prefix": "stage-b-test-large-2-gpu", "expected_count": 4},
+              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
+            ]
+          max-wait-minutes: '480'
 
   # =============================================== PR Gate ====================================================
   call-gate:
@@ -826,6 +726,79 @@ jobs:
         run: |
           cd python/sglang/jit_kernel
           pytest tests/
+
+  jit-kernel-unit-test-nightly:
+    needs: [check-changes]
+    if: |
+      github.event_name == 'schedule' &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run full nightly test
+        timeout-minutes: 60
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
+
+  jit-kernel-benchmark-test:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs and when target_stage is set
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    timeout-minutes: 240
+    env:
+      CI: true
+      RUNNER_LABELS: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run benchmark tests
+        timeout-minutes: 45
+        run: |
+          cd python/sglang/jit_kernel/benchmark
+          echo "Running jit-kernel benchmark tests in CI mode..."
+
+          failures=()
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            if ! timeout 120 python3 "$bench_file"; then
+              failures+=("$bench_file")
+            fi
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          if [ ${#failures[@]} -ne 0 ]; then
+            echo "The following benchmark tests failed: ${failures[*]}"
+            exit 1
+          fi
+
+          echo "All jit-kernel benchmark tests completed successfully!"
 
   # =============================================== primary ====================================================
 
@@ -1270,6 +1243,45 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.part }}
 
+  multimodal-gen-unit-test:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'multimodal-gen-unit-test') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
+    runs-on: 1-gpu-runner
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion unit tests
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py --suite unit
+
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1310,7 +1322,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1433,7 +1445,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1495,7 +1507,7 @@ jobs:
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1587,7 +1599,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1, 2, 3]
 
     steps:
       - name: Checkout code
@@ -1616,7 +1628,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1691,7 +1703,10 @@ jobs:
         wait-for-stage-b,
 
         jit-kernel-unit-test,
+        jit-kernel-unit-test-nightly,
+        jit-kernel-benchmark-test,
 
+        multimodal-gen-unit-test,
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
 

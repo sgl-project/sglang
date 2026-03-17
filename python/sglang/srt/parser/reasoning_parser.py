@@ -418,9 +418,9 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
-class NanoV3Detector(BaseReasoningFormatDetector):
+class Nemotron3Detector(BaseReasoningFormatDetector):
     """
-    Detector for NanoV3 model.
+    Detector for Nemotron3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
 
     """
@@ -431,6 +431,7 @@ class NanoV3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<think>",
@@ -440,6 +441,13 @@ class NanoV3Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
 
 
 class ReasoningParser:
@@ -466,7 +474,7 @@ class ReasoningParser:
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
-        "nano_v3": NanoV3Detector,
+        "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
     }
 
@@ -501,6 +509,10 @@ class ReasoningParser:
         ):
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content
+
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        if chat_template_kwargs.get("force_nonempty_content") is True:
+            kwargs["force_nonempty_content"] = True
 
         self.detector = detector_class(**kwargs)
 

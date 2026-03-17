@@ -7,6 +7,8 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+# Import to register custom ops for torch.compile compatibility
+import sglang.srt.layers.moe.flashinfer_trtllm_moe  # noqa: F401
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
@@ -119,6 +121,77 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
     layer.output2_scales_scalar = Parameter(output2_scales_scalar, requires_grad=False)
 
 
+def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
+    """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
+    from flashinfer import (
+        reorder_rows_for_gated_act_gemm,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
+
+    w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
+    w2_weight = cast(torch.Tensor, layer.w2_weight).contiguous()
+    w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv).contiguous()
+    w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv).contiguous()
+
+    assert w13_scale.dtype == torch.uint8
+    assert w2_scale.dtype == torch.uint8
+
+    num_experts, two_n, _ = w13_weight.shape
+    _, hidden_size, _ = w2_weight.shape
+    epilogue_tile_m = 128
+
+    w13_interleaved = [
+        reorder_rows_for_gated_act_gemm(w13_weight[i]) for i in range(num_experts)
+    ]
+    w13_scale_interleaved = [
+        reorder_rows_for_gated_act_gemm(w13_scale[i]) for i in range(num_experts)
+    ]
+
+    w13_shuffled = [
+        shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
+        for i in range(num_experts)
+    ]
+    w2_shuffled = [
+        shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
+        for i in range(num_experts)
+    ]
+    w13_scale_shuffled = [
+        shuffle_matrix_sf_a(
+            w13_scale_interleaved[i].view(torch.uint8).reshape(two_n, -1),
+            epilogue_tile_m,
+        )
+        for i in range(num_experts)
+    ]
+    w2_scale_shuffled = [
+        shuffle_matrix_sf_a(
+            w2_scale[i].view(torch.uint8).reshape(hidden_size, -1),
+            epilogue_tile_m,
+        )
+        for i in range(num_experts)
+    ]
+
+    # Keep parameter identities stable for CUDA graph capture reuse.
+    copy_or_rebind_param(
+        layer, "w13_weight", torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
+    )
+    copy_or_rebind_param(
+        layer, "w2_weight", torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
+    )
+    copy_or_rebind_param(
+        layer,
+        "w13_weight_scale_inv",
+        torch.stack(w13_scale_shuffled).reshape_as(w13_scale).contiguous(),
+    )
+    copy_or_rebind_param(
+        layer,
+        "w2_weight_scale_inv",
+        torch.stack(w2_scale_shuffled).reshape_as(w2_scale).contiguous(),
+    )
+    layer.w13_weight_scale_inv.format_ue8m0 = True
+    layer.w2_weight_scale_inv.format_ue8m0 = True
+
+
 def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
@@ -197,6 +270,7 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 
     # Block-quant path
     block_quant: bool
+    use_mxfp8: bool = False
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
@@ -209,15 +283,24 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     use_routing_scales_on_input: bool = False
 
 
+def _pack_topk_for_flashinfer_routed(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack routed top-k tensors into FlashInfer's int32 format."""
+    packed_ids = topk_ids.to(torch.int32)
+    packed_weights = topk_weights.to(torch.bfloat16)
+    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
+    # SGLang can mark padded tokens with -1 expert ids.
+    return packed.masked_fill_(packed_ids < 0, 0)
+
+
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
+    use_routed_topk: bool = False,
 ) -> StandardCombineInput:
-    from flashinfer.fused_moe import (
-        trtllm_fp8_block_scale_moe,
-        trtllm_fp8_per_tensor_scale_moe,
-    )
+    from flashinfer.fused_moe import Fp8QuantizationType
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -228,34 +311,104 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
-    assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-    router_logits = topk_output.router_logits
-    topk_config = topk_output.topk_config
-    correction_bias = (
-        None
-        if topk_config.correction_bias is None
-        else topk_config.correction_bias.to(hidden_states.dtype)
-    )
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(hidden_states.dtype)
+        )
+    else:
+        router_logits = None
+        topk_config = None
+        correction_bias = None
 
     routing_method_type = quant_info.routing_method_type
+    fp8_quantization_type = (
+        Fp8QuantizationType.MxFp8
+        if quant_info.use_mxfp8
+        else Fp8QuantizationType.DeepSeekFp8
+    )
+    use_shuffled_weight = quant_info.use_mxfp8
 
     if quant_info.block_quant:
         assert quant_info.weight_block_k is not None
         assert quant_info.w13_weight_scale_inv is not None
         assert quant_info.w2_weight_scale_inv is not None
 
-        a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
-        a_sf_t = a_sf.t().contiguous()
+        if quant_info.use_mxfp8:
+            assert quant_info.weight_block_k == 32
+            from flashinfer import mxfp8_quantize
 
+            a_q, a_sf = mxfp8_quantize(hidden_states, False)
+            # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
+            # [num_tokens, hidden_size // 32] (no transpose).
+            a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
+        else:
+            a_q, a_sf = per_token_group_quant_fp8(
+                hidden_states, quant_info.weight_block_k
+            )
+            a_sf_t = a_sf.t().contiguous()
+
+        # Allocate output inside symmetric memory context
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
-            # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
-            # so we put the whole function under the ``use_symmetric_memory`` context manager.
-            # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            output = trtllm_fp8_block_scale_moe(
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+
+        # Move kernel call outside context manager to avoid graph breaks
+        # during torch.compile for piecewise cuda graph.
+        # Use custom op wrapper for torch.compile compatibility.
+        if use_routed_topk:
+            assert (
+                runner_config.top_k is not None
+            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            packed_topk_ids = _pack_topk_for_flashinfer_routed(
+                topk_ids=topk_output.topk_ids,
+                topk_weights=topk_output.topk_weights,
+            )
+
+            output = torch.ops.sglang.trtllm_fp8_block_scale_routed_moe_wrapper(
+                topk_ids=packed_topk_ids,
+                routing_bias=None,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+                num_experts=quant_info.global_num_experts,
+                top_k=runner_config.top_k,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=quant_info.intermediate_size,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+                routed_scaling_factor=(
+                    runner_config.routed_scaling_factor
+                    if runner_config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+                routing_method_type=(
+                    RoutingMethodType.TopK
+                    if routing_method_type == RoutingMethodType.DeepSeekV3
+                    else routing_method_type
+                ),
+                use_shuffled_weight=use_shuffled_weight,
+                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                fp8_quantization_type=int(fp8_quantization_type),
+            )
+        else:
+            assert TopKOutputChecker.format_is_bypassed(topk_output)
+
+            output = torch.ops.sglang.trtllm_fp8_block_scale_moe_wrapper(
                 routing_logits=(
                     router_logits.to(torch.float32)
                     if routing_method_type == RoutingMethodType.DeepSeekV3
@@ -270,10 +423,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
-                n_group=(
-                    topk_config.num_expert_group if topk_config.num_expert_group else 0
-                ),
-                topk_group=topk_config.topk_group if topk_config.topk_group else 0,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
                 intermediate_size=quant_info.intermediate_size,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
@@ -283,9 +434,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else 1.0
                 ),
                 routing_method_type=routing_method_type,
-                use_shuffled_weight=False,
+                use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                fp8_quantization_type=int(fp8_quantization_type),
             )
+        symm_output.copy_(output)
+        output = symm_output
     else:
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
@@ -297,36 +451,47 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             None if correction_bias is None else correction_bias.to(torch.bfloat16)
         )
 
+        # Allocate output inside symmetric memory context
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            output = trtllm_fp8_per_tensor_scale_moe(
-                routing_logits=router_logits.to(torch.bfloat16),
-                routing_bias=routing_bias_cast,
-                hidden_states=a_q,
-                gemm1_weights=quant_info.w13_weight,
-                output1_scales_scalar=quant_info.output1_scales_scalar,
-                output1_scales_gate_scalar=quant_info.output1_scales_gate_scalar,
-                gemm2_weights=quant_info.w2_weight,
-                output2_scales_scalar=quant_info.output2_scales_scalar,
-                num_experts=quant_info.global_num_experts,
-                top_k=topk_config.top_k,
-                n_group=(
-                    topk_config.num_expert_group if topk_config.num_expert_group else 0
-                ),
-                topk_group=topk_config.topk_group if topk_config.topk_group else 0,
-                intermediate_size=quant_info.intermediate_size,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                use_routing_scales_on_input=quant_info.use_routing_scales_on_input,
-                routing_method_type=routing_method_type,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
+
+        # Move kernel call outside context manager to avoid graph breaks
+        # during torch.compile for piecewise cuda graph.
+        # Use custom op wrapper for torch.compile compatibility.
+        output = torch.ops.sglang.trtllm_fp8_per_tensor_scale_moe(
+            routing_logits=router_logits.to(torch.bfloat16),
+            routing_bias=routing_bias_cast,
+            hidden_states=a_q,
+            gemm1_weights=quant_info.w13_weight,
+            output1_scales_scalar=quant_info.output1_scales_scalar,
+            output1_scales_gate_scalar=quant_info.output1_scales_gate_scalar,
+            gemm2_weights=quant_info.w2_weight,
+            output2_scales_scalar=quant_info.output2_scales_scalar,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=int(quant_info.w2_weight.shape[2]),
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            use_routing_scales_on_input=False,
+            routing_method_type=routing_method_type,
+            tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+        )
+        symm_output.copy_(output)
+        output = symm_output
 
     return StandardCombineInput(hidden_states=output)
 
@@ -442,7 +607,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         routing_logits=router_logits,
         routing_bias=correction_bias,
         hidden_states=hs_fp4,
-        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+            *hs_scale_linear.shape[:-1], -1
+        ),
         gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
         gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
             torch.float8_e4m3fn
@@ -574,4 +741,22 @@ def fused_experts_none_to_flashinfer_trtllm(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
+    )
+
+
+@register_fused_func("none", "flashinfer_trtllm_routed")
+def fused_experts_none_to_flashinfer_trtllm_routed(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
