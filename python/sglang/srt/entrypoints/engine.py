@@ -88,7 +88,6 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     get_bool_env_var,
-    get_zmq_socket,
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
@@ -97,6 +96,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
@@ -1142,9 +1142,9 @@ def _set_envs_and_config(server_args: ServerArgs):
             )
         if _is_cuda:
             assert_pkg_version(
-                "sgl-kernel",
-                "0.3.21",
-                "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+                "sglang-kernel",
+                "0.4.0",
+                "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
     # Signal handlers can only be registered from the main thread.

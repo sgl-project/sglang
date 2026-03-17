@@ -23,7 +23,6 @@ import functools
 import importlib
 import inspect
 import io
-import ipaddress
 import itertools
 import json
 import logging
@@ -36,7 +35,6 @@ import re
 import resource
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +47,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -79,10 +78,8 @@ import psutil
 import pybase64
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
-import zmq
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -296,7 +293,7 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
@@ -348,7 +345,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -637,7 +634,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -701,73 +698,6 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr.port == port:
-            try:
-                return psutil.Process(conn.pid)
-            except psutil.NoSuchProcess:
-                # It could happen by race condition (the proc dies when psutil.Process is called).
-                pass
-
-    return None
-
-
-def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
-) -> bool:
-    for i in range(timeout_s):
-        if is_port_available(port):
-            return True
-
-        if i > 10 and i % 5 == 0:
-            process = find_process_using_port(port)
-            if process is None:
-                logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
-                )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
-        time.sleep(0.1)
-
-    if raise_exception:
-        raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
-        )
-    return False
-
-
-def is_port_available(port):
-    """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
-            return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
 
 
 def decode_video_base64(video_base64):
@@ -1431,104 +1361,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     return result
 
 
-def get_zmq_socket(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    endpoint: Optional[str] = None,
-    bind: bool = True,
-) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
-        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
-
-    Returns:
-        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
-        If endpoint is provided: The configured ZeroMQ socket.
-    """
-    socket = context.socket(socket_type)
-
-    if endpoint is None:
-        # Bind to random TCP port
-        config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
-    else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
-            socket.setsockopt(zmq.IPV6, 1)
-
-        config_socket(socket, socket_type)
-
-        if bind:
-            socket.bind(endpoint)
-        else:
-            socket.connect(endpoint)
-
-        return socket
-
-
-def get_zmq_socket_on_host(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    host: Optional[str] = None,
-) -> Tuple[int, zmq.Socket]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
-
-    Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
-    """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
-    config_socket(socket, socket_type)
-    if host:
-        if is_valid_ipv6_address(host):
-            socket.setsockopt(zmq.IPV6, 1)
-            bind_host = f"tcp://[{host}]"
-        else:
-            bind_host = f"tcp://{host}"
-    else:
-        bind_host = "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
-
-
-def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-
 def dump_to_file(dirpath, name, value):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -1695,15 +1527,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
             return route.path, True
 
     return request.url.path, False
-
-
-def bind_port(port):
-    """Bind to a specific port, assuming it's available."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
-    sock.bind(("", port))
-    sock.listen(1)
-    return sock
 
 
 def get_amdgpu_memory_capacity():
@@ -2486,6 +2309,44 @@ def nullable_str(val: str):
     return val
 
 
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
+
+
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
     try:
@@ -2640,38 +2501,6 @@ def _configure_uvicorn_access_log_filter(
             loggers_cfg["uvicorn.access"]["filters"] = filters_list
         if filter_name not in filters_list:
             filters_list.append(filter_name)
-
-
-def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
-    if port is not None:
-        port = int(port)
-        while True:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", port))
-                    return port
-            except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -2902,107 +2731,6 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
-
-
-def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
-        return None
-    try:
-        import netifaces
-    except ImportError as e:
-        raise ImportError(
-            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
-        ) from e
-
-    try:
-        addresses = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addresses:
-            for addr_info in addresses[netifaces.AF_INET]:
-                ip = addr_info.get("addr")
-                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-                    return ip
-        if netifaces.AF_INET6 in addresses:
-            for addr_info in addresses[netifaces.AF_INET6]:
-                ip = addr_info.get("addr")
-                if ip and not ip.startswith("fe80::") and ip != "::1":
-                    return ip.split("%")[0]
-    except (ValueError, OSError) as e:
-        logger.warning(
-            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
-        )
-    return None
-
-
-def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
-    return None
-
-
-def get_local_ip_auto(fallback: str = None) -> str:
-    """
-    Automatically detect the local IP address using multiple fallback strategies.
-
-    This function attempts to obtain the local IP address through several methods.
-    If all methods fail, it returns the specified fallback value or raises an exception.
-
-    Args:
-        fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to
-            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
-            Defaults to None.
-
-    Returns:
-        str: The detected local IP address, or the fallback value if detection fails.
-
-    Raises:
-        ValueError: If IP detection fails and no fallback value is provided.
-
-    Note:
-        The function tries detection methods in the following order:
-        1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
-    """
-    # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    logger.debug("get_ip failed")
-    # Fallback
-    if ip := get_local_ip_by_nic():
-        return ip
-    logger.debug("get_local_ip_by_nic failed")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed")
-    if fallback:
-        return fallback
-    raise ValueError("Can not get local ip")
 
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
