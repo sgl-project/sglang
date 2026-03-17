@@ -5,6 +5,7 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -150,6 +151,12 @@ def _is_numa_available() -> bool:
     if constrained_affinity:
         logger.warning(
             "NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration."
+        )
+        return False
+
+    if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
+        logger.warning(
+            "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
         )
         return False
 
