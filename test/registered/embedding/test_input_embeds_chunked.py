@@ -155,20 +155,24 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
             self.assertIn("text", r)
         self._assert_server_alive()
 
-    def test_retraction_with_output_ids(self):
-        """Regression test for #14110.
+    def test_retraction_aborts_input_embeds(self):
+        """input_embeds requests are aborted (not retracted) under KV pressure.
 
-        SGLANG_TEST_RETRACT forces retraction every few scheduler iterations.
-        Combined with ignore_eos and a reasonable max_new_tokens, at least one
-        request is retracted mid-decode with non-empty output_ids, then
-        re-prefilled. Pre-#14110 this crashes (cache_k < loc) because fill_ids
-        includes output_ids but input_embeds does not.
+        Retracting an input_embeds request cannot preserve decode progress:
+        re-prefill would need to embed the generated output_ids via the model's
+        embed_tokens (unreachable from the scheduler), and the previous approach
+        (#14110, clearing output_ids) left 10+ per-step accumulators stale —
+        including cross-process detokenizer/tokenizer_manager state. The result
+        was silent corruption: len(output_token_logprobs) != len(output_ids)
+        for RL workloads. Aborting is the only correct outcome.
+
+        SGLANG_TEST_RETRACT forces the retract path every few scheduler
+        iterations; we verify that at least one request gets a clean 503 and
+        the server survives.
         """
         text = "The quick brown fox jumps over the lazy dog. " * 4
         embeds = _embeds_for(text)
 
-        # Batch of requests with enough decode steps that SGLANG_TEST_RETRACT
-        # (interval=3 by default) fires mid-decode.
         n = 4
         resp = _generate(
             self.base_url,
@@ -176,11 +180,27 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
             max_new_tokens=32,
             ignore_eos=True,
         )
+        # Batch endpoint returns 200 with per-request finish_reason. At least
+        # one request should have been aborted via the retract path.
         self.assertEqual(resp.status_code, 200, resp.text[:300])
         results = resp.json()
         self.assertEqual(len(results), n)
-        for r in results:
-            self.assertIn("text", r)
+        aborted = [
+            r
+            for r in results
+            if r.get("meta_info", {}).get("finish_reason", {}).get("type") == "abort"
+        ]
+        self.assertGreater(
+            len(aborted),
+            0,
+            f"expected at least one abort via SGLANG_TEST_RETRACT; "
+            f"finish_reasons: {[r.get('meta_info', {}).get('finish_reason') for r in results]}",
+        )
+        for r in aborted:
+            self.assertIn(
+                "input_embeds",
+                r["meta_info"]["finish_reason"].get("message", ""),
+            )
         self._assert_server_alive()
 
 
