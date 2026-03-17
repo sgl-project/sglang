@@ -191,6 +191,7 @@ def _make_nvfp4_config() -> _MoEOnlyNvFp4Config:
 
 def _generate_nvfp4_checkpoint_weights(
     config: PretrainedConfig,
+    fuse_shared: bool = False,
 ) -> list[tuple[str, torch.Tensor]]:
     """Generate checkpoint weights matching a real NVFP4 DeepSeek V3 checkpoint.
 
@@ -276,15 +277,64 @@ def _generate_nvfp4_checkpoint_weights(
                 weights.append((f"{pfx}.mlp.experts.{e}.down_proj.input_scale", rand_scalar()))
 
             # Shared expert (DSv3 always has exactly 1)
-            # When not fused into FusedMoE, shared experts are LinearBase layers
-            # (unquantized by _MoEOnlyNvFp4Config), so only BF16 weights.
-            # When fused, they become extra rows in FusedMoE and get NVFP4 layout
-            # — but the checkpoint format is the same (unfused names), and the
-            # weight_loader handles the mapping.
+            # When fused, shared experts become extra rows in FusedMoE and need
+            # NVFP4 layout.  When not fused, they're separate LinearBase layers
+            # (unquantized by _MoEOnlyNvFp4Config) and use BF16.
             assert config.n_shared_experts == 1
-            weights.append((f"{pfx}.mlp.shared_experts.gate_proj.weight", rand_bf16(I_moe, H)))
-            weights.append((f"{pfx}.mlp.shared_experts.up_proj.weight", rand_bf16(I_moe, H)))
-            weights.append((f"{pfx}.mlp.shared_experts.down_proj.weight", rand_bf16(H, I_moe)))
+            if fuse_shared:
+                for proj in ("gate_proj", "up_proj"):
+                    weights.append(
+                        (
+                            f"{pfx}.mlp.shared_experts.{proj}.weight",
+                            rand_uint8(I_moe, H // 2),
+                        )
+                    )
+                    weights.append(
+                        (
+                            f"{pfx}.mlp.shared_experts.{proj}.weight_scale",
+                            rand_fp8_scale(I_moe, H // gs),
+                        )
+                    )
+                    weights.append(
+                        (
+                            f"{pfx}.mlp.shared_experts.{proj}.weight_scale_2",
+                            rand_scalar(),
+                        )
+                    )
+                    weights.append(
+                        (f"{pfx}.mlp.shared_experts.{proj}.input_scale", rand_scalar())
+                    )
+                weights.append(
+                    (
+                        f"{pfx}.mlp.shared_experts.down_proj.weight",
+                        rand_uint8(H, I_moe // 2),
+                    )
+                )
+                weights.append(
+                    (
+                        f"{pfx}.mlp.shared_experts.down_proj.weight_scale",
+                        rand_fp8_scale(H, I_moe // gs),
+                    )
+                )
+                weights.append(
+                    (
+                        f"{pfx}.mlp.shared_experts.down_proj.weight_scale_2",
+                        rand_scalar(),
+                    )
+                )
+                weights.append(
+                    (f"{pfx}.mlp.shared_experts.down_proj.input_scale", rand_scalar())
+                )
+            else:
+                weights.append(
+                    (f"{pfx}.mlp.shared_experts.gate_proj.weight", rand_bf16(I_moe, H))
+                )
+                weights.append(
+                    (f"{pfx}.mlp.shared_experts.up_proj.weight", rand_bf16(I_moe, H))
+                )
+                weights.append(
+                    (f"{pfx}.mlp.shared_experts.down_proj.weight", rand_bf16(H, I_moe))
+                )
         else:
             # Dense MLP (BF16, excluded from quant)
             weights.append((f"{pfx}.mlp.gate_proj.weight", rand_bf16(I_dense, H)))
@@ -308,6 +358,15 @@ def _snapshot_moe_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
         ):
             continue
         for name, param in layer.mlp.experts.named_parameters():
+            # Skip params not managed by load_weights / ep_to_tp_transform:
+            # - blockscale_swizzled: uninitialized after load_weights,
+            #   computed by process_weights_after_loading (not part of this test)
+            # - _sglang_require_global_experts params (NVFP4 input_scale): hold all
+            #   experts on every rank, ep_to_tp_transform skips it entirely
+            if "blockscale_swizzled" in name:
+                continue
+            if getattr(param, "_sglang_require_global_experts", False):
+                continue
             key = f"layer{layer_id}.{name}"
             snapshot[key] = param.data.clone()
     return snapshot
@@ -551,7 +610,7 @@ class TestEpToTpTransform(unittest.TestCase):
         from sglang.srt.server_args import get_global_server_args
 
         config = _make_tiny_config(n_routed_experts=16)
-        weights = _generate_nvfp4_checkpoint_weights(config)
+        weights = _generate_nvfp4_checkpoint_weights(config, fuse_shared=True)
         qc = _make_nvfp4_config()
 
         server_args = get_global_server_args()
