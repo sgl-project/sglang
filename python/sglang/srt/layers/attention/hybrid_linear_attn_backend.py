@@ -945,7 +945,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
-        _maybe_capture_ssm_state(ssm_states, cache_indices, layer.layer_id, "decode")
+        _maybe_capture_ssm_state(ssm_states, cache_indices[:forward_batch.batch_size], layer.layer_id, "decode")
 
         return core_attn_out
 
