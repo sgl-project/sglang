@@ -117,7 +117,8 @@ else
 fi
 
 # Clean up existing installations
-$PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+$PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+
 # Keep flashinfer packages installed if version matches to avoid re-downloading:
 # - flashinfer-cubin: 150+ MB, plus extra cubins from ci_download_flashinfer_cubin.sh
 # - flashinfer-jit-cache: 1.2+ GB, by far the largest download in CI

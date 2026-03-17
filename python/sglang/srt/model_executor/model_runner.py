@@ -176,7 +176,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -672,9 +672,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine.initialize(
             local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
-        self.remote_instance_transfer_engine_session_id = (
-            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
-        )
+        self.remote_instance_transfer_engine_session_id = NetworkAddress(
+            local_ip, self.remote_instance_transfer_engine.get_rpc_port()
+        ).to_host_port_str()
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -774,9 +774,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if dist_init_method_override:
             dist_init_method = dist_init_method_override
         elif self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            na = NetworkAddress.parse(self.server_args.dist_init_addr)
+            dist_init_method = na.to_tcp()
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+            dist_init_method = NetworkAddress(
+                self.server_args.host or "127.0.0.1", self.dist_port
+            ).to_tcp()
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
@@ -956,7 +959,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             if self.tp_rank == 0:
-                instance_ip = socket.gethostbyname(socket.gethostname())
+                instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
@@ -1234,9 +1237,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         success = False
         message = ""
         try:
+            na = NetworkAddress(master_address, group_port)
             self._weights_send_group[group_name] = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{group_port}",
+                init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
@@ -1244,9 +1248,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
-            message = (
-                f"Succeeded to init group through {master_address}:{group_port} group."
-            )
+            message = f"Succeeded to init group through {na.to_host_port_str()} group."
         except Exception as e:
             message = f"Failed to init group: {e}."
             logger.error(message)
@@ -1281,6 +1283,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.cuda.empty_cache()
         success = False
+        na = NetworkAddress(master_address, group_port)
         message = ""
         try:
             for _, weights in self.model.named_parameters():
@@ -1290,7 +1293,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     group=send_group,
                 )
             success = True
-            message = f"Succeeded to send weights through {master_address}:{group_port} {group_name}."
+            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:
             message = f"Failed to send weights: {e}."
             logger.error(message)
@@ -1333,9 +1336,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         try:
+            na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
