@@ -561,24 +561,17 @@ class Engram(nn.Module):
 
         if input_ids.device != device:
             input_ids = input_ids.to(device=device)
-        hash_input_ids = self.hash_mapping.hash_torch(input_ids, layer_id=self.layer_id)
 
         if self._prefetch_stream is not None and device.type == "cuda":
             stream = self._prefetch_stream
             with torch.cuda.stream(stream):
-                embeddings = self.multi_head_embedding(hash_input_ids).flatten(
-                    start_dim=-2
-                )
-                if embeddings.dtype != dtype:
-                    embeddings = embeddings.to(dtype=dtype)
+                embeddings = self.compute_embeddings(input_ids, dtype=dtype)
             event = torch.cuda.Event()
             event.record(stream)
             self._prefetch_event = event
             self._prefetch_embeddings = embeddings
         else:
-            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-            if embeddings.dtype != dtype:
-                embeddings = embeddings.to(dtype=dtype)
+            embeddings = self.compute_embeddings(input_ids, dtype=dtype)
             self._prefetch_event = None
             self._prefetch_embeddings = embeddings
 
@@ -613,6 +606,90 @@ class Engram(nn.Module):
         x = x * torch.rsqrt(variance + self.eps)
         return x * weight
 
+    # ------------------------------------------------------------------
+    # Stage A: hash + embedding lookup (input_ids → embeddings)
+    # Depends only on input_ids; safe to run ahead of time or on a
+    # different device backend.  Subclasses may override to use custom
+    # kernels (e.g. CPU-offloaded or fused CUDA implementations).
+    # ------------------------------------------------------------------
+    def compute_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Stage A: token compression → n-gram hashing → embedding lookup.
+
+        Args:
+            input_ids: ``[B, L]`` token ids.
+            dtype: cast output to this dtype when provided.
+
+        Returns:
+            embeddings: ``[B, L, (max_ngram_size-1) * n_embed_per_ngram]``
+        """
+        hash_input_ids = self.hash_mapping.hash_torch(
+            input_ids, layer_id=self.layer_id
+        )
+        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        if dtype is not None and embeddings.dtype != dtype:
+            embeddings = embeddings.to(dtype=dtype)
+        return embeddings
+
+    # ------------------------------------------------------------------
+    # Stage B: key/value projections + norms (embeddings → keys, values)
+    # Depends only on embeddings (Stage A output); independent of the
+    # current hidden_states.  Subclasses may override for fused or
+    # quantised projection kernels.
+    # ------------------------------------------------------------------
+    def compute_kv_projections(
+        self,
+        embeddings: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage B: linear projections and RMS-norm for keys and values.
+
+        Args:
+            embeddings: ``[B, L, engram_hidden_size]``
+
+        Returns:
+            normed_key: ``[B, L, HC_MULT, D]`` — normalised key tensor.
+            v_projected: ``[B, L, 1, D]``       — projected value tensor.
+        """
+        keys = self.key_projs_all(embeddings).view(
+            *embeddings.shape[:2], self.hc_mult, self.hidden_size
+        )
+        normed_key = self.parallel_rms_norm(keys, self.norm1_weight)
+        v_projected = self.value_proj(embeddings).unsqueeze(2)
+        return normed_key, v_projected
+
+    # ------------------------------------------------------------------
+    # Stage C: gated mixing + short convolution (hidden_states → output)
+    # Depends on hidden_states (previous layer) and Stage A/B outputs.
+    # Subclasses may override to use custom attention or conv kernels.
+    # ------------------------------------------------------------------
+    def compute_mixing(
+        self,
+        hidden_states: torch.Tensor,
+        normed_key: torch.Tensor,
+        v_projected: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage C: scaled dot-product gating and short convolution.
+
+        Args:
+            hidden_states: ``[B, L, HC_MULT, D]``
+            normed_key:    ``[B, L, HC_MULT, D]``
+            v_projected:   ``[B, L, 1, D]``
+
+        Returns:
+            output: ``[B, L, HC_MULT, D]``
+        """
+        normed_query = self.parallel_rms_norm(hidden_states, self.norm2_weight)
+
+        gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(self.hidden_size)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gate = gate.sigmoid().unsqueeze(-1)
+
+        value = gate * v_projected
+        return value + self.short_conv(value)
+
     def forward(self, hidden_states, input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
@@ -622,28 +699,12 @@ class Engram(nn.Module):
         if embeddings is None:
             if input_ids.device != hidden_states.device:
                 input_ids = input_ids.to(device=hidden_states.device)
-            hash_input_ids = self.hash_mapping.hash_torch(
-                input_ids, layer_id=self.layer_id
-            )
-            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            embeddings = self.compute_embeddings(input_ids)
         if embeddings.dtype != hidden_states.dtype:
             embeddings = embeddings.to(dtype=hidden_states.dtype)
 
-        keys = self.key_projs_all(embeddings).view(
-            *embeddings.shape[:2], self.hc_mult, self.hidden_size
-        )
-        normed_key = self.parallel_rms_norm(keys, self.norm1_weight)
-        normed_query = self.parallel_rms_norm(hidden_states, self.norm2_weight)
-
-        gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(self.hidden_size)
-        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gate = gate.sigmoid().unsqueeze(-1)
-
-        v_projected = self.value_proj(embeddings).unsqueeze(2)
-        value = gate * v_projected
-
-        output = value + self.short_conv(value)
-        return output
+        normed_key, v_projected = self.compute_kv_projections(embeddings)
+        return self.compute_mixing(hidden_states, normed_key, v_projected)
 
 
 class TransformerBlock(nn.Module):
