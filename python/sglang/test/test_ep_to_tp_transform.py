@@ -24,7 +24,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.utils import initialize_moe_config
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
@@ -155,6 +155,11 @@ def _generate_checkpoint_weights(
 _MOCK_BLACKWELL = patch(
     "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
     return_value=True,
+)
+
+_MOCK_FLASHINFER_TRTLLM = patch(
+    "sglang.srt.layers.moe.utils.MOE_RUNNER_BACKEND",
+    MoeRunnerBackend.FLASHINFER_TRTLLM,
 )
 
 
@@ -579,7 +584,9 @@ class TestEpToTpTransform(unittest.TestCase):
 
         Exercises both EP→TP code paths via the real ModelOptFp4Config:
           - Block scales (w13/w2_weight_scale): shard_dim != None → all_to_all
-          - Per-tensor scales (weight_scale_2, input_scale): shard_dim == None → all_gather
+          - Per-tensor scales (weight_scale_2): shard_dim == None → all_gather
+        Note: input_scale has _sglang_require_global_experts=True so it bypasses
+        the transform entirely (already holds all experts on every rank).
         """
         config = _make_tiny_config(n_routed_experts=16)
         weights = _generate_nvfp4_checkpoint_weights(config)
@@ -593,7 +600,7 @@ class TestEpToTpTransform(unittest.TestCase):
 
         # Sanity: both block and per-tensor scale params must be present
         block_keys = [k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k]
-        per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k or "input_scale" in k]
+        per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k]
         self.assertTrue(len(block_keys) > 0, "No block scale params found")
         self.assertTrue(len(per_tensor_keys) > 0, "No per-tensor scale params found")
 
@@ -718,6 +725,73 @@ class TestEpToTpTransform(unittest.TestCase):
                     )
         finally:
             server_args.disable_shared_experts_fusion = old_flag
+
+
+    def test_ep_to_tp_flashinfer_trtllm(self):
+        """EP→TP transform must work with flashinfer_trtllm backend layout.
+
+        flashinfer_trtllm differs from the default (auto) backend in two ways:
+          - w31 swap: gate (w1) and up (w3) shard IDs are swapped during loading
+          - Padding: intermediate_size_per_partition is rounded up to multiples of 128
+
+        Uses moe_intermediate_size=192 so that TP=2 gives per_partition=96, which
+        pads to 128, exercising the padded loading path.
+        """
+        config = _make_tiny_config(n_routed_experts=16)
+        config.moe_intermediate_size = 192
+        weights = _generate_checkpoint_weights(config)
+
+        with _MOCK_FLASHINFER_TRTLLM:
+            tp_snapshot = _create_model_and_load(config, weights, ep_load=False)
+            ep_snapshot = _create_model_and_load(config, weights, ep_load=True)
+
+        self.assertEqual(
+            set(tp_snapshot.keys()),
+            set(ep_snapshot.keys()),
+            "Mismatch in parameter names",
+        )
+        for key in sorted(tp_snapshot.keys()):
+            torch.testing.assert_close(
+                ep_snapshot[key],
+                tp_snapshot[key],
+                msg=f"Mismatch on rank {self.rank} for {key}",
+            )
+
+    def test_ep_to_tp_nvfp4_flashinfer_trtllm(self):
+        """EP→TP transform for NVFP4 with flashinfer_trtllm backend.
+
+        This is the real production path: NVFP4 quantization on Blackwell
+        defaults to flashinfer_trtllm. Exercises w31 swap + padding +
+        all NVFP4 scale paths (block scales via all_to_all, per-tensor
+        scales via all_gather).
+        """
+        config = _make_tiny_config(n_routed_experts=16)
+        config.moe_intermediate_size = 192
+        weights = _generate_nvfp4_checkpoint_weights(config)
+        qc = _make_nvfp4_config()
+
+        with _MOCK_FLASHINFER_TRTLLM, _MOCK_BLACKWELL:
+            tp_snapshot = _create_model_and_load(
+                config, weights, ep_load=False, quant_config=qc,
+            )
+            ep_snapshot = _create_model_and_load(
+                config, weights, ep_load=True, quant_config=qc,
+            )
+
+        self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
+
+        # Sanity: both block and per-tensor scale params must be present
+        block_keys = [k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k]
+        per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k]
+        self.assertTrue(len(block_keys) > 0, "No block scale params found")
+        self.assertTrue(len(per_tensor_keys) > 0, "No per-tensor scale params found")
+
+        for key in sorted(tp_snapshot.keys()):
+            torch.testing.assert_close(
+                ep_snapshot[key],
+                tp_snapshot[key],
+                msg=f"Mismatch on rank {self.rank} for {key}",
+            )
 
 
 if __name__ == "__main__":
