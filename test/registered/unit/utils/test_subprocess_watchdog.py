@@ -22,6 +22,9 @@ import unittest
 import unittest.mock
 
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
 
 
 def healthy_worker():
@@ -41,31 +44,35 @@ def slow_crash_worker(delay: float = 0.5):
 
 
 class TestSubprocessWatchdog(unittest.TestCase):
+    def setUp(self):
+        self.sigquit_triggered = threading.Event()
+        self._original_kill = os.kill
+
+        def _mock_kill(pid, sig):
+            if sig == signal.SIGQUIT:
+                self.sigquit_triggered.set()
+            else:
+                self._original_kill(pid, sig)
+
+        self._mock_kill = _mock_kill
+        self._patcher = unittest.mock.patch("os.kill", side_effect=_mock_kill)
+
     def test_healthy_processes_no_callback(self):
         """Test that healthy processes don't trigger SIGQUIT."""
         proc = mp.Process(target=healthy_worker)
         proc.start()
-
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
 
         monitor = SubprocessWatchdog(
             processes=[proc],
             process_names=["test_worker"],
             interval=0.1,
         )
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             time.sleep(0.5)
+            monitor.stop()
 
-        self.assertFalse(callback_triggered.is_set())
-        monitor.stop()
+        self.assertFalse(self.sigquit_triggered.is_set())
         proc.terminate()
         proc.join(timeout=1)
 
@@ -74,54 +81,36 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = mp.Process(target=slow_crash_worker, args=(0.2,))
         proc.start()
 
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
-
         monitor = SubprocessWatchdog(
             processes=[proc],
             process_names=["crashing_worker"],
             interval=0.1,
         )
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             self.assertTrue(
-                callback_triggered.wait(timeout=2.0),
+                self.sigquit_triggered.wait(timeout=2.0),
                 "SIGQUIT was not triggered within timeout",
             )
-        monitor.stop()
+            monitor.stop()
 
     def test_immediate_crash_detection(self):
         """Test that an immediately crashing process is detected."""
         proc = mp.Process(target=crashing_worker)
         proc.start()
 
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
-
         monitor = SubprocessWatchdog(
             processes=[proc],
             process_names=["immediate_crash"],
             interval=0.05,
         )
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             self.assertTrue(
-                callback_triggered.wait(timeout=1.0),
+                self.sigquit_triggered.wait(timeout=1.0),
                 "Immediate crash was not detected",
             )
-        monitor.stop()
+            monitor.stop()
 
     def test_multiple_processes_one_crashes(self):
         """Test monitoring multiple processes where one crashes."""
@@ -131,83 +120,54 @@ class TestSubprocessWatchdog(unittest.TestCase):
         healthy_proc.start()
         crashing_proc.start()
 
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
-
         monitor = SubprocessWatchdog(
             processes=[healthy_proc, crashing_proc],
             process_names=["healthy", "crashing"],
             interval=0.1,
         )
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             self.assertTrue(
-                callback_triggered.wait(timeout=2.0),
+                self.sigquit_triggered.wait(timeout=2.0),
                 "Crash was not detected when one of multiple processes crashed",
             )
-        monitor.stop()
+            monitor.stop()
+
         healthy_proc.terminate()
         healthy_proc.join(timeout=1)
 
     def test_empty_processes_list(self):
         """Test that watchdog handles empty process list gracefully."""
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
-
         monitor = SubprocessWatchdog(processes=[], interval=0.1)
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             time.sleep(0.3)
+            monitor.stop()
 
-        self.assertFalse(callback_triggered.is_set())
-        monitor.stop()
+        self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
         """Test that normal exit (exitcode=0) does not trigger SIGQUIT."""
-        # Use a process that exits normally with code 0
         proc = mp.Process(target=lambda: None)
         proc.start()
-        proc.join(timeout=2)  # Wait for normal exit
+        proc.join(timeout=2)
 
-        callback_triggered = threading.Event()
-        original_kill = os.kill
-
-        def mock_kill(pid, sig):
-            if sig == signal.SIGQUIT:
-                callback_triggered.set()
-            else:
-                original_kill(pid, sig)
-
-        # Monitor the already-exited process
         monitor = SubprocessWatchdog(
             processes=[proc],
             process_names=["normal_exit"],
             interval=0.1,
         )
-        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+        with self._patcher:
             monitor.start()
             time.sleep(0.3)
+            monitor.stop()
 
         self.assertFalse(
-            callback_triggered.is_set(),
+            self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
-        monitor.stop()
 
 
 if __name__ == "__main__":
-    # Required for multiprocessing on some platforms
     mp.set_start_method("spawn", force=True)
     unittest.main()
