@@ -18,12 +18,6 @@ class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     MODELEXPRESS = "modelexpress"
 
 
-MODELEXPRESS_INSTALL_MESSAGE = (
-    "ModelExpress support requires the 'modelexpress' package. "
-    "Install it with: pip install modelexpress"
-)
-
-
 def trigger_init_weights_send_group_for_remote_instance_request(
     remote_instance_weight_loader_seed_instance_ip: str,
     remote_instance_weight_loader_seed_instance_service_port: int,
@@ -125,15 +119,6 @@ def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_in
                 data["remote_instance_transfer_engine_weights_info_dict"],
             )
     return remote_instance_transfer_engine_info
-
-
-def get_modelexpress_modules():
-    try:
-        p2p_pb2 = importlib.import_module("modelexpress.p2p_pb2")
-        mx_client_module = importlib.import_module("modelexpress.client")
-    except ImportError as exc:
-        raise ImportError(MODELEXPRESS_INSTALL_MESSAGE) from exc
-    return p2p_pb2, mx_client_module.MxClient
 
 
 def register_memory_region(model, transfer_engine):

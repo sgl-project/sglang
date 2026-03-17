@@ -143,7 +143,6 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    get_modelexpress_modules,
     register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
@@ -679,7 +678,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _publish_modelexpress_metadata(self):
         """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
-        p2p_pb2, MxClient = get_modelexpress_modules()
+        try:
+            from modelexpress import p2p_pb2
+            from modelexpress.client import MxClient
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress support requires the 'modelexpress' package. "
+                "Install it with: pip install modelexpress"
+            ) from exc
 
         model_name = (
             self.server_args.modelexpress_model_name or self.server_args.model_path
