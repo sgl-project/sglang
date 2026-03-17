@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -87,6 +87,10 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
+
         other_args = [
             "--tp",
             "8",
@@ -113,8 +117,6 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
