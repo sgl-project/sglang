@@ -143,6 +143,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor> quantize_fp8_e4m3fn_cpu(at::Tensor& A);
 
 // gemm
 at::Tensor
@@ -424,6 +425,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("quantize_fp8_e4m3fn_cpu(Tensor A) -> (Tensor, Tensor)");
+  m.impl("quantize_fp8_e4m3fn_cpu", torch::kCPU, &quantize_fp8_e4m3fn_cpu);
 
   // gemm
   m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");

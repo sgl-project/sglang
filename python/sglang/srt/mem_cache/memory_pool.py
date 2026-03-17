@@ -1026,11 +1026,13 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if hasattr(self, "k_scale_buffer") and hasattr(self, "v_scale_buffer"):
-                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-
-                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k_fp8, cache_k_scale = (
+                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_k)
+                )
                 cache_k = cache_k_fp8
-                cache_v_fp8, cache_v_scale = input_to_float8(cache_v, dtype=self.dtype)
+                cache_v_fp8, cache_v_scale = (
+                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_v)
+                )
                 cache_v = cache_v_fp8
             else:
                 if k_scale is not None:
@@ -1599,9 +1601,9 @@ class MLATokenToKVPool(KVCache):
         assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             if hasattr(self, "kv_scale_buffer"):
-                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-
-                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k_fp8, cache_k_scale = (
+                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_k)
+                )
                 cache_k = cache_k_fp8
             else:
                 cache_k = cache_k.to(self.dtype)

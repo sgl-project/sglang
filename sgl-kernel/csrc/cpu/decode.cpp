@@ -1410,16 +1410,17 @@ void decode_set_kv_buffer(
     bool is_mla) {
   constexpr float eps = 1e-12;
   at::parallel_for(0, batches, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0};
-    data_index_init(begin, bs, batches);
-    for (int64_t i = begin; i < end; i++) {
+    for (int64_t bs = begin; bs < end; bs++) {
       int64_t loc_val = loc[bs];
       quantize_tensor_fp8<scalar_t>(
           k_buffer + loc_val * k_strideN,
           k_scale[loc_val],
           key + bs * nk_strideN,
+          1,
           num_heads_kv,
           head_size,
+          0,
+          0,
           k_strideH,
           nk_strideH);
       if (!is_mla) {
@@ -1427,12 +1428,14 @@ void decode_set_kv_buffer(
             v_buffer + loc_val * v_strideN,
             v_scale[loc_val],
             value + bs * nv_strideN,
+            1,
             num_heads_kv,
             head_size_v,
+            0,
+            0,
             v_strideH,
             nv_strideH);
       }
-      data_index_step(bs, batches);
     }
   });
 }

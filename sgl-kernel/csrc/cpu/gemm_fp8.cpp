@@ -472,6 +472,40 @@ void tinygemm_kernel(
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
 
+std::tuple<at::Tensor, at::Tensor> quantize_fp8_e4m3fn_cpu(at::Tensor& A) {
+  RECORD_FUNCTION("sgl-kernel::quantize_fp8_e4m3fn_cpu", std::vector<c10::IValue>({A}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(A);
+  CHECK_DIM(3, A);
+  int64_t B = A.size(0);
+  int64_t H = A.size(1);
+  int64_t D = A.size(2);
+  int64_t strideB_A = A.stride(0);
+  int64_t strideH_A = A.stride(1);
+
+  const auto st = A.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "quantize_fp8_e4m3fn_cpu: expect A to be bfloat16 or half.");
+
+  at::Tensor Aq = at::empty_like(A, at::kFloat8_e4m3fn);
+  at::Tensor As = at::empty({}, at::kFloat);
+  int64_t strideB_Aq = Aq.stride(0);
+  int64_t strideH_Aq = Aq.stride(1);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "quantize_tensor_fp8", [&] {
+    quantize_tensor_fp8(
+        Aq.data_ptr<at::Float8_e4m3fn>(),
+        As.data_ptr<float>()[0],
+        A.data_ptr<scalar_t>(),
+        B,
+        H,
+        D,
+        strideB_Aq,
+        strideB_A,
+        strideH_Aq,
+        strideH_A);
+  });
+  return std::make_tuple(Aq, As);
+}
+
 at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat1,
     at::Tensor& mat2,
