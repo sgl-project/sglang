@@ -207,7 +207,7 @@ class SubprocessWatchdog:
         try:
             while not self._stop_event.is_set():
                 for proc, name in zip(self._processes, self._names):
-                    if not proc.is_alive():
+                    if not proc.is_alive() and proc.exitcode != 0:
                         logger.error(
                             f"Subprocess {name} (pid={proc.pid}) crashed "
                             f"with exit code {proc.exitcode}. "

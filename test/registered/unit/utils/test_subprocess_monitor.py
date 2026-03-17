@@ -174,6 +174,38 @@ class TestSubprocessWatchdog(unittest.TestCase):
         self.assertFalse(callback_triggered.is_set())
         monitor.stop()
 
+    def test_normal_exit_no_sigquit(self):
+        """Test that normal exit (exitcode=0) does not trigger SIGQUIT."""
+        # Use a process that exits normally with code 0
+        proc = mp.Process(target=lambda: None)
+        proc.start()
+        proc.join(timeout=2)  # Wait for normal exit
+
+        callback_triggered = threading.Event()
+        original_kill = os.kill
+
+        def mock_kill(pid, sig):
+            if sig == signal.SIGQUIT:
+                callback_triggered.set()
+            else:
+                original_kill(pid, sig)
+
+        # Monitor the already-exited process
+        monitor = SubprocessWatchdog(
+            processes=[proc],
+            process_names=["normal_exit"],
+            interval=0.1,
+        )
+        with unittest.mock.patch("os.kill", side_effect=mock_kill):
+            monitor.start()
+            time.sleep(0.3)
+
+        self.assertFalse(
+            callback_triggered.is_set(),
+            "SIGQUIT should not be triggered for normal exit (exitcode=0)",
+        )
+        monitor.stop()
+
 
 if __name__ == "__main__":
     # Required for multiprocessing on some platforms
