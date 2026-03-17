@@ -137,25 +137,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_fi = b.view(batch_size, 1, num_v_heads)
 
         if self.use_state_pool:
-            # # DEBUG: use Triton decode to isolate SM100+ decode accuracy gap
-            # from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-            #     fused_sigmoid_gating_delta_rule_update,
-            # )
-            # return fused_sigmoid_gating_delta_rule_update(
-            #     A_log=A_log,
-            #     dt_bias=dt_bias,
-            #     q=q,
-            #     k=k,
-            #     v=v,
-            #     a=a,
-            #     b=b,
-            #     initial_state_source=ssm_states,
-            #     initial_state_indices=cache_indices,
-            #     cu_seqlens=query_start_loc,
-            #     use_qk_l2norm_in_kernel=True,
-            #     softplus_beta=1.0,
-            #     softplus_threshold=20.0,
-            # )
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -163,7 +144,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 state=None,
                 A_log=A_log.detach().float(),
                 a=a_fi,
-                dt_bias=dt_bias.detach().float(),
+                dt_bias=dt_bias.detach(),
                 b=b_fi,
                 use_qk_l2norm=True,
                 initial_state=ssm_states,
