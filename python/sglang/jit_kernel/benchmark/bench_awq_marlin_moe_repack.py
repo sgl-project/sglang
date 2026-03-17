@@ -10,12 +10,9 @@ from sglang.jit_kernel.awq_marlin_repack import (
 from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
-try:
-    from sgl_kernel import awq_marlin_moe_repack as aot_awq_marlin_moe_repack
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "awq_marlin_moe_repack") and hasattr(
+    torch.ops.sgl_kernel.awq_marlin_moe_repack, "default"
+)
 
 IS_CI = is_in_ci()
 
@@ -66,7 +63,9 @@ def check_correctness():
     )
 
     out_jit = jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, SIZE_N, NUM_BITS)
-    out_aot = aot_awq_marlin_moe_repack(b_q_weight, perm, size_k, SIZE_N, NUM_BITS)
+    out_aot = torch.ops.sgl_kernel.awq_marlin_moe_repack.default(
+        b_q_weight, perm, size_k, SIZE_N, NUM_BITS
+    )
     torch.cuda.synchronize()
     torch.testing.assert_close(out_jit, out_aot, rtol=0, atol=0)
     print("Correctness check passed (JIT vs AOT)")
@@ -111,7 +110,7 @@ def benchmark(num_experts, size_k, size_n, num_bits, provider):
             b_q_weight, perm, size_k, size_n, num_bits
         )
     elif provider == "aot":
-        fn = lambda: aot_awq_marlin_moe_repack(
+        fn = lambda: torch.ops.sgl_kernel.awq_marlin_moe_repack.default(
             b_q_weight, perm, size_k, size_n, num_bits
         )
     else:

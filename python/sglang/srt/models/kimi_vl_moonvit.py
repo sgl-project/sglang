@@ -58,6 +58,7 @@ except ImportError:
     flash_attn_varlen_func = None
 
 from sglang.srt.configs import MoonViTConfig
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
@@ -250,7 +251,7 @@ class MoonVisionPatchEmbed(nn.Module):
         ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_dim, out_dim, kernel_size=patch_size, stride=patch_size
         )
 
