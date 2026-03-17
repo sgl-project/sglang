@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class PrefillServerInfo:
+    # Topology fields (fetched from bootstrap server)
     attn_tp_size: int
     attn_cp_size: int
     dp_size: int
@@ -53,6 +54,14 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+
+    # Pre-computed rank mapping (set by ensure_parallel_info on decode side)
+    target_tp_rank: Optional[int] = None
+    target_tp_ranks: Optional[List[int]] = None
+    target_cp_ranks: Optional[List[int]] = None
+    target_pp_ranks: Optional[List[int]] = None
+    required_dst_info_num: Optional[int] = None
+    required_prefill_response_num: Optional[int] = None
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -186,7 +195,7 @@ class CommonKVManager(BaseKVManager):
     def ensure_parallel_info(
         self, bootstrap_addr: str, max_retries: int = 5, retry_interval: float = 1.0
     ) -> bool:
-        """Fetch and cache prefill parallel info if not yet available.
+        """Fetch and cache prefill parallel info and rank mapping if not yet available.
         Returns True if info is available (cached or freshly fetched).
         Retries with backoff if the prefill server hasn't registered yet.
         """
@@ -223,9 +232,89 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
+        """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
+        Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        # TP rank mapping
+        if self.attn_tp_size == info.attn_tp_size:
+            target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+            required_dst_info_num = 1
+            required_prefill_response_num = 1
+            target_tp_ranks = [target_tp_rank]
+        elif self.attn_tp_size > info.attn_tp_size:
+            if not self.is_mla_backend:
+                logger.warning_once(
+                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                )
+            target_tp_rank = (self.kv_args.engine_rank % self.attn_tp_size) // (
+                self.attn_tp_size // info.attn_tp_size
+            )
+            required_dst_info_num = self.attn_tp_size // info.attn_tp_size
+            required_prefill_response_num = 1
+            target_tp_ranks = [target_tp_rank]
+        else:
+            if not self.is_mla_backend:
+                logger.warning_once(
+                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                )
+            # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks
+            target_tp_ranks = list(
+                range(
+                    (self.kv_args.engine_rank % self.attn_tp_size)
+                    * (info.attn_tp_size // self.attn_tp_size),
+                    (self.kv_args.engine_rank % self.attn_tp_size + 1)
+                    * (info.attn_tp_size // self.attn_tp_size),
+                )
+            )
+            # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
+            # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
+            # or the KVPoll will never be set correctly
+            target_tp_rank = target_tp_ranks[0]
+            required_dst_info_num = 1
+            if self.is_mla_backend:
+                required_prefill_response_num = 1
+            else:
+                required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
+
+        # CP rank mapping — decode cp size should be equal to 1
+        assert self.attn_cp_size == 1, (
+            f"Decode cp size ({self.attn_cp_size}) should be equal to 1",
+        )
+        if self.attn_cp_size == info.attn_cp_size:
+            assert info.attn_cp_size == 1, (
+                f"When prefill cp size is 1, attn cp size should be 1, but got {self.attn_cp_size}",
+            )
+            target_cp_ranks = [self.attn_cp_rank]
+        else:
+            target_cp_ranks = list(range(info.attn_cp_size))
+            if not self.enable_all_cp_ranks_for_transfer:
+                # Only retrieve from prefill CP rank 0 when not using all ranks
+                target_cp_ranks = target_cp_ranks[:1]
+                required_prefill_response_num *= 1
+            else:
+                required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
+
+        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
+        assert self.pp_size == info.pp_size or self.pp_size == 1, (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        )
+        if info.pp_size == self.pp_size:
+            target_pp_ranks = [self.pp_rank]
+        else:
+            target_pp_ranks = list(range(info.pp_size))
+            required_prefill_response_num *= info.pp_size // self.pp_size
+
+        info.target_tp_rank = target_tp_rank
+        info.target_tp_ranks = target_tp_ranks
+        info.target_cp_ranks = target_cp_ranks
+        info.target_pp_ranks = target_pp_ranks
+        info.required_dst_info_num = required_dst_info_num
+        info.required_prefill_response_num = required_prefill_response_num
 
     @staticmethod
     def _fetch_prefill_server_info(
@@ -436,93 +525,16 @@ class CommonKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = None
             return
 
+        # Read pre-computed rank mapping from prefill_info (computed in ensure_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
-
-        # Rank mapping for PD with different TP sizes per rank for target DP/CP group
-        if self.kv_mgr.attn_tp_size == self.prefill_info.attn_tp_size:
-            self.target_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
-            )
-            self.required_dst_info_num = 1
-            self.required_prefill_response_num = 1
-            self.target_tp_ranks = [self.target_tp_rank]
-        elif self.kv_mgr.attn_tp_size > self.prefill_info.attn_tp_size:
-            if not self.kv_mgr.is_mla_backend:
-                logger.warning_once(
-                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
-                )
-            self.target_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
-            ) // (self.kv_mgr.attn_tp_size // self.prefill_info.attn_tp_size)
-            self.required_dst_info_num = (
-                self.kv_mgr.attn_tp_size // self.prefill_info.attn_tp_size
-            )
-            self.required_prefill_response_num = 1
-            self.target_tp_ranks = [self.target_tp_rank]
-        else:
-            if not self.kv_mgr.is_mla_backend:
-                logger.warning_once(
-                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
-                )
-            # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
-            self.target_tp_ranks = [
-                rank
-                for rank in range(
-                    (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size)
-                    * (self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size),
-                    (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size + 1)
-                    * (self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size),
-                )
-            ]
-
-            # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
-            # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
-            # or the KVPoll will never be set correctly
-            self.target_tp_rank = self.target_tp_ranks[0]
-            self.required_dst_info_num = 1
-            if self.kv_mgr.is_mla_backend:
-                self.required_prefill_response_num = 1
-            else:
-                self.required_prefill_response_num = (
-                    self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
-                )
-
-        # Decode cp size should be equal to 1
-        assert self.kv_mgr.attn_cp_size == 1, (
-            f"Decode cp size ({self.kv_mgr.attn_cp_size}) should be equal to 1",
+        self.target_tp_rank = self.prefill_info.target_tp_rank
+        self.target_tp_ranks = self.prefill_info.target_tp_ranks
+        self.target_cp_ranks = self.prefill_info.target_cp_ranks
+        self.target_pp_ranks = self.prefill_info.target_pp_ranks
+        self.required_dst_info_num = self.prefill_info.required_dst_info_num
+        self.required_prefill_response_num = (
+            self.prefill_info.required_prefill_response_num
         )
-        if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
-            # This means that the prefill cp size is 1
-            assert self.prefill_info.attn_cp_size == 1, (
-                f"When prefill cp size is 1, attn cp size should be 1, but got {self.kv_mgr.attn_cp_size}",
-            )
-            self.target_cp_ranks = [self.kv_mgr.attn_cp_rank]
-        else:
-            self.target_cp_ranks = [
-                rank for rank in range(self.prefill_info.attn_cp_size)
-            ]
-            if not self.kv_mgr.enable_all_cp_ranks_for_transfer:
-                # Only retrieve from prefill CP rank 0 when not using all ranks
-                self.target_cp_ranks = self.target_cp_ranks[:1]
-                self.required_prefill_response_num *= 1
-            else:
-                self.required_prefill_response_num *= (
-                    self.prefill_info.attn_cp_size // self.kv_mgr.attn_cp_size
-                )
-
-        # Decode pp size should be equal to prefill pp size or 1
-        assert (
-            self.kv_mgr.pp_size == self.prefill_info.pp_size or self.kv_mgr.pp_size == 1
-        ), (
-            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_info.pp_size}) or 1",
-        )
-        if self.prefill_info.pp_size == self.kv_mgr.pp_size:
-            self.target_pp_ranks = [self.kv_mgr.pp_rank]
-        else:
-            self.target_pp_ranks = [rank for rank in range(self.prefill_info.pp_size)]
-            self.required_prefill_response_num *= (
-                self.prefill_info.pp_size // self.kv_mgr.pp_size
-            )
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
