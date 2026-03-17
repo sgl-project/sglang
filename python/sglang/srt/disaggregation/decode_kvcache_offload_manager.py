@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
-import json
 from typing import TYPE_CHECKING
 
 import torch
@@ -81,9 +81,13 @@ class DecodeKVCacheOffloadManager:
         hicache_storage_backend_extra_config = {}
         if server_args.hicache_storage_backend_extra_config:
             try:
-                hicache_storage_backend_extra_config = json.loads(server_args.hicache_storage_backend_extra_config)
+                hicache_storage_backend_extra_config = json.loads(
+                    server_args.hicache_storage_backend_extra_config
+                )
             except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid hicache storage backend extra config JSON: {e}")
+                raise ValueError(
+                    f"Invalid hicache storage backend extra config JSON: {e}"
+                )
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
