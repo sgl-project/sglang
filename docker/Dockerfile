@@ -556,6 +556,9 @@ ENV LANG=en_US.UTF-8 \
 # Copy Python site-packages from framework (contains all built packages)
 COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
+# Copy router CLI binary built in framework stage
+COPY --from=framework /usr/local/bin/sglang-router /usr/local/bin/sglang-router
+
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
 
