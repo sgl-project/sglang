@@ -804,7 +804,7 @@ def get_vae_parallel_rank() -> int:
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
-):
+) -> None:
     global _DIT
     assert _DIT is None, "DIT group is already initialized"
     _DIT = torch.distributed.new_group(
