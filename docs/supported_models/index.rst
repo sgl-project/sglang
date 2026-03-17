@@ -8,7 +8,6 @@ Browse by category below to find models suited for your needs.
    :maxdepth: 2
 
    text_generation/index
-   image_generation/index
    retrieval_ranking/index
    specialized/index
    extending/index

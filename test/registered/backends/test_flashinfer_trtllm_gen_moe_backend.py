@@ -12,10 +12,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=500, suite="nightly-4-gpu-b200", nightly=True)
 
 
-class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
+class FlashinferTrtllmGenMoeBackendFP8Base:
+    backend = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
@@ -29,7 +31,7 @@ class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
                 "--attention-backend",
                 "triton",
                 "--moe-runner-backend",
-                "flashinfer_trtllm",
+                cls.backend,
                 "--tp-size",
                 "4",
                 "--ep-size",
@@ -60,7 +62,9 @@ class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestFlashinferTrtllmGenMoeBackendBF16(CustomTestCase):
+class FlashinferTrtllmGenMoeBackendBF16Base:
+    backend = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
@@ -73,7 +77,7 @@ class TestFlashinferTrtllmGenMoeBackendBF16(CustomTestCase):
                 "--attention-backend",
                 "triton",
                 "--moe-runner-backend",
-                "flashinfer_trtllm",
+                cls.backend,
                 "--cuda-graph-max-bs",
                 "512",
                 "--tp-size",
@@ -104,6 +108,83 @@ class TestFlashinferTrtllmGenMoeBackendBF16(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.93)
+
+
+class FlashinferTrtllmGenMoeBackendMXFP8Base:
+    backend = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            other_args=[
+                "--quantization",
+                "mxfp8",
+                "--fp8-gemm-backend",
+                "flashinfer_trtllm",
+                "--moe-runner-backend",
+                cls.backend,
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.93)
+
+
+class TestFlashinferTrtllmGenMoeBackendFP8(
+    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm"
+
+
+class TestFlashinferTrtllmGenMoeBackendMXFP8(
+    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm"
+
+
+class TestFlashinferTrtllmGenMoeBackendBF16(
+    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm"
+
+
+class TestFlashinferTrtllmGenMoeBackendFP8Routed(
+    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
+    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
 
 
 if __name__ == "__main__":

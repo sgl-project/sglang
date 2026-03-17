@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-""" Inference-only Ernie4.5 VL model compatible with baidu/ERNIE-4.5-VL-*-PT weights. """
+"""Inference-only Ernie4.5 VL model compatible with baidu/ERNIE-4.5-VL-*-PT weights."""
 
 import logging
 from itertools import islice

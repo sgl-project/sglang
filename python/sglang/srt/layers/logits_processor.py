@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,8 @@ class LogitsProcessorOutput:
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: List = None
-    input_top_logprobs_idx: List = None
+    input_top_logprobs_val: Optional[List] = None
+    input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -376,7 +376,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
+            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
                 input_logprob_indices,
@@ -688,6 +688,12 @@ class LogitsProcessor(nn.Module):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
 
+            # Notify lm_head LoRA about the current chunk so it can swap
+            # to the precomputed per-chunk batch_info.  This is a no-op
+            # for non-LoRA lm_head modules.
+            if hasattr(lm_head, "set_lm_head_pass"):
+                lm_head.set_lm_head_pass(i)
+
             # Get indices for this chunk
             chunk_mask = (input_logprob_indices >= start_idx) & (
                 input_logprob_indices < end_idx
@@ -791,6 +797,13 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+
+        # Restore the full-pruned lm_head batch_info after chunk iteration.
+        if hasattr(lm_head, "reset_lm_head_pass"):
+            assert hasattr(
+                lm_head, "set_lm_head_pass"
+            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            lm_head.reset_lm_head_pass()
 
         # Concatenate the results
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
@@ -1055,7 +1068,7 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, delay_cpu_copy=True
+                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
             )
 
         # Get the logprob of top-k tokens

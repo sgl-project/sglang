@@ -55,6 +55,7 @@ class TestQwen3235BFP8(unittest.TestCase):
                 QWEN3_235B_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle3_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+EP2+EAGLE3",
             ),
         ]

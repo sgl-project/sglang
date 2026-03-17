@@ -15,6 +15,7 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 

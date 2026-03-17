@@ -47,7 +47,9 @@ class TimestepPreparationStage(PipelineStage):
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = prepare_extra_set_timesteps_kwargs
+        self.prepare_extra_set_timesteps_kwargs = (
+            prepare_extra_set_timesteps_kwargs or []
+        )
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -131,7 +133,8 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        self.log_debug("timesteps: %s", timesteps)
+        if not batch.is_warmup:
+            self.log_debug("timesteps: %s", timesteps)
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
