@@ -501,15 +501,6 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
-    def _abort_reqs(self, reqs: List[Req], error_msg: str) -> None:
-        """Abort requests and stream error output."""
-        logger.error(error_msg)
-        for req in reqs:
-            prepare_abort(req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            if self.scheduler.enable_metrics:
-                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-            self.scheduler.stream_output([req], req.return_logprob)
-
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[Req]]
     ) -> Tuple[Dict[str, List[Req]], List[Req]]:
@@ -529,11 +520,15 @@ class DecodePreallocQueue:
             self._ensure_retry_count[bootstrap_addr] = count
 
             if count >= self._max_ensure_retries:
-                self._abort_reqs(
-                    reqs,
-                    f"Could not fetch prefill parallel info from {bootstrap_addr} "
-                    f"after {count} attempts",
-                )
+                error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
+                logger.error(error_msg)
+                for req in reqs:
+                    prepare_abort(
+                        req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    self.scheduler.stream_output([req], req.return_logprob)
                 del self._ensure_retry_count[bootstrap_addr]
             else:
                 remaining.extend(reqs)
