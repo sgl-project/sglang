@@ -179,12 +179,16 @@ class TestPPWithHiCache(unittest.TestCase):
 
         return False
 
-    def flush_cache(self) -> bool:
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+    def flush_cache(self, retries: int = 5, interval: float = 2.0) -> bool:
+        for _ in range(retries):
+            try:
+                response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(interval)
+        return False
 
     def test_eval_accuracy(self):
         args = SimpleNamespace(

@@ -114,9 +114,16 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         # Trigger offloading
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
-        # Flush device cache to force remote storage access
-        time.sleep(2)
-        requests.post(self.prefill_url + "/flush_cache")
+        # Flush device cache to force remote storage access.
+        # Retry because in-flight HiCache async ops may block is_fully_idle().
+        for _ in range(5):
+            time.sleep(2)
+            try:
+                resp = requests.post(self.prefill_url + "/flush_cache", timeout=10)
+                if resp.status_code == 200:
+                    break
+            except requests.RequestException:
+                pass
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

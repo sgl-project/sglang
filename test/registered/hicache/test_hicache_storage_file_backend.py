@@ -167,13 +167,21 @@ class HiCacheStorageBaseMixin:
         meta = response_json.get("meta_info", {})
         return int(meta.get("cached_tokens", 0))
 
-    def flush_cache(self) -> bool:
-        """Flush device cache to force remote storage access"""
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+    def flush_cache(self, retries: int = 5, interval: float = 2.0) -> bool:
+        """Flush device cache to force remote storage access.
+
+        Retries because the scheduler may still have in-flight HiCache async
+        ops (GPU↔Host↔L3) that prevent is_fully_idle() from returning True.
+        """
+        for _ in range(retries):
+            try:
+                response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(interval)
+        return False
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""
