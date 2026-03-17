@@ -125,10 +125,11 @@ def _maybe_capture_ssm_state(
         return
     if torch.cuda.is_current_stream_capturing():
         return
+    real_indices = cache_indices[cache_indices > 0]
     key = (layer_id, mode)
     step = _ssm_capture_counter.get(key, 0)
     _ssm_capture_counter[key] = step + 1
-    state = ssm_states[cache_indices.long()].detach().cpu()
+    state = ssm_states[real_indices.long()].detach().cpu()
     os.makedirs(_ssm_capture_dir, exist_ok=True)
     path = os.path.join(
         _ssm_capture_dir, f"ssm_state_layer{layer_id}_{mode}_{step:06d}.pt"
@@ -945,7 +946,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
-        _maybe_capture_ssm_state(ssm_states, cache_indices[cache_indices > 0], layer.layer_id, "decode")
+        _maybe_capture_ssm_state(ssm_states, cache_indices, layer.layer_id, "decode")
 
         return core_attn_out
 
