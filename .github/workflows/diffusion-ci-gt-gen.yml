@@ -40,8 +40,6 @@ jobs:
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
@@ -76,8 +74,6 @@ jobs:
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
