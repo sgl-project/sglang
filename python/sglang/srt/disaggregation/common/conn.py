@@ -198,10 +198,23 @@ class CommonKVManager(BaseKVManager):
         if bootstrap_addr in self.prefill_info_table:
             return True
 
-        info = self._fetch_prefill_server_info(bootstrap_addr)
-        if info is None:
+        info: PrefillServerInfo = None
+        try:
+            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                info = PrefillServerInfo(**data)
+            else:
+                logger.error(
+                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
 
+        # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -302,26 +315,6 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
-
-    @staticmethod
-    def _fetch_prefill_server_info(
-        bootstrap_addr: str,
-    ) -> Optional[PrefillServerInfo]:
-        """Fetch the prefill server info from the bootstrap server."""
-        try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                return PrefillServerInfo(**data)
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return None
-        except Exception as e:
-            logger.error(f"Error fetching prefill server info from bootstrap: {e}")
-            return None
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""
