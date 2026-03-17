@@ -125,7 +125,7 @@ def _maybe_capture_ssm_state(
         return
     if torch.cuda.is_current_stream_capturing():
         return
-    real_indices = cache_indices[cache_indices > 0]
+    real_indices = cache_indices[cache_indices >= 0]
     key = (layer_id, mode)
     step = _ssm_capture_counter.get(key, 0)
     _ssm_capture_counter[key] = step + 1
