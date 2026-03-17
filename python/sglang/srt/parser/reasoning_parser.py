@@ -431,6 +431,7 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<think>",
@@ -440,6 +441,13 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
 
 
 class ReasoningParser:
@@ -501,6 +509,10 @@ class ReasoningParser:
         ):
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content
+
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        if chat_template_kwargs.get("force_nonempty_content") is True:
+            kwargs["force_nonempty_content"] = True
 
         self.detector = detector_class(**kwargs)
 

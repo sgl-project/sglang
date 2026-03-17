@@ -8,12 +8,14 @@ from sglang.jit_kernel.awq_marlin_repack import (
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
-try:
-    from sgl_kernel import awq_marlin_moe_repack as aot_awq_marlin_moe_repack
 
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+def _has_aot_awq_marlin_moe_repack() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "awq_marlin_moe_repack") and hasattr(
+        torch.ops.sgl_kernel.awq_marlin_moe_repack, "default"
+    )
+
+
+AOT_AVAILABLE = _has_aot_awq_marlin_moe_repack()
 
 
 def awq_pack(
@@ -68,7 +70,9 @@ def test_awq_marlin_moe_repack_jit_vs_aot(
     perm = torch.empty((num_experts, 0), dtype=torch.int32, device="cuda")
 
     out_jit = jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
-    out_aot = aot_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
+    out_aot = torch.ops.sgl_kernel.awq_marlin_moe_repack.default(
+        b_q_weight, perm, size_k, size_n, num_bits
+    )
 
     torch.cuda.synchronize()
 
