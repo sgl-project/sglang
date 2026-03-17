@@ -2156,7 +2156,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
         ):
             self.load_model_from_modelexpress(
-                model, load_config, device_config,
+                model,
+                load_config,
+                device_config,
             )
         else:
             raise ValueError("Invalid remote instance weight loader backend.")
@@ -2272,7 +2274,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         return True
 
     def load_model_from_modelexpress(
-        self, model, load_config: LoadConfig, device_config: DeviceConfig,
+        self,
+        model,
+        load_config: LoadConfig,
+        device_config: DeviceConfig,
     ):
         """Load weights via ModelExpress coordination + TransferEngine RDMA."""
         from modelexpress.client import MxClient
@@ -2300,7 +2305,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 model_name,
             )
             ready, session_id, metadata_hash = mx_client.wait_for_ready(
-                model_name, worker_id=tp_rank,
+                model_name,
+                worker_id=tp_rank,
             )
             if not ready:
                 raise RuntimeError(
@@ -2342,7 +2348,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
             logger.info(
                 "ModelExpress: got %d tensor descriptors from seed (session=%s)",
-                len(seed_weight_info), seed_session_id,
+                len(seed_weight_info),
+                seed_session_id,
             )
         finally:
             mx_client.close()

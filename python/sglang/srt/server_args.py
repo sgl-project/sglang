@@ -698,7 +698,9 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
-    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl", "modelexpress"] = "nccl"
+    remote_instance_weight_loader_backend: Literal[
+        "transfer_engine", "nccl", "modelexpress"
+    ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
     modelexpress_config: Optional[str] = None
 

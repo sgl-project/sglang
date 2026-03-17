@@ -678,12 +678,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _publish_modelexpress_metadata(self):
         """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
-        from modelexpress.client import MxClient
         from modelexpress import p2p_pb2
+        from modelexpress.client import MxClient
 
         model_name = (
-            self.server_args.modelexpress_model_name
-            or self.server_args.model_path
+            self.server_args.modelexpress_model_name or self.server_args.model_path
         )
         mx_url = self.server_args.modelexpress_url
         session_id = self.remote_instance_transfer_engine_session_id
@@ -699,12 +698,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Build tensor descriptors from weight_info dict
         tensors = []
         for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=addr,
-                size=numel * element_size,
-                device_id=self.gpu_id,
-            ))
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
 
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=self.tp_rank,
@@ -717,7 +718,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "ModelExpress source: publishing metadata for model=%s, "
                 "tp_rank=%d, session=%s, %d tensors",
-                model_name, self.tp_rank, session_id, len(tensors),
+                model_name,
+                self.tp_rank,
+                session_id,
+                len(tensors),
             )
             mx_client.publish_metadata(model_name, [worker])
             mx_client.publish_ready(
@@ -728,7 +732,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             logger.info(
                 "ModelExpress source: published ready for model=%s, tp_rank=%d",
-                model_name, self.tp_rank,
+                model_name,
+                self.tp_rank,
             )
         finally:
             mx_client.close()
@@ -999,7 +1004,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
             modelexpress_url=self.server_args.modelexpress_url,
-            modelexpress_model_name=self.server_args.modelexpress_model_name or self.server_args.model_path,
+            modelexpress_model_name=self.server_args.modelexpress_model_name
+            or self.server_args.model_path,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
