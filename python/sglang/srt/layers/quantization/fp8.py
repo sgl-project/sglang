@@ -57,10 +57,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
-    prepare_fp8_layer_for_marlin,
-)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -134,6 +131,14 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        if ignored_layers_str := envs.SGLANG_FP8_IGNORED_LAYERS.get():
+            self.ignored_layers.extend(
+                [
+                    layer.strip()
+                    for layer in ignored_layers_str.split(",")
+                    if layer.strip()
+                ]
+            )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
@@ -638,7 +643,7 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            return apply_fp8_marlin_linear(
+            return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -751,7 +756,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return True
         if moe_runner_backend.is_auto():
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_nixl()
             )
         return False
 

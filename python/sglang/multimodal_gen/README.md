@@ -17,6 +17,7 @@ SGLang Diffusion has the following features:
     - AMD GPUs (MI300X, MI325X)
     - Ascend NPU (A2, A3)
     - Apple Silicon (M-series via MPS)
+    - Moore Threads GPUs (MTT S5000)
 
 ### AMD/ROCm Support
 

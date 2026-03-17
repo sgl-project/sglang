@@ -12,6 +12,7 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
   - AMD GPUs (MI300X, MI325X)
   - Ascend NPU (A2, A3)
   - Apple Silicon (M-series via MPS)
+  - Moore Threads GPUs (MTT S5000)
 
 ---
 

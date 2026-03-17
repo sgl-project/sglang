@@ -22,6 +22,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
@@ -43,6 +44,9 @@ class MoeA2ABackend(Enum):
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
+
+    def is_nixl(self):
+        return self == MoeA2ABackend.NIXL
 
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER

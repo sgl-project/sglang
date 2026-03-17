@@ -35,7 +35,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -552,9 +552,8 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        socket = self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        )
+        na = NetworkAddress(remote, dst_port)
+        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
 
         socket.send_multipart(
             [
@@ -759,9 +758,8 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        ).send_multipart(
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
