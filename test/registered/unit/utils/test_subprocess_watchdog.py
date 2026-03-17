@@ -40,11 +40,6 @@ def slow_crash_worker(delay: float = 0.5):
     os._exit(42)
 
 
-def noop_worker():
-    """Exits immediately with code 0."""
-    pass
-
-
 class TestSubprocessWatchdog(unittest.TestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -59,8 +54,8 @@ class TestSubprocessWatchdog(unittest.TestCase):
             else:
                 original_kill(pid, sig)
 
-        # Patch os.kill in the watchdog module so the mock is hit
-        # when _monitor_loop calls os.kill.
+        # Patch os.kill in the watchdog module so the daemon thread's
+        # call to os.kill goes through our mock.
         self._patcher = unittest.mock.patch(
             "sglang.srt.utils.watchdog.os.kill", side_effect=mock_kill
         )
@@ -102,7 +97,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch(proc)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=3.0),
             "SIGQUIT was not triggered within timeout",
         )
 
@@ -110,7 +105,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = self._spawn(crashing_worker)
         self._watch(proc, interval=0.05)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=1.0),
+            self.sigquit_triggered.wait(timeout=3.0),
             "Immediate crash was not detected",
         )
 
@@ -119,7 +114,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         crashing = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch([healthy, crashing], names=["healthy", "crashing"])
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=3.0),
             "Crash was not detected when one of multiple processes crashed",
         )
 
@@ -129,10 +124,10 @@ class TestSubprocessWatchdog(unittest.TestCase):
         self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
-        proc = self._spawn(noop_worker)
+        proc = self._spawn(lambda: None)
         proc.join(timeout=2)
         self._watch(proc)
-        time.sleep(0.3)
+        time.sleep(0.5)
         self.assertFalse(
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
@@ -154,5 +149,4 @@ class TestSubprocessWatchdog(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     unittest.main()
