@@ -18,7 +18,7 @@ register_cuda_ci(est_time=109, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=180, suite="stage-b-test-small-1-gpu-amd")
 
 
-class TestJSONModeMixin:
+class JSONModeMixin:
     """Mixin class containing JSON mode test methods"""
 
     def test_json_mode_response(self):
@@ -123,15 +123,15 @@ class ServerWithGrammarBackend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestJSONModeXGrammar(ServerWithGrammarBackend, TestJSONModeMixin):
+class TestJSONModeXGrammar(ServerWithGrammarBackend, JSONModeMixin):
     backend = "xgrammar"
 
 
-class TestJSONModeOutlines(ServerWithGrammarBackend, TestJSONModeMixin):
+class TestJSONModeOutlines(ServerWithGrammarBackend, JSONModeMixin):
     backend = "outlines"
 
 
-class TestJSONModeLLGuidance(ServerWithGrammarBackend, TestJSONModeMixin):
+class TestJSONModeLLGuidance(ServerWithGrammarBackend, JSONModeMixin):
     backend = "llguidance"
 
 

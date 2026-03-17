@@ -2,6 +2,8 @@ import logging
 import time
 from contextlib import contextmanager
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -65,3 +67,7 @@ class DefaultServerBase(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
         time.sleep(2)
+
+    @classmethod
+    def flush_cache(cls):
+        requests.post(cls.base_url + "/flush_cache")
