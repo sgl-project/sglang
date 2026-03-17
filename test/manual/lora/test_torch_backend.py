@@ -22,11 +22,11 @@ class TestTorchNativeLoRABackend(CustomTestCase):
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=3,
-        input_ids=torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.int32),
+        input_ids=torch.tensor([[1], [2], [3]], dtype=torch.int32),
         req_pool_indices=None,
         seq_lens=None,
         out_cache_loc=None,
-        seq_lens_sum=9,
+        seq_lens_sum=3,
         extend_seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         extend_seq_lens_cpu=seq_lens,
     )
