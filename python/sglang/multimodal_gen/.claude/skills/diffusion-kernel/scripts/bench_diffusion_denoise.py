@@ -17,7 +17,7 @@ Usage:
     # Side-by-side comparison
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux --compare
 
-    # All 9 models, comparison
+    # All 10 models, comparison
     python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --all --compare
 
 Input images required for image-guided models:
@@ -136,27 +136,20 @@ MODELS = {
             "false",
         ],
     },
-    # 6. Wan-AI/Wan2.2-T2V-A14B-Diffusers — Text-to-Video, 720P, 8 GPUs, 81 frames, 40 steps
+    # 6. Wan-AI/Wan2.2-T2V-A14B-Diffusers — Text-to-Video, 720P, 4 GPUs, 81 frames, 2 steps
     "wan-t2v": {
         "path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon.",
         "negative_prompt": " ",
         "extra_args": [
             "--720p",
-            "--num-inference-steps=40",
+            "--num-inference-steps=2",
             "--num-frames=81",
             "--guidance-scale=5.0",
-            "--num-gpus=8",
-            "--enable-cfg-parallel",
+            "--num-gpus=4",
             "--ulysses-degree=4",
-            "--dit-layerwise-offload",
-            "true",
-            "--dit-cpu-offload",
-            "false",
-            "--vae-cpu-offload",
-            "false",
             "--text-encoder-cpu-offload",
-            "true",
+            "--pin-cpu-memory",
         ],
     },
     # 7. Wan-AI/Wan2.2-TI2V-5B-Diffusers — Text-Image-to-Video, 720P, 1 GPU, 81 frames, 50 steps
@@ -197,7 +190,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 9. OpenMOSS-Team/MOVA-720p — Image-to-Video, 4 GPUs, 193 frames, 24 steps
+    # 9. OpenMOSS-Team/MOVA-720p — Image-to-Video, 4 GPUs, 193 frames, 2 steps
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -210,7 +203,25 @@ MODELS = {
             "--ulysses-degree=4",
             "--num-frames=193",
             "--fps=24",
-            "--num-inference-steps=24",
+            "--num-inference-steps=2",
+        ],
+    },
+    # 10. BestWishYsh/Helios-Base — Text-to-Video, 640×384, 33 frames
+    "helios": {
+        "path": "BestWishYsh/Helios-Base",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--text-encoder-cpu-offload",
+            "false",
+            "--vae-cpu-offload",
+            "false",
         ],
     },
 }
@@ -218,7 +229,7 @@ MODELS = {
 
 def required_gpus_for_model(model_key: str) -> int:
     if model_key == "wan-t2v":
-        return 8
+        return 4
     if model_key == "mova-720p":
         return 4
     return 1
