@@ -47,7 +47,7 @@ check "plotly" python3 -c "import plotly"
 **Minimum for benchmarking**: `sglang`, `torch` with CUDA.
 **Level 1 profiling**: `torch.profiler` (bundled with torch).
 **Level 2 profiling**: `nsys`, `pandas`, `plotly` + `gputrc2graph.py` from the sglang repo.
-All commands below assume you are inside the configured diffusion container shell, already `cd`'d to the repo root derived from `sglang.__file__`, with `FLASHINFER_DISABLE_VERSION_CHECK=1` exported. Re-run `print-idle-gpus` before each perf command if GPU availability may have changed. For 8-GPU commands, request eight idle GPUs and export the comma-separated list to `CUDA_VISIBLE_DEVICES` first.
+All commands below assume you are inside the configured diffusion container shell, already `cd`'d to the repo root derived from `sglang.__file__`, with `FLASHINFER_DISABLE_VERSION_CHECK=1` exported. Re-run `print-idle-gpus` before each perf command if GPU availability may have changed. Keep benchmark commands within 4 GPUs or fewer.
 
 Download input images required by some models:
 ```bash
@@ -137,18 +137,17 @@ sglang generate \
   --dit-cpu-offload false --text-encoder-cpu-offload false
 ```
 
-### Wan2.2-T2V-A14B 720P (8 GPUs, 81 frames, 40 steps)
+### Wan2.2-T2V-A14B 720P (4 GPUs, 81 frames, 2 steps)
 ```bash
-# Select eight idle GPUs first:
-# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 8)
+# Select four idle GPUs first:
+# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
 sglang generate \
   --model-path=Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon." \
-  --negative-prompt=" " --720p --num-inference-steps=40 --num-frames=81 \
+  --negative-prompt=" " --720p --num-inference-steps=2 --num-frames=81 \
   --guidance-scale=5.0 --seed=42 --save-output \
-  --num-gpus=8 --enable-cfg-parallel --ulysses-degree=4 \
-  --dit-layerwise-offload true --dit-cpu-offload false \
-  --vae-cpu-offload false --text-encoder-cpu-offload true \
+  --num-gpus=4 --ulysses-degree=4 \
+  --text-encoder-cpu-offload --pin-cpu-memory \
   --warmup --enable-torch-compile
 ```
 
@@ -177,7 +176,7 @@ sglang generate \
   --warmup --enable-torch-compile
 ```
 
-### MOVA-720p (4 GPUs, 193 frames, 24 steps)
+### MOVA-720p (4 GPUs, 193 frames, 2 steps)
 ```bash
 # Select four idle GPUs first:
 # export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
@@ -188,7 +187,7 @@ sglang generate \
   --adjust-frames=false \
   --num-gpus=4 --ring-degree=1 --ulysses-degree=4 \
   --num-frames=193 --fps=24 \
-  --num-inference-steps=24 \
+  --num-inference-steps=2 \
   --enable-torch-compile --save-output --warmup
 ```
 
@@ -205,6 +204,13 @@ Add `--log-level=info` and observe:
 - Per-step DiT latency — denoise ÷ steps
 
 ### Step 2: Profile with torch.profiler (Level 1)
+
+**Compile-safety rule for fused or rewritten kernels**
+- Any new kernel must be checked for `torch.compile` graph breaks before trusting its benchmark result.
+- If a direct Python/library call triggers tracing issues, wrap it as a custom op first.
+- For external libraries, use `register_custom_op_from_extern(...)`.
+- For SGLang JIT kernels, use `@register_custom_op(...)` and keep the JIT/module loading inside the custom op body.
+- Re-run `torch._dynamo.explain` on representative shapes and verify the optimized path still gets `graph_count=1` and `graph_break_count=0`.
 
 ```bash
 SGLANG_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
@@ -464,11 +470,11 @@ TORCH_COMPILE_DEBUG=1 sglang generate ...
 - Dynamic shape changes trigger recompilation → fix resolution and frame count when benchmarking
 - `tensor.item()` in conditional branches causes graph breaks → rewrite as tensor ops
 
-### Step 6: Multi-GPU Efficiency (Wan2.2-T2V-A14B)
+### Step 6: Multi-GPU Efficiency (Wan2.2-T2V-A14B / MOVA)
 
 - Verify `--ulysses-degree` evenly divides `--num-gpus`
-- Confirm `--enable-cfg-parallel` is active (requires `guidance_scale > 1`)
-- `--dit-layerwise-offload true` introduces CPU↔GPU transfer overhead; disable when memory permits
+- Keep the command shape fixed when comparing kernels; for quick checks, reduce only `--num-inference-steps`
+- If a run OOMs or jitters because of host contention, first confirm there are no leaked scheduler processes on the chosen GPU set
 
 ---
 
