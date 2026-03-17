@@ -35,11 +35,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
+from sglang.srt.utils.network import (
+    NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
-from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +251,7 @@ class CommonKVManager(BaseKVManager):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
-            host = NetworkAddress.parse(self.dist_init_addr).host
+            host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
