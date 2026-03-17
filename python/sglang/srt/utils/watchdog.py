@@ -204,17 +204,20 @@ class SubprocessWatchdog:
             self._thread = None
 
     def _monitor_loop(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                for proc, name in zip(self._processes, self._names):
-                    if not proc.is_alive() and proc.exitcode != 0:
-                        logger.error(
-                            f"Subprocess {name} (pid={proc.pid}) crashed "
-                            f"with exit code {proc.exitcode}. "
-                            f"Triggering SIGQUIT for cleanup..."
-                        )
-                        os.kill(os.getpid(), signal.SIGQUIT)
-                        return
-                self._stop_event.wait(self._interval)
-        except Exception as e:
-            logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
+        while not self._stop_event.wait(self._interval):
+            if self._check_processes():
+                return
+
+    def _check_processes(self) -> bool:
+        for proc, name in zip(self._processes, self._names):
+            if proc.is_alive() or proc.exitcode == 0:
+                continue
+
+            logger.error(
+                f"Subprocess {name} (pid={proc.pid}) crashed "
+                f"with exit code {proc.exitcode}. "
+                f"Triggering SIGQUIT for cleanup..."
+            )
+            os.kill(os.getpid(), signal.SIGQUIT)
+            return True
+        return False

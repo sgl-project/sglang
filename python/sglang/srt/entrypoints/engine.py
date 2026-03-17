@@ -179,6 +179,7 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
+        self._subprocess_watchdog = None
         atexit.register(self.shutdown)
 
         # Launch subprocesses
@@ -611,11 +612,17 @@ class Engine(EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
-    ) -> Tuple[TokenizerManager, TemplateManager, PortArgs, SchedulerInitResult]:
+    ) -> Tuple[
+        TokenizerManager,
+        TemplateManager,
+        PortArgs,
+        SchedulerInitResult,
+        Optional["SubprocessWatchdog"],
+    ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
         Returns:
-            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
+            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
         """
         # Configure global environment
         configure_logger(server_args)
@@ -718,10 +725,7 @@ class Engine(EngineBase):
         """Shutdown the engine"""
         # Stop the subprocess watchdog before killing children to prevent
         # false-positive crash detection during normal shutdown.
-        if (
-            hasattr(self, "_subprocess_watchdog")
-            and self._subprocess_watchdog is not None
-        ):
+        if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
