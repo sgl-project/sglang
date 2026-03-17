@@ -45,16 +45,18 @@ logger = init_logger(__name__)
 
 
 def _clear_hunyuan3d_rasterizer_jit_cache() -> None:
-    cache_root = Path.home() / ".cache" / "torch_extensions"
+    try:
+        import torch.utils.cpp_extension
+
+        cache_root = Path(torch.utils.cpp_extension.get_default_build_root())
+    except (ImportError, AttributeError):
+        cache_root = Path.home() / ".cache" / "torch_extensions"
+
     if not cache_root.exists():
         return
 
     matched_paths = sorted(
-        (
-            path
-            for path in cache_root.rglob("*")
-            if path.name.startswith("custom_rasterizer_kernel")
-        ),
+        (path for path in cache_root.rglob("custom_rasterizer_kernel*")),
         key=lambda p: len(p.parts),
         reverse=True,
     )
@@ -66,7 +68,7 @@ def _clear_hunyuan3d_rasterizer_jit_cache() -> None:
                 shutil.rmtree(path)
             else:
                 path.unlink()
-        except Exception as exc:
+        except OSError as exc:
             failed_paths.append((path, str(exc)))
 
     for path, msg in failed_paths:
