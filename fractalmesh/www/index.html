@@ -244,7 +244,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
 <header id="header">
   <div>
     <div class="logo">FRACTAL<span>MESH</span> OMEGA</div>
-    <div class="tagline">Sovereign AI — v401.6 — 21 Agents Operational</div>
+    <div class="tagline">Sovereign AI — v401.6 + Synthwave Empire — 23 Agents Operational</div>
   </div>
   <div class="header-right">
     <div class="pulse"></div>
@@ -291,6 +291,10 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
     </div>
     <div class="nav-item" data-section="nft" onclick="nav(this)">
       <span class="nav-icon">◆</span> NFT Mint
+    </div>
+    <div class="nav-section">Synthwave</div>
+    <div class="nav-item" data-section="synthwave" onclick="nav(this)">
+      <span class="nav-icon">♫</span> Empire
     </div>
     <div class="nav-section">Infrastructure</div>
     <div class="nav-item" data-section="ai-studio" onclick="nav(this)">
@@ -509,9 +513,11 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
             <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-delivery</div><div class="sys-port">background — delivery queue</div></div></div>
             <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">rf-bridge</div><div class="sys-port">background — RF sales sync</div></div></div>
             <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-whitepaper</div><div class="sys-port">cron 0 */10 — publisher</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-ai-dj</div><div class="sys-port">10min cycle — synthwave gen</div></div></div>
+            <div class="sys-item"><div class="sys-dot yellow"></div><div><div class="sys-name">fm-nft-minter</div><div class="sys-port">60s poll — IPFS → Solana mint</div></div></div>
           </div>
           <div style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--dim)">
-            v401.6 — 21 agents total — ~215MB RAM — ARM64 Termux
+            v401.6 + Synthwave Empire — 23 agents total — ~215MB RAM — ARM64 Termux
           </div>
         </div>
       </div>
@@ -519,6 +525,72 @@ body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:1
         <div class="panel-hdr"><h2>Audit Log</h2></div>
         <div class="panel-body" id="audit-log">
           <div class="loading"><div class="loading-spin"></div> Loading...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── SYNTHWAVE EMPIRE ── -->
+    <section class="section" id="sec-synthwave">
+      <div class="page-hdr">
+        <h1>SYNTHWAVE EMPIRE</h1>
+        <p>Autonomous AI music → IPFS → Solana NFT → Dev.to pipeline</p>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px">
+        <div class="stat-card">
+          <div class="stat-label">AI DJ</div>
+          <div class="stat-value" style="color:#b06aff">ON</div>
+          <div class="stat-sub">OpenRouter → MIDI/WAV · 10min cycle</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">NFT Minter</div>
+          <div class="stat-value" style="color:#b06aff">ON</div>
+          <div class="stat-sub">Pinata IPFS → Sugar · 60s poll</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Royalty</div>
+          <div class="stat-value" style="color:var(--cyan)">7%</div>
+          <div class="stat-sub">FMSW symbol · Solana mainnet</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Auto-Publish</div>
+          <div class="stat-value" style="color:var(--green)">Dev.to</div>
+          <div class="stat-sub">Article per mint · 4 tags</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px">
+        <div class="panel">
+          <div class="panel-hdr"><h2 style="color:#b06aff">AI DJ Pipeline</h2></div>
+          <div class="panel-body" style="font-family:var(--mono);font-size:11px;line-height:2;color:var(--dim)">
+            <div><span style="color:#b06aff">1.</span> OpenRouter LLM (Mistral 7B) generates MIDI JSON</div>
+            <div><span style="color:#b06aff">2.</span> midiutil builds .mid file</div>
+            <div><span style="color:#b06aff">3.</span> fluidsynth renders WAV (if soundfont present)</div>
+            <div><span style="color:#b06aff">4.</span> mpv plays track</div>
+            <div><span style="color:#b06aff">5.</span> Writes path → <code style="color:var(--cyan)">~/synthwave/.latest_track</code></div>
+            <div style="margin-top:12px;color:var(--dim)">Themes: neon city · cyberpunk · retro-future · fractal mesh</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hdr"><h2 style="color:var(--cyan)">NFT Mint Pipeline</h2></div>
+          <div class="panel-body" style="font-family:var(--mono);font-size:11px;line-height:2;color:var(--dim)">
+            <div><span style="color:var(--cyan)">1.</span> Polls .latest_track every 60s</div>
+            <div><span style="color:var(--cyan)">2.</span> Pins audio to Pinata IPFS</div>
+            <div><span style="color:var(--cyan)">3.</span> Pins Metaplex metadata JSON</div>
+            <div><span style="color:var(--cyan)">4.</span> Sugar CLI → Solana on-chain mint</div>
+            <div><span style="color:var(--cyan)">5.</span> Dev.to article auto-posted</div>
+            <div style="margin-top:12px;color:var(--dim)">Deduped via .minted_tracks log · degrades gracefully</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hdr"><h2 style="color:var(--green)">Vault Keys Required</h2></div>
+          <div class="panel-body" style="font-family:var(--mono);font-size:11px;line-height:2;color:var(--dim)">
+            <div><span style="color:var(--green)">OPENROUTER_API_KEY</span> — already set</div>
+            <div><span style="color:var(--amber)">PINATA_KEY</span> / PINATA_JWT — IPFS upload</div>
+            <div><span style="color:var(--amber)">DEVTO_KEY</span> — Dev.to posting</div>
+            <div><span style="color:var(--dim)">SOLANA_KEYPAIR_PATH</span> — optional on-chain</div>
+            <div style="margin-top:12px">
+              <code style="color:var(--dim);font-size:9px">pm2 logs fm-ai-dj<br>pm2 logs fm-nft-minter<br>ls ~/synthwave/tracks/</code>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -569,6 +641,7 @@ function nav(el) {
   if (sec === 'products')   loadProducts();
   if (sec === 'ai-studio')  loadAIStudio();
   if (sec === 'system')     loadSystem();
+  if (sec === 'synthwave')  loadSynthwave();
   if (sec === 'nft')        { loadNFTGallery(); drawFractal(); }
 }
 
@@ -961,6 +1034,8 @@ async function loadSystem() {
     {name:'fm-delivery',   port:null, ok: false,     label:'Product delivery queue'},
     {name:'rf-bridge',     port:null, ok: false,     label:'RF sales sync (5min)'},
     {name:'fm-whitepaper', port:null, ok: false,     label:'Cron publisher (*/10h)'},
+    {name:'fm-ai-dj',      port:null, ok: false,     label:'Synthwave gen (10min)'},
+    {name:'fm-nft-minter-sw',port:null,ok: false,    label:'IPFS → Solana mint (60s)'},
   ];
 
   // Check geosignal
@@ -994,6 +1069,12 @@ async function loadSystem() {
         <span class="audit-detail">${a.detail||'—'}</span>
       </div>`).join('') || '<div style="color:var(--dim);padding:12px;font-family:var(--mono);font-size:11px">No events yet</div>';
   }
+}
+
+// ─── SYNTHWAVE ────────────────────────────────────────────────────────────────
+function loadSynthwave() {
+  // Static section — no API call needed. Vault key status checked client-side.
+  // Real status visible via: pm2 logs fm-ai-dj
 }
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
