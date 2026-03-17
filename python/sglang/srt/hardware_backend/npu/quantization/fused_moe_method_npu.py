@@ -535,7 +535,6 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
         return StandardCombineInput(hidden_states=output)
 
-
     def apply_without_routing_weights(
         self,
         layer,
