@@ -325,8 +325,8 @@ class Indexer(MultiPlatformOp):
                 key = rotate_activation(key)
             current_stream.wait_stream(self.alt_stream)
         elif (
-            self.alt_stream is not None 
-            and forward_batch.nsa_cp_metadata is not None 
+            self.alt_stream is not None
+            and forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
         ):
             key = rotate_activation(key)
