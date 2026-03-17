@@ -136,6 +136,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_npu,
+    _is_xpu,
     _use_aiter,
     _use_aiter_gfx95,
     yarn_get_mscale,
@@ -655,6 +656,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if (
             not _is_cuda
+            and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
