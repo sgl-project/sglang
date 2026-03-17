@@ -132,7 +132,7 @@ class TemplateManager:
                         detect_jinja_template_content_format(hf_template)
                     )
                     logger.info(
-                        f"Using defaultttttt2 HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
+                        f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
                 else:
                     # Default to string content format if no template was found
