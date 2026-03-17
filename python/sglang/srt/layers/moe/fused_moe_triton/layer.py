@@ -1352,6 +1352,9 @@ class FusedMoE(torch.nn.Module):
         self.moe_runner_config.num_local_experts = self.num_local_experts
         self.moe_runner_config.intermediate_size_per_partition = self.intermediate_size_per_partition
 
+        # Mark transform as complete so forward() can verify
+        self._ep_load_for_tp = False
+
     def _get_ep_to_tp_shard_dim(self, param_name: str) -> int | None:
         """Return the dimension holding intermediate_size for a given parameter,
         or None if the parameter has no intermediate dimension to shard (e.g. per-tensor scales).
@@ -1896,6 +1899,11 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        if self._ep_load_for_tp:
+            raise RuntimeError(
+                "Internal error: forward() called while model is still in EP-load state. "
+                "ep_to_tp_transform() must be called after load_weights() before inference for TP."
+            )
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
