@@ -296,11 +296,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
             )
-            if core_attn_out is not None:
-                self._track_mamba_state_decode(
-                    forward_batch, conv_states, ssm_states, cache_indices
-                )
-                return core_attn_out
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,
