@@ -546,7 +546,10 @@ class NpuFuseEPMoE(DeepEPMoE):
         return torch.nn.Parameter(scale, requires_grad=False)
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if envs.SGLANG_NPU_FUSED_MOE_MODE.get() == FusedMoEMode.DISPATCH_FFN_COMBINE.value:
+        if (
+            envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+            == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+        ):
             w13_weight = self.release_weight_cache(layer.w13_weight)
             layer.w13_weight.data = npu_format_cast(w13_weight)
             w2_weight = self.release_weight_cache(layer.w2_weight)
