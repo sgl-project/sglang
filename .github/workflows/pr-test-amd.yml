@@ -334,7 +334,16 @@ jobs:
 
   stage-b-test-small-1-gpu-amd-nondeterministic:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -434,7 +443,16 @@ jobs:
 
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -465,7 +483,15 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -706,7 +732,16 @@ jobs:
 
   stage-c-test-large-8-gpu-amd:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     env:
       RUNNER_LABELS: linux-mi325-8gpu-sglang.test
     strategy:
