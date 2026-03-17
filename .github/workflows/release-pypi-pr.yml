@@ -4,11 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to build wheel for'
-        required: true
-        type: string
-      pr_branch:
-        description: 'PR branch name to build from (e.g., my-feature-branch or refs/pull/123/head)'
+        description: 'PR number to build wheel for (works with both internal and fork PRs)'
         required: true
         type: string
 
@@ -27,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_branch }}
+          ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0  # Need full history for version generation
 
       - name: Set up Python
@@ -38,8 +34,14 @@ jobs:
       - name: Generate PR wheel version
         id: gen_version
         run: |
-          # Get base version from version.py
-          BASE_VERSION=$(cat python/sglang/version.py | cut -d'"' -f2)
+          # Get base version from the latest v*.*.* git tag directly
+          # Note: We cannot use setuptools_scm here because the [tool.setuptools_scm]
+          # config (with custom git_describe_command) lives in python/pyproject.toml,
+          # not at the repo root. Without that config, setuptools_scm falls back to
+          # default git describe which finds gateway-* tags instead of v*.*.* release tags.
+          LATEST_TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1)
+          BASE_VERSION=${LATEST_TAG#v}
+          echo "Latest release tag: ${LATEST_TAG}"
 
           # Get commit info
           COMMIT_HASH=$(git rev-parse --short HEAD)
@@ -68,15 +70,17 @@ jobs:
       - name: Update pyproject.toml with PR wheel version
         run: |
           cd python
-          BASE_VERSION=$(cat sglang/version.py | cut -d'"' -f2)
           WHEEL_VERSION="${{ steps.gen_version.outputs.wheel_version }}"
 
-          # Update version (temporary, not committed)
-          sed -i "s/version = \"${BASE_VERSION}\"/version = \"${WHEEL_VERSION}\"/" pyproject.toml
+          # Update pyproject.toml to use static version instead of dynamic
+          # Remove 'version' from dynamic list and add static version
+          sed -i 's/dynamic = \["version"\]/dynamic = []/' pyproject.toml
+          sed -i "/^name = \"sglang\"/a version = \"${WHEEL_VERSION}\"" pyproject.toml
 
           # Verify update
           echo "Updated version in pyproject.toml:"
           grep "^version" pyproject.toml
+          grep "^dynamic" pyproject.toml
 
       - name: Install build dependencies
         run: |
@@ -132,9 +136,14 @@ jobs:
             Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
             Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
 
-            **Installation via index:**
+            **Installation via index (pip):**
             ```bash
-            pip install sglang=={version} --index-url https://sgl-project.github.io/whl/pr/
+            pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/
+            ```
+
+            **Installation via index (uv):**
+            ```bash
+            uv pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/ --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             ```
 
             **Direct installation:**

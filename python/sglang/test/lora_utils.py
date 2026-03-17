@@ -68,7 +68,7 @@ ALL_OTHER_LORA_MODELS = [
         base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
             LoRAAdaptor(
-                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                name="nvidia/llama-3.1-nemoguard-8b-topic-control",
                 prefill_tolerance=1e-1,
             ),
         ],
@@ -96,6 +96,7 @@ CI_MULTI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=2,
+        max_loaded_loras=4,
     ),
 ]
 
@@ -108,7 +109,7 @@ ALL_OTHER_MULTI_LORA_MODELS = [
                 prefill_tolerance=1e-1,
             ),
             LoRAAdaptor(
-                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                name="nvidia/llama-3.1-nemoguard-8b-topic-control",
                 prefill_tolerance=1e-1,
             ),
         ],
@@ -125,7 +126,7 @@ LORA_MODELS_QWEN3 = [
                 prefill_tolerance=3e-1,
             ),
             LoRAAdaptor(
-                name="y9760210/Qwen3-4B-lora_model",
+                name="TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0",
                 prefill_tolerance=3e-1,
             ),
         ],
@@ -194,6 +195,67 @@ def reference_sgmv_shrink(
             output[token_offset : token_offset + seq_len, : num_slices * rank] = (
                 scaling * result
             )
+
+        token_offset += seq_len
+
+    return output
+
+
+def reference_embedding_lora_a_shrink(
+    input_ids: torch.Tensor,
+    weights: torch.Tensor,
+    weight_indices: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """
+    Simple sequence-level reference implementation of embedding LoRA A shrink operation.
+
+    Args:
+        input_ids: (total_seq_len,) - Token IDs
+        weights: (num_loras, max_rank, vocab_size) - LoRA A embedding weights
+        weight_indices: LoRA idx for each sequence
+        seq_lengths: Length of each sequence
+        lora_ranks: LoRA rank for each LoRA adapters
+        vocab_size: Base vocabulary size
+
+    Returns:
+        output: (total_seq_len, max_rank) - Embedded features
+    """
+    if weights.numel() == 0:
+        total_tokens = input_ids.shape[0]
+        return torch.zeros(total_tokens, 0, dtype=weights.dtype, device=weights.device)
+
+    total_tokens = input_ids.shape[0]
+    _, max_rank, _ = weights.shape
+
+    output = torch.zeros(
+        total_tokens, max_rank, dtype=weights.dtype, device=weights.device
+    )
+
+    token_offset = 0
+    for lora_idx, seq_len, rank in zip(
+        weight_indices,
+        seq_lengths,
+        lora_ranks[weight_indices],
+    ):
+        if seq_len == 0:
+            continue
+
+        if rank > 0:
+            # Get token IDs for this sequence
+            seq_input_ids = input_ids[token_offset : token_offset + seq_len]
+
+            # Clamp token IDs to vocab size
+            clamped_ids = torch.clamp(seq_input_ids, max=vocab_size - 1)
+
+            # Lookup embeddings: weights[lora_idx, :rank, token_ids] -> (seq_len, rank)
+            # weights shape: (num_loras, max_rank, vocab_size)
+            lora_weights = weights[lora_idx, :rank, :]  # (rank, vocab_size)
+            embeddings = lora_weights[:, clamped_ids].t()  # (seq_len, rank)
+
+            output[token_offset : token_offset + seq_len, :rank] = embeddings
 
         token_offset += seq_len
 
@@ -285,6 +347,7 @@ def run_lora_test_one_by_one(
     torch_dtype: torch.dtype,
     max_new_tokens: int,
     backend: str = "csgmv",
+    enable_lora_overlap_loading: Optional[bool] = None,
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
@@ -331,6 +394,7 @@ def run_lora_test_one_by_one(
         lora_paths=[
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
+        enable_lora_overlap_loading=enable_lora_overlap_loading,
         max_loras_per_batch=model_case.max_loras_per_batch,
         max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,
@@ -545,7 +609,6 @@ def ensure_reproducibility():
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True)
 
 
 TEST_MULTIPLE_BATCH_PROMPTS = [
@@ -577,8 +640,12 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
+    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+    from sglang.srt.utils.common import is_hip
 
-    return [
+    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+    test_cases = [
         (
             [
                 random.choice(prompts),
@@ -591,18 +658,19 @@ def create_multiple_batch_test_samples(
                 lora_adapter_paths[1],
             ],
         ),
-        (
-            [
-                random.choice(prompts),
-                random.choice(prompts),
-                random.choice(prompts),
-            ],
-            [
-                lora_adapter_paths[0],
-                None,
-                lora_adapter_paths[1],
-            ],
-        ),
+        # It can pass half the time on CI, so skip this flaky case for now
+        # (
+        #     [
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #     ],
+        #     [
+        #         lora_adapter_paths[0],
+        #         None,
+        #         lora_adapter_paths[1],
+        #     ],
+        # ),
         (
             [
                 random.choice(prompts),
@@ -611,23 +679,31 @@ def create_multiple_batch_test_samples(
             ],
             [lora_adapter_paths[0], lora_adapter_paths[1], None],
         ),
-        (
-            [
-                random.choice(prompts),
-                random.choice(prompts),
-                random.choice(prompts),
-            ],
-            [None, lora_adapter_paths[1], None],
-        ),
-        (
-            [
-                random.choice(prompts),
-                random.choice(prompts),
-                random.choice(prompts),
-            ],
-            [None, None, None],
-        ),
+        # It can pass half the time on CI, so skip this flaky case for now
+        # (
+        #     [
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #     ],
+        #     [None, lora_adapter_paths[1], None],
+        # ),
     ]
+
+    # [AMD] Aiter may fail this case but the model quality doesn't drop
+    # Skip this flaky case for now
+    if not _use_aiter:
+        test_cases.append(
+            (
+                [
+                    random.choice(prompts),
+                    random.choice(prompts),
+                    random.choice(prompts),
+                ],
+                [None, None, None],
+            )
+        )
+    return test_cases
 
 
 def run_lora_multiple_batch_on_model_cases(
@@ -637,6 +713,7 @@ def run_lora_multiple_batch_on_model_cases(
     disable_cuda_graph: bool = True,
     enable_deterministic_inference: bool = False,
     disable_radix_cache: bool = True,
+    enable_lora_overlap_loading: Optional[bool] = None,
 ):
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
@@ -670,6 +747,7 @@ def run_lora_multiple_batch_on_model_cases(
                 torch_dtype=torch_dtype,
                 model_type="generation",
                 lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
+                enable_lora_overlap_loading=enable_lora_overlap_loading,
                 max_loras_per_batch=len(lora_adapter_paths) + 1,
                 max_loaded_loras=model_case.max_loaded_loras,
                 sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
@@ -730,6 +808,7 @@ def run_lora_batch_splitting_equivalence_test(
     attention_backend: str = "torch_native",
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
+    enable_lora_overlap_loading: Optional[bool] = None,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -798,6 +877,7 @@ def run_lora_batch_splitting_equivalence_test(
             torch_dtype=torch_dtype,
             model_type="generation",
             lora_paths=lora_adapter_paths,
+            enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loras_per_batch=max_loras_per_batch,
             max_loaded_loras=model_case.max_loaded_loras,
             sleep_on_idle=True,

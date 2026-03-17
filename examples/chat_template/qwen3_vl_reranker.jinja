@@ -1,0 +1,32 @@
+{#- Qwen3-VL-Reranker chat template for multimodal reranking -#}
+{#- This template formats query-document pairs for yes/no relevance judgment -#}
+{#- Supports text, images, and videos in both query and documents -#}
+<|im_start|>system
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+<|im_start|>user
+<Instruct>: {{ instruct | default("Given a search query, retrieve relevant candidates that answer the query.") }}
+{#- Process query content -#}
+<Query>: {%- for content in query -%}
+    {%- if content.type == 'image' or 'image' in content or 'image_url' in content -%}
+        <|vision_start|><|image_pad|><|vision_end|>
+    {%- elif content.type == 'video' or 'video' in content -%}
+        <|vision_start|><|video_pad|><|vision_end|>
+    {%- elif 'text' in content -%}
+        {{ content.text }}
+    {%- elif content.type == 'text' -%}
+        {{ content.text }}
+    {%- endif -%}
+{%- endfor %}
+{#- Process document content -#}
+{{ '\n' }}<Document>: {%- for content in document -%}
+    {%- if content.type == 'image' or 'image' in content or 'image_url' in content -%}
+        <|vision_start|><|image_pad|><|vision_end|>
+    {%- elif content.type == 'video' or 'video' in content -%}
+        <|vision_start|><|video_pad|><|vision_end|>
+    {%- elif 'text' in content -%}
+        {{ content.text }}
+    {%- elif content.type == 'text' -%}
+        {{ content.text }}
+    {%- endif -%}
+{%- endfor %}<|im_end|>
+<|im_start|>assistant{{ '\n' }}

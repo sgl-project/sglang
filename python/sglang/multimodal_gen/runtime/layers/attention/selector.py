@@ -170,7 +170,6 @@ def global_force_attn_backend_context_manager(
     manager.
 
     Arguments:
-
     * attn_backend: attention backend to force
 
     Returns:

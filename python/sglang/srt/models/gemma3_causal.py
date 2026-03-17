@@ -16,7 +16,6 @@ from typing import Iterable, Optional, Set, Tuple
 
 import einops
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,
@@ -35,7 +34,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -193,57 +192,12 @@ class Gemma3Attention(nn.Module):
             sliding_window_size=self.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            attn_type=AttentionType.DECODER_BIDIRECTIONAL,
         )
 
         # Gemma3 adds normalization for q and k
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
-
-    def naive_attn_with_masks(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        q = q.view(-1, self.num_heads, self.head_dim)
-        # Expand the key and value to handle GQA.
-        num_queries_per_kv = self.num_heads // self.num_kv_heads
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        k = k.repeat_interleave(num_queries_per_kv, dim=-2)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.repeat_interleave(num_queries_per_kv, dim=-2)
-
-        if self.is_sliding:
-            attn_masks = kwargs["local_attn_masks"]
-        else:
-            attn_masks = kwargs["global_attn_masks"]
-
-        seq_lens = kwargs["seq_lens"]
-        start_idx = 0
-        for seq_len, attn_mask in zip(seq_lens, attn_masks):
-            end_idx = start_idx + seq_len
-            query = q[start_idx:end_idx].unsqueeze(0)
-            key = k[start_idx:end_idx].unsqueeze(0)
-            value = v[start_idx:end_idx].unsqueeze(0)
-
-            # Transpose.
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
-
-            output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask,
-                self.scaling,
-            )
-            output = output.transpose(1, 2).flatten(-2, -1)
-            out[start_idx:end_idx] = output
-            start_idx = end_idx
-        return out
 
     def forward(
         self,

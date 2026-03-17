@@ -56,11 +56,13 @@ from sglang.srt.utils import (
     fast_topk,
     get_compiler_backend,
     is_cuda,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +244,7 @@ class Llama4Attention(nn.Module):
             RMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
+                has_weight=False,
             )
             if self.use_qk_norm
             else None
@@ -328,6 +331,8 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
+            if _is_npu:
+                qk = torch.cat([q_out_unused, k_out_unused], dim=-1)
             del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:
@@ -486,7 +491,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
