@@ -427,6 +427,7 @@ def get_embedding_chunk(
 
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
+    items_size: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
@@ -437,38 +438,32 @@ def _get_precomputed_embedding(
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
-    for idx, item in enumerate(items):
-        if item.precomputed_embeddings is None:
-            precomputed_embeddings.append(None)
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
             continue
-        seq_start_idx = prefix_length[idx]
-        seq_end_idx = seq_start_idx + extend_length[idx] - 1
-        prefix_embedding_length = []
-        extend_embedding_length = []
-        for mm_start_idx, mm_end_idx in items_offset_list[idx]:
-            if mm_start_idx > seq_end_idx:
-                break
-            if seq_start_idx > mm_start_idx:
-                prefix_embedding_length.append(
-                    min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
-                )
-            if mm_end_idx >= seq_start_idx:
-                extend_embedding_length.append(
-                    min(
-                        mm_end_idx - seq_start_idx + 1,
-                        seq_end_idx - mm_start_idx + 1,
-                        mm_end_idx - mm_start_idx + 1,
-                        seq_end_idx - seq_start_idx + 1,
-                    )
-                )
-        prefix_embedding_length = int(np.sum(prefix_embedding_length))
-        extend_embedding_length = int(np.sum(extend_embedding_length))
-        precomputed_embeddings.append(
-            item.precomputed_embeddings[
-                prefix_embedding_length : prefix_embedding_length
-                + extend_embedding_length
-            ]
-        )
+
+        items_per_req = items[items_size[i] : items_size[i + 1]]
+        extend_len = extend_length[i] if i < len(extend_length) else 0
+        items_offset = items_offset_list[i]
+
+        if any(item.precomputed_embeddings is None for item in items_per_req):
+            chunk = None
+        else:
+            req_embeddings = torch.concat(
+                [item.precomputed_embeddings for item in items_per_req]
+            )
+            chunk, _, _ = get_embedding_chunk(
+                embedding=req_embeddings,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_len,
+                items_offset=items_offset,
+            )
+
+        if chunk is None and len(items_per_req) > 1:
+            return None
+        precomputed_embeddings.append(chunk)
 
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
@@ -886,7 +881,7 @@ def get_embedding_and_mask(
     """
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
-        embedding_items, prefix_length, extend_length, items_offset_list
+        embedding_items, items_size, prefix_length, extend_length, items_offset_list
     )
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
