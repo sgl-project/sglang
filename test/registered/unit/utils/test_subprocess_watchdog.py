@@ -28,17 +28,14 @@ register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
 
 
 def healthy_worker():
-    """A worker that stays alive for a while."""
     time.sleep(10)
 
 
 def crashing_worker():
-    """A worker that crashes immediately."""
     os._exit(1)
 
 
 def slow_crash_worker(delay: float = 0.5):
-    """A worker that crashes after a delay."""
     time.sleep(delay)
     os._exit(42)
 
@@ -46,122 +43,87 @@ def slow_crash_worker(delay: float = 0.5):
 class TestSubprocessWatchdog(unittest.TestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
-        self._original_kill = os.kill
+        self._procs = []
+        self._monitor = None
 
-        def _mock_kill(pid, sig):
+        original_kill = os.kill
+
+        def mock_kill(pid, sig):
             if sig == signal.SIGQUIT:
                 self.sigquit_triggered.set()
             else:
-                self._original_kill(pid, sig)
+                original_kill(pid, sig)
 
-        self._mock_kill = _mock_kill
-        self._patcher = unittest.mock.patch("os.kill", side_effect=_mock_kill)
+        self._patcher = unittest.mock.patch("os.kill", side_effect=mock_kill)
+        self._patcher.start()
 
-    def test_healthy_processes_no_callback(self):
-        """Test that healthy processes don't trigger SIGQUIT."""
-        proc = mp.Process(target=healthy_worker)
+    def tearDown(self):
+        if self._monitor is not None:
+            self._monitor.stop()
+        self._patcher.stop()
+        for p in self._procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1)
+
+    def _spawn(self, target, args=()):
+        proc = mp.Process(target=target, args=args)
         proc.start()
+        self._procs.append(proc)
+        return proc
 
-        monitor = SubprocessWatchdog(
-            processes=[proc],
-            process_names=["test_worker"],
-            interval=0.1,
+    def _watch(self, procs, names=None, interval=0.1):
+        if not isinstance(procs, list):
+            procs = [procs]
+        self._monitor = SubprocessWatchdog(
+            processes=procs,
+            process_names=names,
+            interval=interval,
         )
-        with self._patcher:
-            monitor.start()
-            time.sleep(0.5)
-            monitor.stop()
+        self._monitor.start()
+        return self._monitor
 
+    def test_healthy_processes_no_sigquit(self):
+        proc = self._spawn(healthy_worker)
+        self._watch(proc)
+        time.sleep(0.5)
         self.assertFalse(self.sigquit_triggered.is_set())
-        proc.terminate()
-        proc.join(timeout=1)
 
     def test_crashed_process_triggers_sigquit(self):
-        """Test that a crashed process triggers SIGQUIT."""
-        proc = mp.Process(target=slow_crash_worker, args=(0.2,))
-        proc.start()
-
-        monitor = SubprocessWatchdog(
-            processes=[proc],
-            process_names=["crashing_worker"],
-            interval=0.1,
+        proc = self._spawn(slow_crash_worker, args=(0.2,))
+        self._watch(proc)
+        self.assertTrue(
+            self.sigquit_triggered.wait(timeout=2.0),
+            "SIGQUIT was not triggered within timeout",
         )
-        with self._patcher:
-            monitor.start()
-            self.assertTrue(
-                self.sigquit_triggered.wait(timeout=2.0),
-                "SIGQUIT was not triggered within timeout",
-            )
-            monitor.stop()
 
     def test_immediate_crash_detection(self):
-        """Test that an immediately crashing process is detected."""
-        proc = mp.Process(target=crashing_worker)
-        proc.start()
-
-        monitor = SubprocessWatchdog(
-            processes=[proc],
-            process_names=["immediate_crash"],
-            interval=0.05,
+        proc = self._spawn(crashing_worker)
+        self._watch(proc, interval=0.05)
+        self.assertTrue(
+            self.sigquit_triggered.wait(timeout=1.0),
+            "Immediate crash was not detected",
         )
-        with self._patcher:
-            monitor.start()
-            self.assertTrue(
-                self.sigquit_triggered.wait(timeout=1.0),
-                "Immediate crash was not detected",
-            )
-            monitor.stop()
 
     def test_multiple_processes_one_crashes(self):
-        """Test monitoring multiple processes where one crashes."""
-        healthy_proc = mp.Process(target=healthy_worker)
-        crashing_proc = mp.Process(target=slow_crash_worker, args=(0.2,))
-
-        healthy_proc.start()
-        crashing_proc.start()
-
-        monitor = SubprocessWatchdog(
-            processes=[healthy_proc, crashing_proc],
-            process_names=["healthy", "crashing"],
-            interval=0.1,
+        healthy = self._spawn(healthy_worker)
+        crashing = self._spawn(slow_crash_worker, args=(0.2,))
+        self._watch([healthy, crashing], names=["healthy", "crashing"])
+        self.assertTrue(
+            self.sigquit_triggered.wait(timeout=2.0),
+            "Crash was not detected when one of multiple processes crashed",
         )
-        with self._patcher:
-            monitor.start()
-            self.assertTrue(
-                self.sigquit_triggered.wait(timeout=2.0),
-                "Crash was not detected when one of multiple processes crashed",
-            )
-            monitor.stop()
-
-        healthy_proc.terminate()
-        healthy_proc.join(timeout=1)
 
     def test_empty_processes_list(self):
-        """Test that watchdog handles empty process list gracefully."""
-        monitor = SubprocessWatchdog(processes=[], interval=0.1)
-        with self._patcher:
-            monitor.start()
-            time.sleep(0.3)
-            monitor.stop()
-
+        self._watch([], interval=0.1)
+        time.sleep(0.3)
         self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
-        """Test that normal exit (exitcode=0) does not trigger SIGQUIT."""
-        proc = mp.Process(target=lambda: None)
-        proc.start()
+        proc = self._spawn(lambda: None)
         proc.join(timeout=2)
-
-        monitor = SubprocessWatchdog(
-            processes=[proc],
-            process_names=["normal_exit"],
-            interval=0.1,
-        )
-        with self._patcher:
-            monitor.start()
-            time.sleep(0.3)
-            monitor.stop()
-
+        self._watch(proc)
+        time.sleep(0.3)
         self.assertFalse(
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
