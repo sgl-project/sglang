@@ -38,6 +38,7 @@ import torch
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
+    get_modelexpress_modules,
     register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -2280,7 +2281,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ):
         """Load weights via ModelExpress coordination + TransferEngine RDMA."""
-        from modelexpress.client import MxClient
+        _, MxClient = get_modelexpress_modules()
 
         transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
         if transfer_engine is None:
