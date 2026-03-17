@@ -545,7 +545,6 @@ class TestEpToTpTransform(unittest.TestCase):
                 msg=f"Mismatch on rank {self.rank} for {key}",
             )
 
-    @unittest.expectedFailure  # BUG: ep_to_tp_transform doesn't handle _sglang_require_global_experts params (input_scale)
     def test_ep_to_tp_nvfp4_scales_with_shared_experts(self):
         """EP-load + transform must match normal TP load for NVFP4 scales with fused shared experts."""
         from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM

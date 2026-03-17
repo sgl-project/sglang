@@ -639,6 +639,13 @@ class FusedMoE(torch.nn.Module):
             if not hasattr(param, "_ep_to_tp_buf"):
                 continue
 
+            # Params with _sglang_require_global_experts=True (e.g. NVFP4
+            # input_scale) already hold scales for ALL experts on every rank,
+            # so they need no redistribution — just drop the buffer.
+            if getattr(param, "_sglang_require_global_experts", False):
+                del param._ep_to_tp_buf
+                continue
+
             data = param.data  # [num_routed_local + shared, ...]
 
             # Separate routed and shared portions
