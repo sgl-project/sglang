@@ -1,8 +1,6 @@
 import argparse
 
 import torch
-import triton
-import triton.testing
 from transformers import AutoConfig
 
 from sglang.benchmark.bench_utils import run_bench

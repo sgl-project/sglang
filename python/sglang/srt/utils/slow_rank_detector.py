@@ -3,7 +3,6 @@ from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-import triton
 
 from sglang.benchmark.bench_utils import run_bench
 
