@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 from collections.abc import Iterable
 
 import torch
@@ -21,6 +20,7 @@ import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_group,
@@ -214,7 +214,7 @@ class MOVADenoisingStage(PipelineStage):
             _inductor_cfg.reorder_for_compute_comm_overlap = True
         except ImportError:
             pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        mode = envs.SGLANG_TORCH_COMPILE_MODE
         logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(mode=mode, fullgraph=False, dynamic=None)
