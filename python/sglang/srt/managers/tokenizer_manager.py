@@ -80,6 +80,7 @@ from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.label_transform import transform_priority
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -1926,8 +1927,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             labels.update(custom_labels)
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+            labels["priority"] = transform_priority(priority)
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL
