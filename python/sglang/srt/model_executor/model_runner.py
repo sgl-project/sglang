@@ -696,8 +696,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
         )
 
-        # Determine bootstrap server host
-        # (Same pattern as CommonKVManager.register_to_bootstrap in disaggregation/common/conn.py)
         if self.server_args.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0)
             bootstrap_host = (
@@ -718,36 +716,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             },
         }
 
-        max_retries = 30
-        for attempt in range(max_retries):
-            try:
-                resp = http_requests.put(url, json=payload, timeout=5)
-                if resp.status_code == 200:
-                    logger.info(
-                        f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                        f"with bootstrap server at {bootstrap_na}"
-                    )
-                    return
-                else:
-                    logger.warning(
-                        f"Bootstrap registration attempt {attempt + 1}/{max_retries} "
-                        f"failed with status {resp.status_code}: {resp.text}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Bootstrap registration attempt {attempt + 1}/{max_retries} "
-                    f"failed: {e}"
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_na}"
                 )
-
-            if attempt < max_retries - 1:
-                import time
-
-                time.sleep(1)
-
-        logger.error(
-            f"Failed to register transfer engine info for tp_rank={self.tp_rank} "
-            f"after {max_retries} attempts"
-        )
+            else:
+                logger.error(
+                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+            )
 
     def model_specific_adjustment(self):
         server_args = self.server_args

@@ -26,7 +26,7 @@ ENGINE_INFO_BOOTSTRAP_PORT_OFFSET = 100
 
 
 class EngineInfoBootstrapServer:
-    """Lightweight aiohttp server for per-rank transfer engine info registration.
+    """Lightweight aiohttp server for per-rank model info registration.
 
     Runs in a daemon thread on node_rank==0. Each ModelRunner registers its
     info via HTTP PUT after model initialization. The Engine

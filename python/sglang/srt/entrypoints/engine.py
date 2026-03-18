@@ -197,11 +197,10 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         self.port_args = port_args
-        self.engine_info_bootstrap = scheduler_init_result.engine_info_bootstrap
-        if self.engine_info_bootstrap is not None:
-            # Use bootstrap server as the source of transfer engine info
+        # Access transfer engine info if bootstrap server is started.
+        if scheduler_init_result.engine_info_bootstrap is not None:
             self.remote_instance_transfer_engine_info = (
-                self.engine_info_bootstrap.transfer_engine_info
+                scheduler_init_result.engine_info_bootstrap.transfer_engine_info
             )
 
         # Initialize ZMQ sockets
@@ -626,22 +625,22 @@ class Engine(EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
-        # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
-        )
-
-        # Start the engine info bootstrap server before schedulers are ready
+        # Start the engine info bootstrap server if per-rank info is needed.
+        engine_info_bootstrap = None
         if (
             server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
             and server_args.node_rank == 0
         ):
-            # Attach bootstrap server on first node.
             bootstrap_port = server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
             engine_info_bootstrap = EngineInfoBootstrapServer(
                 host="0.0.0.0", port=bootstrap_port
             )
-            scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
+
+        # Launch scheduler processes
+        scheduler_init_result = cls._launch_scheduler_processes(
+            server_args, port_args, run_scheduler_process_func
+        )
+        scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
 
         if (
             server_args.enable_elastic_expert_backup
@@ -1199,7 +1198,7 @@ def _wait_for_scheduler_ready(
     scheduler_pipe_readers: List,
     scheduler_procs: List,
 ) -> List[Dict]:
-    """Wait for the model to finish loading and return flattened scheduler infos."""
+    """Wait for the model to finish loading and return scheduler infos."""
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         try:
@@ -1216,11 +1215,7 @@ def _wait_for_scheduler_ready(
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-
-        if "_dp_scheduler_infos" in data:
-            scheduler_infos.extend(data["_dp_scheduler_infos"])
-        else:
-            scheduler_infos.append(data)
+        scheduler_infos.append(data)
     return scheduler_infos
 
 
