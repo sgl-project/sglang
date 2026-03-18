@@ -514,7 +514,6 @@ class MUSAEnv(BaseEnv):
             return {}
 
 
-
 class MPSEnv(BaseEnv):
     """Environment checker for Apple MPS (Metal Performance Shaders)"""
 
@@ -588,6 +587,7 @@ class MPSEnv(BaseEnv):
         # Apple Silicon uses a unified memory architecture with a single GPU
         # device, so there is no multi-device topology to report.
         return {}
+
 
 if __name__ == "__main__":
     if is_cuda_v2():
