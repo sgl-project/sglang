@@ -455,11 +455,23 @@ def sample_generated_shared_prefix_requests(
         tokenizer,
     )
 
-    # Try to load from cache first
-    if cache_path.exists():
-        print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "r") as f:
-            return json.load(f)
+    # Use .json suffix to avoid conflicts with pickle caches from other scripts
+    json_cache_path = cache_path.with_suffix(".json")
+
+    # Try to load from JSON cache first
+    if json_cache_path.exists():
+        print(f"\nLoading cached generated input data from {json_cache_path}")
+        try:
+            with open(json_cache_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            print("Cache file is not valid JSON, regenerating...")
+            json_cache_path.unlink()
+
+    # Remove old pickle cache if present (no longer used by this script)
+    if cache_path.exists() and cache_path.suffix == ".pkl":
+        print(f"Removing old pickle cache: {cache_path}")
+        cache_path.unlink()
 
     print("\nGenerating new input data...")
 
@@ -512,9 +524,9 @@ def sample_generated_shared_prefix_requests(
     )
 
     # Save to cache
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "w") as f:
+    json_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Caching generated input data to {json_cache_path}")
+    with open(json_cache_path, "w") as f:
         json.dump(input_requests, f)
 
     return input_requests
