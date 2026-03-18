@@ -1488,45 +1488,72 @@ def add_prometheus_track_response_middleware(app):
         )
     )
 
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
+    # Use a pure ASGI middleware instead of @app.middleware("http") which is
+    # backed by Starlette's BaseHTTPMiddleware.  BaseHTTPMiddleware.call_next()
+    # replaces the ASGI `receive` callable with an internal channel, which
+    # prevents downstream handlers from detecting client disconnects via
+    # `request.is_disconnected()`.  A pure ASGI middleware passes `receive`
+    # through untouched, preserving disconnect detection.
+    # See: https://github.com/encode/starlette/discussions/2094
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
+    class PrometheusTrackResponseMiddleware:
+        def __init__(self, asgi_app):
+            self.app = asgi_app
 
-        try:
-            response = await call_next(request)
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
 
-            http_response_counter.labels(
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
+            path, _ = _get_asgi_request_path(app, scope)
+            method = scope.get("method", "")
+            headers = dict(
+                (k.decode(), v.decode()) for k, v in scope.get("headers", [])
+            )
+            routing_key = headers.get("x-smg-routing-key")
 
-            return response
-        finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            http_request_counter.labels(endpoint=path, method=method).inc()
+            http_requests_active.labels(endpoint=path, method=method).inc()
             if routing_key:
-                routing_keys_active.dec(routing_key)
+                routing_keys_active.inc(routing_key)
+
+            status_code = None
+
+            async def send_wrapper(message):
+                nonlocal status_code
+                if message["type"] == "http.response.start":
+                    status_code = message.get("status", 0)
+                await send(message)
+
+            try:
+                # Pass `receive` through directly so downstream handlers
+                # can still call `request.is_disconnected()` successfully.
+                await self.app(scope, receive, send_wrapper)
+            finally:
+                if status_code is not None:
+                    http_response_counter.labels(
+                        endpoint=path,
+                        method=method,
+                        status_code=str(status_code),
+                    ).inc()
+                http_requests_active.labels(endpoint=path, method=method).dec()
+                if routing_key:
+                    routing_keys_active.dec(routing_key)
+
+    app.add_middleware(PrometheusTrackResponseMiddleware)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
-def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+def _get_asgi_request_path(app, scope) -> Tuple[str, bool]:
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
+    for route in app.routes:
+        match, child_scope = route.matches(scope)
         if match == Match.FULL:
             return route.path, True
 
-    return request.url.path, False
+    path = scope.get("path", "/")
+    return path, False
 
 
 def get_amdgpu_memory_capacity():
