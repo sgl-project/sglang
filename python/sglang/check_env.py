@@ -523,6 +523,7 @@ class MPSEnv(BaseEnv):
 
     def __init__(self):
         super().__init__()
+        self.package_list = list(self.package_list)
         self.package_list.extend(MPSEnv.EXTRA_PACKAGE_LIST)
 
     def get_info(self):
@@ -543,6 +544,8 @@ class MPSEnv(BaseEnv):
             output = subprocess.check_output(
                 ["system_profiler", "SPDisplaysDataType"],
                 text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
             )
             for line in output.splitlines():
                 line = line.strip()
@@ -555,7 +558,7 @@ class MPSEnv(BaseEnv):
                     gpu_info[key] = line.split(":", 1)[1].strip()
                 elif line.startswith("Total Number of Cores:"):
                     gpu_info["GPU Cores"] = line.split(":", 1)[1].strip()
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError):
             gpu_info["GPU"] = "Not Available"
         return gpu_info
 
@@ -571,11 +574,11 @@ class MPSEnv(BaseEnv):
         # Apple Silicon uses unified memory shared between CPU and GPU
         try:
             output = subprocess.check_output(
-                ["sysctl", "-n", "hw.memsize"], text=True
+                ["sysctl", "-n", "hw.memsize"], text=True, timeout=10
             ).strip()
             mem_bytes = int(output)
             mac_info["Unified Memory"] = f"{mem_bytes / (1024 ** 3):.1f} GB"
-        except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        except (subprocess.SubprocessError, OSError, ValueError):
             pass
         return mac_info
 
