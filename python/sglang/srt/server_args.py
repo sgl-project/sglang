@@ -720,6 +720,7 @@ class ServerArgs:
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
+    weight_loader_prefetch_num_threads: int = 4
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
@@ -6086,6 +6087,12 @@ class ServerArgs:
             "Each rank prefetches a fraction of the shards, reducing total "
             "network I/O on shared filesystems (NFS/Lustre) from N*checkpoint "
             "to 1*checkpoint. Recommended for models on network storage.",
+        )
+        parser.add_argument(
+            "--weight-loader-prefetch-num-threads",
+            type=int,
+            default=ServerArgs.weight_loader_prefetch_num_threads,
+            help="Number of threads per rank for checkpoint prefetching (default: 4).",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",

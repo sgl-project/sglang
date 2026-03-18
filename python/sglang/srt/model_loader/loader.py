@@ -506,6 +506,7 @@ class DefaultModelLoader(BaseModelLoader):
             server_args = get_global_server_args()
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
+            prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -519,12 +520,14 @@ class DefaultModelLoader(BaseModelLoader):
                     ),
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
                 )
 
         else:

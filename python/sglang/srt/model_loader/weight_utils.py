@@ -68,6 +68,9 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+# Block size for sequential checkpoint prefetch reads (page cache warming).
+_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024  # 16 MB
+
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -706,9 +709,8 @@ def _prefetch_checkpoint_file(file_path: str) -> None:
     Reads the file sequentially in 16 MB blocks so the kernel caches its pages
     before workers load the same file via mmap.
     """
-    block_size = 16 * 1024 * 1024  # 16 MB
     with open(file_path, "rb") as f:
-        while f.read(block_size):
+        while f.read(_PREFETCH_BLOCK_SIZE):
             pass
 
 
@@ -772,6 +774,7 @@ def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -781,7 +784,7 @@ def safetensors_weights_iterator(
     sorted_files = sorted(hf_weights_files)
 
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files)
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
 
     for st_file in tqdm(
         sorted_files,
@@ -897,6 +900,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers: int,
     disable_mmap: bool = False,
     prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -905,7 +909,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted(hf_weights_files))
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
