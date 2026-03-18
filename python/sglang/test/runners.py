@@ -558,6 +558,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         enable_lora_overlap_loading: Optional[bool] = None,
+        enable_lora_zero_copy_load: bool = False,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
@@ -620,6 +621,7 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             enable_lora_overlap_loading=enable_lora_overlap_loading,
+            enable_lora_zero_copy_load=enable_lora_zero_copy_load,
             max_loaded_loras=max_loaded_loras,
             json_model_override_args=(
                 json.dumps(json_model_override_args)

@@ -54,6 +54,7 @@ class LoRAAdapter(nn.Module):
         base_hf_config: AutoConfig,
         load_config: LoadConfig,
         lora_backend: BaseLoRABackend,
+        enable_zero_copy_load: bool = False,
     ):
         super().__init__()
         self.uid: str = uid
@@ -62,6 +63,7 @@ class LoRAAdapter(nn.Module):
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
         self.lora_backend: BaseLoRABackend = lora_backend
+        self.enable_zero_copy_load: bool = enable_zero_copy_load
         self.scaling: float = self.config.lora_alpha / self.config.r
 
         self.layers: List[LoRALayer] = nn.ModuleList(
@@ -87,13 +89,15 @@ class LoRAAdapter(nn.Module):
         ):
             self._process_weight(name, loaded_weight)
 
-        self._normalize_weights()
+        if not self.enable_zero_copy_load:
+            self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
-        self._normalize_weights()
+        if not self.enable_zero_copy_load:
+            self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules

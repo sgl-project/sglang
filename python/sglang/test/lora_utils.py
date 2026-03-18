@@ -348,6 +348,7 @@ def run_lora_test_one_by_one(
     max_new_tokens: int,
     backend: str = "csgmv",
     enable_lora_overlap_loading: Optional[bool] = None,
+    enable_lora_zero_copy_load: bool = False,
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
@@ -395,6 +396,7 @@ def run_lora_test_one_by_one(
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
         enable_lora_overlap_loading=enable_lora_overlap_loading,
+        enable_lora_zero_copy_load=enable_lora_zero_copy_load,
         max_loras_per_batch=model_case.max_loras_per_batch,
         max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,

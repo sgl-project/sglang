@@ -4,6 +4,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.distributed import divide
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -292,6 +293,286 @@ class LoRAMemoryPool:
             self.get_lora_B_shape,
         )
 
+    @staticmethod
+    def _has_module_name(weight_name: str, module_name: str) -> bool:
+        return module_name in weight_name.split(".")
+
+    @staticmethod
+    def _is_lora_a(weight_name: str) -> bool:
+        return "lora_A" in weight_name or "lora_embedding_A" in weight_name
+
+    def _find_layer_weight(
+        self,
+        layer_weights: Dict[str, torch.Tensor],
+        module_name: str,
+        is_lora_a: bool,
+    ) -> Optional[torch.Tensor]:
+        for weight_name, weight in layer_weights.items():
+            if self._has_module_name(weight_name, module_name) and (
+                self._is_lora_a(weight_name) == is_lora_a
+            ):
+                return weight
+        return None
+
+    @staticmethod
+    def _assert_supported_backend_for_missing_gate_up_proj(
+        lora_backend_name: str,
+    ) -> None:
+        assert lora_backend_name in LORA_SUPPORTED_BACKENDS, (
+            f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
+            f"Received backend: {lora_backend_name}. Please verify your backend configuration "
+            f"or consider implementing custom initialization logic for other backends."
+        )
+
+    @staticmethod
+    def _infer_qkv_proj_sizes(
+        b_buffer_view: torch.Tensor,
+        q_weight: Optional[torch.Tensor],
+        k_weight: Optional[torch.Tensor],
+        v_weight: Optional[torch.Tensor],
+    ) -> Tuple[int, int]:
+        q_size = None if q_weight is None else q_weight.shape[0]
+        kv_size = None
+        if k_weight is not None:
+            kv_size = k_weight.shape[0]
+        elif v_weight is not None:
+            kv_size = v_weight.shape[0]
+
+        total_size = b_buffer_view.shape[0]
+        if q_size is None and kv_size is None:
+            return total_size, 0
+        if q_size is None:
+            q_size = total_size - 2 * kv_size
+        if kv_size is None:
+            kv_size = (total_size - q_size) // 2
+
+        assert total_size == q_size + 2 * kv_size
+        return q_size, kv_size
+
+    def _load_standard_layer_weights(
+        self,
+        layer_weights: Dict[str, torch.Tensor],
+        target_module: str,
+        layer_id: int,
+        buffer_id: int,
+        lora_rank: int,
+        load_lora_weight_tensor: Callable[[torch.Tensor, Optional[torch.Tensor]], None],
+        layer_module: Optional[BaseLayerWithLoRA],
+    ):
+        lora_a_weight = self._find_layer_weight(layer_weights, target_module, True)
+        lora_b_weight = self._find_layer_weight(layer_weights, target_module, False)
+
+        a_buffer_view = self.A_buffer[target_module][layer_id][buffer_id, :lora_rank, :]
+        if lora_a_weight is None:
+            a_buffer_view.zero_()
+        elif self.tp_size > 1 and layer_module is not None:
+            load_lora_weight_tensor(
+                a_buffer_view,
+                layer_module.slice_lora_a_weights(lora_a_weight, self.tp_rank),
+            )
+        else:
+            load_lora_weight_tensor(a_buffer_view, lora_a_weight)
+
+        b_buffer_view = self.B_buffer[target_module][layer_id][buffer_id, :, :lora_rank]
+        if lora_b_weight is None:
+            b_buffer_view.zero_()
+        elif self.tp_size > 1 and layer_module is not None:
+            load_lora_weight_tensor(
+                b_buffer_view,
+                layer_module.slice_lora_b_weights(lora_b_weight, self.tp_rank),
+            )
+        else:
+            load_lora_weight_tensor(b_buffer_view, lora_b_weight)
+
+    def _load_qkv_weights(
+        self,
+        layer_weights: Dict[str, torch.Tensor],
+        layer_id: int,
+        buffer_id: int,
+        lora_rank: int,
+        load_lora_weight_tensor: Callable[[torch.Tensor, Optional[torch.Tensor]], None],
+        layer_module: Optional[BaseLayerWithLoRA],
+    ):
+        a_buffer_view = self.A_buffer["qkv_proj"][layer_id][
+            buffer_id, : 3 * lora_rank, :
+        ]
+        a_buffer_view.zero_()
+        fused_a_weight = self._find_layer_weight(layer_weights, "qkv_proj", True)
+        if fused_a_weight is not None:
+            if fused_a_weight.shape == a_buffer_view.shape:
+                load_lora_weight_tensor(a_buffer_view, fused_a_weight)
+            else:
+                for idx in range(3):
+                    load_lora_weight_tensor(
+                        a_buffer_view[idx * lora_rank : (idx + 1) * lora_rank, :],
+                        fused_a_weight,
+                    )
+        else:
+            for idx, module_name in enumerate(("q_proj", "k_proj", "v_proj")):
+                lora_a_weight = self._find_layer_weight(
+                    layer_weights, module_name, True
+                )
+                if lora_a_weight is not None:
+                    load_lora_weight_tensor(
+                        a_buffer_view[idx * lora_rank : (idx + 1) * lora_rank, :],
+                        lora_a_weight,
+                    )
+
+        b_buffer_view = self.B_buffer["qkv_proj"][layer_id][buffer_id, :, :lora_rank]
+        b_buffer_view.zero_()
+        fused_b_weight = self._find_layer_weight(layer_weights, "qkv_proj", False)
+        if fused_b_weight is not None:
+            if self.tp_size > 1 and layer_module is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view,
+                    layer_module.slice_lora_b_weights(fused_b_weight, self.tp_rank),
+                )
+            else:
+                load_lora_weight_tensor(b_buffer_view, fused_b_weight)
+            return
+
+        if self.tp_size > 1:
+            assert (
+                layer_module is not None
+            ), "qkv_proj target module should exist in model"
+            q_proj_shard_size = layer_module.base_layer.q_proj_shard_size
+            kv_proj_shard_size = layer_module.base_layer.kv_proj_shard_size
+            q_start_idx = q_proj_shard_size * self.tp_rank
+            q_end_idx = q_start_idx + q_proj_shard_size
+
+            kv_shard_id = self.tp_rank // layer_module.base_layer.num_kv_head_replicas
+            kv_start_idx = kv_proj_shard_size * kv_shard_id
+            kv_end_idx = kv_start_idx + kv_proj_shard_size
+
+            q_weight = self._find_layer_weight(layer_weights, "q_proj", False)
+            if q_weight is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view[:q_proj_shard_size, :],
+                    q_weight[q_start_idx:q_end_idx, :],
+                )
+            k_weight = self._find_layer_weight(layer_weights, "k_proj", False)
+            if k_weight is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view[
+                        q_proj_shard_size : q_proj_shard_size + kv_proj_shard_size, :
+                    ],
+                    k_weight[kv_start_idx:kv_end_idx, :],
+                )
+            v_weight = self._find_layer_weight(layer_weights, "v_proj", False)
+            if v_weight is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view[
+                        q_proj_shard_size
+                        + kv_proj_shard_size : q_proj_shard_size
+                        + 2 * kv_proj_shard_size,
+                        :,
+                    ],
+                    v_weight[kv_start_idx:kv_end_idx, :],
+                )
+            return
+
+        q_weight = self._find_layer_weight(layer_weights, "q_proj", False)
+        k_weight = self._find_layer_weight(layer_weights, "k_proj", False)
+        v_weight = self._find_layer_weight(layer_weights, "v_proj", False)
+        q_size, kv_size = self._infer_qkv_proj_sizes(
+            b_buffer_view, q_weight, k_weight, v_weight
+        )
+
+        if q_weight is not None:
+            load_lora_weight_tensor(b_buffer_view[:q_size, :], q_weight)
+        if k_weight is not None:
+            load_lora_weight_tensor(
+                b_buffer_view[q_size : q_size + kv_size, :],
+                k_weight,
+            )
+        if v_weight is not None:
+            load_lora_weight_tensor(b_buffer_view[q_size + kv_size :, :], v_weight)
+
+    def _load_gate_up_weights(
+        self,
+        layer_weights: Dict[str, torch.Tensor],
+        layer_id: int,
+        buffer_id: int,
+        lora_rank: int,
+        load_lora_weight_tensor: Callable[[torch.Tensor, Optional[torch.Tensor]], None],
+        layer_module: Optional[BaseLayerWithLoRA],
+        lora_backend_name: str,
+    ):
+        a_buffer_view = self.A_buffer["gate_up_proj"][layer_id][
+            buffer_id, : 2 * lora_rank, :
+        ]
+        a_buffer_view.zero_()
+        fused_a_weight = self._find_layer_weight(layer_weights, "gate_up_proj", True)
+        if fused_a_weight is not None:
+            if fused_a_weight.shape == a_buffer_view.shape:
+                load_lora_weight_tensor(a_buffer_view, fused_a_weight)
+            else:
+                for idx in range(2):
+                    load_lora_weight_tensor(
+                        a_buffer_view[idx * lora_rank : (idx + 1) * lora_rank, :],
+                        fused_a_weight,
+                    )
+        else:
+            gate_a_weight = self._find_layer_weight(layer_weights, "gate_proj", True)
+            up_a_weight = self._find_layer_weight(layer_weights, "up_proj", True)
+            if gate_a_weight is not None and up_a_weight is None:
+                self._assert_supported_backend_for_missing_gate_up_proj(
+                    lora_backend_name
+                )
+
+            if gate_a_weight is not None:
+                load_lora_weight_tensor(a_buffer_view[:lora_rank, :], gate_a_weight)
+            if up_a_weight is not None:
+                load_lora_weight_tensor(
+                    a_buffer_view[lora_rank : 2 * lora_rank, :], up_a_weight
+                )
+
+        b_buffer_view = self.B_buffer["gate_up_proj"][layer_id][
+            buffer_id, :, :lora_rank
+        ]
+        b_buffer_view.zero_()
+        fused_b_weight = self._find_layer_weight(layer_weights, "gate_up_proj", False)
+        if fused_b_weight is not None:
+            if self.tp_size > 1 and layer_module is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view,
+                    layer_module.slice_lora_b_weights(fused_b_weight, self.tp_rank),
+                )
+            else:
+                load_lora_weight_tensor(b_buffer_view, fused_b_weight)
+            return
+
+        gate_weight = self._find_layer_weight(layer_weights, "gate_proj", False)
+        up_weight = self._find_layer_weight(layer_weights, "up_proj", False)
+        if gate_weight is not None and up_weight is None:
+            self._assert_supported_backend_for_missing_gate_up_proj(lora_backend_name)
+
+        if self.tp_size > 1:
+            assert (
+                layer_module is not None
+            ), "gate_up_proj target module should exist in model"
+            shard_size = layer_module.base_layer.output_partition_sizes[0]
+            start_idx = self.tp_rank * shard_size
+            end_idx = start_idx + shard_size
+
+            if gate_weight is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view[:shard_size, :],
+                    gate_weight[start_idx:end_idx, :],
+                )
+            if up_weight is not None:
+                load_lora_weight_tensor(
+                    b_buffer_view[shard_size : 2 * shard_size, :],
+                    up_weight[start_idx:end_idx, :],
+                )
+            return
+
+        gate_size = self.base_hf_config.intermediate_size
+        if gate_weight is not None:
+            load_lora_weight_tensor(b_buffer_view[:gate_size, :], gate_weight)
+        if up_weight is not None:
+            load_lora_weight_tensor(b_buffer_view[gate_size:, :], up_weight)
+
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
@@ -411,47 +692,43 @@ class LoRAMemoryPool:
         lora_rank = lora_adapter.config.r
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
-            temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
-                target_module: None for target_module in self.A_buffer
-            }
-            temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
-                target_module: None for target_module in self.B_buffer
-            }
-            for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if "lora_A" in name:
-                    temp_A_buffer[target_module] = weights
+            cur_layer_modules = lora_modules[layer_id]
+            modules_by_target = {}
+            for module_name, module in cur_layer_modules.items():
+                target_module = get_target_module_name(module_name, self.target_modules)
+                modules_by_target[target_module] = module
+
+            for target_module in self.A_buffer:
+                layer_module = modules_by_target.get(target_module)
+                if target_module == "qkv_proj":
+                    self._load_qkv_weights(
+                        layer_weights,
+                        layer_id,
+                        buffer_id,
+                        lora_rank,
+                        load_lora_weight_tensor,
+                        layer_module,
+                    )
+                elif target_module == "gate_up_proj":
+                    self._load_gate_up_weights(
+                        layer_weights,
+                        layer_id,
+                        buffer_id,
+                        lora_rank,
+                        load_lora_weight_tensor,
+                        layer_module,
+                        lora_adapter.lora_backend.name,
+                    )
                 else:
-                    temp_B_buffer[target_module] = weights
-
-            if self.tp_size > 1:
-                cur_layer_modules = lora_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
+                    self._load_standard_layer_weights(
+                        layer_weights,
+                        target_module,
+                        layer_id,
+                        buffer_id,
+                        lora_rank,
+                        load_lora_weight_tensor,
+                        layer_module,
                     )
-
-                    if temp_A_buffer[target_module] is None:
-                        # Skip weight slicing if the weight is not present in the adapter
-                        continue
-
-                    temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                        temp_A_buffer[target_module], self.tp_rank
-                    )
-                    temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                        temp_B_buffer[target_module], self.tp_rank
-                    )
-
-            for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
-                target_buffer = self.A_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                load_lora_weight_tensor(buffer_view, weights)
-
-            for name, weights in temp_B_buffer.items():
-                target_buffer = self.B_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                load_lora_weight_tensor(buffer_view, weights)
 
         if lora_adapter.embedding_layers:
 

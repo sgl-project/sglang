@@ -33,6 +33,16 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_prepare_server_args_lora_zero_copy_flag(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--enable-lora-zero-copy-load",
+            ]
+        )
+        self.assertTrue(server_args.enable_lora_zero_copy_load)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

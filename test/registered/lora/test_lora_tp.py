@@ -46,6 +46,7 @@ class TestLoRATP(CustomTestCase):
         self,
         model_cases: List[LoRAModelCase],
         enable_lora_overlap_loading: Optional[bool] = None,
+        enable_lora_zero_copy_load: bool = False,
     ):
         tp_list = [2]  # Define TP sizes to iterate over
         for model_case in model_cases:
@@ -64,7 +65,12 @@ class TestLoRATP(CustomTestCase):
                         torch_dtype,
                         max_new_tokens=32,
                         enable_lora_overlap_loading=enable_lora_overlap_loading,
-                        test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
+                        enable_lora_zero_copy_load=enable_lora_zero_copy_load,
+                        test_tag=(
+                            f"tp={tp_size}, "
+                            f"enable_lora_overlap_loading={enable_lora_overlap_loading}, "
+                            f"enable_lora_zero_copy_load={enable_lora_zero_copy_load}"
+                        ),
                     )
 
     def test_ci_lora_models(self):
@@ -73,6 +79,11 @@ class TestLoRATP(CustomTestCase):
     def test_lora_overlap_loading_ci_lora_models(self):
         self._run_tp_on_model_cases(
             CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
+        )
+
+    def test_lora_zero_copy_ci_lora_models(self):
+        self._run_tp_on_model_cases(
+            CI_MULTI_LORA_MODELS, enable_lora_zero_copy_load=True
         )
 
     def test_all_lora_models(self):

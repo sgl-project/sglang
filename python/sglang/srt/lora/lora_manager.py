@@ -75,6 +75,7 @@ class LoRAManager:
         self.enable_lora_overlap_loading: Optional[bool] = (
             server_args.enable_lora_overlap_loading
         )
+        self.enable_lora_zero_copy_load: bool = server_args.enable_lora_zero_copy_load
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -477,6 +478,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            enable_zero_copy_load=self.enable_lora_zero_copy_load,
         )
         lora_adapter.initialize_weights()
 
@@ -498,6 +500,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            enable_zero_copy_load=self.enable_lora_zero_copy_load,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
