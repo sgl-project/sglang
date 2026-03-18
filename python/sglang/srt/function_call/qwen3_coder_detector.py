@@ -359,10 +359,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                         # Construct JSON fragment: "key": value
                         # Note: We must be careful with json.dumps to ensure valid JSON streaming
-                        json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+                        json_key_val = f"{json.dumps(param_name)}:{json.dumps(converted_val, ensure_ascii=False)}"
 
                         if self.current_tool_param_count > 0:
-                            fragment = f", {json_key_val}"
+                            fragment = f",{json_key_val}"
                         else:
                             fragment = json_key_val
 
