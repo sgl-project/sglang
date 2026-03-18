@@ -1330,15 +1330,12 @@ class Scheduler(
         # so all DP ranks make the same overlap decision (avoiding deadlock).
         # In non-DP mode, use the local forward_mode directly.
         if self.require_mlp_sync:
-            batch_is_extend = batch and batch.is_extend_in_batch
-            last_batch_is_extend = (
-                self.last_batch and self.last_batch.is_extend_in_batch
-            )
+            is_extend = lambda b: b and b.is_extend_in_batch
         else:
-            batch_is_extend = batch and batch.forward_mode.is_extend()
-            last_batch_is_extend = (
-                self.last_batch and self.last_batch.forward_mode.is_extend()
-            )
+            is_extend = lambda b: b and b.forward_mode.is_extend()
+
+        batch_is_extend = is_extend(batch)
+        last_batch_is_extend = is_extend(self.last_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
