@@ -468,18 +468,17 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        enable_rocjpeg=False,
     ):
         """
         Load a single multimodal data.
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Static method that can be pickled for multiprocessing
-        For images:
-          - JPEG: returns (img_tensor_bytes, 'jpeg')
-          - Non-JPEG: returns (img_tensor, None)
-
-        Static method that can be pickled for multiprocessing"""
+        Static method that can be pickled for multiprocessing.
+        When enable_rocjpeg=True, JPEG images return (img_tensor_bytes, 'jpeg')
+        for batch GPU decoding; otherwise all images return (img_tensor, None).
+        """
         if isinstance(data, dict):
             data_format = data.get("format")
             if data_format in (
@@ -491,10 +490,9 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                # load_image_tensor automatically distinguishes between JPEG and non-JPEG
-                # JPEG returns: (img_tensor_bytes, 'jpeg')
-                # Non-JPEG returns: (img_tensor, None)
-                return load_image_tensor(data, discard_alpha_channel)
+                return load_image_tensor(
+                    data, discard_alpha_channel, enable_rocjpeg=enable_rocjpeg
+                )
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
@@ -557,12 +555,12 @@ class BaseMultimodalProcessor(ABC):
     ) -> Tuple[List, List]:
         """
         Load multimodal data parallelly using iterators.
-        For images, will return either:
-          - JPEG: (img_tensor_bytes, 'jpeg') for batch decoding
-          - Non-JPEG: (img_tensor, None) already decoded
+        When mm_enable_rocjpeg is on, JPEG images return (img_tensor_bytes, 'jpeg')
+        for batch GPU decoding; otherwise all images are decoded immediately.
         """
         futures = []
         task_info = []
+        enable_rocjpeg = getattr(self.server_args, "mm_enable_rocjpeg", False)
 
         for text_part in text_parts:
             modality = multimodal_tokens.get_modality_of_token(text_part)
@@ -602,6 +600,7 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        enable_rocjpeg,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))
