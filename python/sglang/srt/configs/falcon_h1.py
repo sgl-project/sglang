@@ -20,7 +20,7 @@ from transformers.utils import logging
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
-    mamba_state_dtype,
+    mamba2_state_dtype,
 )
 
 logger = logging.get_logger(__name__)
@@ -298,7 +298,7 @@ class FalconH1Config(PretrainedConfig):
         return range(self.num_hidden_layers)
 
     @property
-    def mamba_cache_params(self):
+    def mamba2_cache_params(self):
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
@@ -311,5 +311,5 @@ class FalconH1Config(PretrainedConfig):
             conv_kernel=self.mamba_d_conv,
         )
         return Mamba2CacheParams(
-            shape=shape, layers=self.linear_layer_ids, dtype=mamba_state_dtype(self)
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
         )

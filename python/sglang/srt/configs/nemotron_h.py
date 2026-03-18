@@ -21,7 +21,7 @@ from transformers.utils import logging
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
-    mamba_state_dtype,
+    mamba2_state_dtype,
 )
 
 logger = logging.get_logger(__name__)
@@ -415,7 +415,7 @@ class NemotronHConfig(PretrainedConfig):
         ]
 
     @property
-    def mamba_cache_params(self) -> Mamba2CacheParams:
+    def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
@@ -429,7 +429,7 @@ class NemotronHConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(
-            shape=shape, layers=self.mamba_layer_ids, dtype=mamba_state_dtype(self)
+            shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
         )
 
     @property

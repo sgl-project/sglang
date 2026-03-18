@@ -699,7 +699,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
-        layer_cache = self.req_to_token_pool.mamba_layer_cache(layer_id)
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         return mixer.forward(
             hidden_states=hidden_states,
             output=output,
@@ -769,7 +769,7 @@ class Mamba1AttnBackend(MambaAttnBackendBase):
         layer_id: int,
     ):
         assert isinstance(self.forward_metadata, Mamba1Metadata)
-        layer_cache = self.req_to_token_pool.mamba_layer_cache(layer_id)
+        layer_cache = self.req_to_token_pool.mamba1_layer_cache(layer_id)
         return mixer.forward(
             hidden_states=hidden_states,
             output=output,

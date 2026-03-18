@@ -21,7 +21,7 @@ from transformers.utils import logging
 from sglang.srt.configs.mamba_utils import (
     Mamba1CacheParams,
     Mamba1StateShape,
-    mamba_state_dtype,
+    mamba2_state_dtype,
 )
 
 logger = logging.get_logger(__name__)
@@ -241,7 +241,7 @@ class JambaConfig(PretrainedConfig):
         return self.attention_layer_ids
 
     @property
-    def mamba_cache_params(self) -> Mamba1CacheParams:
+    def mamba2_cache_params(self) -> Mamba1CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba1StateShape.create(
@@ -254,5 +254,5 @@ class JambaConfig(PretrainedConfig):
         return Mamba1CacheParams(
             shape=shape,
             layers=self.mamba_layer_ids,
-            dtype=mamba_state_dtype(self),
+            dtype=mamba2_state_dtype(self),
         )

@@ -6,7 +6,7 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
-    mamba_state_dtype,
+    mamba2_state_dtype,
 )
 
 
@@ -55,7 +55,7 @@ class JetNemotronConfig(PretrainedConfig):
         ]
 
     @property
-    def mamba_cache_params(self) -> Mamba2CacheParams:
+    def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         jet_block_config = JetBlockConfig(**self.efficient_attention_config["jet"])
@@ -76,5 +76,5 @@ class JetNemotronConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(
-            shape=shape, layers=self.linear_layer_ids, dtype=mamba_state_dtype(self)
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
         )

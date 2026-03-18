@@ -39,14 +39,14 @@ def extra_groups_for_head_shards(ngroups: int, tp_size: int):
 
 
 @dataclass(kw_only=True, frozen=True)
-class MambaStateDType:
+class Mamba2StateDType:
     conv: torch.dtype
     temporal: torch.dtype
 
 
-def mamba_state_dtype(config=None) -> MambaStateDType:
+def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     """
-    Get mamba state dtype from config or environment variable.
+    Get mamba2 state dtype from config or environment variable.
 
     Priority (from highest to lowest):
     1. Environment variable SGLANG_MAMBA_SSM_DTYPE
@@ -58,7 +58,7 @@ def mamba_state_dtype(config=None) -> MambaStateDType:
                 mamba_ssm_dtype from it. For VL models, reads from text_config.
 
     Returns:
-        MambaStateDType with conv and temporal dtypes
+        Mamba2StateDType with conv and temporal dtypes (also used for Mamba1)
     """
     dtype_map = {
         "float32": torch.float32,
@@ -102,14 +102,14 @@ def mamba_state_dtype(config=None) -> MambaStateDType:
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
 
-    logger.debug(f"Mamba state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
-    return MambaStateDType(conv=conv_dtype, temporal=ssm_dtype)
+    return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
-    dtype: MambaStateDType = field(default_factory=lambda: mamba_state_dtype(None))
+    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
 
     @property
