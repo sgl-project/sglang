@@ -261,7 +261,7 @@ class SchedulerMetricsMixin:
             if batch is not None and batch.forward_iter is not None
             else self.forward_ct
         )
-        iter_msg = f" [{batch_iter}]"
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -459,7 +459,12 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]"
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
