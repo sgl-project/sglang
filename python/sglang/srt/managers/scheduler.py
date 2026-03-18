@@ -2145,6 +2145,9 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2168,9 +2171,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2654,6 +2654,11 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
+        # Health check piggybacks on running requests in process_output.
+        # Only running_batch + waiting_queue guarantee active GPU processing;
+        # disagg queues (bootstrap/prealloc/transfer) may have items without
+        # any request actually running on GPU — e.g. stuck handshake, full
+        # KV cache, or stalled transfer — so they can't carry health info.
         # Batch running status
         idle = (
             self.running_batch.is_empty()
@@ -2667,20 +2672,28 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            idle &= (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
-                and len(self.disagg_decode_transfer_queue.queue) == 0
-            )
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch results
-            # instantly, but they still indicate the server is not fully idle.
+            # Grammar queue and prefill inflight queue may not produce batch
+            # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+
+            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
+            # destructive operations like attach/detach/flush_cache.
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                idle &= len(tc.ongoing_write_through) == 0
+                idle &= len(tc.ongoing_load_back) == 0
+                if tc.enable_storage:
+                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= len(tc.ongoing_backup) == 0
 
         return idle
 

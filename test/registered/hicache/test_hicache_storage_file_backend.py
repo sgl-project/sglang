@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    flush_cache_with_retry,
     is_in_ci,
     popen_launch_server,
 )
@@ -168,12 +169,8 @@ class HiCacheStorageBaseMixin:
         return int(meta.get("cached_tokens", 0))
 
     def flush_cache(self) -> bool:
-        """Flush device cache to force remote storage access"""
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+        """Flush device cache to force remote storage access."""
+        return flush_cache_with_retry(self.base_url)
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""

@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_sm,
     get_int_env_var,
     get_quantization_config,
+    human_readable_int,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -613,6 +614,9 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    pre_warm_nccl: bool = dataclasses.field(
+        default_factory=lambda: is_hip()
+    )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -767,9 +771,11 @@ class ServerArgs:
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
+        self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
 
         # Handle Hicache settings.
@@ -1993,6 +1999,8 @@ class ServerArgs:
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "KimiK25ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
@@ -2030,6 +2038,19 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
+
+        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
+        # See https://github.com/sgl-project/sglang/issues/20791
+        if (
+            self.linear_attn_decode_backend == "flashinfer"
+            and self.mamba_scheduler_strategy == "no_buffer"
+        ):
+            raise ValueError(
+                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
+                "compatible with --mamba-scheduler-strategy no_buffer. "
+                "Please use --mamba-scheduler-strategy extra_buffer instead. "
+                "See https://github.com/sgl-project/sglang/issues/20791"
+            )
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
@@ -2410,6 +2431,15 @@ class ServerArgs:
         if is_hip():
             self.triton_attention_num_kv_splits = 16
 
+    def _handle_nccl_pre_warm(self):
+        # pre_warm_nccl is only used with CUDA or HIP hardware
+        if self.pre_warm_nccl and not (is_cuda() or is_hip()):
+            logger.warning(
+                "pre_warm_nccl is only applicable for CUDA or HIP hardware. "
+                "Ignoring pre_warm_nccl setting on current hardware."
+            )
+            self.pre_warm_nccl = False
+
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -2429,6 +2459,23 @@ class ServerArgs:
                 raise ValueError(
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
+
+    def _handle_linear_attn_backend(self):
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        import torch
+
+        decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        if (
+            decode == "flashinfer"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
@@ -2586,6 +2633,15 @@ class ServerArgs:
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            fuse_mode = os.environ.get("SGLANG_NPU_FUSED_MOE_MODE", None)
+            if fuse_mode not in ["1", "2"]:
+                raise ValueError(
+                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
+                )
+            elif fuse_mode == "2":
+                assert (
+                    self.quantization == "modelslim"
+                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
             self.ep_size = self.tp_size
             logger.warning(
@@ -3097,6 +3153,11 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
                 )
+            if self.hicache_storage_backend is None:
+                raise ValueError(
+                    "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -3384,9 +3445,10 @@ class ServerArgs:
         )
         parser.add_argument(
             "--context-length",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--is-embedding",
@@ -3613,10 +3675,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--max-total-tokens",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-            "This option is typically used for development and debugging purposes.",
+            "This option is typically used for development and debugging purposes."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--chunked-prefill-size",
@@ -3638,9 +3701,10 @@ class ServerArgs:
         )
         parser.add_argument(
             "--max-prefill-tokens",
-            type=int,
+            type=human_readable_int,
             default=ServerArgs.max_prefill_tokens,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
+            + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
             "--schedule-policy",
@@ -5088,6 +5152,11 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--pre-warm-nccl",
+            action="store_true",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
