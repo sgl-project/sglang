@@ -2,6 +2,7 @@ import enum
 import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
+import os
 import torch
 from torch import nn
 
@@ -421,8 +422,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
-
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        is_not_npu_extend = not _is_npu or forward_batch.forward_mode.is_cuda_graph()
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu and is_not_npu_extend:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
