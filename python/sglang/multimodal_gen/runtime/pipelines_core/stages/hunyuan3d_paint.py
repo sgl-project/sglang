@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import get_compiler_backend, is_npu
 
 logger = init_logger(__name__)
 
@@ -589,7 +590,12 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
                 "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
             logger.info("Compiling paint transformer with mode: %s", compile_mode)
-            self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)
+            if is_npu():
+                backend = get_compiler_backend()
+                logger.info("Using NPU compiler backend: %s", backend)
+                self.transformer.compile(backend=backend)
+            else:
+                self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)
 
     def _convert_pil_list_to_tensor(
         self, images: list, device: torch.device

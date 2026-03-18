@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.srt.utils import get_compiler_backend, is_npu
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 logger = init_logger(__name__)
@@ -145,8 +146,13 @@ class DenoisingStage(PipelineStage):
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info(f"Compiling transformer with mode: {mode}")
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(mode=mode, fullgraph=False, dynamic=None)
+        
+        if is_npu():
+            backend = get_compiler_backend()
+            logger.info(f"Using NPU compiler backend: {backend}")
+            module.compile(backend=backend)
+        else:
+            module.compile(mode=mode, fullgraph=False, dynamic=None)
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
