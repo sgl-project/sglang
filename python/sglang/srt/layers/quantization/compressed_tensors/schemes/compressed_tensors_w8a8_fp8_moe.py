@@ -123,18 +123,22 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
-        w13_processed, w2_processed = get_moe_weight_sizes(
+        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=True,
             is_concat=True,
             is_packed=False,
         )
 
+        extra_weight_attrs.update(
+            {"weight_padded": weight_padded},
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                w13_processed,
+                w13_up_dim,
                 hidden_size,
                 dtype=params_dtype,
             ),
@@ -147,7 +151,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                w2_processed,
+                w2_down_dim,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -171,7 +175,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    w13_processed,
+                    w13_up_dim,
                     1,
                     dtype=torch.float32,
                 ),

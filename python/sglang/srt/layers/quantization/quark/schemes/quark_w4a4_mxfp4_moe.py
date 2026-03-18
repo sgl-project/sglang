@@ -74,26 +74,29 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        # Add the quantization method used (per tensor/grouped/channel)
-        # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-        )
-
-        params_dtype = torch.uint8
-
-        w13_processed, w2_processed = get_moe_weight_sizes(
+        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=True,
             is_concat=True,
             is_packed=True,
         )
 
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly
+        extra_weight_attrs.update(
+            {
+                "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
+                "weight_padded": weight_padded,
+            },
+        )
+
+        params_dtype = torch.uint8
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                w13_processed,
+                w13_up_dim,
                 hidden_size // 2,
                 dtype=params_dtype,
             ),
@@ -107,7 +110,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                w2_processed,
+                w2_down_dim,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -120,7 +123,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                w13_processed,
+                w13_up_dim,
                 hidden_size // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),

@@ -745,7 +745,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
 
-        w13_processed, w2_processed = get_moe_weight_sizes(
+        w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=True,
             is_concat=True,
@@ -802,7 +802,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    w13_processed,
+                    w13_up_dim,
                     hidden_size,
                     dtype=params_dtype,
                 ),
@@ -812,11 +812,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 torch.empty(
                     num_experts,
                     hidden_size,
-                    w2_processed,
+                    w2_up_dim,
                     dtype=params_dtype,
                 ),
                 requires_grad=False,
             )
+
+        extra_weight_attrs.update(
+            {"weight_padded": weight_padded},
+        )
 
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
