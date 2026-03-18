@@ -2012,6 +2012,7 @@ def _setup_and_run_http_server(
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            engine_info_bootstrap_port=engine_info_bootstrap_port,
         )
     )
 
