@@ -16,7 +16,8 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
-    fuse_scale_shift_gate_select01_kernel,
+    fuse_layernorm_scale_shift_gate_select01_kernel,
+    fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -26,7 +27,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_layernorm_only,
     apply_qk_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -44,15 +44,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-_is_cuda = current_platform.is_cuda()
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -808,18 +804,38 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if _is_cuda:
-                if is_scale_residual:
-                    x = gate_x * x + residual_x
-                    residual_out = x
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if not index.is_contiguous():
-                    index = index.contiguous()
-                # TODO: fuse norm with above select01 kernel, workaround now
-                x = apply_layernorm_only(x, norm_module)
-                x, gate_result = fuse_scale_shift_gate_select01_kernel(
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if not index.is_contiguous():
+                index = index.contiguous()
+            if is_scale_residual:
+                if not residual_x.is_contiguous():
+                    residual_x = residual_x.contiguous()
+                if not gate_x.is_contiguous():
+                    gate_x = gate_x.contiguous()
+                x, residual_out, gate_result = (
+                    fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+                        x,
+                        residual=residual_x,
+                        residual_gate=gate_x,
+                        weight=getattr(norm_module.norm, "weight", None),
+                        bias=getattr(norm_module.norm, "bias", None),
+                        scale0=scale0.contiguous(),
+                        shift0=shift0.contiguous(),
+                        gate0=gate0.contiguous(),
+                        scale1=scale1.contiguous(),
+                        shift1=shift1.contiguous(),
+                        gate1=gate1.contiguous(),
+                        index=index,
+                        eps=norm_module.eps,
+                    )
+                )
+                return x, residual_out, gate_result
+            else:
+                x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
                     x,
+                    weight=getattr(norm_module.norm, "weight", None),
+                    bias=getattr(norm_module.norm, "bias", None),
                     scale0=scale0.contiguous(),
                     shift0=shift0.contiguous(),
                     gate0=gate0.contiguous(),
@@ -827,32 +843,9 @@ class QwenImageTransformerBlock(nn.Module):
                     shift1=shift1.contiguous(),
                     gate1=gate1.contiguous(),
                     index=index,
+                    eps=norm_module.eps,
                 )
-                if is_scale_residual:
-                    return x, residual_out, gate_result
-                else:
-                    return x, gate_result
-            else:
-                mask = (index == 0).unsqueeze(-1)
-                shift_result = torch.where(
-                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
-                )
-                scale_result = torch.where(
-                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
-                )
-                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-                if is_scale_residual:
-                    modulated, residual_out = norm_module(
-                        residual=residual_x,
-                        x=x,
-                        gate=gate_x,
-                        shift=shift_result,
-                        scale=scale_result,
-                    )
-                    return modulated, residual_out, gate_result
-                else:
-                    modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-                    return modulated, gate_result
+                return x, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
@@ -879,7 +872,7 @@ class QwenImageTransformerBlock(nn.Module):
         temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        modulate_index: Optional[List[int]] = None,
+        modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
