@@ -75,10 +75,20 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_device_sm,
+    is_cuda,
+    is_flashinfer_available,
+    is_npu,
+    make_layers,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
+_device_sm = get_device_sm()
 
 
 class GptOssConfig(PretrainedConfig):
@@ -95,6 +105,43 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
+
+
+class MoEGate(ReplicatedLinear):
+    """
+    Router gate that uses flashinfer tinygemm_bf16 when input batch size is <= 128,
+    otherwise falls back to the standard ReplicatedLinear path.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.use_flashinfer_tinygemm = False
+        if (
+            _is_cuda
+            and _device_sm >= 90
+            and is_flashinfer_available()
+            and self.params_dtype == torch.bfloat16
+            and self.input_size % 64 == 0
+            and self.output_size % 16 == 0
+        ):
+            from flashinfer.gemm.routergemm import tinygemm_bf16
+
+            self.use_flashinfer_tinygemm = True
+            self.flashinfer_tinygemm_bf16 = tinygemm_bf16
+
+    def forward(self, x: torch.Tensor):
+        if (
+            self.use_flashinfer_tinygemm
+            and x.dtype == torch.bfloat16
+            and x.shape[0] <= 128
+        ):
+            output = torch.empty(
+                x.shape[0], self.output_size, dtype=torch.bfloat16, device=x.device
+            )
+            self.flashinfer_tinygemm_bf16(x, self.weight, output, bias=self.bias)
+            return output, None
+        return super().forward(x)
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -147,7 +194,7 @@ class GptOssSparseMoeBlock(nn.Module):
             **extra_kwargs,
         )
 
-        self.router = ReplicatedLinear(
+        self.router = MoEGate(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
