@@ -72,7 +72,7 @@ class GDNKernelDispatcher:
             self.decode_kernel = CuteDSLGDNKernel()
         elif decode_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                 FlashInferGDNKernel,
             )
@@ -91,7 +91,7 @@ class GDNKernelDispatcher:
             )
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
             if decode_backend.is_flashinfer():
                 self.extend_kernel = flashinfer_kernel
@@ -399,6 +399,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
+
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
