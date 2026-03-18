@@ -143,5 +143,8 @@ class TestInternVL35_2BTritonServer(ImageOpenAITestMixin, InternVLXPUServerBase)
         pass
 
 
+# Delete the mixin classes so that they are not collected by pytest
+del ImageOpenAITestMixin
+
 if __name__ == "__main__":
     unittest.main()

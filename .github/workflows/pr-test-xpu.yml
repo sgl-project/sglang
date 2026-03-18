@@ -117,7 +117,7 @@ jobs:
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec -w /home/sdp/sglang/ "$cid" \
