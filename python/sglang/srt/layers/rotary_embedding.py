@@ -805,6 +805,128 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         return query.flatten(-2), key.flatten(-2)
 
 
+class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
+    """MiniMax M2.5 model scaled rotary embedding with length extrapolation support.
+
+    Based on the Phi3LongRoPEScaledRotaryEmbedding implementation, but compatible with
+    MiniMax M2.5's partial rotary dimension and supports Yarn and Dynamic NTK scaling.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        original_max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_type: str,
+        scaling_factor: float,
+        **kwargs,
+    ):
+        super().__init__()
+
+        if is_neox_style is False:
+            raise ValueError(
+                "`MiniMaxLongRoPEScaledRotaryEmbedding` only supports neox_style."
+            )
+
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+        self.scaling_type = scaling_type
+        self.scaling_factor = scaling_factor
+
+        # Compute short range cache (original length)
+        short_rope = RotaryEmbedding(
+            head_size, rotary_dim, original_max_position_embeddings, base, is_neox_style, dtype
+        )
+        self.short_cos_sin_cache = short_rope.cos_sin_cache.to(dtype)
+
+        # Compute long range cache based on scaling type
+        if scaling_type == "yarn":
+            # Use existing YaRNScalingRotaryEmbedding
+            print(f"scaling_factor---: {scaling_factor}，original_max_position_embeddings: {original_max_position_embeddings}")
+            long_rope = YaRNScalingRotaryEmbedding(
+                head_size, rotary_dim, original_max_position_embeddings, base, is_neox_style,
+                scaling_factor, dtype, **kwargs
+            )
+            print(f"long_cos_sin_cache type---: {scaling_type}")
+        elif scaling_type == "dynamic":
+            # Use existing DynamicNTKScalingRotaryEmbedding
+            long_rope = DynamicNTKScalingRotaryEmbedding(
+                head_size, rotary_dim, original_max_position_embeddings, base, is_neox_style,
+                scaling_factor, dtype
+            )
+        else:
+            # Fallback to standard RoPE for long range
+            long_rope = RotaryEmbedding(
+                head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+            )
+        self.long_cos_sin_cache = long_rope.cos_sin_cache.to(dtype)
+
+        # Combine caches for efficient lookup (like Phi3LongRoPEScaledRotaryEmbedding)
+        long_short_cache = torch.cat(
+            [self.short_cos_sin_cache, self.long_cos_sin_cache], dim=0
+        )
+        self.register_buffer("long_short_cos_sin_cache", long_short_cache, persistent=False)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with dynamic position encoding switching."""
+        # Reshape query and key for consistent processing
+        query = query.unflatten(1, (-1, self.head_size))
+        key = key.unflatten(1, (-1, self.head_size))
+
+        # Handle offsets
+        if offsets is not None:
+            positions = positions + offsets
+
+        # Determine which cache to use based on position
+        k = self.original_max_position_embeddings
+        print(f"positions: {positions}")
+        long_prompt_offset = (
+            torch.any(positions > k).float() * torch.full_like(positions, k)
+        ).long()
+        idx = torch.add(positions, long_prompt_offset)
+
+        # Get cos/sin values from combined cache
+        self.long_short_cos_sin_cache = self.long_short_cos_sin_cache.to(idx.device)
+        idx = idx.flatten()
+        cos_sin = torch.index_select(self.long_short_cos_sin_cache, 0, idx)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        # Repeat and reshape cos/sin for neox style
+        cos = cos.repeat(1, 2).unsqueeze(-2)
+        sin = sin.repeat(1, 2).unsqueeze(-2)
+
+        # Apply rotary embedding to query
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = query_rot * cos + _rotate_neox(query_rot) * sin
+        query = torch.cat((query_rot, query_pass), dim=-1)
+
+        # Apply rotary embedding to key
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = key_rot * cos + _rotate_neox(key_rot) * sin
+        key = torch.cat((key_rot, key_pass), dim=-1)
+
+        # Flatten back to original shape
+        return query.flatten(-2), key.flatten(-2)
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
@@ -3533,6 +3655,31 @@ def get_rope(
                     dtype,
                     **extra_kwargs,
                 )
+        elif scaling_type == "minimax_long_rope":
+            print("---------------use minimax long rope---------------")
+            # MiniMax M2.5 specific long rope implementation
+            scaling_factor = rope_scaling.get("factor", 5.0)  # Approximately 1M / 196608
+            original_max_position = rope_scaling.get("original_max_position_embeddings", 196608)
+            sub_scaling_type = rope_scaling.get("sub_scaling_type", "yarn")
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k
+                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+            }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
+            rotary_emb = MiniMaxLongRoPEScaledRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                original_max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_type=sub_scaling_type,
+                scaling_factor=scaling_factor,
+                **extra_kwargs,
+            )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]

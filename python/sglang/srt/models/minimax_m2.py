@@ -567,7 +567,7 @@ class MiniMaxM2Attention(nn.Module):
 
         # RoPE settings - support partial RoPE
         self.rope_theta = getattr(config, "rope_theta", 10000)
-        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 196608)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
         )  # MiniMax uses rotary_dim=64
@@ -597,6 +597,17 @@ class MiniMaxM2Attention(nn.Module):
 
         # Setup RoPE with partial rotary dimension
         rope_scaling = getattr(config, "rope_scaling", None)
+        # Support for Yarn and Dynamic NTK position encodings
+        if rope_scaling is not None:
+            # For Yarn, ensure original_max_position_embeddings is set
+            if rope_scaling.get("type") == "yarn" or rope_scaling.get("rope_type") == "yarn":
+                if "original_max_position_embeddings" not in rope_scaling:
+                    rope_scaling["original_max_position_embeddings"] = 196608
+            # For Dynamic NTK, use appropriate scaling factor
+            elif rope_scaling.get("type") == "dynamic" or rope_scaling.get("rope_type") == "dynamic":
+                if "factor" not in rope_scaling:
+                    rope_scaling["factor"] = 5.0  # Approximately 1M / 196608
+        
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,  # Use partial rotary dimension
