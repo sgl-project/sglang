@@ -1,5 +1,4 @@
 import ast
-import json
 import logging
 import re
 from typing import List
@@ -12,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ class PythonicDetector(BaseFormatDetector):
                     ToolCallItem(
                         tool_index=call_index,  # Use the call index in the response, not tool position
                         name=function_name,
-                        parameters=json.dumps(arguments, ensure_ascii=False),
+                        parameters=dumps_args(arguments),
                     )
                 )
 

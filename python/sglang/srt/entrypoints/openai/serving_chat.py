@@ -1118,10 +1118,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
                     # Create a ToolCallItem from the JSON data
+                    params_json = dumps_args(tool["parameters"])
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=params_json,
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -1132,9 +1133,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=params_json,
                             ),
                         )
                     )

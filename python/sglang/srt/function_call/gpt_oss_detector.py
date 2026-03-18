@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
 logger = logging.getLogger(__name__)
@@ -234,7 +235,7 @@ class GptOssDetector(BaseFormatDetector):
         return ToolCallItem(
             tool_index=tool_index,
             name=function_name,
-            parameters=json.dumps(arguments, ensure_ascii=False),
+            parameters=dumps_args(arguments),
         )
 
     def structure_info(self) -> _GetInfoFunc:

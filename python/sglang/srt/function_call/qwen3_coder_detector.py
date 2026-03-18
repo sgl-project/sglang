@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         ToolCallItem(
                             tool_index=tool_idx,
                             name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                            parameters=dumps_args(parsed_params),
                         )
                     )
                     tool_idx += 1

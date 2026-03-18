@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class Llama32Detector(BaseFormatDetector):
         try:
             parsed = ast.literal_eval(text.strip())
             if isinstance(parsed, dict):
-                return json.dumps(parsed, ensure_ascii=False)
+                return dumps_args(parsed)
         except:
             pass
         return text

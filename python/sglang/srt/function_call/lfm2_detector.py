@@ -32,6 +32,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ class Lfm2Detector(BaseFormatDetector):
         return ToolCallItem(
             tool_index=call_index,  # Use the call index in the response, not tool position
             name=function_name,
-            parameters=json.dumps(arguments, ensure_ascii=False),
+            parameters=dumps_args(arguments),
         )
 
     def _parse_pythonic_content(
