@@ -1,3 +1,5 @@
+import concurrent.futures
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -76,6 +78,64 @@ class TestDPAttentionDP2TP2(
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
+    def test_overlap_disable_with_asymmetric_dp_load(self):
+        """Trigger extend vs decode across DP ranks to test overlap disable consistency.
+
+        Sends long-prompt requests only to rank 0 (consecutive extends) while
+        rank 1 is in decode from earlier requests. If the overlap disable
+        decision is not globally synchronized, ranks will deadlock.
+        """
+        long_prompt = "Write a very long story. " * 100
+        short_prompt = "Hi"
+
+        # Step 1: Send short requests to rank 1 so it enters decode
+        short_futures = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            for _ in range(4):
+                short_futures.append(
+                    executor.submit(
+                        requests.post,
+                        self.base_url + "/generate",
+                        json={
+                            "text": short_prompt,
+                            "sampling_params": {
+                                "max_new_tokens": 32,
+                                "temperature": 0,
+                            },
+                            "routed_dp_rank": 1,
+                        },
+                    )
+                )
+            # Brief pause to let rank 1 finish prefill and enter decode
+            time.sleep(0.5)
+
+            # Step 2: Send long-prompt requests to rank 0 (consecutive extends)
+            # while rank 1 is still generating (decode)
+            long_futures = []
+            for _ in range(4):
+                long_futures.append(
+                    executor.submit(
+                        requests.post,
+                        self.base_url + "/generate",
+                        json={
+                            "text": long_prompt,
+                            "sampling_params": {
+                                "max_new_tokens": 8,
+                                "temperature": 0,
+                            },
+                            "routed_dp_rank": 0,
+                        },
+                    )
+                )
+
+            # All requests should complete without deadlock
+            for f in short_futures + long_futures:
+                resp = f.result(timeout=60)
+                resp.raise_for_status()
+
+        # Verify server is still alive
+        self.assertIsNone(self.process.poll())
 
 
 class TestDPRetract(
