@@ -82,12 +82,14 @@ class QuarkConfig(QuantizationConfig):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
     @property
-    def quantized_layers(self) -> tuple[list[str], int]:
-        # Extract unique layer types (last part after ".")
-        layer_types = sorted(
-            set(name.split(".")[-1] for name in self._quantized_layers)
-        )
-        return layer_types, len(self._quantized_layers)
+    def quantized_layers(self) -> tuple[dict[str, int], int]:
+        # Count layers per type (last two parts after ".")
+        type_counts: dict[str, int] = {}
+        for name in self._quantized_layers:
+            parts = name.split(".")
+            layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+            type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
+        return dict(sorted(type_counts.items())), len(self._quantized_layers)
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -258,14 +260,29 @@ class QuarkConfig(QuantizationConfig):
             "re:.*embed_tokens",
         ]
 
-        # DeepSeek V3.2-specific exclusions for accuracy,
-        # adapted from https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json#L39-L41
+        # Exclusion for accuracy adapted from
+        # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
         if model_type == "deepseek_v3":
             exclude.extend(
                 [
                     "re:.*model.layers.61.*",
                     "re:.*self_attn.*",
                     "re:.*mlp.gate$",
+                ]
+            )
+        elif model_type == "qwen3_5_moe":
+            # Exclusion for accuracy adapted from
+            # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+            exclude.extend(
+                [
+                    "re:.*n_proj_a",
+                    "re:.*in_proj_b",
+                    "re:.*in_proj_qkv",
+                    "re:.*in_proj_z",
+                    "re:.*o_proj",
+                    "re:.*out_proj",
+                    "re:.*qkv_proj",
+                    "re:.*shared_expert",
                 ]
             )
 

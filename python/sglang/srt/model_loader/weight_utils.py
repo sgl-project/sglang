@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -204,7 +204,8 @@ def get_quant_config(
         hf_quant_config["hf_config"] = model_config.hf_config
 
         # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
-        hf_quant_config["requantization_method"] = model_config.quantization
+        if model_config.quantization in REQUANTIZATION_METHODS:
+            hf_quant_config["requantization_method"] = model_config.quantization
 
         return quant_cls.from_config(hf_quant_config)
 
