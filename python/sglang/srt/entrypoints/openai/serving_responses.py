@@ -258,8 +258,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         if hasattr(self.tokenizer_manager.model_config, "context_len")
                         else 4096
                     )
+                    # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
+                    # that the tokenizer_manager adds during validation
+                    num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
                     default_max_tokens = max(
-                        context_len - prompt_length, 512
+                        context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
                     sampling_params = request.to_sampling_params(
                         default_max_tokens, self.default_sampling_params
@@ -1313,7 +1316,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 context_len = getattr(
                     self.tokenizer_manager.model_config, "context_len", 4096
                 )
-                remaining_tokens = context_len - len(prompt_token_ids) - 1
+                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
+                remaining_tokens = (
+                    context_len - len(prompt_token_ids) - num_reserved_tokens
+                )
 
                 if isinstance(sampling_params, dict):
                     sampling_params["max_new_tokens"] = max(remaining_tokens, 1)

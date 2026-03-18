@@ -193,7 +193,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.ones(self.num_v_heads // self.attn_tp_size),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size),
+            torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
         )
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
@@ -397,7 +397,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter,
+                should_allreduce_fusion,
+            )
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
@@ -646,7 +651,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter,
+                should_allreduce_fusion,
+            )
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter

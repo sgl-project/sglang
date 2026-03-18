@@ -83,25 +83,6 @@ def sglang_pos_enc_rope(
     )
 
 
-def sgl_kernel_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    positions: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
-
-    head_size = q.shape[-1]
-    apply_rope_with_cos_sin_cache_inplace(
-        positions=positions,
-        query=q.view(q.shape[0], -1),
-        key=k.view(k.shape[0], -1),
-        head_size=head_size,
-        cos_sin_cache=COS_SIN_CACHE,
-        is_neox=is_neox,
-    )
-
-
 def sglang_fused_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -150,37 +131,6 @@ def jit_rope_then_store(
     )
 
 
-def sgl_kernel_fused_rope_store(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    positions: torch.Tensor,
-    out_loc: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
-
-    head_size = q.shape[-1]
-    apply_rope_with_cos_sin_cache_inplace(
-        positions=positions,
-        query=q.view(q.shape[0], -1),
-        key=k.view(k.shape[0], -1),
-        head_size=head_size,
-        cos_sin_cache=COS_SIN_CACHE,
-        is_neox=is_neox,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=v.view(v.shape[0], -1),
-            k_buffer=k_cache,
-            v_buffer=v_cache,
-            k_scale=None,
-            v_scale=None,
-            cache_loc=out_loc,
-        ),
-    )
-
-
 def jit_fused_rope_store(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -221,14 +171,13 @@ IS_NEOX_RANGE = get_benchmark_range(
 # Benchmark 1: RoPE only
 # ---------------------------------------------------------------------------
 
-ROPE_LINE_VALS = ["flashinfer", "jit_pos_enc", "sgl_kernel", "jit_fused_rope"]
+ROPE_LINE_VALS = ["flashinfer", "jit_pos_enc", "jit_fused_rope"]
 ROPE_LINE_NAMES = [
     "FlashInfer",
     "SGL JIT PosEnc",
-    "sgl-kernel",
     "SGL JIT Fused RoPE",
 ]
-ROPE_STYLES = [("green", "-."), ("red", "-"), ("orange", "-"), ("blue", "--")]
+ROPE_STYLES = [("green", "-."), ("red", "-"), ("blue", "--")]
 
 rope_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
 
@@ -270,7 +219,6 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
     FN_MAP = {
         "flashinfer": flashinfer_rope,
         "jit_pos_enc": sglang_pos_enc_rope,
-        "sgl_kernel": sgl_kernel_rope,
         "jit_fused_rope": sglang_fused_rope,
     }
     fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
@@ -281,13 +229,12 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
 # Benchmark 2: RoPE + KV cache store
 # ---------------------------------------------------------------------------
 
-STORE_LINE_VALS = ["jit_rope_then_store", "sgl_kernel_fused_store", "jit_fused_store"]
+STORE_LINE_VALS = ["jit_rope_then_store", "jit_fused_store"]
 STORE_LINE_NAMES = [
     "SGL JIT RoPE + Store",
-    "sgl-kernel Fused RoPE + Store",
     "SGL JIT Fused RoPE + Store",
 ]
-STORE_STYLES = [("red", "-"), ("orange", "-"), ("blue", "--")]
+STORE_STYLES = [("red", "-"), ("blue", "--")]
 
 store_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
 
@@ -343,7 +290,6 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
 
     FN_MAP = {
         "jit_rope_then_store": jit_rope_then_store,
-        "sgl_kernel_fused_store": sgl_kernel_fused_rope_store,
         "jit_fused_store": jit_fused_rope_store,
     }
     fn = lambda: FN_MAP[provider](
