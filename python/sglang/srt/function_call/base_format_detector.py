@@ -56,6 +56,7 @@ class BaseFormatDetector(ABC):
         """Update cached previous tool call state for the given tool_id."""
         while len(self.prev_tool_call_arr) <= tool_id:
             self.prev_tool_call_arr.append({})
+        while len(self.prev_tool_call_args_json) <= tool_id:
             self.prev_tool_call_args_json.append("")
         self.prev_tool_call_arr[tool_id] = tool_call
         self.prev_tool_call_args_json[tool_id] = args_json
