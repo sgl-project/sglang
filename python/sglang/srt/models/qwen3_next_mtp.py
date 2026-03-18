@@ -17,10 +17,12 @@
 import logging
 from typing import Iterable, Optional, Tuple
 
+import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import is_npu
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -46,6 +48,8 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        if get_global_server_args().speculative_draft_model_quantization is None:
+            quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
@@ -86,6 +90,10 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if is_npu() and self.quant_config is None:
+            # ascend mtp unquant
+            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
 
@@ -103,6 +111,10 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
                 forward_batch,
                 hidden_states,
             )
+        if is_npu() and self.quant_config is None:
+            # ascend mtp unquant
+            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

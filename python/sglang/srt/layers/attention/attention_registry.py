@@ -192,7 +192,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             HybridLinearAttnBackend,
             Mamba2AttnBackend,
         )
-        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
@@ -201,6 +200,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
+
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import AscendGDNAttnBackend as GDNAttnBackend
+        else:
+            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
