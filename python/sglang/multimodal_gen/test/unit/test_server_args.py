@@ -3,21 +3,47 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 class TestServerArgsPathExpansion(unittest.TestCase):
+    def _from_dict_without_model_resolution(self, kwargs):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            return ServerArgs.from_dict(kwargs)
+
     def test_tilde_model_path_is_expanded(self):
-        args = ServerArgs.from_dict({"model_path": "~/fake/local/model"})
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "~/fake/local/model"}
+        )
         expected = os.path.expanduser("~/fake/local/model")
         self.assertEqual(args.model_path, expected)
         self.assertFalse(args.model_path.startswith("~"))
 
     def test_absolute_path_is_unchanged(self):
-        args = ServerArgs.from_dict({"model_path": "/data/my-model"})
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/data/my-model"}
+        )
         self.assertEqual(args.model_path, "/data/my-model")
+
+    def test_component_paths_are_expanded_before_pipeline_resolution(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_paths": {"vae": "~/fake/local/vae"},
+            }
+        )
+
+        self.assertEqual(
+            args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
+        )
 
 
 class TestModelIdResolution(unittest.TestCase):
@@ -29,9 +55,6 @@ class TestModelIdResolution(unittest.TestCase):
         # --model-id tells the engine which config to use
         info = _get_config_info("/data/my-custom-qwen", model_id="Qwen-Image")
         self.assertIsNotNone(info)
-        from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-            QwenImagePipelineConfig,
-        )
 
         self.assertIs(info.pipeline_config_cls, QwenImagePipelineConfig)
 

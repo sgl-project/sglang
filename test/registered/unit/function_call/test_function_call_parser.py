@@ -3274,6 +3274,7 @@ class TestGigaChat3Detector(unittest.TestCase):
     def test_has_tool_call(self):
         """Test detection of tool call markers."""
         self.assertTrue(self.detector.has_tool_call("function call<|role_sep|>\n{}"))
+        self.assertTrue(self.detector.has_tool_call("<|function_call|>{}"))
         self.assertFalse(self.detector.has_tool_call("No tool call here"))
 
     def test_detect_and_parse_no_tool_call(self):
@@ -3687,6 +3688,134 @@ function call<|role_sep|>
         """Test streaming when JSON is split at quote boundaries."""
         chunks = [
             "<|message_sep|>\n\nfunction call<|role_sep|>\n",
+            '{"name',
+            '": "',
+            "get_weather",
+            '", "arguments',
+            '": {"city',
+            '": "',
+            "Rome",
+            '"}}',
+        ]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
+
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "Rome")
+
+    def test_detect_and_parse_function_call_marker_simple_tool_call(self):
+        """Test parsing a simple <|function_call|> tool call (GigaChat3.1-style)."""
+        text = '<|function_call|>{"name": "manage_user_memory", "arguments": {"action": "create", "id": "preferences"}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "manage_user_memory")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["action"], "create")
+        self.assertEqual(params["id"], "preferences")
+
+    def test_detect_and_parse_function_call_marker_with_content_before(self):
+        """Test parsing <|function_call|> tool call with prefix content."""
+        text = (
+            'I\'ll check that for you.<|function_call|>{"name": "get_weather", '
+            '"arguments": {"city": "Tokyo"}}'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "I'll check that for you.")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_function_call_marker_with_eos_token(self):
+        """Test parsing <|function_call|> tool call with EOS token at the end."""
+        text = '<|function_call|>{"name": "manage_user_memory", "arguments": {"action": "create", "id": "preferences"}}</s>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "manage_user_memory")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["action"], "create")
+        self.assertEqual(params["id"], "preferences")
+
+    def test_detect_and_parse_function_call_marker_invalid_json(self):
+        """Test parsing invalid JSON after <|function_call|> marker."""
+        text = '<|function_call|>{"name": "manage_user_memory", "arguments": {invalid json}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("<|function_call|>", result.normal_text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_function_call_marker_simple_tool_call(self):
+        """Test streaming parsing of the <|function_call|> marker form."""
+        chunks = [
+            "I'll help you.",
+            "<|function_call|>",
+            '{"name": "manage_user_memory", "arguments": ',
+            '{"action": "create", "id": "prefs"}}',
+        ]
+
+        accumulated_text = ""
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            accumulated_text += result.normal_text
+
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(accumulated_text, "I'll help you.")
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
+
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["action"], "create")
+        self.assertEqual(params["id"], "prefs")
+
+    def test_streaming_function_call_marker_json_split_at_quotes(self):
+        """Test streaming when JSON is split at quote boundaries (<|function_call|>)."""
+        chunks = [
+            "<|function_call|>",
             '{"name',
             '": "',
             "get_weather",
