@@ -5,10 +5,12 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.dump_loader import (
+    LOAD_FAILED,
     ValueWithMeta,
     _add_duplicate_index,
     _cast_to_polars_dtype,
     find_row,
+    parse_meta_from_filename,
     read_meta,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -92,8 +94,34 @@ class TestValueWithMeta:
         path.write_text("not a valid pt file")
 
         loaded = ValueWithMeta.load(path)
-        assert loaded.value is None
+        assert loaded.value is LOAD_FAILED
         assert loaded.meta["name"] == "bad"
+
+
+class TestRecomputeStatusParsing:
+    def test_parse_recompute_status_from_filename(self) -> None:
+        from pathlib import Path
+
+        meta_disabled = parse_meta_from_filename(
+            Path(
+                "step=0___rank=0___dump_index=1___name=x___recompute_status=disabled.pt"
+            )
+        )
+        assert meta_disabled["recompute_status"] == "disabled"
+
+        meta_recompute = parse_meta_from_filename(
+            Path(
+                "step=0___rank=0___dump_index=1___name=x___recompute_status=recompute.pt"
+            )
+        )
+        assert meta_recompute["recompute_status"] == "recompute"
+
+        meta_original = parse_meta_from_filename(
+            Path(
+                "step=0___rank=0___dump_index=1___name=x___recompute_status=original.pt"
+            )
+        )
+        assert meta_original["recompute_status"] == "original"
 
 
 if __name__ == "__main__":

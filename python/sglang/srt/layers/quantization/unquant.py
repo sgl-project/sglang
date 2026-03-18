@@ -58,6 +58,7 @@ if _is_npu:
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
@@ -384,6 +385,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                activation_type=(
+                    ActivationType.Relu2
+                    if moe_runner_config.activation == "relu2"
+                    else ActivationType.Swiglu
+                ),
             )[0]
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
@@ -546,7 +552,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
+        # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
         original_dtype = x.dtype
@@ -554,10 +562,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
-        top_k = layer.top_k
-
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
+        top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
             torch.ops.npu.npu_moe_init_routing_v2(

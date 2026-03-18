@@ -28,6 +28,10 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import (
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -44,6 +48,7 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
@@ -71,6 +76,27 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
+    elif use_int4_w4a16:
+        w1 = torch.randint(
+            0,
+            255,
+            (
+                num_experts,
+                shard_intermediate_size,
+                hidden_size // 2,
+            ),
+            dtype=torch.uint8,
+        )
+        w2 = torch.randint(
+            0,
+            255,
+            (
+                num_experts,
+                hidden_size,
+                shard_intermediate_size // 4,
+            ),
+            dtype=torch.uint8,
+        )
     else:
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
@@ -89,6 +115,19 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+    if use_int4_w4a16:
+        block_n = 1 if (block_shape[0] == 0) else block_shape[0]
+        block_k = block_shape[1]
+        n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
+        n_tiles_w2 = (hidden_size + block_n - 1) // block_n
+        k_tiles_w1 = (hidden_size + block_k - 1) // block_k
+        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+        w1_scale = torch.randn(
+            (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
+        )
+        w2_scale = torch.randn(
+            (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.bfloat16
+        )
     if use_fp8_w8a8 or use_int8_w8a8:
         if use_int8_w8a8 and block_shape is None:
             w1_scale = torch.randn(
@@ -146,6 +185,7 @@ def benchmark_config(
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
@@ -195,13 +235,14 @@ def benchmark_config(
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
 
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, server_args: ServerArgs) -> None:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
         self.device_id = int(ray.get_gpu_ids()[0])
+        set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
         self,
@@ -214,20 +255,27 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
-            dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
+            dtype,
+            use_int8_w8a16=use_int8_w8a16,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int4_w4a16=use_int4_w4a16,
         )
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
+        N = shard_intermediate_size // 2
+        if use_int4_w4a16:
+            N = N // 2
         op_config = get_moe_configs(
             num_experts,
-            shard_intermediate_size // 2,
+            N,
             dtype_str,
             block_n,
             block_k,
@@ -258,6 +306,7 @@ class BenchmarkWorker:
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
+                use_int4_w4a16,
                 per_channel_quant,
                 block_shape,
             )
@@ -274,6 +323,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
@@ -294,6 +344,7 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
+                        use_int4_w4a16,
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
@@ -312,7 +363,9 @@ class BenchmarkWorker:
 
 
 def main(args: argparse.Namespace):
-    print(args)
+    server_args = ServerArgs(
+        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
+    )
 
     model_config = get_model_config(
         args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
@@ -328,6 +381,7 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    use_int4_w4a16 = args.dtype == "int4_w4a16"
     per_channel_quant = args.per_channel_quant
 
     if args.batch_size is None:
@@ -337,7 +391,7 @@ def main(args: argparse.Namespace):
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
 
     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
         outputs = []
@@ -369,6 +423,7 @@ def main(args: argparse.Namespace):
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a16,
             per_channel_quant,
             block_shape,
         )
@@ -390,6 +445,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
+                    use_int4_w4a16,
                     per_channel_quant,
                     block_shape,
                     search_space,
@@ -420,6 +476,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
+                    use_int4_w4a16,
                     per_channel_quant,
                     block_shape,
                 )
@@ -442,7 +499,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
         default="auto",
     )
     parser.add_argument(

@@ -54,7 +54,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -150,6 +153,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -220,6 +224,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
+        self.is_nextn = is_nextn
 
     def get_moe_weights(self):
         return [
@@ -262,8 +267,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if not self.is_nextn
+                    else None
                 ),
             )
         else:
@@ -304,6 +313,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -329,7 +339,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -642,7 +657,7 @@ class Qwen2MoeModel(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if get_global_server_args().enable_piecewise_cuda_graph
+                    if not get_global_server_args().disable_piecewise_cuda_graph
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:

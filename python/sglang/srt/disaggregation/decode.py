@@ -24,7 +24,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -64,7 +65,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.server_args import ServerArgs
 
-CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -82,6 +82,11 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
         req.bootstrap_host is None
         and server_args.disaggregation_transfer_backend == "fake"
     )
+
+
+def _bootstrap_addr(req: Req) -> str:
+    # FIXME: make a property of a req
+    return f"{req.bootstrap_host}:{req.bootstrap_port}"
 
 
 class DecodeReqToTokenPool:
@@ -128,15 +133,17 @@ class DecodeReqToTokenPool:
         return len(self.free_slots)
 
     def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
-        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        # Indices of reqs that already have a req_pool_idx and will reuse
+        # their existing slot (e.g. chunked prefill continuing across chunks).
+        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         assert (
-            len(chunked) <= 1
+            len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
-        ), "request has req_pool_idx but is not chunked"
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+        ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(chunked)
+        need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -169,6 +176,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
+        enable_overlap_schedule: bool,
         mamba_size: int = None,
     ):
         DecodeReqToTokenPool.__init__(
@@ -179,9 +187,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         effective_mamba_size = (
@@ -235,7 +242,6 @@ class DecodePreallocQueue:
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
-        prefill_pp_size: int,
         pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
@@ -257,7 +263,6 @@ class DecodePreallocQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
-        self.prefill_pp_size = prefill_pp_size
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
@@ -265,7 +270,8 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
-        self.prefill_pp_size = prefill_pp_size
+        self._ensure_retry_count: Dict[str, int] = {}
+        self._max_ensure_retries: int = 30  # scheduling cycles
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -282,10 +288,8 @@ class DecodePreallocQueue:
         attn_tp_size = get_attention_tp_size()
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
-        kv_args.decode_tp_size = attn_tp_size
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -355,22 +359,23 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is None:
-                self.pending_reqs.append(req)
+            # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
+            if _is_fake_transfer(req, self.scheduler.server_args):
+                self._create_receiver_and_enqueue(req, 0)
                 return
-            self._create_receiver_and_enqueue(req, prefill_dp_rank)
+
+            # Fast path: cache-only lookup, no network calls
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                self._create_receiver_and_enqueue(req, prefill_dp_rank)
+            else:
+                self.pending_reqs.append(req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
             return req.disagg_prefill_dp_rank
 
-        if _is_fake_transfer(req, self.scheduler.server_args):
-            return 0
-
-        bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
-
-        prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         if prefill_info is None:
             return None
 
@@ -392,7 +397,7 @@ class DecodePreallocQueue:
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
             prefill_dp_rank=prefill_dp_rank,
         )
@@ -478,6 +483,7 @@ class DecodePreallocQueue:
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -495,47 +501,78 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _ensure_prefill_info(
+        self, addr_to_reqs: Dict[str, List[Req]]
+    ) -> Tuple[Dict[str, List[Req]], List[Req]]:
+        """Non-blocking ensure parallel info for each addr.
+        Returns (ready_addrs, remaining_reqs)."""
+        ready: Dict[str, List[Req]] = {}
+        remaining: List[Req] = []
+
+        for bootstrap_addr, reqs in addr_to_reqs.items():
+            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+                if bootstrap_addr in self._ensure_retry_count:
+                    del self._ensure_retry_count[bootstrap_addr]
+                ready[bootstrap_addr] = reqs
+                continue
+
+            count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
+            self._ensure_retry_count[bootstrap_addr] = count
+
+            if count >= self._max_ensure_retries:
+                error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
+                logger.error(error_msg)
+                for req in reqs:
+                    prepare_abort(
+                        req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    self.scheduler.stream_output([req], req.return_logprob)
+                del self._ensure_retry_count[bootstrap_addr]
+            else:
+                remaining.extend(reqs)
+
+        return ready, remaining
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
             return
 
-        bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
-
-        # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the prefill_dp_ranks
-        # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving it.
-        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-            return
-
-        resolved = []
-        need_query = []
+        # Group pending requests by bootstrap_addr
+        addr_to_reqs: Dict[str, List[Req]] = {}
         for req in self.pending_reqs:
-            # NOTE: we need resolve it again because we may ensure the parallel info here
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is not None:
-                resolved.append((req, prefill_dp_rank))
-            else:
-                need_query.append(req)
+            addr = _bootstrap_addr(req)
+            addr_to_reqs.setdefault(addr, []).append(req)
 
-        if need_query:
-            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+        # Pass 1: ensure parallel info for each addr
+        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-            rooms = [req.bootstrap_room for req in need_query]
-            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                bootstrap_addr, rooms
-            )
-            remaining = []
-            for req in need_query:
-                room_key = str(req.bootstrap_room)
-                if room_key in room_to_rank:
-                    resolved.append((req, int(room_to_rank[room_key])))
+        # Pass 2: resolve dp rank for addrs whose info is available
+        resolved = []
+        for bootstrap_addr, reqs in ready_addrs.items():
+            need_query: List[Req] = []
+            for req in reqs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                if prefill_dp_rank is not None:
+                    resolved.append((req, prefill_dp_rank))
                 else:
-                    remaining.append(req)
-            self.pending_reqs = remaining
-        else:
-            self.pending_reqs = []
+                    need_query.append(req)
+
+            if need_query:
+                rooms = [req.bootstrap_room for req in need_query]
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr, rooms
+                )
+                for req in need_query:
+                    prefill_dp_rank = room_to_rank.get(str(req.bootstrap_room))
+                    if prefill_dp_rank is not None:
+                        resolved.append((req, int(prefill_dp_rank)))
+                    else:
+                        remaining.append(req)
+
+        self.pending_reqs = remaining
 
         for req, prefill_dp_rank in resolved:
             self._create_receiver_and_enqueue(req, prefill_dp_rank)
@@ -1033,39 +1070,27 @@ class SchedulerDisaggregationDecodeMixin:
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        """Create fake completed prefill if possible and merge with running batch"""
-        # Merge the prefill batch into the running batch
-        last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_prebuilt():
-            # chunked prefill doesn't happen in decode instance.
-            assert self.chunked_req is None
-            # Filter finished batches.
-            last_batch.filter_batch()
-            if not last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = last_batch
-                else:
-                    # merge running_batch with prefill batch
-                    self.running_batch.merge_batch(last_batch)
-
+        """Process prebuilt batch and schedule the next decode batch."""
+        # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
-
-        ret: Optional[ScheduleBatch] = None
         if new_prebuilt_batch:
-            ret = new_prebuilt_batch
+            assert self.chunked_req is None
+            self.process_batch_result_prebuilt(new_prebuilt_batch)
+            new_prebuilt_batch.filter_batch()
+            if not new_prebuilt_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = new_prebuilt_batch
+                else:
+                    self.running_batch.merge_batch(new_prebuilt_batch)
+
+        # Schedule decode batch
+        if self.running_batch.is_empty():
+            ret = None
         else:
-            if self.running_batch.is_empty():
-                ret = None
-            else:
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+            self.running_batch = self.update_running_batch(self.running_batch)
+            ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        # 1. decode + None -> decode + idle
-        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
-        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
-        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
         ret = self.maybe_prepare_mlp_sync_batch(ret)
-
         if ret:
             set_schedule_time_batch(ret)
         return ret

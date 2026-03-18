@@ -442,7 +442,15 @@ def sample_generated_shared_prefix_requests(
     disable_shuffle: bool = False,
 ) -> SampleOutput:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    cache_path = get_gen_prefix_cache_path(
+        args.seed,
+        num_groups,
+        prompts_per_group,
+        system_prompt_len,
+        question_len,
+        output_len,
+        tokenizer,
+    )
 
     # Try to load from cache first
     if cache_path.exists():

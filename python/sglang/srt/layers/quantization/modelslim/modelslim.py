@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
+    ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
@@ -152,6 +153,9 @@ class ModelSlimConfig(QuantizationConfig):
                 key = "vision_model"
             elif "visual" in prefix:
                 key = "visual"
+            if "vision_tower" in prefix or "mm_projector" in prefix:
+                prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
+                prefix = prefix.replace(r"attn.proj", r"wo")
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
@@ -211,7 +215,11 @@ class ModelSlimConfig(QuantizationConfig):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
 
-        prefix_in_quant_config = prefix + ".0.down_proj.weight"
+        prefix_in_quant_config = prefix + ".0.gate_proj.weight"
+        is_moe_w4a4_dynamic = (
+            self.quant_description.get(prefix_in_quant_config, "STATIC")
+            == "W4A4_DYNAMIC"
+        )
         is_moe_w4a8_dynamic = (
             self.quant_description.get(prefix_in_quant_config, "STATIC")
             == "W4A8_DYNAMIC"
@@ -220,7 +228,10 @@ class ModelSlimConfig(QuantizationConfig):
             self.quant_description.get(prefix_in_quant_config, "STATIC")
             == "W8A8_DYNAMIC"
         )
-        if is_moe_w4a8_dynamic:
+        if is_moe_w4a4_dynamic:
+            logger.info_once("Using ModelSlimW4A4Int4MoE")
+            return ModelSlimW4A4Int4MoE(self)
+        elif is_moe_w4a8_dynamic:
             logger.info_once("Using ModelSlimW4A8Int8MoE")
             return ModelSlimW4A8Int8MoE(self)
         elif is_moe_w8a8_dynamic:
@@ -239,15 +250,6 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
-        if not hasattr(self, "_quant_description_normalized"):
-            quant_description = {}
-            for prefix_, value in self.quant_description.items():
-                prefix_ = prefix_.replace("language_model.", "")
-                if "visual" in prefix_:
-                    prefix_ = prefix_.replace("model.", "")
-                quant_description[prefix_] = value
-            self.quant_description = quant_description
-            self._quant_description_normalized = True
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)

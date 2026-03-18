@@ -17,14 +17,17 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 
 ## When to use JIT vs AOT (`sgl-kernel`)
 
-- **JIT (`jit_kernel`)**: lightweight, few dependencies, rapid iteration, compiled on first use
-- **AOT (`sgl-kernel`)**: depends on CUTLASS / FlashInfer / DeepGEMM, needs pre-built wheel
+- **JIT (`jit_kernel`)**: prefer this first for kernels that do **not** depend on CUTLASS or another large C++ project. It is the default choice for lightweight kernels that benefit from rapid iteration and first-use compilation.
+- **AOT (`sgl-kernel`)**: prefer this when the kernel **does** depend on CUTLASS or another large C++ project, or when it should live in `sgl-kernel/` and participate in the wheel build / torch op registration flow.
+- **Exception**: kernels that depend on `flashinfer`, or on CUTLASS that is already provided through `flashinfer`, can still be implemented as `jit_kernel`.
 
 ---
 
 ## Common Abstractions in `python/sglang/jit_kernel/include/sgl_kernel/`
 
 **Always prefer these abstractions over raw CUDA primitives.** They provide safety, readability, and consistency with the rest of the codebase.
+
+**Important include rule:** for every `#include <sgl_kernel/...>` line, add a short trailing comment explaining why that header is included (for example `// For TensorMatcher, SymbolicSize, SymbolicDevice`). This matches the current JIT kernel style and keeps include usage self-documenting.
 
 ### `utils.h` — Host-side utilities
 
@@ -80,7 +83,7 @@ auto device = SymbolicDevice{};
 device.set_options<kDLCUDA>();
 TensorMatcher({N})  //
     .with_dtype<fp16_t>()
-    .with_device(device)
+    .with_device<kDLCUDA>(device)
     .verify(dst)
     .verify(src);  // same shape, dtype, device as dst
 const size_t n = N.unwrap();
@@ -95,7 +98,8 @@ const DLDevice dev = device.unwrap();
 
 - **`dtype_trait<T>`** — Static trait struct for each scalar type. Provides:
   - `dtype_trait<T>::from(value)` — convert from another type (e.g. `fp32_t` → `fp16_t`)
-  - `dtype_trait<T>::abs/sqrt/rsqrt/max/min(x)` — type-dispatched math (for `fp32_t`)
+  - `dtype_trait<T>::abs/sqrt/rsqrt/exp/sin/cos(x)` — type-dispatched unary math (primarily for `fp32_t`)
+  - `dtype_trait<T>::max/min(x, y)` — type-dispatched binary math (primarily for `fp32_t`)
 - **`packed_t<T>`** — Two-element packed alias: `packed_t<fp16_t>` = `fp16x2_t`, `packed_t<bf16_t>` = `bf16x2_t`, `packed_t<fp32_t>` = `fp32x2_t`. Use for vectorized loads/stores.
 - **`device::cast<To, From>(value)`** — Type-safe cast using `dtype_trait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
 
@@ -105,7 +109,7 @@ const DLDevice dev = device.unwrap();
 #include <sgl_kernel/vec.cuh>
 ```
 
-- **`device::AlignedVector<T, N>`** — Aligned storage for N elements of type T. N must be a power of two, `sizeof(T)*N <= 32`. Enables 128-bit vector loads/stores for bandwidth efficiency.
+- **`device::AlignedVector<T, N>`** — Aligned storage for N elements of type T. N must be a power of two, `sizeof(T)*N <= 32`. Enables vectorized loads/stores for bandwidth efficiency. In terms of API/codegen constraints, the upper bound is 256-bit; in practice, 128-bit is the portable default, while 256-bit vectorization is typically only viable on `SM100+` and should be gated by an architecture check when needed.
   - `.load(ptr, offset)` — vectorized load from `ptr[offset]`
   - `.store(ptr, offset)` — vectorized store to `ptr[offset]`
   - `.fill(value)` — fill all lanes
@@ -117,10 +121,13 @@ const DLDevice dev = device.unwrap();
 #include <sgl_kernel/tile.cuh>
 ```
 
-- **`device::tile::Memory<T>::cta(blockDim.x)`** — Creates a tile accessor where each thread handles `tid = threadIdx.x` with stride `blockDim.x`. Common for loops over a 1D array.
-- **`.load(ptr, offset)`** — loads `ptr[tid + offset * blockDim.x]`
-- **`.store(ptr, val, offset)`** — stores to `ptr[tid + offset * blockDim.x]`
+- `tile::Memory<T>` is fundamentally a **1D cooperative accessor** over a contiguous region.
+- **`device::tile::Memory<T>::cta(blockDim.x)`** — Creates a tile accessor where each thread handles `tid = threadIdx.x` with stride `tsize` (for `cta(blockDim.x)`, this is `blockDim.x`). Common for loops over a 1D array.
+- **`.load(ptr, offset)`** — loads `ptr[tid + offset * tsize]`
+- **`.store(ptr, val, offset)`** — stores to `ptr[tid + offset * tsize]`
 - **`.in_bound(n, offset)`** — boundary check
+
+For a **2D tile**, either flatten `(row, col)` into a linear tile index first, or compute the address manually with `ptr[row * stride + col]` using your thread/block coordinates.
 
 ### `math.cuh` — Device math (`device::math::`)
 
@@ -128,8 +135,8 @@ const DLDevice dev = device.unwrap();
 #include <sgl_kernel/math.cuh>
 ```
 
-- `device::math::max/min/abs/sqrt/rsqrt<T>(a, b)` — type-dispatched math via `dtype_trait`
-- `device::math::exp/sin/cos(float)` — fast float math wrappers
+- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `dtype_trait`
+- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `dtype_trait`
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -191,11 +198,11 @@ Create `python/sglang/jit_kernel/csrc/elementwise/scale.cuh`.
 The implementation fully uses the project abstractions described above:
 
 ```cpp
-#include <sgl_kernel/tensor.h>   // TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/type.cuh>   // dtype_trait, fp16_t, bf16_t, fp32_t
-#include <sgl_kernel/utils.h>    // RuntimeCheck, div_ceil
-#include <sgl_kernel/utils.cuh>  // LaunchKernel, SGL_DEVICE
-#include <sgl_kernel/vec.cuh>    // AlignedVector
+#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/type.cuh>   // For dtype_trait, fp16_t, bf16_t, fp32_t
+#include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -257,7 +264,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 
   TensorMatcher({N})  //
       .with_dtype<T>()
-      .with_device(device_)
+      .with_device<kDLCUDA>(device_)
       .verify(dst)
       .verify(src);  // same shape / dtype / device as dst
 
@@ -292,6 +299,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 **Key points:**
 
 - Include headers from `sgl_kernel/` — **not** raw CUDA headers for anything already covered
+- Add a short trailing `// For ...` explanation to every `#include <sgl_kernel/...>` line
 - Use `TensorMatcher` for all tensor validation; never manually check shape/dtype/device
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
@@ -446,13 +454,7 @@ def test_scale_unsupported_dtype():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
-```
-
-Run:
-
-```bash
-pytest python/sglang/jit_kernel/tests/test_scale.py -q
+    pytest.main([__file__, "-v", "-s"])
 ```
 
 ---

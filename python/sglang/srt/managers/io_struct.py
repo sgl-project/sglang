@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -226,8 +226,8 @@ class GenerateReqInput(BaseReq):
     received_time: Optional[float] = None
 
     # For EPD-disaggregated inference
-    need_wait_for_image: Optional[bool] = None
-    num_items_assigned: Optional[List] = None
+    need_wait_for_mm_inputs: Optional[bool] = None
+    num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -731,8 +731,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    need_wait_for_image: bool = False
-    num_items_assigned: Optional[List] = None
+    need_wait_for_mm_inputs: bool = False
+    num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
@@ -1229,6 +1229,21 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class PinPrefixReqInput(BaseReq):
+    """Pin a prefix by token_ids to resist eviction."""
+
+    token_ids: List[int] = field(default_factory=list)
+    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
+
+
+@dataclass
+class PinPrefixReqOutput(BaseReq):
+    success: bool
+    nodes_pinned: int = 0
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
@@ -1337,6 +1352,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
 
 
 @dataclass
@@ -1399,6 +1416,19 @@ class SendWeightsToRemoteInstanceReqInput(BaseReq):
 class SendWeightsToRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class UpdateExpertBackupReq(BaseReq):
+    pass
+
+
+@dataclass
+class BackupDramReq(BaseReq):
+    rank: int
+    weight_pointer_map: Dict[str, Any]
+    session_id: str
+    buffer_size: int
 
 
 @dataclass
@@ -1610,6 +1640,8 @@ class ConfigureLoggingReq(BaseReq):
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
 
 
 @dataclass
@@ -1734,6 +1766,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
+    load_format: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(

@@ -20,15 +20,17 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A beautiful sunset over the mountains"
 ```
 
-## Diffusers Backend Configuration
+## Diffusers Backend
 
 Cache-DiT supports loading acceleration configs from a custom YAML file. For
-diffusers pipelines, pass the YAML/JSON path via `--cache-dit-config`. This
+diffusers pipelines (`diffusers` backend), pass the YAML/JSON path via `--cache-dit-config`. This
 flow requires cache-dit >= 1.2.0 (`cache_dit.load_configs`).
 
 ### Single GPU inference
 
-Define a `config.yaml` file that contains:
+Define a `cache.yaml` file that contains:
+
+- DBCache + TaylorSeer
 
 ```yaml
 cache_config:
@@ -46,15 +48,150 @@ cache_config:
 Then apply the config with:
 
 ```bash
-sglang generate --backend diffusers \
+sglang generate \
+  --backend diffusers \
   --model-path Qwen/Qwen-Image \
-  --cache-dit-config config.yaml \
+  --cache-dit-config cache.yaml \
   --prompt "A beautiful sunset over the mountains"
+```
+
+- DBCache + TaylorSeer + SCM (Step Computation Mask)
+
+```yaml
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+  # Must set the num_inference_steps for SCM. The SCM will automatically
+  # generate the steps computation mask based on the num_inference_steps.
+  # Reference: https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#scm-steps-computation-masking
+  num_inference_steps: 28
+  steps_computation_mask: fast
+```
+
+- DBCache + TaylorSeer + SCM (Step Computation Mask) + Cache CFG
+
+```yaml
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+  num_inference_steps: 28
+  steps_computation_mask: fast
+  enable_sperate_cfg: true # e.g, Qwen-Image, Wan, Chroma, Ovis-Image, etc.
 ```
 
 ### Distributed inference
 
-Define a `parallel_config.yaml` file that contains:
+- 1D Parallelism
+
+Define a parallelism only config yaml `parallel.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+```
+
+Then, apply the distributed inference acceleration config from yaml. `ulysses_size: auto` means that cache-dit will auto detect the `world_size` as the ulysses_size. Otherwise, you should manually set it as specific int number, e.g, 4.
+
+Then apply the distributed config with: (Note: please add `--num-gpus N` to specify the number of gpus for distributed inference)
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config parallel.yaml \
+  --prompt "A futuristic cityscape at sunset"
+```
+
+- 2D Parallelism
+
+You can also define a 2D parallelism config yaml `parallel_2d.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  tp_size: 2
+  attention_backend: native
+```
+Then, apply the 2D parallelism config from yaml. Here `tp_size: 2` means using tensor parallelism with size 2. The `ulysses_size: auto` means that cache-dit will auto detect the `world_size // tp_size` as the ulysses_size.
+
+- 3D Parallelism
+
+You can also define a 3D parallelism config yaml `parallel_3d.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: 2
+  ring_size: 2
+  tp_size: 2
+  attention_backend: native
+```
+Then, apply the 3D parallelism config from yaml. Here `ulysses_size: 2`, `ring_size: 2`, `tp_size: 2` means using ulysses parallelism with size 2, ring parallelism with size 2 and tensor parallelism with size 2.
+
+- Ulysses Anything Attention
+
+To enable Ulysses Anything Attention, you can define a parallelism config yaml `parallel_uaa.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_anything: true
+```
+
+- Ulysses FP8 Communication
+
+For device that don't have NVLink support, you can enable Ulysses FP8 Communication to further reduce the communication overhead. You can define a parallelism config yaml `parallel_fp8.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_float8: true
+```
+
+- Async Ulysses CP
+
+You can also enable async ulysses CP to overlap the communication and computation. Define a parallelism config yaml `parallel_async.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_async: true # Now, only support for FLUX.1, Qwen-Image, Ovis-Image and Z-Image.
+```
+Then, apply the config from yaml. Here `ulysses_async: true` means enabling async ulysses CP.
+
+- TE-P and VAE-P
+
+You can also specify the extra parallel modules in the yaml config. For example, define a parallelism config yaml `parallel_extra.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
+```
+
+
+### Hybrid Cache and Parallelism
+
+Define a hybrid cache and parallel acceleration config yaml `hybrid.yaml` file that contains:
 
 ```yaml
 cache_config:
@@ -69,22 +206,86 @@ cache_config:
   taylorseer_order: 1
 parallelism_config:
   ulysses_size: auto
-  parallel_kwargs:
-    attention_backend: native
-    extra_parallel_modules: ["text_encoder", "vae"]
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
 ```
 
-`ulysses_size: auto` means cache-dit will auto-detect the world_size. Otherwise,
-set it to a specific integer (e.g., `4`).
-
-Then apply the distributed config with:
+Then, apply the hybrid cache and parallel acceleration config from yaml.
 
 ```bash
-sglang generate --backend diffusers \
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
   --model-path Qwen/Qwen-Image \
-  --cache-dit-config parallel_config.yaml \
-  --prompt "A futuristic cityscape at sunset"
+  --cache-dit-config hybrid.yaml \
+  --prompt "A beautiful sunset over the mountains"
 ```
+
+### Attention Backend
+
+In some cases, users may want to only specify the attention backend without any other optimization configs. In this case, you can define a yaml file `attention.yaml` that only contains:
+
+```yaml
+attention_backend: "flash" # '_flash_3' for Hopper
+```
+
+### Quantization
+
+You can also specify the quantization config in the yaml file, required `torchao>=0.16.0`. For example, define a yaml file `quantize.yaml` that contains:
+
+```yaml
+quantize_config: # quantization configuration for transformer modules
+  # float8 (DQ), float8_weight_only, float8_blockwise, int8 (DQ), int8_weight_only, etc.
+  quant_type: "float8"
+  # layers to exclude from quantization (transformer). layers that contains any of the
+  # keywords in the exclude_layers list will be excluded from quantization. This is useful
+  # for some sensitive layers that are not robust to quantization, e.g., embedding layers.
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false # whether to print verbose logs during quantization
+```
+Then, apply the quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization. For example:
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --model-path Qwen/Qwen-Image \
+  --warmup \
+  --cache-dit-config quantize.yaml \
+  --enable-torch-compile \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+### Combined Configs: Cache + Parallelism + Quantization
+
+You can also combine all the above configs together in a single yaml file `combined.yaml` that contains:
+
+```yaml
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
+quantize_config:
+  quant_type: "float8"
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false
+```
+Then, apply the combined cache, parallelism and quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization.
 
 ## Advanced Configuration
 
@@ -206,14 +407,6 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 ## Troubleshooting
 
-### Distributed environment warning
-
-```
-WARNING: cache-dit is disabled in distributed environment (world_size=N)
-```
-
-This is expected behavior. Cache-DiT currently only supports single-GPU inference.
-
 ### SCM disabled for low step count
 
 For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
@@ -221,5 +414,5 @@ acceleration still works.
 
 ## References
 
-- [Cache-Dit](https://github.com/vipshop/cache-dit)
+- [Cache-DiT](https://github.com/vipshop/cache-dit)
 - [SGLang Diffusion](../index.md)

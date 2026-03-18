@@ -123,9 +123,15 @@ def npu_format_cast(
     if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
         return tensor
 
-    import torch_npu
-
-    return torch_npu.npu_format_cast(tensor, acl_format.value)
+    if tensor.device == torch.device("cpu"):
+        logger.warning_once(
+            "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
+            "Please disable offloading, otherwise the performance will be "
+            "significantly reduced."
+        )
+        return tensor
+    else:
+        return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():

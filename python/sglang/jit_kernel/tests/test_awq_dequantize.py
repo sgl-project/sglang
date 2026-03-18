@@ -161,4 +161,4 @@ def test_awq_dequantize_jit_vs_aot(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v", "-s"])

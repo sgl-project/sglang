@@ -8,7 +8,7 @@ from utils import (
     precision,
 )
 
-from sglang.srt.layers.rotary_embedding import _apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.test.test_utils import CustomTestCase
 
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
@@ -46,8 +46,8 @@ def rotary_emb(q_pe, k_pe, pos, cos_sin_cache):
     key_rot = k_pe[..., :rotary_dim]
     cos_sin = cos_sin_cache[pos]
     cos, sin = cos_sin.chunk(2, dim=-1)
-    query_rot = _apply_rotary_emb(query_rot, cos, sin, False)
-    key_rot = _apply_rotary_emb(key_rot, cos, sin, False)
+    query_rot = apply_rotary_emb(query_rot, cos, sin, False)
+    key_rot = apply_rotary_emb(key_rot, cos, sin, False)
     return query_rot.to(orig_dtype), key_rot.to(orig_dtype)
 
 

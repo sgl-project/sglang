@@ -294,7 +294,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertIn("tools", rows[1].extra_request_body)
 
     def test_generated_shared_prefix_sampler(self):
-        args = make_args(gsp_range_ratio=0.0, gsp_num_groups=2, gsp_prompts_per_group=2)
+        args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -303,7 +303,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             output_len=args.gsp_output_len,
             range_ratio=args.gsp_range_ratio,
             tokenizer=self.tokenizer,
-            args=args,
+            seed=args.seed,
         )
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
@@ -415,6 +415,15 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             mmmu_args = make_args(dataset_name="mmmu", num_prompts=1)
             mmmu_rows = get_dataset(mmmu_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(mmmu_rows), 1)
+
+        gsp_args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=2,
+            gsp_prompts_per_group=2,
+        )
+        gsp_rows = get_dataset(gsp_args, self.tokenizer, model_id="dummy-model")
+        self.assertEqual(len(gsp_rows), 4)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in gsp_rows))
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
