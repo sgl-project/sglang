@@ -1170,6 +1170,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             return False
 
         # Initialize Wan-specific parameters
+        teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
         num_steps = ctx.num_inference_steps
 
