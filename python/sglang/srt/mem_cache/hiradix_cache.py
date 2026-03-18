@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     IncLockRefResult,
+    InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -1066,11 +1067,10 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
-        mem_quota: Optional[int] = None,
+        params: InitLoadBackParams,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -1093,6 +1093,9 @@ class HiRadixCache(RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         return self.cache_controller.start_loading()
+
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()

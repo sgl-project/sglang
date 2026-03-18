@@ -416,6 +416,11 @@ class NetworkAddress:
     host: str
     port: int
 
+    def __post_init__(self):
+        # Auto-strip IPv6 brackets so callers can pass "[::1]" or "::1"
+        if self.host.startswith("[") and self.host.endswith("]"):
+            object.__setattr__(self, "host", self.host[1:-1])
+
     @property
     def is_ipv6(self) -> bool:
         return _is_ipv6(self.host)
@@ -435,6 +440,26 @@ class NetworkAddress:
     def to_host_port_str(self) -> str:
         """``host:port`` string for gRPC listen address, session IDs, logs."""
         return f"{_wrap(self.host)}:{self.port}"
+
+    @staticmethod
+    def resolve_host(host: str) -> str:
+        """Return *host* as-is if it's an IP, otherwise DNS-resolve to one."""
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+        try:
+            return socket.getaddrinfo(
+                host, None, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG
+            )[0][4][0]
+        except socket.gaierror as e:
+            raise ValueError(f"Cannot resolve host {host!r}: {e}") from e
+
+    def resolved(self) -> NetworkAddress:
+        """DNS-resolve hostname to IP; return self if already an IP."""
+        ip = self.resolve_host(self.host)
+        return self if ip == self.host else NetworkAddress(ip, self.port)
 
     def to_bind_tuple(self) -> Tuple[str, int]:
         """Raw ``(host, port)`` tuple for ``socket.bind()`` / ``socket.connect()``.
@@ -491,17 +516,6 @@ class NetworkAddress:
                 f"Use [{host}]:{port_str} instead."
             )
         return NetworkAddress(host, _parse_port(port_str))
-
-    @staticmethod
-    def from_parts(host: str, port: int) -> NetworkAddress:
-        """Create from separate host and port, stripping brackets if present.
-
-        Useful when the host may come from user input that already has
-        brackets (e.g. ``[::1]``).
-        """
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
-        return NetworkAddress(host, port)
 
     def __str__(self) -> str:
         return self.to_host_port_str()

@@ -18,7 +18,7 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import AutoImageProcessor
+from transformers import AutoProcessor
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileRe
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -48,7 +49,12 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
-from sglang.srt.utils.network import config_socket, get_local_ip_auto, get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    config_socket,
+    get_local_ip_auto,
+    get_zmq_socket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,16 +123,44 @@ def _convert(data):
         return data
 
 
-_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+_mm_grid_attrs = {
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    Modality.VIDEO: ["video_grid_thw"],
+    Modality.AUDIO: ["audio_feature_lens_raw"],
+}
+
+_mm_feature_attrs = {
+    Modality.IMAGE: ["pixel_values"],
+    Modality.VIDEO: ["pixel_values_videos"],
+    Modality.AUDIO: ["input_features"],
+}
 
 
-def _get_image_grid_dim(images_input):
-    for attr in _image_grid_attrs:
-        if attr in images_input:
-            return images_input[attr]
+def _get_mm_grid_dim(mm_inputs, modality):
+    for attr in _mm_grid_attrs[modality]:
+        if attr in mm_inputs:
+            return mm_inputs[attr]
+    raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
+
+
+def _get_mm_feature(mm_inputs, modality):
+    for attr in _mm_feature_attrs[modality]:
+        if attr in mm_inputs:
+            return mm_inputs[attr]
     raise ValueError(
-        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+        f"Feature attrs ({_mm_feature_attrs[modality]}) not found in {mm_inputs}"
     )
+
+
+def _build_mm_aux_data(mm_inputs):
+    """
+    Build auxiliary data for video modality.
+    """
+    aux_data = {
+        "video_timestamps": mm_inputs.get("video_timestamps", None),
+        "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
+    }
+    return aux_data
 
 
 class MMEncoder:
@@ -142,17 +176,11 @@ class MMEncoder:
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
-
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            use_fast=True,
-        )
+        self._load_mm_processor(server_args)
 
         self.model_config = ModelConfig.from_server_args(
             server_args,
         )
-
         self.load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
@@ -161,6 +189,9 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
+        self.model_type = getattr(
+            self.model_config.hf_config, "model_type", "unknown"
+        ).lower()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank
@@ -172,7 +203,10 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
-        self.use_image_processor_gpu = use_image_processor_gpu
+        self.use_image_processor_gpu = (
+            use_image_processor_gpu and not server_args.disable_fast_image_processor
+        )
+        self._build_vision_config(server_args.mm_process_config)
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
@@ -214,10 +248,11 @@ class MMEncoder:
                 EmbeddingCacheController,
             )
 
+            hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
-                hidden_dim=self.model_config.hidden_size,
+                hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
             )
@@ -233,10 +268,156 @@ class MMEncoder:
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
+                if self.engine is None:
+                    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                        init_mooncake_transfer_engine,
+                    )
+
+                    self.engine = init_mooncake_transfer_engine(
+                        hostname=self.local_ip,
+                        gpu_id=self.gpu_id,
+                        ib_device=(
+                            self.server_args.disaggregation_ib_device
+                            or self.server_args.mooncake_ib_device
+                        ),
+                    )
 
             self.embedding_to_send = dict()
 
         logger.info(f"rank {rank} init finish ")
+
+    def _infer_embedding_dims(self) -> dict:
+        """Infer per-modality embedding dimensions from hf_config at init time."""
+        default = self.model_config.hidden_size
+        hf_cfg = self.model_config.hf_config
+        thinker_cfg = getattr(hf_cfg, "thinker_config", None)
+        dims = {
+            Modality.IMAGE: default,
+            Modality.VIDEO: default,
+            Modality.AUDIO: default,
+        }
+
+        vision_cfg = getattr(thinker_cfg, "vision_config", None) or getattr(
+            hf_cfg, "vision_config", None
+        )
+        if vision_cfg is not None:
+            out_hs = getattr(vision_cfg, "out_hidden_size", None)
+            if out_hs is not None:
+                ds = getattr(vision_cfg, "deepstack_visual_indexes", None)
+                vis_dim = (
+                    out_hs * (1 + len(ds))
+                    if isinstance(ds, (list, tuple)) and ds
+                    else out_hs
+                )
+                dims[Modality.IMAGE] = vis_dim
+                dims[Modality.VIDEO] = vis_dim
+
+        audio_cfg = getattr(thinker_cfg, "audio_config", None) or getattr(
+            hf_cfg, "audio_config", None
+        )
+        if audio_cfg is not None:
+            for attr in ("output_dim", "d_model"):
+                val = getattr(audio_cfg, attr, None)
+                if val and int(val) > 0:
+                    dims[Modality.AUDIO] = int(val)
+                    break
+
+        logger.info(f"Global cache embedding dims: {dims}")
+        return dims
+
+    def _build_vision_config(self, mm_process_config):
+        """
+        Validate vision config, used for image/video/audio.
+        If not provided, keep default values.
+        """
+        self.vision_config = (
+            mm_process_config.get("vision_config", {})
+            if mm_process_config is not None
+            else {}
+        )
+        for modality_str in ["image", "video", "audio"]:
+            if not self.vision_config.get(modality_str, None):
+                self.vision_config[modality_str] = {}
+            if self.use_image_processor_gpu:
+                self.vision_config[modality_str]["device"] = self.device
+
+            if modality_str == "video":
+                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
+                for k, v in video_defaults.items():
+                    self.vision_config["video"].setdefault(k, v)
+
+            if modality_str == "audio":
+                if "return_attention_mask" not in self.vision_config["audio"]:
+                    self.vision_config["audio"]["return_attention_mask"] = True
+                if "padding" not in self.vision_config["audio"]:
+                    if self.model_type == "qwen2_audio":
+                        # For Qwen2Audio, use padding="max_length"
+                        # (same as https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_audio/processing_qwen2_audio.py#L93)
+                        self.vision_config["audio"]["padding"] = "max_length"
+                    else:
+                        self.vision_config["audio"]["padding"] = True
+                if "truncation" not in self.vision_config["audio"]:
+                    # keep same logic as base_processor.py
+                    if (
+                        hasattr(self, "audio_processor")
+                        and self.audio_processor is not None
+                    ):
+                        if self.audio_processor.__class__.__name__ in {
+                            "Gemma3nProcessor",
+                            "GlmAsrProcessor",
+                            "Qwen2AudioProcessor",
+                            "Qwen3OmniMoeProcessor",
+                        }:
+                            self.vision_config["audio"]["truncation"] = False
+
+    def _load_mm_processor(self, server_args: ServerArgs):
+        """
+        Load image/video/audio processor separately,
+        avoid issues with AutoProcessor not recognizing certain models
+        """
+        from transformers import AutoImageProcessor, AutoVideoProcessor
+
+        try:
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load image processor: {e}")
+            self.image_processor = None
+
+        try:
+            self.video_processor = AutoVideoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load video processor: {e}")
+            self.video_processor = None
+
+        try:
+            # Note: AutoProcessor is used for audio processor
+            _audio_proc = AutoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+            if not hasattr(_audio_proc, "feature_extractor"):
+                logger.warning(
+                    "Loaded AutoProcessor has no feature_extractor attribute, "
+                    "audio processing will be unavailable."
+                )
+                self.audio_processor = None
+            else:
+                self.audio_processor = _audio_proc
+        except Exception as e:
+            logger.warning(f"Failed to load audio processor: {e}")
+            self.audio_processor = None
 
     def _load_single_item(
         self,
@@ -282,16 +463,69 @@ class MMEncoder:
                 task_info.append((modality, data))
         return futures, task_info
 
-    async def _flatten_and_load_images(self, mm_items):
+    def _get_feat_extract_output_lengths(self, feature_lens):
         """
-        Flatten mm_items structure, load images concurrently, and restore original structure.
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        # qwen2_audio/qwen2.5_omni
+        if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+        # qwen3_omni_moe
+        elif self.model_type == "qwen3_omni_moe":
+            input_lengths_leave = feature_lens % 100
+            feat_lengths = (input_lengths_leave - 1) // 2 + 1
+            output_lengths = (
+                ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
+            )
+            return output_lengths
+        else:
+            # fallback to original HF audio sample logic for other models
+            logger.warning(
+                f"Fallback to original HF audio sample logic for {self.model_type}"
+            )
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+
+    async def _flatten_and_load_videos(self, mm_items):
+        if not isinstance(mm_items, (list, tuple)):
+            mm_items = [mm_items]
+
+        futures, _ = self.submit_data_loading_tasks(
+            mm_items, [Modality.VIDEO] * len(mm_items)
+        )
+        async_futures = [asyncio.wrap_future(f) for f in futures]
+        video_items = await asyncio.gather(*async_futures)
+
+        video_processor_kwargs = {}
+        if "qwen" in self.model_type:
+            # for qwen-series model, do sample frames before preprocess
+            video_processed = [
+                await preprocess_video(
+                    video, video_config=self.vision_config.get("video", {})
+                )
+                for video in video_items
+            ]
+            videos, video_metadata = map(list, zip(*video_processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+        else:
+            raise NotImplementedError(
+                f"Video processing is not supported for {self.model_type} model."
+            )
+
+    async def _flatten_and_load_data_by_modality(self, mm_items, modality):
+        """
+        Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
 
         Returns:
-            Same structure as load_images would return
+            Same structure as load_mm_items would return, support for image/audio
         """
-        # Handle single image (not a list)
+        # Handle single mm_item (not a list)
         if not isinstance(mm_items, (list, tuple)):
-            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
 
         # Handle nested list (list of lists)
@@ -299,14 +533,14 @@ class MMEncoder:
             # Flatten nested structure
             flat_data = []
             flat_indices = []  # Track which group each item belongs to
-            for group_idx, image_group in enumerate(mm_items):
-                for item in image_group:
+            for group_idx, item_group in enumerate(mm_items):
+                for item in item_group:
                     flat_data.append(item)
                     flat_indices.append(group_idx)
 
             # Submit all tasks concurrently
             futures, _ = self.submit_data_loading_tasks(
-                flat_data, [Modality.IMAGE] * len(flat_data)
+                flat_data, [modality] * len(flat_data)
             )
 
             # Wait for all tasks to complete asynchronously
@@ -323,123 +557,137 @@ class MMEncoder:
         # Handle simple list
         else:
             futures, _ = self.submit_data_loading_tasks(
-                mm_items, [Modality.IMAGE] * len(mm_items)
+                mm_items, [modality] * len(mm_items)
             )
             # Wait for all tasks to complete asynchronously
             async_futures = [asyncio.wrap_future(f) for f in futures]
             return await asyncio.gather(*async_futures)
 
-    def get_num_patches(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """Calculate number of raw patches (before 2x2 merge). Used for pixel_values slicing."""
-        return int(grid[0] * grid[1] * grid[2])
+    def get_num_patches(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
+        if modality == Modality.AUDIO:
+            return int(grid.item())
+        else:
+            return int(grid[0] * grid[1] * grid[2])
 
-    def get_num_tokens(self, grid: Union[torch.Tensor, List[int]]) -> int:
+    def get_num_tokens(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
         """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
-        merge_size = getattr(self.image_processor, "merge_size", 2)
-        return self.get_num_patches(grid) // (merge_size**2)
+        if modality == Modality.AUDIO:
+            input_length = self.get_num_patches(grid, modality)
+            return self._get_feat_extract_output_lengths(input_length)
+        else:
+            merge_size = getattr(self.image_processor, "merge_size", 2)
+            return self.get_num_patches(grid, modality) // (merge_size**2)
 
     def slice_embedding(
-        self, mm_embedding: torch.Tensor, grid_thw: List
+        self, mm_embedding: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[torch.Tensor]:
         """Slice a concatenated embedding tensor into individual image embeddings."""
         slices, offset = [], 0
         for grid in grid_thw:
-            count = self.get_num_tokens(grid)
+            count = self.get_num_tokens(grid, modality)
             slices.append(mm_embedding[offset : offset + count])
             offset += count
         return slices
 
     def _calculate_hashes_from_features(
-        self, pixel_values: torch.Tensor, grid_thw: List
+        self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[str]:
-        """CPU Task: Compute hashes based on processed feature patches (pixel_values)."""
+        """CPU Task: Compute hashes based on processed feature patches."""
         hashes, offset = [], 0
+        logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
-            num_patches = self.get_num_patches(grid)
-            feature_slice = pixel_values[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(
-                modality=Modality.IMAGE, feature=feature_slice
-            )
+            num_patches = self.get_num_patches(grid, modality)
+            feature_slice = mm_feature[offset : offset + num_patches]
+            tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
             tmp_item.set_pad_value()
             hashes.append(tmp_item.hash)
             offset += num_patches
         return hashes
 
     async def _encode_missing(
-        self, pixel_values: torch.Tensor, images_input: dict, indices: List[int]
+        self,
+        mm_feature: torch.Tensor,
+        mm_inputs: dict,
+        indices: List[int],
+        modality: Modality = Modality.IMAGE,
+        get_feature_fn=None,
     ) -> List[torch.Tensor]:
         """
-        GPU Task: Run ViT inference ONLY on the subset of images missing from the cache.
+        GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = images_input["image_grid_thw"]
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
 
-        # 1. Slice pixel_values to get only the patches for missing images
-        sub_pixel_list = []
+        # 1. Slice mm_feature to get only the patches for missing mm items
+        sub_feature_list = []
         offsets = [0]
         curr = 0
         for g in grid_thw:
-            curr += self.get_num_patches(g)
+            curr += self.get_num_patches(g, modality)
             offsets.append(curr)
 
         for idx in indices:
-            sub_pixel_list.append(pixel_values[offsets[idx] : offsets[idx + 1]])
+            sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
 
-        sub_feature = torch.cat(sub_pixel_list, dim=0)
+        sub_feature = torch.cat(sub_feature_list, dim=0)
 
         mm_item = MultimodalDataItem.from_dict(
             {
-                "modality": Modality.IMAGE,
+                "modality": modality,
                 "feature": _convert(sub_feature),
             }
         )
 
-        for k, v in images_input.items():
-            if k == "pixel_values":
+        for k, v in mm_inputs.items():
+            if k in _mm_feature_attrs.get(modality, []):
                 continue
             val = _convert(v)
-            if k in _image_grid_attrs:
+            if k in _mm_grid_attrs.get(modality, []):
                 mm_item.set(k, val[indices])
             else:
                 mm_item.set(k, val)
 
         with torch.inference_mode():
-            new_embeddings = self.model.get_image_feature([mm_item]).cpu()
+            new_embeddings = get_feature_fn([mm_item]).cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
         sub_grids = [grid_thw[i] for i in indices]
-        return self.slice_embedding(new_embeddings, sub_grids)
+        return self.slice_embedding(new_embeddings, sub_grids, modality)
 
     async def encode_with_global_cache(
         self,
         mm_items,
+        modality: Modality,
         req_id: str,
         num_parts: int,
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
-        images = await self._flatten_and_load_images(mm_items)
-        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-        images_input = self.image_processor(images=images, **kwargs)
-        pixel_values = images_input["pixel_values"]
-        grid_thw = images_input["image_grid_thw"]
-        num_images = len(grid_thw)
+        mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        num_items = len(grid_thw)
 
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
         if self.rank == 0:
             if hashes is None:
-                image_hashes = self._calculate_hashes_from_features(
-                    pixel_values, grid_thw
+                mm_hashes = self._calculate_hashes_from_features(
+                    mm_feature, grid_thw, modality
                 )
             else:
-                image_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(image_hashes)
+                mm_hashes = hashes
+            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
         else:
-            image_hashes = None
-            mask_tensor = torch.zeros(num_images, dtype=torch.int32)
+            mm_hashes = None
+            mask_tensor = torch.zeros(num_items, dtype=torch.int32)
 
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
@@ -456,7 +704,7 @@ class MMEncoder:
         new_slices = []
         if missing_indices:
             new_slices = await self._encode_missing(
-                pixel_values, images_input, missing_indices
+                mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
         # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
@@ -464,9 +712,11 @@ class MMEncoder:
 
         if self.rank == 0:
             if hit_indices:
-                hit_hashes = [image_hashes[i] for i in hit_indices]
-                hit_tokens = [self.get_num_tokens(grid_thw[i]) for i in hit_indices]
-                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
+                hit_hashes = [mm_hashes[i] for i in hit_indices]
+                hit_tokens = [
+                    self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
+                ]
+                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens, modality)
 
                 try:
 
@@ -478,7 +728,7 @@ class MMEncoder:
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.error(
                         f"Prefetch failed for req {req_id}: {e}. "
-                        f"Falling back to ViT for {len(hit_indices)} hit images."
+                        f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
                     prefetch_status[0] = 0
 
@@ -490,21 +740,21 @@ class MMEncoder:
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit images.
+        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
         if prefetch_status.item() == 0 and hit_indices:
             logger.info(
                 f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} images."
+                f"for {len(hit_indices)} mm items."
             )
             fallback_slices = await self._encode_missing(
-                pixel_values, images_input, hit_indices
+                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
             )
         else:
             fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
         if self.rank == 0:
-            final_slices = [None] * num_images
+            final_slices = [None] * num_items
 
             for i, idx in enumerate(missing_indices):
                 final_slices[idx] = new_slices[i]
@@ -512,7 +762,7 @@ class MMEncoder:
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [image_hashes[i] for i in hit_indices]
+                    [mm_hashes[i] for i in hit_indices]
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -524,10 +774,10 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [image_hashes[i] for i in missing_indices]
+            all_new_hashes = [mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [image_hashes[i] for i in hit_indices]
+                all_new_hashes += [mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -543,8 +793,15 @@ class MMEncoder:
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
 
+            aux_data = _build_mm_aux_data(mm_inputs)
             self.embedding_to_send[req_id] = EmbeddingData(
-                req_id, num_parts, part_idx, grid_thw, mm_embedding
+                req_id,
+                num_parts,
+                part_idx,
+                grid_thw,
+                modality,
+                mm_embedding,
+                **aux_data,
             )
             return (
                 mm_embedding.nbytes,
@@ -556,30 +813,151 @@ class MMEncoder:
         else:
             return (0, 0, 0, None, None)
 
-    async def _encode(self, mm_items) -> torch.Tensor:
-        try:
-            images = await self._flatten_and_load_images(mm_items)
-        except Exception as e:
-            raise BadRequestError(f"Failed to load images from input: {str(e)}")
+    async def _flatten_and_load_audios(self, mm_items):
+        """
+        Flatten mm_items structure, load audios concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
 
-        try:
-            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-            images_input = self.image_processor(images=images, **kwargs)
-            feature = images_input["pixel_values"]
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": Modality.IMAGE,
-                    "feature": _convert(feature),
-                }
+    async def _flatten_and_load_images(self, mm_items):
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+
+    def _calculate_timestamps(self, indices, video_fps: float, merge_size: int = 2):
+        """Calculate timestamps for video frames, used for qwen3_vl models."""
+        # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py#L255
+        if not isinstance(indices, list):
+            indices = indices.tolist()
+        if len(indices) % merge_size != 0:
+            indices.extend(
+                indices[-1] for _ in range(merge_size - len(indices) % merge_size)
             )
-            for k, v in images_input.items():
-                if k == "pixel_values":
-                    continue
-                mm_item.set(k, _convert(v))
+        timestamps = [idx / video_fps for idx in indices]
+        # Frames are merged by merge_size, so we need to average the timestamps
+        # between the first/last frame within the temporal patch
+        timestamps = [
+            (timestamps[i] + timestamps[i + merge_size - 1]) / 2
+            for i in range(0, len(timestamps), merge_size)
+        ]
+        return timestamps
 
+    async def _process_mm_items(self, mm_items, modality):
+        if modality == Modality.IMAGE and self.image_processor:
+            images = await self._flatten_and_load_images(mm_items)
+            image_config = self.vision_config.get("image", {})
+            processor_input = self.image_processor(images=images, **image_config)
+            feature = processor_input["pixel_values"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_image_feature
+            else:
+                get_feature_method = self.model.get_image_feature
+        elif modality == Modality.VIDEO and self.video_processor:
+            videos, video_processor_kwargs = await self._flatten_and_load_videos(
+                mm_items
+            )
+            processor_input = self.video_processor(
+                videos=videos, **video_processor_kwargs
+            )
+            # Get additional video metadata
+            if (
+                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                and video_processor_kwargs.get("video_metadata", None) is not None
+            ):
+                # For qwen3-vl models, we need to store the video timestamps
+                video_metadata = video_processor_kwargs["video_metadata"]
+                try:
+                    merge_size = (
+                        self.model_config.hf_config.vision_config.spatial_merge_size
+                    )
+                except (AttributeError, KeyError):
+                    merge_size = 2  # Default merge_size
+
+                video_timestamps = []
+                for metadata in video_metadata:
+                    video_fps = metadata.get("fps", None) or 24  # original video fps
+                    frames_indices = metadata.get("frames_indices", None)
+                    timestamps = self._calculate_timestamps(
+                        frames_indices, video_fps, merge_size
+                    )
+                    video_timestamps.append(timestamps)
+                processor_input["video_timestamps"] = video_timestamps
+            elif (
+                self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
+                and processor_input.get("video_grid_thw", None) is not None
+            ):
+                # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
+                video_grid_thw = processor_input["video_grid_thw"]
+                try:
+                    temporal_patch_size = self.video_processor.temporal_patch_size
+                except AttributeError:
+                    temporal_patch_size = 2  # Default temporal_patch_size
+                # get sampled fps, default: 2
+                fps_list = [
+                    self.vision_config.get("video", {}).get("fps", None) or 2
+                ] * len(video_grid_thw)
+                second_per_grid_ts = [(temporal_patch_size / fps) for fps in fps_list]
+                second_per_grid_ts_tensor = torch.tensor(
+                    second_per_grid_ts, dtype=torch.float32
+                )
+                processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
+
+            feature = processor_input["pixel_values_videos"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_video_feature
+            else:
+                get_feature_method = self.model.get_video_feature
+        elif modality == Modality.AUDIO and self.audio_processor:
+            audios = await self._flatten_and_load_audios(mm_items)
+            audio_config = self.vision_config.get("audio", {})
+            processor_input = self.audio_processor.feature_extractor(
+                audios, **audio_config
+            )
+            processor_input["feature_attention_mask"] = processor_input.pop(
+                "attention_mask"
+            )
+            # convert to same format as image/video
+            input_lengths = torch.tensor(
+                processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
+            )
+            processor_input["audio_feature_lens_raw"] = input_lengths
+            output_lengths = self._get_feat_extract_output_lengths(input_lengths)
+            processor_input["audio_feature_lens"] = output_lengths
+            feature = processor_input["input_features"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_audio_feature
+            else:
+                get_feature_method = self.model.get_audio_feature
+        else:
+            raise ValueError(
+                f"Currently only support image, video and audio modalities, {modality} modality has no processor available."
+            )
+
+        return processor_input, get_feature_method
+
+    async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+        except NotImplementedError as e:
+            raise InternalError(f"Not implemented error: {str(e)}")
+        except Exception as e:
+            raise BadRequestError(f"Failed to process mm items: {str(e)}")
+        try:
             # support mm_cache
             mm_embedding = None
             mm_hash = None
+
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": modality,
+                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+                }
+            )
+            for k, v in mm_inputs.items():
+                if k in _mm_feature_attrs[modality]:
+                    continue
+                mm_item.set(k, _convert(v))
 
             if self.server_args.enable_prefix_mm_cache:
                 mm_item.set_pad_value()
@@ -591,7 +969,7 @@ class MMEncoder:
 
             if mm_embedding is None:
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
@@ -602,7 +980,8 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            return _get_image_grid_dim(images_input), mm_embedding
+            aux_data = _build_mm_aux_data(mm_inputs)
+            return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
@@ -626,14 +1005,12 @@ class MMEncoder:
             self.engine.deregister(embedding.data_ptr())
 
             mm_data.embedding = None
-            mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
-        endpoint = (
-            f"tcp://{url}"
-            if url is not None
-            else f"tcp://{prefill_host}:{embedding_port}"
-        )
+        if url is not None:
+            endpoint = NetworkAddress.parse(url).to_tcp()
+        else:
+            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
@@ -665,16 +1042,19 @@ class MMEncoder:
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
-    async def encode_with_hash(self, mm_items, req_id, num_parts, part_idx, hashes):
-        images = await self._flatten_and_load_images(mm_items)
-
-    async def encode(self, mm_items, req_id, num_parts, part_idx):
+    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         try:
-            image_grid_dim, mm_embedding = await self._encode(mm_items)
+            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
-                    req_id, num_parts, part_idx, image_grid_dim, mm_embedding
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_dim,
+                    modality,
+                    mm_embedding,
+                    **aux_data,
                 )
                 self.embedding_to_send[req_id] = mm_data
             return (
@@ -694,6 +1074,7 @@ class MMEncoder:
                     num_parts,
                     part_idx,
                     None,
+                    modality,
                     error_msg=error_msg,
                     error_code=error_code,
                 )
@@ -894,6 +1275,7 @@ async def run_encoder(
             if encoder.mm_global_cache is not None:
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
@@ -902,6 +1284,7 @@ async def run_encoder(
             else:
                 await encoder.encode(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
@@ -924,9 +1307,12 @@ def launch_server(server_args: ServerArgs):
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
     if server_args.dist_init_addr:
-        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+        na = NetworkAddress.parse(server_args.dist_init_addr)
+        dist_init_method = na.to_tcp()
     else:
-        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+        dist_init_method = NetworkAddress(
+            server_args.host or "127.0.0.1", port_args.nccl_port
+        ).to_tcp()
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
@@ -966,6 +1352,7 @@ async def handle_encode_request(request: dict):
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
@@ -976,6 +1363,7 @@ async def handle_encode_request(request: dict):
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
