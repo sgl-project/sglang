@@ -94,6 +94,7 @@ class EAGLEWorker(TpModelWorker):
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.draft_kv_num_steps = self.speculative_num_steps - 1
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -409,8 +410,7 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            alloc_len_per_decode = self.speculative_num_steps * self.topk
-            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
+            alloc_len_per_decode = self.draft_kv_num_steps * self.topk
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
                 num_seqs * alloc_len_per_decode,
@@ -422,11 +422,11 @@ class EAGLEWorker(TpModelWorker):
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     batch.seq_lens,
-                    self.speculative_num_steps,
+                    self.draft_kv_num_steps,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
-                extend_num_tokens = num_seqs * self.speculative_num_steps
+                seq_lens_cpu = batch.seq_lens_cpu + self.draft_kv_num_steps
+                extend_num_tokens = num_seqs * self.draft_kv_num_steps
             else:
                 # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
@@ -449,14 +449,14 @@ class EAGLEWorker(TpModelWorker):
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     batch.seq_lens,
-                    self.speculative_num_steps,
+                    self.draft_kv_num_steps,
                     self.topk,
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
                 last_page_lens_cpu = prefix_lens_cpu % self.page_size
                 num_new_pages_per_topk = (
-                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
+                    last_page_lens_cpu + self.draft_kv_num_steps + self.page_size - 1
                 ) // self.page_size
                 seq_lens_cpu = (
                     prefix_lens_cpu // self.page_size * self.page_size
@@ -504,10 +504,10 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
-            self.speculative_num_steps,
+            self.draft_kv_num_steps,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
+            next_power_of_2(self.draft_kv_num_steps + self.page_size),
         )
 
         if self.page_size > 1 and self.topk > 1:
@@ -516,9 +516,8 @@ class EAGLEWorker(TpModelWorker):
                     target_cache_loc, source_cache_loc
                 )
             # Remove padded slots
-            # TODO: We only need self.speculative_num_steps - 1 cache loc
             out_cache_loc = out_cache_loc[
-                : num_seqs * self.topk * self.speculative_num_steps
+                : num_seqs * self.topk * self.draft_kv_num_steps
             ]
 
         batch.out_cache_loc = out_cache_loc
@@ -634,12 +633,11 @@ class EAGLEWorker(TpModelWorker):
 
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
-        # TODO: We only need self.speculative_num_steps - 1 cache loc
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            forward_batch.batch_size, self.topk, self.draft_kv_num_steps
         )
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+            self.draft_kv_num_steps, -1
         )
 
         # Return values
