@@ -1171,6 +1171,122 @@ class TestGlm47MoeDetector(unittest.TestCase):
             f"'value' appears {value_count} times - indicates reprocessing bug",
         )
 
+    # ==================== Whitespace Preservation Tests ====================
+
+    def test_whitespace_preserved_in_string_args_glm47(self):
+        """Regression test for issue #20542: whitespace preservation in GLM47."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff to a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "<tool_call>apply_diff"
+            "<arg_key>old_string</arg_key>"
+            "<arg_value>    def foo():</arg_value>"
+            "<arg_key>new_string</arg_key>"
+            "<arg_value>        def bar():</arg_value>"
+            "</tool_call>"
+        )
+        detector = Glm47MoeDetector()
+        result = detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    def foo():")
+        self.assertEqual(params["new_string"], "        def bar():")
+
+    def test_whitespace_preserved_in_string_args_glm4(self):
+        """Regression test for issue #20542: whitespace preservation in GLM4."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff to a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            ),
+        ]
+        nl = chr(10)
+        text = (
+            "<tool_call>apply_diff"
+            + nl
+            + "<arg_key>old_string</arg_key>"
+            + nl
+            + "<arg_value>    def foo():</arg_value>"
+            + nl
+            + "<arg_key>new_string</arg_key>"
+            + nl
+            + "<arg_value>        def bar():</arg_value>"
+            + nl
+            + "</tool_call>"
+        )
+        detector = Glm4MoeDetector()
+        result = detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    def foo():")
+        self.assertEqual(params["new_string"], "        def bar():")
+
+    def test_whitespace_preserved_streaming_glm47(self):
+        """Regression test for issue #20542: whitespace preservation in streaming."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff to a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            ),
+        ]
+        chunks = [
+            "<tool_call>apply_diff",
+            "<arg_key>old_string</arg_key>",
+            "<arg_value>    def foo():</arg_value>",
+            "<arg_key>new_string</arg_key>",
+            "<arg_value>        def bar():</arg_value>",
+            "</tool_call>",
+        ]
+        detector = Glm47MoeDetector()
+        all_calls = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            all_calls.extend(result.calls)
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "apply_diff")
+        full_params = "".join([c.parameters for c in all_calls if c.parameters])
+        params = json.loads(full_params)
+        self.assertEqual(params["old_string"], "    def foo():")
+        self.assertEqual(params["new_string"], "        def bar():")
+
 
 class TestGlm4ComplexJsonSchema(unittest.TestCase):
     """Test complex JSON Schema type inference for GLM function call parsers."""
