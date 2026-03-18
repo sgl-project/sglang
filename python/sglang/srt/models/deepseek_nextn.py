@@ -19,6 +19,7 @@ import os
 from typing import Iterable, Optional, Tuple
 
 import torch
+from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -100,6 +101,13 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.rot_weight = None
+        if _is_npu:
+            rot_weight_path = get_global_server_args().model_path + "/rot.safetensors"
+            if os.path.isfile(rot_weight_path):
+                self.rot_weight = load_file(rot_weight_path)
+                self.rot_weight = self.rot_weight["rot.weight"].npu()
+
         self.alt_stream = (
             torch.cuda.Stream()
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -162,7 +170,13 @@ class DeepseekModelNextN(nn.Module):
                 torch.cat(
                     (
                         self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
+                        self.hnorm(
+                            forward_batch.spec_info.hidden_states
+                            if self.rot_weight is None
+                            else torch.matmul(
+                                forward_batch.spec_info.hidden_states, self.rot_weight
+                            )
+                        ),
                     ),
                     dim=-1,
                 )
