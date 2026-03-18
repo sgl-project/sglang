@@ -276,7 +276,9 @@ class BaseFormatDetector(ABC):
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = self._dumps_args(cur_arguments)
-                    prev_args_json = self._get_prev_args_json(self.current_tool_id) or None
+                    prev_args_json = (
+                        self._get_prev_args_json(self.current_tool_id) or None
+                    )
 
                     argument_diff = None
 
