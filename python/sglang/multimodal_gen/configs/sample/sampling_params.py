@@ -156,6 +156,9 @@ class SamplingParams:
 
     # TeaCache parameters
     enable_teacache: bool = False
+    teacache_params: Any = (
+        None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
+    )
 
     # Profiling
     profile: bool = False
@@ -575,7 +578,9 @@ class SamplingParams:
         user_kwargs.pop("diffusers_kwargs", None)
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
-        sampling_params._merge_with_user_params(user_sampling_params)
+        sampling_params._merge_with_user_params(
+            user_sampling_params, explicit_fields=set(user_kwargs.keys())
+        )
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -591,213 +596,190 @@ class SamplingParams:
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields"""
-        parser.add_argument("--data-type", type=str, nargs="+", default=DataType.VIDEO)
-        parser.add_argument(
+
+        def add_argument(*name_or_flags, **kwargs):
+            kwargs.setdefault("default", argparse.SUPPRESS)
+            return parser.add_argument(*name_or_flags, **kwargs)
+
+        add_argument("--data-type", type=str, nargs="+")
+        add_argument(
             "--num-frames-round-down",
             action="store_true",
-            default=SamplingParams.num_frames_round_down,
         )
-        parser.add_argument(
+        add_argument(
             "--enable-teacache",
             action="store_true",
-            default=SamplingParams.enable_teacache,
         )
 
         # profiling
-        parser.add_argument(
+        add_argument(
             "--profile",
             action="store_true",
-            default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
         )
-        parser.add_argument(
+        add_argument(
             "--num-profiled-timesteps",
             type=int,
-            default=SamplingParams.num_profiled_timesteps,
             help="Number of timesteps to profile after warmup",
         )
-        parser.add_argument(
+        add_argument(
             "--profile-all-stages",
             action="store_true",
             dest="profile_all_stages",
-            default=SamplingParams.profile_all_stages,
             help="Used with --profile, profile all pipeline stages",
         )
 
-        parser.add_argument(
+        add_argument(
             "--debug",
             action="store_true",
-            default=SamplingParams.debug,
             help="",
         )
 
-        parser.add_argument(
+        add_argument(
             "--prompt",
             type=str,
             nargs="+",
-            default=SamplingParams.prompt,
             help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
-        parser.add_argument(
+        add_argument(
             "--negative-prompt",
             type=str,
-            default=SamplingParams.negative_prompt,
             help="Negative text prompt for generation",
         )
-        parser.add_argument(
+        add_argument(
             "--prompt-path",
             type=str,
-            default=SamplingParams.prompt_path,
             help="Path to a text file containing the prompt",
         )
-        parser.add_argument(
+        add_argument(
             "--output-file-name",
             type=str,
-            default=SamplingParams.output_file_name,
             help="Name of the output file",
         )
-        parser.add_argument(
+        add_argument(
             "--output-quality",
             type=str,
-            default=SamplingParams.output_quality,
             help="Output quality setting (default, low, medium, high, maximum)",
         )
-        parser.add_argument(
+        add_argument(
             "--output-compression",
             type=int,
-            default=SamplingParams.output_compression,
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
-        parser.add_argument(
+        add_argument(
             "--num-outputs-per-prompt",
             type=int,
-            default=SamplingParams.num_outputs_per_prompt,
             help="Number of outputs to generate per prompt",
         )
-        parser.add_argument(
+        add_argument(
             "--seed",
             type=int,
-            default=SamplingParams.seed,
             help="Random seed for generation",
         )
-        parser.add_argument(
+        add_argument(
             "--generator-device",
             type=str,
-            default=SamplingParams.generator_device,
             choices=["cuda", "musa", "cpu"],
             help="Device for random generator (cuda, musa or cpu). Default: cuda",
         )
-        parser.add_argument(
+        add_argument(
             "--num-frames",
             type=int,
-            default=SamplingParams.num_frames,
             help="Number of frames to generate",
         )
-        parser.add_argument(
+        add_argument(
             "--height",
             type=int,
-            default=SamplingParams.height,
             help="Height of generated output",
         )
-        parser.add_argument(
+        add_argument(
             "--width",
             type=int,
-            default=SamplingParams.width,
             help="Width of generated output",
         )
         # resolution shortcuts
-        parser.add_argument(
+        add_argument(
             "--4k",
             action="store_true",
             dest="resolution_4k",
             help="Set resolution to 4K (3840x2160)",
         )
-        parser.add_argument(
+        add_argument(
             "--2k",
             action="store_true",
             dest="resolution_2k",
             help="Set resolution to 2K (2560x1440)",
         )
-        parser.add_argument(
+        add_argument(
             "--1080p",
             action="store_true",
             dest="resolution_1080p",
             help="Set resolution to 1080p (1920x1080)",
         )
-        parser.add_argument(
+        add_argument(
             "--720p",
             action="store_true",
             dest="resolution_720p",
             help="Set resolution to 720p (1280x720)",
         )
 
-        parser.add_argument(
+        add_argument(
             "--fps",
             type=int,
-            default=SamplingParams.fps,
             help="Frames per second for saved output",
         )
-        parser.add_argument(
+        add_argument(
             "--num-inference-steps",
             type=int,
-            default=SamplingParams.num_inference_steps,
             help="Number of denoising steps",
         )
-        parser.add_argument(
+        add_argument(
             "--guidance-scale",
             type=float,
-            default=SamplingParams.guidance_scale,
             help="Classifier-free guidance scale",
         )
-        parser.add_argument(
+        add_argument(
             "--guidance-scale-2",
             type=float,
-            default=SamplingParams.guidance_scale_2,
             dest="guidance_scale_2",
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
         )
-        parser.add_argument(
+        add_argument(
             "--guidance-rescale",
             type=float,
-            default=SamplingParams.guidance_rescale,
             help="Guidance rescale factor",
         )
-        parser.add_argument(
+        add_argument(
             "--cfg-normalization",
             type=float,
-            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
             dest="cfg_normalization",
             help=("CFG renormalization factor (for Z-Image). "),
         )
-        parser.add_argument(
+        add_argument(
             "--boundary-ratio",
             type=float,
-            default=SamplingParams.boundary_ratio,
             help="Boundary timestep ratio",
         )
-        parser.add_argument(
+        add_argument(
             "--save-output",
             action="store_true",
-            default=SamplingParams.save_output,
             help="Whether to save the output to disk",
         )
-        parser.add_argument(
+        add_argument(
             "--no-save-output",
             action="store_false",
             dest="save_output",
             help="Don't save the output to disk",
         )
-        parser.add_argument(
+        add_argument(
             "--return-frames",
             action="store_true",
-            default=SamplingParams.return_frames,
             help="Whether to return the raw frames",
         )
-        parser.add_argument(
+        add_argument(
             "--image-path",
             type=str,
             nargs="+",
-            default=SamplingParams.image_path,
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
                 "generation. For multiple images, pass them as space-separated "
@@ -805,106 +787,93 @@ class SamplingParams:
                 '--image-path "img1.png" "img2.png"'
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--moba-config-path",
             type=str,
-            default=None,
             help="Path to a JSON file containing V-MoBA specific configurations.",
         )
-        parser.add_argument(
+        add_argument(
             "--return-trajectory-latents",
             action="store_true",
-            default=SamplingParams.return_trajectory_latents,
             help="Whether to return the trajectory",
         )
-        parser.add_argument(
+        add_argument(
             "--return-trajectory-decoded",
             action="store_true",
-            default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
         )
-        parser.add_argument(
+        add_argument(
             "--diffusers-kwargs",
             type=str,
-            default=None,
             help="JSON string of extra kwargs to pass to diffusers pipeline. "
             'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
-        parser.add_argument(
+        add_argument(
             "--no-override-protected-fields",
             action="store_true",
-            default=SamplingParams.no_override_protected_fields,
             help=(
                 "If set, disallow user params to override fields defined in subclasses."
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--adjust-frames",
             action=StoreBoolean,
-            default=SamplingParams.adjust_frames,
             help=(
                 "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
                 "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--return-file-paths-only",
             action=StoreBoolean,
-            default=SamplingParams.return_file_paths_only,
             help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-sequence-shard",
             action=StoreBoolean,
-            default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-frame-interpolation",
             action="store_true",
             help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-exp",
             type=int,
-            default=SamplingParams.frame_interpolation_exp,
             help="Frame interpolation exponent: 1=2x, 2=4x (default: 1).",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-scale",
             type=float,
-            default=SamplingParams.frame_interpolation_scale,
             help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-model-path",
             type=str,
-            default=SamplingParams.frame_interpolation_model_path,
             help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
             "(default: elfgum/RIFE-4.22.lite, downloaded automatically). "
             "Only RIFE 4.22.lite architecture is supported; other RIFE versions or "
             "frame interpolation models are not compatible.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-upscaling",
             action="store_true",
             help="Enable post-generation upscaling using Real-ESRGAN.",
         )
-        parser.add_argument(
+        add_argument(
             "--upscaling-model-path",
             type=str,
-            default=SamplingParams.upscaling_model_path,
             help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
             "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
             "Only RRDBNet (e.g. RealESRGAN_x4plus) and SRVGGNetCompact (e.g. realesr-animevideov3) "
             "architectures are supported; other super-resolution models are not compatible. "
             "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
         )
-        parser.add_argument(
+        add_argument(
             "--upscaling-scale",
             type=int,
-            default=SamplingParams.upscaling_scale,
             help="Upscaling factor (default: 4).",
         )
         return parser
@@ -928,16 +897,29 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        return {
+            attr: getattr(args, attr)
+            for attr in attrs
+            if hasattr(args, attr) and getattr(args, attr) is not None
+        }
 
     def output_file_path(self):
         if self.output_path is None:
             return None
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params: "SamplingParams"):
+    def _merge_with_user_params(
+        self,
+        user_params: "SamplingParams",
+        explicit_fields: set[str] | None = None,
+    ):
         """
         Merges parameters from a user-provided SamplingParams object.
+
+        Args:
+            explicit_fields: field names explicitly set by the user (e.g. from
+                CLI kwargs). These are always treated as user-modified even when
+                their value matches the base-class default.
         """
         if user_params is None:
             return
@@ -951,8 +933,9 @@ class SamplingParams:
             user_value = getattr(user_params, field_name)
             default_class_value = getattr(SamplingParams, field_name)
 
-            # A field is considered user-modified if its value is different from the default
-            is_user_modified = user_value != default_class_value
+            is_user_modified = user_value != default_class_value or (
+                explicit_fields is not None and field_name in explicit_fields
+            )
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
