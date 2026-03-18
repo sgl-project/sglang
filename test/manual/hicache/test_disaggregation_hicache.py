@@ -14,6 +14,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    flush_cache_with_retry,
     popen_launch_pd_server,
 )
 
@@ -115,15 +116,8 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access.
-        # Retry because in-flight HiCache async ops may block is_fully_idle().
-        for _ in range(5):
-            time.sleep(2)
-            try:
-                resp = requests.post(self.prefill_url + "/flush_cache", timeout=10)
-                if resp.status_code == 200:
-                    break
-            except requests.RequestException:
-                pass
+        time.sleep(2)
+        flush_cache_with_retry(self.prefill_url)
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
