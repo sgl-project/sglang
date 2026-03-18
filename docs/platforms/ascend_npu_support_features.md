@@ -72,6 +72,11 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
 | `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
+| `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
+| `--prefill-delayer-token-usage-low-watermark`       | `None`   | Type: float                    |      A2, A3      |
+| `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
+| `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
@@ -82,6 +87,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--device`                                         | `None`   | Type: str                 |      A2, A3      |
 | `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
 | `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
+| `--attention-context-parallel-size`<br/>`--attn-cp-size`  |`1`| Type: int                 |      A2, A3      |
+| `--moe-data-parallel-size`<br>`--moe-dp-size`      |`1`       | Type: int                 |      A2, A3      |
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
 | `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
 | `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
@@ -92,6 +99,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--watchdog-timeout`                               | `300`    | Type: float               |      A2, A3      |
 | `--soft-watchdog-timeout`                          | `300`    | Type: float               |      A2, A3      |
 | `--dist-timeout`                                   | `None`   | Type: int                 |      A2, A3      |
+| `--download-dir`                                   | `None`   | Type: str                 |      A2, A3      |
+| `--model-checksum`                                 | `None`   | Type: str                 |      A2, A3      |
 | `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
 | `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
 | `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
@@ -464,7 +473,7 @@ NPU, like Ktransformer, checkpoint-engine etc.
 | `--kt-weight-path`                                                | `None`    | Type: str                 |
 | `--kt-method`                                                     | `AMXINT4` | Type: str                 |
 | `--kt-cpuinfer`                                                   | `None`    | Type: int                 |
-| `--kt-threadpool-count`                                           | 2         | Type: int                 |
+| `--kt-threadpool-count`                                           | `2`       | Type: int                 |
 | `--kt-num-gpu-experts`                                            | `None`    | Type: int                 |
 | `--kt-max-deferred-`<br/>`experts-per-token`                      | `None`    | Type: int                 |
 
