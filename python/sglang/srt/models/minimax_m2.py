@@ -1076,9 +1076,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            _is_kv_scale = name.endswith(".k_scale") or name.endswith(".v_scale")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+                # Skip kv cache scales - maybe_remap_kv_scale_name expects the
+                # original checkpoint name (e.g. self_attn.k_proj.k_scale) to
+                # remap it to self_attn.attn.k_scale. Renaming k_proj -> qkv_proj
+                # here would break that pattern match.
+                if _is_kv_scale:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
