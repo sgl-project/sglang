@@ -1,4 +1,3 @@
-import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
@@ -34,6 +33,8 @@ class BaseFormatDetector(ABC):
         # Used by serving layer for completion handling when streaming ends.
         # Format: [{"name": str, "arguments": dict}, ...]
         self.prev_tool_call_arr: List[Dict] = []
+        # Cached JSON serialization of prev arguments per tool, avoids re-serializing every chunk
+        self.prev_tool_call_args_json: List[str] = []
         # Index of currently streaming tool call. Starts at -1 (no active tool),
         # increments as each tool completes. Tracks which tool's arguments are streaming.
         self.current_tool_id: int = -1
@@ -49,6 +50,25 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
+
+    @staticmethod
+    def _dumps_args(arguments: Any) -> str:
+        """Serialize arguments to JSON string using orjson."""
+        return orjson.dumps(arguments, option=orjson.OPT_NON_STR_KEYS).decode()
+
+    def _update_prev_tool(self, tool_id: int, tool_call: Dict, args_json: str) -> None:
+        """Update cached previous tool call state for the given tool_id."""
+        while len(self.prev_tool_call_arr) <= tool_id:
+            self.prev_tool_call_arr.append({})
+            self.prev_tool_call_args_json.append("")
+        self.prev_tool_call_arr[tool_id] = tool_call
+        self.prev_tool_call_args_json[tool_id] = args_json
+
+    def _get_prev_args_json(self, tool_id: int) -> str:
+        """Get cached JSON string of previous arguments for the given tool_id."""
+        if tool_id < len(self.prev_tool_call_args_json):
+            return self.prev_tool_call_args_json[tool_id]
+        return ""
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
@@ -85,9 +105,8 @@ class BaseFormatDetector(ABC):
                 ToolCallItem(
                     tool_index=tool_indices.get(name, -1),
                     name=name,
-                    parameters=json.dumps(
-                        act.get("parameters") or act.get("arguments", {}),
-                        ensure_ascii=False,
+                    parameters=self._dumps_args(
+                        act.get("parameters") or act.get("arguments", {})
                     ),
                 )
             )
@@ -256,12 +275,8 @@ class BaseFormatDetector(ABC):
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    prev_arguments = None
-                    if self.current_tool_id < len(self.prev_tool_call_arr):
-                        prev_arguments = self.prev_tool_call_arr[
-                            self.current_tool_id
-                        ].get("arguments")
+                    cur_args_json = self._dumps_args(cur_arguments)
+                    prev_args_json = self._get_prev_args_json(self.current_tool_id) or None
 
                     argument_diff = None
 
@@ -276,19 +291,17 @@ class BaseFormatDetector(ABC):
                         self._buffer = current_text[start_idx + end_idx :]
 
                     # If the tool is still being parsed, send incremental changes
-                    elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                    elif prev_args_json:
                         if cur_args_json != prev_args_json:
-                            prefix = _find_common_prefix(prev_args_json, cur_args_json)
+                            prefix = _find_common_prefix(
+                                prev_args_json, cur_args_json, start=sent
+                            )
                             argument_diff = prefix[sent:]
 
-                    # Update prev_tool_call_arr with current state
+                    # Update prev_tool_call_arr and cached JSON with current state
                     if self.current_tool_id >= 0:
-                        # Ensure prev_tool_call_arr is large enough
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        self.prev_tool_call_arr[self.current_tool_id] = (
-                            current_tool_call
+                        self._update_prev_tool(
+                            self.current_tool_id, current_tool_call, cur_args_json
                         )
 
                     # Advance to next tool if complete
