@@ -12,12 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 
-import asyncio
+import json
 import logging
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Optional, Tuple
-
-from aiohttp import web
+from urllib.parse import parse_qs, urlparse
 
 from sglang.srt.utils.network import NetworkAddress
 
@@ -43,12 +43,16 @@ def get_engine_info_bootstrap_port(server_args) -> int:
 
 
 class EngineInfoBootstrapServer:
-    """Lightweight aiohttp server for per-rank model info registration.
+    """Lightweight HTTP server for per-rank model info registration.
 
     Runs in a daemon thread on node_rank==0. Each ModelRunner registers its
     info via HTTP PUT after model initialization. The Engine
     accesses the collected info directly in-process; external consumers can
     query via HTTP GET.
+
+    Uses a route-table pattern: adding a new endpoint is just one
+    ``self._routes[("METHOD", "/path")] = handler_fn`` line in
+    ``_register_routes``.
 
     Currently supports transfer engine memory registration info.
     """
@@ -56,29 +60,36 @@ class EngineInfoBootstrapServer:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.app = web.Application()
-        self._setup_routes()
 
         # Storage: {tp_rank: (session_id, weights_info_dict)}
         self.transfer_engine_info: Dict[int, Tuple] = {}
-        self.lock = asyncio.Lock()
+        self.lock = threading.Lock()
 
+        # Route table: {("METHOD", "/path"): handler_fn}
+        self._routes: Dict[Tuple[str, str], callable] = {}
+        self._register_routes()
+
+        self._httpd = HTTPServer((host, port), self._make_handler())
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
 
-    def _setup_routes(self):
-        self.app.router.add_put(
-            "/register_engine_info", self._handle_register_engine_info
-        )
-        self.app.router.add_get(
-            "/get_transfer_engine_info", self._handle_get_transfer_engine_info
-        )
-        self.app.router.add_get("/health", self._handle_health_check)
+    # ------------------------------------------------------------------
+    # Route registration
+    # ------------------------------------------------------------------
 
-    async def _handle_health_check(self, request: web.Request):
-        return web.Response(text="OK", status=200)
+    def _register_routes(self):
+        self._routes[("PUT", "/register_engine_info")] = self._put_engine_info
+        self._routes[("GET", "/get_transfer_engine_info")] = self._get_engine_info
+        self._routes[("GET", "/health")] = self._get_health
 
-    async def _handle_register_engine_info(self, request: web.Request):
+    # ------------------------------------------------------------------
+    # Route handlers — each receives (handler, parsed_url)
+    # ------------------------------------------------------------------
+
+    def _get_health(self, h, _parsed):
+        h._reply(200, "OK")
+
+    def _put_engine_info(self, h, _parsed):
         """Handle PUT /register_engine_info from ModelRunner.
 
         Payload: {
@@ -90,25 +101,30 @@ class EngineInfoBootstrapServer:
         }
         """
         try:
-            data = await request.json()
+            content_length = int(h.headers.get("Content-Length", 0))
+            body = h.rfile.read(content_length)
+            data = json.loads(body)
             tp_rank = data["tp_rank"]
             info = data["transfer_engine_info"]
             session_id = info["session_id"]
             weights_info_dict = info["weights_info_dict"]
 
-            async with self.lock:
-                self.transfer_engine_info[tp_rank] = (session_id, weights_info_dict)
+            with self.lock:
+                self.transfer_engine_info[tp_rank] = (
+                    session_id,
+                    weights_info_dict,
+                )
 
             logger.info(
                 f"Registered transfer engine info for tp_rank={tp_rank}, "
                 f"session_id={session_id}"
             )
-            return web.Response(text="OK", status=200)
+            h._reply(200, "OK")
         except Exception as e:
             logger.error(f"Failed to register engine info: {e}")
-            return web.Response(text=str(e), status=400)
+            h._reply(400, str(e))
 
-    async def _handle_get_transfer_engine_info(self, request: web.Request):
+    def _get_engine_info(self, h, parsed):
         """Handle GET /get_transfer_engine_info?rank=N.
 
         Response:
@@ -117,57 +133,82 @@ class EngineInfoBootstrapServer:
             "remote_instance_transfer_engine_info": [session_id, weights_info_dict]
         }
         """
-        rank_str = request.query.get("rank")
-        if rank_str is None:
-            return web.Response(text="Missing rank parameter", status=400)
+        params = parse_qs(parsed.query)
+        rank_values = params.get("rank")
+        if not rank_values:
+            h._reply(400, "Missing rank parameter")
+            return
 
         try:
-            rank = int(rank_str)
+            rank = int(rank_values[0])
         except ValueError:
-            return web.Response(text="Invalid rank parameter", status=400)
+            h._reply(400, "Invalid rank parameter")
+            return
 
         if rank < 0:
-            return web.Response(text="Invalid rank parameter", status=400)
+            h._reply(400, "Invalid rank parameter")
+            return
 
-        async with self.lock:
+        with self.lock:
             info = self.transfer_engine_info.get(rank)
 
         if info is None:
-            return web.Response(
-                text=f"No transfer engine info for rank {rank}", status=404
-            )
+            h._reply(404, f"No transfer engine info for rank {rank}")
+            return
 
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": list(info),
-        }
-        return web.json_response(result, status=200)
+        h._reply(
+            200,
+            {"rank": rank, "remote_instance_transfer_engine_info": list(info)},
+        )
+
+    # ------------------------------------------------------------------
+    # Handler factory
+    # ------------------------------------------------------------------
+
+    def _make_handler(self):
+        routes = self._routes
+
+        class Handler(BaseHTTPRequestHandler):
+            def _dispatch(h):
+                parsed = urlparse(h.path)
+                fn = routes.get((h.command, parsed.path))
+                if fn:
+                    fn(h, parsed)
+                else:
+                    h._reply(404, "Not Found")
+
+            do_GET = do_PUT = _dispatch
+
+            def _reply(h, status, body):
+                if isinstance(body, dict):
+                    payload = json.dumps(body).encode()
+                    content_type = "application/json"
+                else:
+                    payload = str(body).encode()
+                    content_type = "text/plain"
+                h.send_response(status)
+                h.send_header("Content-Type", content_type)
+                h.send_header("Content-Length", str(len(payload)))
+                h.end_headers()
+                h.wfile.write(payload)
+
+            def log_message(h, fmt, *args):
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(fmt, *args)
+
+        return Handler
+
+    # ------------------------------------------------------------------
+    # Server lifecycle
+    # ------------------------------------------------------------------
 
     def _run_server(self):
-        """Run the aiohttp server in a dedicated thread."""
+        """Run the HTTP server in a dedicated thread."""
         try:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-
-            access_log = None
-            if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
-                access_log = self.app.logger
-
-            self._runner = web.AppRunner(self.app, access_log=access_log)
-            self._loop.run_until_complete(self._runner.setup())
-
-            site = web.TCPSite(self._runner, host=self.host, port=self.port)
-            self._loop.run_until_complete(site.start())
-
             logger.info(f"EngineInfoBootstrapServer started on {self.host}:{self.port}")
-
-            self._loop.run_forever()
+            self._httpd.serve_forever()
         except Exception as e:
             logger.error(f"EngineInfoBootstrapServer error: {e}")
-        finally:
-            if hasattr(self, "_loop") and self._loop is not None:
-                self._loop.run_until_complete(self._runner.cleanup())
-                self._loop.close()
 
     def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
