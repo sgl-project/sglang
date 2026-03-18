@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -77,6 +78,17 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
+        hicache_storage_backend_extra_config = {}
+        if server_args.hicache_storage_backend_extra_config:
+            try:
+                hicache_storage_backend_extra_config = json.loads(
+                    server_args.hicache_storage_backend_extra_config
+                )
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid hicache storage backend extra config JSON: {e}"
+                )
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
@@ -86,7 +98,7 @@ class DecodeKVCacheOffloadManager:
             load_cache_event=threading.Event(),
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
-            storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
 
         self.ongoing_offload = {}
@@ -256,7 +268,7 @@ class DecodeKVCacheOffloadManager:
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
 
-            logger.info(
+            logger.debug(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
             )
 

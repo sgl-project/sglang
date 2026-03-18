@@ -22,6 +22,11 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+class FusedMoEMode(IntEnum):
+    FUSED_DEEP_MOE = 1
+    DISPATCH_FFN_COMBINE = 2
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
@@ -124,7 +129,12 @@ def npu_format_cast(
         return tensor
 
     if tensor.device == torch.device("cpu"):
-        return torch.ops.npu.npu_format_cast(tensor.npu(), acl_format.value).cpu()
+        logger.warning_once(
+            "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
+            "Please disable offloading, otherwise the performance will be "
+            "significantly reduced."
+        )
+        return tensor
     else:
         return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
