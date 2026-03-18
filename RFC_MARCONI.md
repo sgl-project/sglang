@@ -10,7 +10,7 @@ Related Code: https://github.com/ruipeterpan/marconi/tree/main
 
 This RFC proposes integrating Marconi's prefix caching into SGLang. We extend SGLang's existing support for Hybrid Architecture with Marconi's FLOP-efficiency-weighted cache eviction policy.
 
-Target Model: `Qwen/Qwen3.5-27B`
+Target Model: `Qwen/Qwen3.5-9B`
 
 ---
 
