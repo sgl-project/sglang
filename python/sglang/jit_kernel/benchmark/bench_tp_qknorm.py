@@ -5,13 +5,16 @@ import os
 
 import torch
 import torch.distributed as dist
-from flashinfer.norm import rmsnorm
 
+import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
 from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 
 Q_K_DIMS = [(6144, 1024)]
 DTYPE = torch.bfloat16
@@ -30,11 +33,6 @@ def parse_args():
 
 
 def init_distributed():
-    import sglang.srt.distributed.parallel_state as ps
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     rank = local_rank
@@ -49,8 +47,6 @@ def init_distributed():
     )
 
     cpu_group = coord.cpu_group
-    nccl_group = coord.device_group
-    assert nccl_group is not None
 
     max_pull_size = 16 * 1024 * 1024
     max_push_size = 16 * 1024 * 1024
@@ -68,10 +64,10 @@ def init_distributed():
         max_push_size,
         max_push_blocks=props.multi_processor_count * max_occupancy,
     )
-    if comm.disabled:
+    comm_ = CustomAllReduceV2(cpu_group, device)
+    if comm.disabled or comm_.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
-
-    return rank, world_size, device, cpu_group, nccl_group, comm
+    return rank, world_size, device, cpu_group, comm, comm_
 
 
 @torch.inference_mode()
@@ -97,9 +93,24 @@ def bench_one(fn, warmup: int, iters: int) -> float:
     return start.elapsed_time(end) * 1000.0 / (iters * NUM_LAYERS)
 
 
+def rmsnorm_baseline(
+    comm_,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    world_size: int,
+):
+    from sglang.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
+
+    sum_sq = rms_sumsq_serial(q, k)
+    comm_.custom_all_reduce(sum_sq)
+    rms_apply_serial(q, k, q_weight, k_weight, sum_sq, world_size, EPS)
+
+
 def main():
     args = parse_args()
-    rank, world_size, device, _, nccl_group, comm = init_distributed()
+    rank, world_size, device, _, comm, comm_ = init_distributed()
     torch.cuda.set_stream(torch.cuda.Stream())
 
     if rank == 0:
@@ -131,8 +142,14 @@ def main():
                 )
 
             def run_baseline(i: int):
-                rmsnorm(q[i], q_weight[i], out=q[i], eps=EPS)
-                rmsnorm(k[i], k_weight[i], out=k[i], eps=EPS)
+                rmsnorm_baseline(
+                    comm_,
+                    q[i],
+                    k[i],
+                    q_weight[i],
+                    k_weight[i],
+                    world_size,
+                )
 
             fused_us = bench_one(run_fused, args.warmup, args.iters)
             baseline_us = bench_one(run_baseline, args.warmup, args.iters)
