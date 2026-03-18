@@ -13,6 +13,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.step3_vl import Step3VLConfig
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -316,7 +317,7 @@ class PerceptionEncoder(nn.Module):
             raise ValueError("use_rope2d must be True")
         self.image_size = config.image_size
 
-        self.conv1 = nn.Conv2d(
+        self.conv1 = Conv2dLayer(
             in_channels=3,
             out_channels=config.width,
             kernel_size=config.patch_size,

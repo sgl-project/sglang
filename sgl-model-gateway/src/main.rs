@@ -1153,17 +1153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("\n{}", "=".repeat(78));
-    eprintln!(
-        "WARNING: This copy of sgl-model-gateway is DEPRECATED and no longer maintained."
-    );
-    eprintln!("The actively maintained version has moved to:");
-    eprintln!("  https://github.com/lightseekorg/smg");
-    eprintln!();
-    eprintln!("Please migrate to the standalone repository for the latest features,");
-    eprintln!("bug fixes, and security updates.");
-    eprintln!("{}\n", "=".repeat(78));
-
     let prefill_urls = parse_prefill_args();
 
     let mut filtered_args: Vec<String> = Vec::new();
