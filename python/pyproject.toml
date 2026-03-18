@@ -38,7 +38,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl==4.3.5",
+  "nvidia-cutlass-dsl>=4.4.1",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -54,12 +54,12 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels==0.2.4",
+  "quack-kernels>=0.3.0",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-fa4==4.0.5",
+  "flash-attn-4>=4.0.0b4",
   "sglang-kernel==0.4.0",
   "soundfile==0.13.1",
   "tiktoken",
@@ -77,7 +77,6 @@ dependencies = [
   "uvloop",
   "watchfiles",
   "xgrammar==0.1.27",
-
   "smg-grpc-servicer>=0.5.0",
 ]
 
