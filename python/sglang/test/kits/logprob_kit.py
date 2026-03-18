@@ -14,25 +14,6 @@ Verified artifacts:
     - logprob_start_len:     boundary correctness
     - return_text_in_logprobs: structural validation
 
-Usage as a Mixin (recommended for eagle / spec-decoding tests):
-
-    from sglang.test.kits.logprob_kit import LogprobCrossModeMixin
-
-    class TestMySpecDecoding(EagleServerBase, LogprobCrossModeMixin):
-        logprob_decimal_places = 2   # override tolerance as needed
-        # test methods are inherited from the mixin
-
-Usage as standalone functions:
-
-    from sglang.test.kits.logprob_kit import (
-        run_logprob_cross_mode_check,
-        run_logprob_start_len_check,
-    )
-
-    class TestMyServer(CustomTestCase):
-        def test_logprobs(self):
-            run_logprob_cross_mode_check(self, self.base_url)
-
 HF ground-truth comparison utilities:
 
     from sglang.test.kits.logprob_kit import (
@@ -72,27 +53,42 @@ DEFAULT_DECIMAL_PLACES = 1
 # ---------------------------------------------------------------------------
 
 
-def _generate_with_logprobs(
+def generate_with_logprobs(
     url,
     prompt_or_ids,
     max_new_tokens,
     top_logprobs_num,
-    token_ids_logprob,
-    logprob_start_len,
+    token_ids_logprob=None,
+    logprob_start_len=-1,
     return_text_in_logprobs=False,
+    sampling_params=None,
 ):
+    """Send a generate request with logprob options to an SGLang server.
+
+    Args:
+        url: Server base URL.
+        prompt_or_ids: Text string or list of token IDs.
+        max_new_tokens: Number of tokens to generate.
+        top_logprobs_num: Number of top logprobs to return.
+        token_ids_logprob: Optional token IDs for the token_ids_logprob artifact.
+        logprob_start_len: Starting position for input logprobs (-1 to skip).
+        return_text_in_logprobs: Include token text in logprob tuples.
+        sampling_params: Optional dict of sampling parameters.  Defaults to
+            ``{"temperature": 0, "ignore_eos": True}``.  ``max_new_tokens``
+            is always set from the explicit argument.
+    """
     if isinstance(prompt_or_ids, str):
         payload = {"text": prompt_or_ids}
     else:
         payload = {"input_ids": prompt_or_ids}
 
+    if sampling_params is None:
+        sampling_params = {"temperature": 0, "ignore_eos": True}
+    sampling_params = {**sampling_params, "max_new_tokens": max_new_tokens}
+
     payload.update(
         {
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
+            "sampling_params": sampling_params,
             "return_logprob": True,
             "top_logprobs_num": top_logprobs_num,
             "logprob_start_len": logprob_start_len,
@@ -355,7 +351,7 @@ def run_logprob_cross_mode_check(
         print(f"\n--- Cross-mode check {tag_prefix}: {prompt!r} ---")
 
         # Step 1: generate from target with logprob_start_len=0
-        gen_res = _generate_with_logprobs(
+        gen_res = generate_with_logprobs(
             target_url,
             prompt,
             max_new_tokens,
@@ -372,7 +368,7 @@ def run_logprob_cross_mode_check(
         full_sequence = input_token_ids + output_token_ids
 
         # Step 2: score the full sequence via prefill on baseline
-        score_res = _generate_with_logprobs(
+        score_res = generate_with_logprobs(
             baseline_url,
             full_sequence,
             max_new_tokens=0,
@@ -479,7 +475,7 @@ def run_logprob_start_len_check(
 
     for prompt in prompts:
         # Probe to get prompt_tokens
-        probe_res = _generate_with_logprobs(
+        probe_res = generate_with_logprobs(
             target_url,
             prompt,
             max_new_tokens=1,
@@ -497,7 +493,7 @@ def run_logprob_start_len_check(
             if sl >= P:
                 continue
             with test_case.subTest(prompt=prompt, logprob_start_len=sl):
-                res = _generate_with_logprobs(
+                res = generate_with_logprobs(
                     target_url,
                     prompt,
                     max_new_tokens,
