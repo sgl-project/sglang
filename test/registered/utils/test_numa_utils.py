@@ -38,11 +38,12 @@ class TestIsNumaAvailable(unittest.TestCase):
         self.assertFalse(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
+    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     @patch("sglang.srt.utils.numa_utils.psutil")
     def test_returns_true_on_numa_system_with_full_affinity(
-        self, mock_psutil, _mock_isdir, _mock_mempolicy
+        self, mock_psutil, _mock_isdir, _mock_which, _mock_mempolicy
     ):
         all_cpus = list(range(128))
         mock_process = MagicMock()
@@ -53,11 +54,12 @@ class TestIsNumaAvailable(unittest.TestCase):
         self.assertTrue(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
+    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     @patch("sglang.srt.utils.numa_utils.psutil")
     def test_returns_false_when_mempolicy_not_permitted(
-        self, mock_psutil, _mock_isdir, _mock_mempolicy
+        self, mock_psutil, _mock_isdir, _mock_which, _mock_mempolicy
     ):
         all_cpus = list(range(128))
         mock_process = MagicMock()
@@ -68,11 +70,12 @@ class TestIsNumaAvailable(unittest.TestCase):
         self.assertFalse(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
+    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     @patch("sglang.srt.utils.numa_utils.psutil")
     def test_isdir_called_with_node1_path(
-        self, mock_psutil, mock_isdir, _mock_mempolicy
+        self, mock_psutil, mock_isdir, _mock_which, _mock_mempolicy
     ):
         all_cpus = list(range(8))
         mock_process = MagicMock()
