@@ -83,6 +83,7 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "gguf",
     "bitsandbytes",
+    "mistral",
     "layered",
     "flash_rl",
     "remote",
@@ -2963,6 +2964,12 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        if self.load_format == "auto" and self._is_mistral_native_format():
+            self.load_format = "mistral"
+            logger.info(
+                "Detected Mistral native format checkpoint, setting load_format='mistral'"
+            )
+
         if is_remote_url(self.model_path):
             self.load_format = "remote"
 
@@ -3012,6 +3019,19 @@ class ServerArgs:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
             )
+
+    def _is_mistral_native_format(self) -> bool:
+        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        if os.path.isdir(self.model_path):
+            return os.path.exists(os.path.join(self.model_path, "params.json"))
+        # For hub models, check remote files
+        try:
+            from huggingface_hub import HfApi
+
+            files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
+            return "params.json" in files
+        except Exception:
+            return False
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":

@@ -1216,8 +1216,11 @@ class DeepseekV2AttentionMLA(
                 device=get_global_server_args().device,
             )
 
-            if rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
+            if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
+                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                scaling_factor = rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         else:
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None

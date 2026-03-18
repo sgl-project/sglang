@@ -19,6 +19,7 @@ import logging
 import os
 import tempfile
 import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -267,11 +268,11 @@ def _load_deepseek_v32_model(
 
 
 # Temporary hack for Mistral Large
+@lru_cache(maxsize=2)
 def _load_mistral_large_3_for_causal_LM(
     model_path: str,
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
-    **kwargs,
 ):
     # first get the local path
     local_path = download_from_hf(model_path)
@@ -283,7 +284,7 @@ def _load_mistral_large_3_for_causal_LM(
         json.dump(config_dict, f)
         f.flush()
         loaded_config = AutoConfig.from_pretrained(
-            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            f.name, trust_remote_code=trust_remote_code, revision=revision
         )
     text_config = getattr(loaded_config, "text_config", None)
     if text_config is not None and isinstance(text_config, dict):
@@ -477,9 +478,13 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    if "mistral-large-3" in str(model).lower():
+    if (
+        "mistral-large-3" in str(model).lower()
+        or "mistral-small-4" in str(model).lower()
+        or "leanstral" in str(model).lower()
+    ):
         config = _load_mistral_large_3_for_causal_LM(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model, trust_remote_code=trust_remote_code, revision=revision
         )
     else:
         _ensure_llama_flash_attention2_compat()
@@ -1104,12 +1109,15 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-    if "mistral-large-3" in str(tokenizer_name).lower():
+    if (
+        "mistral-large-3" in str(tokenizer_name).lower()
+        or "mistral-small-4" in str(tokenizer_name).lower()
+        or "leanstral" in str(tokenizer_name).lower()
+    ):
         config = _load_mistral_large_3_for_causal_LM(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
             revision=revision,
-            **kwargs,
         )
     else:
         _ensure_llama_flash_attention2_compat()
@@ -1192,7 +1200,48 @@ def get_processor(
             )
         else:
             raise e
+    # If processor is a bare tokenizer (e.g. Mistral-Small-4 has no processor_config.json)
+    # and the model is a vision model (pixtral), wrap it in a proper PixtralProcessor
+    # so that image data is actually processed through the image processor.
+    if (
+        isinstance(processor, PreTrainedTokenizerBase)
+        and getattr(config, "model_type", None) == "pixtral"
+    ):
+        from transformers.models.pixtral.image_processing_pixtral import (
+            PixtralImageProcessor,
+        )
+        from transformers.models.pixtral.processing_pixtral import (
+            PixtralProcessor as HFPixtralProcessor,
+        )
+
+        vision_config = config.vision_config
+        patch_size = vision_config.patch_size
+        image_size = vision_config.image_size
+        spatial_merge_size = getattr(vision_config, "spatial_merge_size", 1)
+
+        effective_patch = patch_size * spatial_merge_size
+        image_processor = PixtralImageProcessor(
+            do_resize=True,
+            size={"longest_edge": image_size},
+            patch_size={"height": effective_patch, "width": effective_patch},
+        )
+        processor = HFPixtralProcessor(
+            image_processor=image_processor,
+            tokenizer=processor,
+            patch_size=patch_size,
+            spatial_merge_size=spatial_merge_size,
+        )
+
     tokenizer = get_tokenizer_from_processor(processor)
+
+    if tokenizer.chat_template is None:
+        local_path = download_from_hf(
+            tokenizer_name, allow_patterns=["*.json", "*.jinja", "*.model"]
+        )
+        jinja_path = Path(local_path) / "chat_template.jinja"
+        if jinja_path.is_file():
+            tokenizer.chat_template = jinja_path.read_text()
+            logger.info("Loaded chat_template from %s", jinja_path)
 
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
