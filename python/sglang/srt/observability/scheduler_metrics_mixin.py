@@ -55,6 +55,7 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    schedule_debug_reason: Optional[str] = None
 
     @classmethod
     def from_adder(
@@ -71,6 +72,17 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+        )
+
+    @classmethod
+    def zero_input_prefill(cls, schedule_debug_reason: str):
+        return cls(
+            log_input_tokens=0,
+            log_hit_tokens=0,
+            new_token_ratio=0.0,
+            num_running_reqs=QueueCount(),
+            num_new_seqs=0,
+            schedule_debug_reason=schedule_debug_reason,
         )
 
 
@@ -185,6 +197,7 @@ class SchedulerMetricsMixin:
 
     def report_prefill_stats(
         self: Scheduler,
+        batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
@@ -243,7 +256,12 @@ class SchedulerMetricsMixin:
         token_usage_msg = ", ".join(msg_parts) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]"
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -276,6 +294,8 @@ class SchedulerMetricsMixin:
         )
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
+        if prefill_stats.schedule_debug_reason:
+            msg += f", schedule-debug: {prefill_stats.schedule_debug_reason}"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -439,7 +459,7 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        iter_msg = f" [{self.forward_ct}]"
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
