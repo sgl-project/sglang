@@ -280,7 +280,7 @@ class ServingChatTestCase(unittest.TestCase):
             }
         ]
         mock_detector.streamed_args_for_tool = [
-            '{"location": "San Francisco"'  # Partial arguments streamed so far
+            '{"location":"San Francisco"'  # Partial arguments streamed so far
         ]
         mock_parser.detector = mock_detector
 
@@ -313,7 +313,7 @@ class ServingChatTestCase(unittest.TestCase):
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
-        self.assertIn(', "unit": "celsius"}', arguments)
+        self.assertIn(',"unit":"celsius"}', arguments)
 
         self.assertIn(
             '"finish_reason":null',
@@ -333,7 +333,7 @@ class ServingChatTestCase(unittest.TestCase):
             {"name": "get_weather", "arguments": {"location": "San Francisco"}}
         ]
         mock_detector.streamed_args_for_tool = [
-            '{"location": "San Francisco"}'  # All arguments already streamed
+            '{"location":"San Francisco"}'  # All arguments already streamed
         ]
         mock_parser.detector = mock_detector
 
