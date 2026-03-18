@@ -696,9 +696,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
-            if not input_text and self.mm_processor and obj.contains_mm_input():
+            if self.mm_processor and obj.contains_mm_input():
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
