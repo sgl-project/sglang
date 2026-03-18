@@ -298,6 +298,13 @@ class TestAnthropicServer(CustomTestCase):
         self.assertEqual(message_start["message"]["role"], "assistant")
         self.assertIn("usage", message_start["message"])
 
+        # Verify input_tokens is populated in message_start (not zero)
+        self.assertGreater(
+            message_start["message"]["usage"]["input_tokens"],
+            0,
+            "message_start should report actual input_tokens, not 0",
+        )
+
         # Verify we got content deltas
         content_deltas = [e for e in events if e["type"] == "content_block_delta"]
         self.assertTrue(
@@ -371,6 +378,37 @@ class TestAnthropicServer(CustomTestCase):
         event_types = [e["type"] for e in events]
         self.assertIn("message_start", event_types)
         self.assertIn("message_stop", event_types)
+
+    def test_stream_input_tokens_in_message_start(self):
+        """Test that streaming message_start carries actual input_tokens (not 0).
+
+        Regression test for https://github.com/sgl-project/sglang/issues/20678.
+        Per the Anthropic spec, message_start.usage.input_tokens must reflect
+        the real prompt token count so that clients like Claude Code can track
+        context-window consumption correctly.
+        """
+        payload = self._default_payload(stream=True)
+        resp = self._make_request(payload, stream=True)
+        self.assertEqual(resp.status_code, 200)
+
+        events = self._parse_sse_events(resp)
+
+        # message_start must exist and carry non-zero input_tokens
+        message_start = next((e for e in events if e["type"] == "message_start"), None)
+        self.assertIsNotNone(message_start, "Expected a message_start event")
+        usage = message_start["message"]["usage"]
+        self.assertGreater(
+            usage["input_tokens"],
+            0,
+            "message_start.usage.input_tokens should be > 0",
+        )
+
+        # message_delta should still carry output_tokens
+        message_deltas = [e for e in events if e["type"] == "message_delta"]
+        self.assertTrue(len(message_deltas) > 0, "Expected message_delta event")
+        last_delta = message_deltas[-1]
+        self.assertIn("usage", last_delta)
+        self.assertIsInstance(last_delta["usage"]["output_tokens"], int)
 
     # ---- Error handling tests ----
 
