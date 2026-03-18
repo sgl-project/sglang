@@ -511,8 +511,10 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
-    # can optimize (e.g. fuse / compile)
+    # @torch.compile(dynamic=True)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if layer_idx is None:
+            return
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(

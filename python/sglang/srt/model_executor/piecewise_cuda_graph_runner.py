@@ -176,6 +176,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
+            capture_size_align=self.attn_tp_size,
         )
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.compile_config.add_split_op(
@@ -383,7 +384,9 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=torch.tensor(
+                    num_tokens, device=self.device, dtype=torch.int32
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -540,7 +543,9 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=torch.tensor(
+                    num_tokens, device=self.device, dtype=torch.int32
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )

@@ -1405,21 +1405,30 @@ class FlashInferFP4MoE(FusedMoE):
         return result
 
 
-@register_custom_op(out_shape="hidden_states")
+@register_custom_op(mutates_args=["output"])
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     router_logits: torch.Tensor,
+    output: torch.Tensor,
     layer_id: int,
-) -> torch.Tensor:
+) -> None:
     # only standard topk output is supported for piecewise cuda graph
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    return moe_layer.forward_impl(hidden_states, topk_output)
+    ret = moe_layer.forward_impl(hidden_states, topk_output)
+
+    assert (
+        output.numel() == ret.numel()
+    ), f"DeepSeekV3.2 mlp DeepEP-MoE Output tensor shape is not matching. {output.shape} != {ret.shape}"
+
+    output.view(ret.shape).copy_(ret)
+
+    return
 
 
 @register_custom_op(out_shape="hidden_states")

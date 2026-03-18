@@ -740,15 +740,20 @@ def is_power_of_two(n):
 
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
-    num_token_non_padded: Optional[torch.Tensor] = None,
+    num_token_non_padded: torch.Tensor,
 ):
+    # 这里可以加piecewise判断
     if num_token_non_padded is None:
         return
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+    # mask = indices.ge(num_token_non_padded).int().unsqueeze(1)
+    # topk_ids = topk_ids * (1 - mask) + (-mask)
+
+    # return topk_ids
     topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
@@ -775,6 +780,11 @@ def biased_grouped_topk_gpu(
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
+    # if get_forward_context() is not None:
+    #     context = get_forward_context()
+    #     forward_batch = context.forward_batch
+    #     if forward_batch.forward_mode.is_extend():
+    fused_topk_deepseek = None
 
     if (
         _is_cuda
@@ -835,7 +845,6 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
             apply_routed_scaling_factor_on_output,
         )
-
         return topk_weights, topk_ids
 
     elif _use_aiter:

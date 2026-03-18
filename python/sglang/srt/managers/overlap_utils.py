@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import get_compiler_backend, is_npu
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
