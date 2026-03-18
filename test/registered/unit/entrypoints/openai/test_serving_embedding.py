@@ -59,7 +59,7 @@ class _MockTokenizerManager:
 class _MockTemplateManager:
     def __init__(self):
         self.chat_template_name = None  # None for embeddings usually
-        self.jinja_template_content_format = None
+        self.jinja_template_content_format = "openai"
         self.completion_template_name = None
 
 
@@ -148,6 +148,39 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertEqual(adapted_request.image_data[0], "base64_image_data")
         self.assertIsNone(adapted_request.image_data[1])
         # self.assertEqual(adapted_request.rid, "test-id")
+
+    def test_convert_multimodal_request_with_jinja_chat_template(self):
+        """Multimodal embeddings should apply explicit/HF Jinja chat templates."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            side_effect=[
+                "<prompt>Hello<image></prompt>",
+                "<prompt>World</prompt>",
+            ]
+        )
+
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            self.multimodal_req
+        )
+
+        self.assertEqual(
+            adapted_request.text,
+            ["<prompt>Hello<image></prompt>", "<prompt>World</prompt>"],
+        )
+        self.assertEqual(adapted_request.image_data[0], "base64_image_data")
+        self.assertIsNone(adapted_request.image_data[1])
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2
+        )
+        first_call = self.tokenizer_manager.tokenizer.apply_chat_template.call_args_list[
+            0
+        ]
+        first_messages = first_call.args[0]
+        self.assertEqual(first_messages[0]["role"], "user")
+        self.assertEqual(first_messages[0]["content"][0]["type"], "image")
+        self.assertEqual(first_messages[0]["content"][1]["type"], "text")
+        self.assertEqual(first_call.kwargs["tokenize"], False)
+        self.assertEqual(first_call.kwargs["add_generation_prompt"], True)
 
 
 if __name__ == "__main__":
