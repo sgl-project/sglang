@@ -106,6 +106,11 @@ static_assert(
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
 
+// Maximum vector size in bytes supported by current architecture.
+// Pre-Blackwell / AMD: 128-bit (16 bytes)
+// Blackwell or greater: 256-bit (32 bytes)
+inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
+
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).

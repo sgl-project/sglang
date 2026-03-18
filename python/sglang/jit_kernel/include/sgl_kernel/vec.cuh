@@ -73,8 +73,10 @@ struct alignas(sizeof(T) * N) AlignedStorage {
 template <typename T, std::size_t N>
 struct AlignedVector {
  private:
-  /// NOTE: N must be a power of two and sizeof(T) * N <= 32 bytes (256 bits)
-  static_assert((N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= 32, "CUDA only supports at most 256-bit vector op");
+  static_assert(
+      (N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= kMaxVecBytes,
+      "CUDA vector size exceeds arch limit: max 16 bytes on pre-Blackwell/AMD, "
+      "32 bytes on Blackwell or greater");
   using element_t = typename details::sized_int<T>;
   using storage_t = AlignedStorage<element_t, N>;
 
