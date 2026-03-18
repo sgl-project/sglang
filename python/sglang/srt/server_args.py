@@ -2633,6 +2633,15 @@ class ServerArgs:
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            fuse_mode = os.environ.get("SGLANG_NPU_FUSED_MOE_MODE", None)
+            if fuse_mode not in ["1", "2"]:
+                raise ValueError(
+                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
+                )
+            elif fuse_mode == "2":
+                assert (
+                    self.quantization == "modelslim"
+                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
             self.ep_size = self.tp_size
             logger.warning(
