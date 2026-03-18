@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=957, suite="stage-b-test-small-1-gpu")
-
 """
 Usage:
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
@@ -12,6 +8,7 @@ import unittest
 
 import openai
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import *
 from sglang.test.vlm_utils import (
     AudioOpenAITestMixin,
@@ -21,6 +18,8 @@ from sglang.test.vlm_utils import (
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
 )
+
+register_cuda_ci(est_time=957, suite="stage-b-test-large-1-gpu")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):

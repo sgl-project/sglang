@@ -93,13 +93,19 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+
+        if isinstance(x, tuple):
+            """dynamic_scale is calculated in malprolog kernel"""
+            original_dtype = torch.bfloat16
+            quant_out, dynamic_scale = x
+        else:
+            original_dtype = x.dtype
+            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
-            pertoken_scale=dynamic_scale,
+            pertoken_scale=dynamic_scale.flatten(),
             bias=bias,
             output_dtype=original_dtype,
         )
@@ -131,7 +137,7 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
             quant_out,
             layer.weight,
             layer.weight_scale,
-            pertoken_scale=dynamic_scale,
+            pertoken_scale=dynamic_scale.flatten(),
             bias=bias,
             output_dtype=original_dtype,
         )

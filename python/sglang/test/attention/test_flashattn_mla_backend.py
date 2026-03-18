@@ -28,6 +28,8 @@ class MockModelRunner:
             {
                 "context_len": context_len,
                 "attention_arch": attention_arch,
+                "is_encoder_decoder": False,
+                "is_local_attention_model": False,
             },
         )
         self.sliding_window_size = None

@@ -60,7 +60,7 @@ class ServeSubcommand(CLISubcommand):
         serve_parser = subparsers.add_parser(
             "serve",
             help="Launch the server and start FastAPI listener.",
-            usage="sgl_diffusion serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
+            usage="sglang serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
         )
 
         serve_parser = add_multimodal_gen_serve_args(serve_parser)

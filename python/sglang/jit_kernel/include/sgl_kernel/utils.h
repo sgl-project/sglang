@@ -1,3 +1,15 @@
+/// \file utils.h
+/// \brief Host-side C++ utilities used by JIT kernel wrappers.
+///
+/// Provides:
+/// - `DebugInfo` - wraps `std::source_location` for error reporting.
+/// - `RuntimeCheck` - runtime assertion with formatted error messages.
+/// - `Panic` - unconditional abort with formatted error messages.
+/// - `pointer::offset` - safe void-pointer arithmetic (host side).
+/// - `div_ceil` - integer ceiling division.
+/// - `dtype_bytes` - byte width of a `DLDataType`.
+/// - `irange` - Python-style integer range for range-for loops.
+
 #pragma once
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
@@ -47,10 +59,12 @@ namespace host {
 template <typename>
 inline constexpr bool dependent_false_v = false;
 
+/// \brief Source-location wrapper for debug/error messages.
 struct DebugInfo : public source_location_t {
   DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };
 
+/// \brief Exception type thrown by `RuntimeCheck` and `Panic`.
 struct PanicError : public std::runtime_error {
  public:
   explicit PanicError(std::string msg) : runtime_error(msg), m_message(std::move(msg)) {}
@@ -64,6 +78,7 @@ struct PanicError : public std::runtime_error {
   std::string m_message;
 };
 
+/// \brief Unconditionally abort with a formatted error message.
 template <typename... Args>
 [[noreturn]]
 inline auto panic(DebugInfo location, Args&&... args) -> void {
@@ -78,6 +93,15 @@ inline auto panic(DebugInfo location, Args&&... args) -> void {
   throw PanicError(std::move(os).str());
 }
 
+/**
+ * \brief Runtime assertion: panics with a formatted message when `condition`
+ *        is false. Extra `args` are streamed to the error message.
+ *
+ * Example:
+ * \code
+ *   RuntimeCheck(n > 0, "n must be positive, got ", n);
+ * \endcode
+ */
 template <typename... Args>
 struct RuntimeCheck {
   template <typename Cond>
@@ -133,11 +157,13 @@ inline auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
+/// \brief Integer ceiling division: ceil(a / b).
 template <std::integral T, std::integral U>
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
 
+/// \brief Returns the byte width of a DLPack data type.
 inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
@@ -145,11 +171,13 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
 namespace stdr = std::ranges;
 namespace stdv = stdr::views;
 
+/// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>
 inline auto irange(T end) {
   return stdv::iota(static_cast<T>(0), end);
 }
 
+/// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
 template <std::integral T>
 inline auto irange(T start, T end) {
   return stdv::iota(start, end);

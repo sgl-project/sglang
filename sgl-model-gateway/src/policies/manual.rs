@@ -15,6 +15,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
 use tracing::info;
@@ -194,7 +195,7 @@ impl ManualPolicy {
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo,
+        info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, ExecutionBranch) {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
@@ -207,14 +208,19 @@ impl ManualPolicy {
         }
 
         (
-            Some(self.select_new_worker(workers, &healthy_indices)),
+            Some(random_select(&healthy_indices)),
             ExecutionBranch::NoRoutingId,
         )
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for ManualPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_manual_policy_branch(branch.as_str());
         Metrics::set_manual_policy_cache_entries(self.routing_map.len());
@@ -927,5 +933,49 @@ mod tests {
             selected_worker_0,
             "Random mode should sometimes select worker 0 despite higher load"
         );
+    }
+
+    fn assert_no_routing_key_uses_random(
+        assignment_mode: ManualAssignmentMode,
+        setup_load: impl Fn(&[Arc<dyn Worker>]),
+    ) {
+        let config = ManualConfig {
+            assignment_mode,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        setup_load(&workers);
+
+        let mut selected_worker_0 = false;
+        for _ in 0..50 {
+            let info = SelectWorkerInfo::default();
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, ExecutionBranch::NoRoutingId);
+            if result == Some(0) {
+                selected_worker_0 = true;
+                break;
+            }
+        }
+        assert!(
+            selected_worker_0,
+            "Should randomly select worker 0 despite higher load"
+        );
+    }
+
+    #[test]
+    fn test_no_routing_key_uses_random_even_with_min_load_mode() {
+        assert_no_routing_key_uses_random(ManualAssignmentMode::MinLoad, |workers| {
+            workers[0].increment_load();
+            workers[0].increment_load();
+        });
+    }
+
+    #[test]
+    fn test_no_routing_key_uses_random_even_with_min_group_mode() {
+        assert_no_routing_key_uses_random(ManualAssignmentMode::MinGroup, |workers| {
+            workers[0].worker_routing_key_load().increment("k1");
+            workers[0].worker_routing_key_load().increment("k2");
+        });
     }
 }

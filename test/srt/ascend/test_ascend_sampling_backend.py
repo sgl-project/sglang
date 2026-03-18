@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 class TestAscendSamplingBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-7B-Instruct"
+        cls.model = "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
