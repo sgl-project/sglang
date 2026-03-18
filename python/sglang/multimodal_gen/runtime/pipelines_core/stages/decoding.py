@@ -22,41 +22,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
-
-_is_hip = current_platform.is_hip()
-_use_aiter_vae = get_bool_env_var("SGLANG_USE_ROCM_VAE") and _is_hip
-
-
-def _replace_groupnorm_with_aiter(module: torch.nn.Module) -> int:
-    """Recursively replace nn.GroupNorm with AITer GroupNorm in a module tree.
-
-    Returns the number of replaced modules.
-    """
-    from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
-
-    count = 0
-    for name, child in module.named_children():
-        if isinstance(child, torch.nn.GroupNorm) and child.affine:
-            aiter_gn = AiterGroupNorm(
-                num_groups=child.num_groups,
-                num_channels=child.num_channels,
-                eps=child.eps,
-                affine=True,
-                device=child.weight.device,
-                dtype=child.weight.dtype,
-            )
-            aiter_gn.weight = child.weight
-            aiter_gn.bias = child.bias
-            setattr(module, name, aiter_gn)
-            count += 1
-        else:
-            count += _replace_groupnorm_with_aiter(child)
-    return count
 
 
 def _ensure_tensor_decode_output(decode_output):
@@ -87,11 +56,11 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
-    def __init__(self, vae, pipeline=None) -> None:
+    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
-        self._aiter_gn_applied = False
+        self.component_name = component_name
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -185,38 +154,20 @@ class DecodingStage(PipelineStage):
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
-    def _apply_aiter_groupnorm(self):
-        """Replace nn.GroupNorm with AITer GroupNorm (called once after VAE load)."""
-        if self._aiter_gn_applied:
-            return
-        self._aiter_gn_applied = True
-        try:
-            count = _replace_groupnorm_with_aiter(self.vae)
-            if count > 0:
-                logger.info(
-                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
-                    count,
-                )
-        except Exception:
-            logger.warning(
-                "Failed to apply AITer GroupNorm to VAE. "
-                "Model may be in an inconsistent state.",
-                exc_info=True,
-            )
-
     def load_model(self):
         # load vae if not already loaded (used for memory constrained devices)
         pipeline = self.pipeline() if self.pipeline else None
-        if not self.server_args.model_loaded["vae"]:
+        if not self.server_args.model_loaded[self.component_name]:
             loader = VAELoader()
-            self.vae = loader.load(
-                self.server_args.model_paths["vae"], self.server_args
+            self.vae, _ = loader.load(
+                self.server_args.model_paths[self.component_name],
+                self.server_args,
+                component_name=self.component_name,
+                transformers_or_diffusers=loader.expected_library,
             )
             if pipeline:
-                pipeline.add_module("vae", self.vae)
-            self.server_args.model_loaded["vae"] = True
-        if _use_aiter_vae:
-            self._apply_aiter_groupnorm()
+                pipeline.add_module(self.component_name, self.vae)
+            self.server_args.model_loaded[self.component_name] = True
 
     def offload_model(self):
         # Offload models if needed
@@ -226,11 +177,13 @@ class DecodingStage(PipelineStage):
             self.vae.to("cpu", non_blocking=True)
 
         if torch.backends.mps.is_available():
+            # Flush lazy MPS kernels before freeing weights to avoid hangs.
+            torch.mps.synchronize()
             del self.vae
             pipeline = self.pipeline() if self.pipeline else None
-            if pipeline is not None and "vae" in pipeline.modules:
-                del pipeline.modules["vae"]
-            self.server_args.model_loaded["vae"] = False
+            if pipeline is not None and self.component_name in pipeline.modules:
+                del pipeline.modules[self.component_name]
+            self.server_args.model_loaded[self.component_name] = False
 
     @torch.no_grad()
     def forward(
@@ -287,6 +240,8 @@ class DecodingStage(PipelineStage):
             metrics=batch.metrics,
         )
 
-        self.offload_model()
+        # Keep VAE resident during warmup; the real request needs it next.
+        if not getattr(batch, "is_warmup", False):
+            self.offload_model()
 
         return output_batch

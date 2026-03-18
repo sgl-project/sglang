@@ -7,8 +7,12 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -223,17 +227,17 @@ class SessionAwareCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         if isinstance(node, _VirtualNode):
-            return None
+            return IncLockRefResult()
         return self.inner.inc_lock_ref(node)
 
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if isinstance(node, _VirtualNode):
-            return
-        if swa_uuid_for_lock is not None:
-            return self.inner.dec_lock_ref(node, swa_uuid_for_lock)
-        return self.inner.dec_lock_ref(node)
+            return DecLockRefResult()
+        return self.inner.dec_lock_ref(node, params)
 
     # -- Session lifecycle --
 
@@ -245,7 +249,10 @@ class SessionAwareCache(BasePrefixCache):
 
         if slot.last_node is not None:
             if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(slot.last_node, slot.swa_uuid_for_lock)
+                self.inner.dec_lock_ref(
+                    slot.last_node,
+                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
+                )
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
@@ -313,11 +320,14 @@ class SessionAwareCache(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, last_host_node, host_hit_length):
-        return self.inner.init_load_back(last_host_node, host_hit_length)
+    def init_load_back(self, params: InitLoadBackParams):
+        return self.inner.init_load_back(params)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
+
+    def flush_write_through_acks(self) -> None:
+        return self.inner.flush_write_through_acks()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()
