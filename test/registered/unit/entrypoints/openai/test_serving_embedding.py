@@ -7,6 +7,8 @@ import unittest
 import uuid
 from unittest.mock import MagicMock, Mock
 
+import jinja2
+
 # Stub out sgl_kernel (and all submodules) before any sglang import so
 # the test runs on CPU-only runners without the real CUDA library.
 for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
@@ -90,6 +92,13 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             input=[
                 MultimodalEmbeddingInput(text="Hello", image="base64_image_data"),
                 MultimodalEmbeddingInput(text="World", image=None),
+            ],
+            encoding_format="float",
+        )
+        self.image_only_multimodal_req = EmbeddingRequest(
+            model="test-model",
+            input=[
+                MultimodalEmbeddingInput(text=None, image="base64_image_data"),
             ],
             encoding_format="float",
         )
@@ -181,6 +190,36 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertEqual(first_messages[0]["content"][1]["type"], "text")
         self.assertEqual(first_call.kwargs["tokenize"], False)
         self.assertEqual(first_call.kwargs["add_generation_prompt"], True)
+
+    def test_convert_image_only_multimodal_request_with_jinja_chat_template(self):
+        """Image-only requests should not inject literal padding into Jinja prompts."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            return_value="<prompt><image></prompt>"
+        )
+
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            self.image_only_multimodal_req
+        )
+
+        self.assertEqual(adapted_request.text, "<prompt><image></prompt>")
+        first_call = self.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        first_messages = first_call.args[0]
+        self.assertEqual(first_messages[0]["role"], "user")
+        self.assertEqual(len(first_messages[0]["content"]), 1)
+        self.assertEqual(first_messages[0]["content"][0]["type"], "image")
+
+    def test_jinja_template_errors_are_raised_as_value_error(self):
+        """Template failures should be converted to ValueError for a 400 response."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            side_effect=jinja2.TemplateError("bad template")
+        )
+
+        with self.assertRaisesRegex(ValueError, "bad template"):
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
+            )
 
 
 if __name__ == "__main__":

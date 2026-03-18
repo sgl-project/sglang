@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import jinja2
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
@@ -92,8 +93,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 images = []
                 videos = []
                 for item in prompt:
-                    # Use padding for text if None - this could be improved
-                    texts.append(item.text if item.text is not None else "padding")
+                    texts.append(item.text)
                     images.append(item.image if item.image is not None else None)
                     videos.append(item.video if item.video is not None else None)
 
@@ -115,7 +115,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         texts, images, videos
                     )
                 else:
-                    generate_prompts = texts
+                    generate_prompts = [
+                        text if text is not None else "padding" for text in texts
+                    ]
 
                 if len(generate_prompts) == 1:
                     prompt_kwargs = {
@@ -180,11 +182,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 audio_data=[],
                 modalities=[],
             )
-            prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                [processed_msg],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            try:
+                prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    [processed_msg],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except jinja2.TemplateError as template_error:
+                raise ValueError(str(template_error)) from template_error
             prompts.append(prompt)
 
         return prompts
