@@ -527,8 +527,17 @@ class ModelConfigForExpertLocation:
             return model_class.get_model_config_for_expert_location(
                 model_config.hf_config
             )
-        else:
+        hf_config = model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        num_logical_experts = getattr(text_config, "num_experts", None)
+        num_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_logical_experts is None or num_layers is None:
             return None
+        return ModelConfigForExpertLocation(
+            num_layers=num_layers,
+            num_logical_experts=num_logical_experts,
+            num_groups=getattr(text_config, "num_groups", None),
+        )
 
 
 def compute_initial_expert_location_metadata(

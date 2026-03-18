@@ -1070,8 +1070,20 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(len(self.layers))
+                    if isinstance(self.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+                }
+            )
 
         return loaded_params
+        
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -1404,6 +1416,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(len(self.model.layers))
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock
+                    )
+                }
+            )
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
