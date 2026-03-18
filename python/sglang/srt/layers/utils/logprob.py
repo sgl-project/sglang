@@ -410,9 +410,10 @@ def add_output_logprobs_for_spec_v1(
     verified_ids = batch_next_token_ids.tolist()
     token_top_logprobs_val = logits_output.next_token_top_logprobs_val
     token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
+    token_ids_logprobs_val = logits_output.next_token_token_ids_logprobs_val
+    token_ids_logprobs_idx = logits_output.next_token_token_ids_logprobs_idx
     for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
         for _ in range(num_tokens):
-            # TODO: add token_ids_logprobs to each request
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[pt])
                 req.output_token_logprobs_idx.append(verified_ids[pt])
@@ -422,4 +423,7 @@ def add_output_logprobs_for_spec_v1(
                     ), "Inconsistent state: should_top_logprobs is False"
                     req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
                     req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
+                if req.token_ids_logprob is not None and should_token_ids_logprobs:
+                    req.output_token_ids_logprobs_val.append(token_ids_logprobs_val[pt])
+                    req.output_token_ids_logprobs_idx.append(token_ids_logprobs_idx[pt])
             pt += 1

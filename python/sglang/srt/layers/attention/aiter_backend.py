@@ -217,7 +217,11 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
-            if self.num_head == 32:
+            # current mla_decode_fwd onln support fake-nps in self.num_head == 16
+            # so all num_head size does not use qh16 kernel to simulate
+            # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
+            # it will cause gpu-fault or accuracy issue
+            if self.num_head == 32 or self.num_head == 128:
                 fast_mode = True
                 intra_batch_mode = False
 
