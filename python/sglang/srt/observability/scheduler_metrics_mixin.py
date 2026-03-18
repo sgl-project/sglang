@@ -55,7 +55,6 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
-    schedule_debug_reason: Optional[str] = None
 
     @classmethod
     def from_adder(
@@ -72,17 +71,6 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
-        )
-
-    @classmethod
-    def zero_input_prefill(cls, schedule_debug_reason: str):
-        return cls(
-            log_input_tokens=0,
-            log_hit_tokens=0,
-            new_token_ratio=0.0,
-            num_running_reqs=QueueCount(),
-            num_new_seqs=0,
-            schedule_debug_reason=schedule_debug_reason,
         )
 
 
@@ -294,8 +282,6 @@ class SchedulerMetricsMixin:
         )
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
-        if prefill_stats.schedule_debug_reason:
-            msg += f", schedule-debug: {prefill_stats.schedule_debug_reason}"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
