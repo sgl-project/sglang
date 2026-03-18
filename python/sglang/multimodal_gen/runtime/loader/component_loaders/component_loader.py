@@ -17,6 +17,7 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _model_construction_lock,
     _normalize_component_type,
     component_name_to_loader_cls,
     get_memory_usage_of_component,
@@ -105,9 +106,14 @@ class ComponentLoader(ABC):
                     f"Error while loading customized {component_name}, falling back to native version"
                 )
             # fallback to native version
-            component = self.load_native(
-                component_model_path, server_args, transformers_or_diffusers
-            )
+            # Hold _model_construction_lock so that AutoModel.from_pretrained's
+            # accelerate.init_empty_weights() — which patches
+            # nn.Module.register_parameter globally — cannot race with FSDP
+            # sharding in other threads (which also modify module state).
+            with _model_construction_lock:
+                component = self.load_native(
+                    component_model_path, server_args, transformers_or_diffusers
+                )
             should_offload = self.should_offload(server_args)
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
