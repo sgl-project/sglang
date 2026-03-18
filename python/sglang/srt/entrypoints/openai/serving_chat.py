@@ -1090,7 +1090,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Align with Kimi-K2 format: functions.{name}:{index}
             # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
             # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
@@ -1238,25 +1238,41 @@ class OpenAIServingChat(OpenAIServingBase):
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
-        if self.reasoning_parser in ["deepseek-v3"]:
-            # Models that require explicit enable thinking (thinking=True)
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("thinking") is True
-            )
-        if self.reasoning_parser in ["kimi_k2"]:
-            # Models that thinking by default, and can be disabled by setting thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("thinking") is not False
-            )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking") is not False
-            )
-        return True  # default
+
+        parser_control_config = {
+            # parser: (chat_template bool key, parser-level fallback default)
+            "deepseek-v3": ("thinking", False),
+            "kimi_k2": ("thinking", True),
+            "qwen3": ("enable_thinking", True),
+            "glm45": ("enable_thinking", True),
+            "nemotron_3": ("enable_thinking", True),
+            "interns1": ("enable_thinking", True),
+        }
+        control_config = parser_control_config.get(self.reasoning_parser)
+        if control_config is None:
+            return True
+
+        param_name, parser_default = control_config
+
+        # Explicit request parameter has the highest priority.
+        if request.chat_template_kwargs and param_name in request.chat_template_kwargs:
+            value = request.chat_template_kwargs.get(param_name)
+            if not parser_default:
+                # Off-by-default parsers require an explicit True signal.
+                return value is True
+            return value is not False
+
+        # If omitted, use the default inferred from chat template when available.
+        get_template_default = getattr(
+            self.template_manager, "get_chat_template_bool_default", None
+        )
+        if callable(get_template_default):
+            template_default = get_template_default(param_name)
+            if template_default is not None:
+                return template_default
+
+        # Fallback to parser-level historical behavior.
+        return parser_default
 
     async def _process_tool_call_stream(
         self,

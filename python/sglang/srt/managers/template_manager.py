@@ -58,6 +58,7 @@ class TemplateManager:
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = "openai"
         self._force_reasoning: bool = False
+        self._chat_template_bool_defaults: Dict[str, bool] = {}
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -84,6 +85,10 @@ class TemplateManager:
         """
         return self._force_reasoning
 
+    def get_chat_template_bool_default(self, param_name: str) -> Optional[bool]:
+        """Get detected default for a bool chat-template parameter."""
+        return self._chat_template_bool_defaults.get(param_name)
+
     def _detect_reasoning_pattern(self, template: str) -> bool:
         """
         Detect if the chat template contains reasoning/thinking patterns.
@@ -99,6 +104,48 @@ class TemplateManager:
             logger.info("Detected the force reasoning pattern in chat template.")
 
         return has_reasoning
+
+    def _detect_chat_template_bool_default(
+        self,
+        tokenizer_manager: TokenizerManager,
+        param_name: str,
+    ) -> Optional[bool]:
+        """
+        Detect whether a bool chat-template parameter defaults to True/False.
+
+        Returns:
+            True if template default behavior matches {param_name}=True,
+            False if it matches {param_name}=False,
+            None if unknown or cannot be detected.
+        """
+        tokenizer = tokenizer_manager.tokenizer
+        if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
+            return None
+        if not hasattr(tokenizer, "apply_chat_template"):
+            return None
+
+        messages = [{"role": "user", "content": "."}]
+        common_kwargs = {"tokenize": False, "add_generation_prompt": True}
+
+        try:
+            prompt_default = tokenizer.apply_chat_template(messages, **common_kwargs)
+            prompt_true = tokenizer.apply_chat_template(
+                messages, **{**common_kwargs, param_name: True}
+            )
+            prompt_false = tokenizer.apply_chat_template(
+                messages, **{**common_kwargs, param_name: False}
+            )
+        except Exception as e:
+            logger.debug(
+                f"Failed to detect default for chat template param '{param_name}': {e}"
+            )
+            return None
+
+        if prompt_default == prompt_true and prompt_default != prompt_false:
+            return True
+        if prompt_default == prompt_false and prompt_default != prompt_true:
+            return False
+        return None
 
     def load_chat_template(
         self,
@@ -141,11 +188,21 @@ class TemplateManager:
                         "No chat template found, defaulting to 'string' content format"
                     )
 
-        # Detect reasoning pattern from chat template
+        # Detect reasoning pattern and bool parameter defaults from chat template
+        self._chat_template_bool_defaults = {}
         if tokenizer_manager.tokenizer:
             self._force_reasoning = self._detect_reasoning_pattern(
                 tokenizer_manager.tokenizer.chat_template
             )
+            # Bool chat-template parameter defaults are only meaningful for HF/Jinja
+            # templates. Built-in conversation templates are handled elsewhere.
+            if self._chat_template_name is None:
+                for param_name in ("enable_thinking", "thinking"):
+                    detected = self._detect_chat_template_bool_default(
+                        tokenizer_manager, param_name
+                    )
+                    if detected is not None:
+                        self._chat_template_bool_defaults[param_name] = detected
 
     def _load_explicit_chat_template(
         self, tokenizer_manager: TokenizerManager, chat_template_arg: str

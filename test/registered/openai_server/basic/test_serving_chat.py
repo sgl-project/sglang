@@ -79,6 +79,10 @@ class _MockTemplateManager:
         self.chat_template_name: Optional[str] = "llama-3"
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
+        self.chat_template_bool_defaults = {}
+
+    def get_chat_template_bool_default(self, param_name: str) -> Optional[bool]:
+        return self.chat_template_bool_defaults.get(param_name)
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -133,6 +137,75 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
+
+    def test_on_by_default_parser_reasoning_resolution_precedence(self):
+        self.chat.reasoning_parser = "qwen3"
+        cases = [
+            (
+                "explicit_true_overrides_template_false",
+                {"enable_thinking": False},
+                {"enable_thinking": True},
+                True,
+            ),
+            (
+                "explicit_false_overrides_template_false",
+                {"enable_thinking": False},
+                {"enable_thinking": False},
+                False,
+            ),
+            (
+                "explicit_none_treated_as_enabled",
+                {"enable_thinking": False},
+                {"enable_thinking": None},
+                True,
+            ),
+            (
+                "template_default_used_when_param_missing",
+                {"enable_thinking": False},
+                None,
+                False,
+            ),
+            ("parser_fallback_used_when_no_template_default", {}, None, True),
+        ]
+
+        for _, template_defaults, kwargs, expected in cases:
+            with self.subTest(
+                template_defaults=template_defaults, kwargs=kwargs, expected=expected
+            ):
+                self.template_manager.chat_template_bool_defaults = template_defaults
+                req = ChatCompletionRequest(
+                    model="test",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    chat_template_kwargs=kwargs,
+                )
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+
+    def test_off_by_default_parser_reasoning_resolution_precedence(self):
+        self.chat.reasoning_parser = "deepseek-v3"
+        cases = [
+            ("explicit_true_required", {}, {"thinking": True}, True),
+            ("explicit_false_stays_disabled", {}, {"thinking": False}, False),
+            ("explicit_none_stays_disabled", {}, {"thinking": None}, False),
+            (
+                "template_default_used_when_param_missing",
+                {"thinking": True},
+                None,
+                True,
+            ),
+            ("parser_fallback_used_when_no_template_default", {}, None, False),
+        ]
+
+        for _, template_defaults, kwargs, expected in cases:
+            with self.subTest(
+                template_defaults=template_defaults, kwargs=kwargs, expected=expected
+            ):
+                self.template_manager.chat_template_bool_defaults = template_defaults
+                req = ChatCompletionRequest(
+                    model="test",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    chat_template_kwargs=kwargs,
+                )
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
 
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
