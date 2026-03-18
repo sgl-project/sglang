@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import os
+import platform
 import resource
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
@@ -513,6 +514,81 @@ class MUSAEnv(BaseEnv):
             return {}
 
 
+
+class MPSEnv(BaseEnv):
+    """Environment checker for Apple MPS (Metal Performance Shaders)"""
+
+    EXTRA_PACKAGE_LIST = [
+        "mlx",
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.package_list.extend(MPSEnv.EXTRA_PACKAGE_LIST)
+
+    def get_info(self):
+        mps_info = {"MPS available": torch.backends.mps.is_available()}
+        if mps_info["MPS available"]:
+            mps_info.update(self.get_device_info())
+            mps_info.update(self._get_macos_info())
+        return mps_info
+
+    def get_device_info(self):
+        """
+        Get information about the Apple GPU via system_profiler.
+        torch.mps does not expose device name or count APIs, so we
+        fall back to macOS system_profiler.
+        """
+        gpu_info = {}
+        try:
+            output = subprocess.check_output(
+                ["system_profiler", "SPDisplaysDataType"],
+                text=True,
+            )
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith("Chipset Model:"):
+                    gpu_info["GPU"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Metal Support:") or line.startswith(
+                    "Metal Family:"
+                ):
+                    key = line.split(":", 1)[0].strip()
+                    gpu_info[key] = line.split(":", 1)[1].strip()
+                elif line.startswith("Total Number of Cores:"):
+                    gpu_info["GPU Cores"] = line.split(":", 1)[1].strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            gpu_info["GPU"] = "Not Available"
+        return gpu_info
+
+    def _get_macos_info(self):
+        """
+        Get macOS and hardware version information.
+        """
+        mac_info = {}
+        mac_ver = platform.mac_ver()[0]
+        if mac_ver:
+            mac_info["macOS Version"] = mac_ver
+        mac_info["Machine"] = platform.machine()
+        # Apple Silicon uses unified memory shared between CPU and GPU
+        try:
+            output = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"], text=True
+            ).strip()
+            mem_bytes = int(output)
+            mac_info["Unified Memory"] = f"{mem_bytes / (1024 ** 3):.1f} GB"
+        except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+            pass
+        return mac_info
+
+    def get_hypervisor_vendor(self) -> dict:
+        # lscpu is not available on macOS
+        return {}
+
+    def get_topology(self):
+        # Apple Silicon uses a unified memory architecture with a single GPU
+        # device, so there is no multi-device topology to report.
+        return {}
+
 if __name__ == "__main__":
     if is_cuda_v2():
         env = GPUEnv()
@@ -522,4 +598,9 @@ if __name__ == "__main__":
         env = NPUEnv()
     elif is_musa():
         env = MUSAEnv()
+    elif is_mps():
+        env = MPSEnv()
+    else:
+        print("No supported device found (CUDA, ROCm, NPU, MUSA, or MPS).")
+        sys.exit(1)
     env.check_env()
