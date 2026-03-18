@@ -1,3 +1,9 @@
+## Apple MPS
+
+| Environment Variable | Default | Description                                                  |
+|----------------------|---------|--------------------------------------------------------------|
+| `SGLANG_USE_MLX`     | not set | Set to `1` to enable MLX fused Metal kernels for norm ops on MPS |
+
 ## Caching Acceleration
 
 These variables configure caching acceleration for Diffusion Transformer (DiT) models.

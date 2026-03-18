@@ -644,7 +644,7 @@ class PiecewiseCudaGraphRunner:
 
         out_cache_loc_swa = (
             buffers.out_cache_loc_swa[:static_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
+            if buffers.out_cache_loc_swa is not None
             else None
         )
 
@@ -728,6 +728,9 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
         )
+
+        if out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 

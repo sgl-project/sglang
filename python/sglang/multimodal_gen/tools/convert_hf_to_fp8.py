@@ -149,6 +149,7 @@ def process_file(
             and "net" not in key
             and "txt_mod" not in key
             and "img_mod" not in key
+            and "modulation" not in key
             and "img_in" not in key
             and "txt_in" not in key
             and "time_in" not in key

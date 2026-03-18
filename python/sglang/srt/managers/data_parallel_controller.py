@@ -47,13 +47,11 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
-    bind_port,
-    configure_ipv6,
     configure_logger,
-    get_zmq_socket,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
+from sglang.srt.utils.network import NetworkAddress, bind_port, get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -289,13 +287,14 @@ class DataParallelController:
         """
         # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
-            endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
-        elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-            port, host = configure_ipv6(server_args.dist_init_addr)
-            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+            na = NetworkAddress(
+                server_args.host or "127.0.0.1",
+                server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+            )
         else:
-            host, port = server_args.dist_init_addr.split(":")
-            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+            na = NetworkAddress.parse(server_args.dist_init_addr)
+            na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
+        endpoint = na.to_tcp()
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes

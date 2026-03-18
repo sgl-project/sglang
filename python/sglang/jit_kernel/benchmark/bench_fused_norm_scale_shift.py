@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark_no_cudagraph
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNormScaleShift,
@@ -78,9 +78,7 @@ def bench_fused_norm_scale_shift(
     else:
         fn = lambda: layer.forward_cuda(x, shift, scale)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms  # convert to us
+    return run_benchmark_no_cudagraph(fn)
 
 
 # ============================================================================
@@ -117,9 +115,7 @@ def bench_fused_scale_residual_norm_scale_shift(
     else:
         fn = lambda: layer.forward_cuda(residual, x, gate, shift, scale)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms  # convert to us
+    return run_benchmark_no_cudagraph(fn)
 
 
 if __name__ == "__main__":
