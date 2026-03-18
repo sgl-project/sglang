@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import torch
 import triton
@@ -9,20 +7,14 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_repack as jit_awq_marlin_repack,
 )
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
-try:
-    from sgl_kernel import awq_marlin_repack as aot_awq_marlin_repack
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
-
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "awq_marlin_repack") and hasattr(
+    torch.ops.sgl_kernel.awq_marlin_repack, "default"
 )
+
+IS_CI = is_in_ci()
 
 SIZE_K = 4096
 SIZE_N = 4096
@@ -55,7 +47,9 @@ def check_correctness():
         print("sgl_kernel AOT not available, skipping correctness check")
         return
     out_jit = jit_awq_marlin_repack(_q_w_awq, SIZE_K, SIZE_N, NUM_BITS)
-    out_aot = aot_awq_marlin_repack(_q_w_awq, SIZE_K, SIZE_N, NUM_BITS)
+    out_aot = torch.ops.sgl_kernel.awq_marlin_repack.default(
+        _q_w_awq, SIZE_K, SIZE_N, NUM_BITS
+    )
     torch.cuda.synchronize()
     torch.testing.assert_close(out_jit, out_aot, rtol=0, atol=0)
     print("Correctness check passed (JIT vs AOT)")
@@ -101,7 +95,9 @@ def benchmark(size_k, size_n, num_bits, provider):
     if provider == "jit":
         fn = lambda: jit_awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
     elif provider == "aot":
-        fn = lambda: aot_awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
+        fn = lambda: torch.ops.sgl_kernel.awq_marlin_repack.default(
+            q_w_awq, size_k, size_n, num_bits
+        )
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

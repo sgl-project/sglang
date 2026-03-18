@@ -1,12 +1,11 @@
 import itertools
-import os
 
 import torch
 import triton
 import triton.testing
 
 from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 
 try:
     from sgl_kernel import awq_dequantize as aot_awq_dequantize
@@ -15,10 +14,7 @@ try:
 except ImportError:
     AOT_AVAILABLE = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 if IS_CI:
     qweight_row_range = [128]

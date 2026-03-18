@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -528,23 +528,62 @@ class NpuFuseEPMoE(DeepEPMoE):
 
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
+    def release_weight_cache(self, weight: torch.Tensor):
+        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
+        origin_weight = weight.data.transpose(1, 2)
+        new_weight = origin_weight.contiguous()
+        origin_weight.untyped_storage().resize_(0)
+        return new_weight
+
+    def scale_from_float_to_int64(self, scale):
+        import numpy as np
+
+        scale = torch.from_numpy(
+            np.frombuffer(
+                scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
+            ).astype(np.int64)
+        ).to(scale.device)
+        return torch.nn.Parameter(scale, requires_grad=False)
+
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
-        layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+        if (
+            envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+            == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+        ):
+            w13_weight = self.release_weight_cache(layer.w13_weight)
+            layer.w13_weight.data = npu_format_cast(w13_weight)
+            w2_weight = self.release_weight_cache(layer.w2_weight)
+            layer.w2_weight.data = npu_format_cast(w2_weight)
 
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(
+                layer.w13_weight_scale.data.shape[0], -1
+            )
+            w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+            layer.w2_weight_scale = torch.nn.Parameter(
+                w2_scale.to(torch.float32), requires_grad=False
+            )
 
-        w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
-        w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
-        layer.w13_weight_scale = torch.nn.Parameter(
-            w13_scale.to(torch.float32), requires_grad=False
-        )
+            layer.w13_weight_scale = self.scale_from_float_to_int64(
+                layer.w13_weight_scale.data
+            )
+            layer.w2_weight_scale = self.scale_from_float_to_int64(
+                layer.w2_weight_scale.data
+            )
+        else:
+            cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
+            layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
+            w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
+            w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
+            layer.w13_weight_scale = torch.nn.Parameter(
+                w13_scale.to(torch.float32), requires_grad=False
+            )
+            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
-        w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
-        layer.w2_weight_scale = torch.nn.Parameter(
-            w2_scale.to(torch.float32), requires_grad=False
-        )
+            w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+            layer.w2_weight_scale = torch.nn.Parameter(
+                w2_scale.to(torch.float32), requires_grad=False
+            )
 
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
@@ -747,7 +786,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+    if (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mooncake()
+        or get_moe_a2a_backend().is_nixl()
+    ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
@@ -763,10 +806,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         elif (
             quant_config is None
             or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "mxfp8"
             or quant_config.get_name() == "modelopt_fp8"
             or quant_config.get_name() == "compressed_tensors"
         ):
-            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
+            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
             return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():

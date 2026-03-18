@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -608,6 +608,35 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+    @classmethod
+    def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
+        """
+        Generates a filter function that tests whether the (layer_id, expert_id)
+        indicated by a param name lies in the `logical_experts` map
+        Args:
+            logical_experts_map: a map of layer_id to expert_ids, specifying a list of expert_ids by a specific layer_id.
+
+        Returns:
+            A function (name: str) -> bool
+        """
+        import re
+
+        # Regex pattern to extract layer_id and expert_id from weight name
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match:
+                layer_id, expert = int(match.group(1)), int(match.group(2))
+                # First check if layer_id exists, then check if expert is in the list
+                return (
+                    layer_id in logical_experts_map
+                    and expert in logical_experts_map[layer_id]
+                )
+            return False
+
+        return weight_name_filter
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,
