@@ -72,7 +72,7 @@ from sglang.srt.entrypoints.engine import (
     run_scheduler_process,
 )
 from sglang.srt.entrypoints.engine_info_bootstrap import (
-    ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
+    get_engine_info_bootstrap_port,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -2197,9 +2197,7 @@ def launch_server(
     # Determine bootstrap port if bootstrap server was started
     engine_info_bootstrap_port = None
     if scheduler_init_result.engine_info_bootstrap is not None:
-        engine_info_bootstrap_port = (
-            server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
-        )
+        engine_info_bootstrap_port = get_engine_info_bootstrap_port(server_args)
 
     _setup_and_run_http_server(
         server_args,

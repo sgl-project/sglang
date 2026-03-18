@@ -19,10 +19,27 @@ from typing import Dict, Optional, Tuple
 
 from aiohttp import web
 
+from sglang.srt.utils.network import NetworkAddress
+
 logger = logging.getLogger(__name__)
 
 # Port offset from server_args.port for the bootstrap server
 ENGINE_INFO_BOOTSTRAP_PORT_OFFSET = 100
+
+
+def get_engine_info_bootstrap_port(server_args) -> int:
+    """Compute the bootstrap server port consistently across all nodes.
+
+    In multi-node setups, dist_init_addr is the same on every node, so we
+    derive the port from it.  In single-node setups we fall back to
+    server_args.port.
+    """
+    if server_args.dist_init_addr:
+        return (
+            NetworkAddress.parse(server_args.dist_init_addr).port
+            + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
+        )
+    return server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
 
 
 class EngineInfoBootstrapServer:
