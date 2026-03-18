@@ -1132,7 +1132,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
         return loaded_params
 
     @classmethod
