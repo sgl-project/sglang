@@ -176,7 +176,7 @@ def _init_config():
         # NOTE: This result is based on benchmarks on H200 GPUs
         THRESHOLD_2_SHOT_MAP = {
             2: ModeConfig(2 * MB, INF),
-            3: ModeConfig(512 * MB, 512 * KB),
+            3: ModeConfig(512 * KB, 512 * KB),
             4: ModeConfig(384 * KB, 256 * KB),
             5: ModeConfig(256 * KB, 256 * KB),
             6: ModeConfig(192 * KB, 192 * KB),
