@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
+    DeepSeekR1ThinkingBudgetLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
@@ -54,7 +55,6 @@ class TestCustomLogitProcessorSerialization(unittest.TestCase):
         s = DisallowedTokensLogitsProcessor.to_str()
         cls1 = _cache_from_str(s)
         cls2 = _cache_from_str(s)
-        # The cached function returns the CLASS, not an instance
         self.assertIs(cls1, cls2)
 
 
@@ -224,6 +224,37 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         # Batch 1 should have been modified (budget exceeded)
         self.assertEqual(result[1, self.NL].item(), 0.0)
         self.assertTrue(torch.isinf(result[1, 0]) and result[1, 0] < 0)
+
+    def test_multiple_thinking_start_counts_from_first(self):
+        """When multiple THINKING_START tokens exist, .index() finds the first.
+        Budget is counted from the *first* START, not the last."""
+        req = _make_req(
+            origin_input_ids=[self.START, 100, 101],
+            output_ids=[self.START, 200, 201],  # second START in output
+        )
+        # cur_ids = [START, 100, 101, START, 200, 201]
+        # First START at index 0, tokens_after_start = 5
+        # Budget=10 → 5 < 10 → no modification
+        params = [{"thinking_budget": 10, "__req__": req}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_deepseek_r1_variant_forces_end(self):
+        """Verify DeepSeekR1 variant works with its own token IDs."""
+        proc = DeepSeekR1ThinkingBudgetLogitProcessor()
+        START = proc.THINKING_START_TOKEN_ID  # 128798
+        NL = proc.NEW_LINE_TOKEN_ID  # 201
+        VOCAB = 200000
+
+        req = _make_req(origin_input_ids=[START], output_ids=[100] * 5)
+        params = [{"thinking_budget": 5, "__req__": req}]
+        logits = torch.zeros(1, VOCAB)
+        result = proc(logits, params)
+        # Budget exceeded, last token (100) is not newline → force newline
+        self.assertEqual(result[0, NL].item(), 0.0)
+        self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
 
 
 # ---------------------------------------------------------------------------

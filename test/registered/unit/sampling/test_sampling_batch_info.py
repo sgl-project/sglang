@@ -243,6 +243,29 @@ class TestUpdateRegexVocabMask(unittest.TestCase):
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
 
+    def test_mixed_grammars_only_active_fills(self):
+        """Finished/terminated/None grammars should be skipped by fill loop."""
+        active = MagicMock()
+        active.finished = False
+        active.is_terminated.return_value = False
+        active.allocate_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
+        active.move_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
+
+        finished = MagicMock()
+        finished.finished = True
+
+        terminated = MagicMock()
+        terminated.finished = False
+        terminated.is_terminated.return_value = True
+
+        info = _make_info(batch_size=3)
+        info.grammars = [active, finished, terminated]
+        info.update_regex_vocab_mask()
+
+        active.fill_vocab_mask.assert_called_once()
+        finished.fill_vocab_mask.assert_not_called()
+        terminated.fill_vocab_mask.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # filter_batch
@@ -262,6 +285,8 @@ class TestFilterBatch(unittest.TestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 1.0)
         self.assertAlmostEqual(info.temperatures[1, 0].item(), 3.0)
         self.assertAlmostEqual(info.top_ps[1].item(), 0.7)
+        # logit_bias should also be filtered
+        self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
 
     def test_filter_with_custom_logit_processor(self):
         proc = MagicMock()
@@ -315,11 +340,23 @@ class TestMergeBatch(unittest.TestCase):
         self.assertAlmostEqual(info1.temperatures[2, 0].item(), 3.0)
 
     def test_merge_combines_flags(self):
-        info1 = _make_info(is_all_greedy=True, need_top_p_sampling=False)
-        info2 = _make_info(is_all_greedy=False, need_top_p_sampling=True)
+        info1 = _make_info(
+            is_all_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+        )
+        info2 = _make_info(
+            is_all_greedy=False,
+            need_top_p_sampling=True,
+            need_top_k_sampling=True,
+            need_min_p_sampling=True,
+        )
         info1.merge_batch(info2)
-        self.assertFalse(info1.is_all_greedy)
-        self.assertTrue(info1.need_top_p_sampling)
+        self.assertFalse(info1.is_all_greedy)       # AND semantics
+        self.assertTrue(info1.need_top_p_sampling)   # OR semantics
+        self.assertTrue(info1.need_top_k_sampling)   # OR semantics
+        self.assertTrue(info1.need_min_p_sampling)   # OR semantics
 
     def test_merge_with_logit_bias(self):
         info1 = _make_info(batch_size=1)
@@ -351,6 +388,18 @@ class TestMergeBatch(unittest.TestCase):
         info2.sampling_seed = None
         info1.merge_batch(info2)
         self.assertIsNone(info1.sampling_seed)
+
+    def test_merge_with_both_sampling_seeds(self):
+        """When both sides have sampling_seed tensors, they should be concatenated."""
+        info1 = _make_info(batch_size=2)
+        info1.sampling_seed = torch.tensor([10, 20], dtype=torch.int64)
+        info2 = _make_info(batch_size=1)
+        info2.sampling_seed = torch.tensor([30], dtype=torch.int64)
+        info1.merge_batch(info2)
+        self.assertEqual(info1.sampling_seed.shape[0], 3)
+        self.assertEqual(info1.sampling_seed[0].item(), 10)
+        self.assertEqual(info1.sampling_seed[1].item(), 20)
+        self.assertEqual(info1.sampling_seed[2].item(), 30)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +497,22 @@ class TestFromScheduleBatch(unittest.TestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    def test_from_schedule_batch_sampling_flags(self, mock_server_args):
+        """Verify need_top_p/top_k/min_p flags are computed correctly."""
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+
+        reqs = [self._make_req(top_p=0.9, top_k=50, min_p=0.1)]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.need_top_p_sampling)   # 0.9 != 1.0
+        self.assertTrue(info.need_top_k_sampling)   # 50 != TOP_K_ALL
+        self.assertTrue(info.need_min_p_sampling)   # 0.1 > 0
+        self.assertFalse(info.is_all_greedy)        # top_k=50 > 1
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_no_logit_bias_when_all_none(self, mock_server_args):

@@ -297,6 +297,27 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertTrue(torch.isinf(logits[0, 5]) and logits[0, 5] < 0)
         self.assertTrue(torch.isinf(logits[0, 10]) and logits[0, 10] < 0)
 
+    def test_blocks_additional_stop_tokens(self):
+        """additional_stop_token_ids from tokenizer should also be blocked."""
+        req = _make_req(min_tokens=3, stop_ids=None, eos_id=2)
+        req.tokenizer.additional_stop_token_ids = {7, 8}
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        # EOS (2) + additional stops (7, 8) should all be blocked
+        for tok in [2, 7, 8]:
+            self.assertTrue(
+                torch.isinf(logits[0, tok]) and logits[0, tok] < 0,
+                f"token {tok} should be blocked before min_new_tokens",
+            )
+        # Non-stop tokens should be fine
+        self.assertEqual(logits[0, 0].item(), 0.0)
+
     def test_filter_keeps_subset(self):
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])
         keep = torch.tensor([1])

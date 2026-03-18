@@ -67,6 +67,11 @@ class TestSamplingParamsInit(unittest.TestCase):
         sp = SamplingParams(stop_token_ids=None)
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_empty_stop_token_ids_becomes_none(self):
+        """Empty list is falsy in Python — treated same as None, not as empty set."""
+        sp = SamplingParams(stop_token_ids=[])
+        self.assertIsNone(sp.stop_token_ids)
+
 
 # ---------------------------------------------------------------------------
 # SamplingParams.verify — parameter validation
@@ -94,6 +99,11 @@ class TestSamplingParamsVerify(unittest.TestCase):
             sp.verify(self.VOCAB_SIZE)
 
     # --- top_p ---
+    def test_top_p_negative_raises(self):
+        sp = self._make(top_p=-0.5)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
     def test_top_p_zero_raises(self):
         """top_p=0 is not in (0, 1]."""
         sp = self._make(top_p=0.0)
@@ -134,6 +144,14 @@ class TestSamplingParamsVerify(unittest.TestCase):
         """top_k=0 is invalid (must be >=1 or -1 for all)."""
         sp = self._make()
         sp.top_k = 0  # bypass __init__ conversion
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_top_k_negative_raises(self):
+        """top_k=-2 stays as-is (__init__ only converts -1 to TOP_K_ALL),
+        and verify() should reject it."""
+        sp = self._make()
+        sp.top_k = -2  # bypass __init__ conversion
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
@@ -192,6 +210,11 @@ class TestSamplingParamsVerify(unittest.TestCase):
     def test_min_equals_max_new_tokens_valid(self):
         sp = self._make(min_new_tokens=10, max_new_tokens=10)
         sp.verify(self.VOCAB_SIZE)
+
+    def test_max_new_tokens_none_skips_validation(self):
+        """When max_new_tokens is None, the min<=max check is skipped entirely."""
+        sp = self._make(min_new_tokens=9999, max_new_tokens=None)
+        sp.verify(self.VOCAB_SIZE)  # should not raise
 
     # --- logit_bias ---
     def test_logit_bias_token_exceeds_vocab_raises(self):
