@@ -700,8 +700,11 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
-    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
+    remote_instance_weight_loader_backend: Literal[
+        "transfer_engine", "nccl", "modelexpress"
+    ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -2967,7 +2970,19 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.load_format == "remote_instance":
-            if (
+            if self.remote_instance_weight_loader_backend == "modelexpress":
+                # ModelExpress backend: requires url in --modelexpress-config
+                if self.modelexpress_url is None:
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to missing 'url' in --modelexpress-config."
+                    )
+                    self.load_format = "auto"
+                elif not self.validate_transfer_engine():
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by modelexpress) not being supported."
+                    )
+                    self.load_format = "auto"
+            elif (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
@@ -5567,14 +5582,20 @@ class ServerArgs:
         parser.add_argument(
             "--remote-instance-weight-loader-backend",
             type=str,
-            choices=["transfer_engine", "nccl"],
+            choices=["transfer_engine", "nccl", "modelexpress"],
             default=ServerArgs.remote_instance_weight_loader_backend,
-            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--modelexpress-config",
+            type=str,
+            default=ServerArgs.modelexpress_config,
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
         )
 
         # For PD-Multiplexing
@@ -6109,7 +6130,11 @@ class ServerArgs:
         )
 
     def validate_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
+        try:
+            mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
+        except (ModuleNotFoundError, ValueError):
+            mooncake_available = False
+        if not mooncake_available:
             logger.warning(
                 "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
@@ -6122,14 +6147,44 @@ class ServerArgs:
         else:
             return True
 
+    @property
+    def _parsed_modelexpress_config(self) -> dict:
+        cache = getattr(self, "_mx_config_cache", None)
+        if cache is not None:
+            return cache
+        if self.modelexpress_config is None:
+            result = {}
+        elif isinstance(self.modelexpress_config, str):
+            result = json.loads(self.modelexpress_config)
+        else:
+            result = self.modelexpress_config
+        object.__setattr__(self, "_mx_config_cache", result)
+        return result
+
+    @property
+    def modelexpress_url(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("url")
+
+    @property
+    def modelexpress_model_name(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("model_name")
+
+    @property
+    def modelexpress_source(self) -> bool:
+        return self._parsed_modelexpress_config.get("source", False)
+
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
+        # ModelExpress source mode also needs TransferEngine init.
+        if self.modelexpress_source:
+            return True
         # Use TransferEngine as client backend.
         elif (
             self.load_format == "remote_instance"
-            and self.remote_instance_weight_loader_backend == "transfer_engine"
+            and self.remote_instance_weight_loader_backend
+            in ("transfer_engine", "modelexpress")
         ):
             return True
         else:
