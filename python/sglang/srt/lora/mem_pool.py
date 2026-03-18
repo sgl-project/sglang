@@ -70,6 +70,7 @@ class LoRAMemoryPool:
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+        self.padding_to_max_lora_rank = True
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
