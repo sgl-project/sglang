@@ -1,11 +1,8 @@
-import logging
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -84,23 +81,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
             from sglang.srt.layers.communicator import get_attn_tp_context
 
-            if get_attn_tp_context().allow_input_scattered:
-                logger.warning(
-                    "VocabParallelEmbeddingWithLoRA with TP > 1 under "
-                    "input_scattered mode (e.g., DeepSeek-v2 MLA with "
-                    "--enable-attn-tp-input-scattered) is not fully "
-                    "supported and may produce incorrect results. "
-                    "Consider disabling input_scattered or removing "
-                    "embed_tokens from LoRA target modules."
-                )
-            else:
-                logger.warning(
-                    "VocabParallelEmbeddingWithLoRA with TP > 1: LoRA "
-                    "weights are fully replicated (unsharded) on every "
-                    "rank, which increases memory usage. If you encounter "
-                    "OOM, consider implementing a sharded embedding LoRA "
-                    "kernel and the corresponding weight-slicing logic."
-                )
+            assert (
+                not get_attn_tp_context().allow_input_scattered
+            ), "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
 
         self.output_offset = torch.tensor(
             [0, self.embed_dim],
