@@ -80,7 +80,6 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 10
         run: |
-          pip install --force-reinstall --no-deps sglang-kernel==0.4.0
           pip install -e "python/[test]"
 
       - name: Run unit tests with coverage
