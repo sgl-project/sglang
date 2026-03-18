@@ -69,7 +69,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     grammar: BaseGrammarObject = None
 
     # Shape info for padding
-    num_tokens_per_batch: int = -1
+    num_tokens_per_req: int = -1
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -154,6 +154,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 dtype=torch.int64,
                 device=batch.device,
             )
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
         self,
@@ -426,9 +428,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
@@ -634,8 +636,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     kv_indices: torch.Tensor = None
 
     # Shape info for padding
-    num_tokens_per_batch: int = -1
-    num_tokens_for_logprob_per_batch: int = -1
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
 
     # Inputs for draft extend
     # shape: (b,)
@@ -652,7 +654,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 

@@ -12,9 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(
-    est_time=400, suite="stage-c-test-8-gpu-h200", disabled="TCP fallback flaky"
-)
+register_cuda_ci(est_time=500, suite="stage-c-test-8-gpu-h200")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
@@ -29,8 +27,8 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -97,8 +95,8 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -158,10 +156,6 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
-@unittest.skipIf(
-    is_in_ci(),
-    "Temporarily disable the flaky test: tcp fallback is not stable currently.",
-)
 class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase):
     """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
 
@@ -175,8 +169,8 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 

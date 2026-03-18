@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
@@ -262,16 +265,17 @@ class CausalWanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
         self.attn1 = CausalWanSelfAttention(
             dim,
             num_heads,
@@ -296,28 +300,30 @@ class CausalWanTransformerBlock(nn.Module):
             raise Exception
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim,
-            norm_type="layer",
-            eps=eps,
-            elementwise_affine=True,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
         )
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
+        self.attn2 = WanT2VCrossAttention(
             dim,
-            norm_type="layer",
+            num_heads,
+            qk_norm=qk_norm,
             eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            supported_attention_backends=cross_attn_backends,
+            quant_config=quant_config,
+        )
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+        )
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -431,7 +437,12 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: WanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -476,6 +487,7 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends,
                     prefix=f"{config.prefix}.blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -484,11 +496,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)

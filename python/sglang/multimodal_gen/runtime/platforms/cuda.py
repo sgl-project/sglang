@@ -15,6 +15,7 @@ import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -123,6 +128,9 @@ class CudaPlatformBase(Platform):
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -215,6 +223,35 @@ class CudaPlatformBase(Platform):
                 )
                 raise ImportError(
                     "Video Sparse Attention backend is not installed."
+                ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:

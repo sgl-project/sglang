@@ -382,7 +382,7 @@ class Runtime:
         # client code without installing SRT server and its dependency if they want.
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
-        from sglang.srt.utils import is_port_available
+        from sglang.srt.utils.network import is_port_available
 
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 

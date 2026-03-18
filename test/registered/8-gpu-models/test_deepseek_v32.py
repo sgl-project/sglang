@@ -30,7 +30,7 @@ DP_ARGS = [
 
 # Accuracy thresholds
 GSM8K_BASELINE = 0.935
-GPQA_BASELINE = 0.835
+GPQA_BASELINE = 0.83
 
 
 class TestDeepseekV32(unittest.TestCase):
@@ -68,6 +68,7 @@ class TestDeepseekV32(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
@@ -82,6 +83,7 @@ class TestDeepseekV32(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]

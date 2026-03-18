@@ -1,4 +1,4 @@
-# Set Up Self-Hosted Runners for GitHub Action
+# Set Up Self-Hosted Runners for GitHub Actions
 
 ## Add a Runner
 

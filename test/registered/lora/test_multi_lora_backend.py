@@ -26,7 +26,7 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd-nondeterministic")
 
 
 class TestMultiLoRABackend(CustomTestCase):

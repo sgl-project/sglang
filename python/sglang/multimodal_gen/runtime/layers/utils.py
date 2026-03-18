@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/utils.py
 """Utility methods for model layers."""
+
 import inspect
 from typing import Any, Callable, List, Optional
 
@@ -10,6 +11,24 @@ import torch
 from torch.library import Library
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+
+
+def get_group_size(group) -> int:
+    if hasattr(group, "world_size"):
+        return group.world_size  # GroupCoordinator
+    elif hasattr(group, "size") and callable(getattr(group, "size", None)):
+        return group.size()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
+
+
+def get_group_rank(group) -> int:
+    if hasattr(group, "rank_in_group"):
+        return group.rank_in_group  # GroupCoordinator
+    elif hasattr(group, "rank") and callable(getattr(group, "rank", None)):
+        return group.rank()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
 
 
 def get_token_bin_counts_and_mask(

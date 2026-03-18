@@ -11,8 +11,9 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 import psutil
-import requests
 import yaml
+
+from sglang.utils import wait_for_http_ready
 
 
 @dataclass
@@ -182,18 +183,20 @@ class ExperimentRunner:
         self.process_manager = ProcessManager()
         self.logger = logging.getLogger(__name__)
 
-    def wait_for_server(self, port: int, timeout: int = 300) -> bool:
-        start_time = time.perf_counter()
-
-        while time.perf_counter() - start_time < timeout:
-            try:
-                response = requests.get(f"http://localhost:{port}/health")
-                if response.status_code == 200:
-                    self.logger.debug(f"Server ready on port {port}")
-                    return True
-            except requests.RequestException:
-                time.sleep(2)
-        return False
+    def wait_for_server(
+        self, port: int, timeout: int = 300, process: Optional[subprocess.Popen] = None
+    ) -> bool:
+        try:
+            wait_for_http_ready(
+                url=f"http://localhost:{port}/health",
+                timeout=timeout,
+                process=process,
+            )
+            self.logger.debug(f"Server ready on port {port}")
+            return True
+        except (RuntimeError, TimeoutError) as e:
+            self.logger.error("Server failed to become ready: %s", e)
+            return False
 
     def run_task(self, config: TaskConfig) -> TaskResult:
         start_time = time.perf_counter()
@@ -216,7 +219,9 @@ class ExperimentRunner:
                 self.process_manager.start_process(config.server_cmd, "SERVER")
             )
 
-            if not self.wait_for_server(port):
+            if not self.wait_for_server(
+                port, process=self.process_manager.server_process
+            ):
                 raise TimeoutError("Server startup timeout")
 
             time.sleep(10)

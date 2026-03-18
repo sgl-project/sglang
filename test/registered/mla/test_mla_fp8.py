@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 # MLA FP8 KV cache test with MGSM evaluation
 register_cuda_ci(est_time=77, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=360, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=800, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestMLA(CustomTestCase):

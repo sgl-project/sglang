@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
+    CachedTokensDetails,
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
@@ -83,3 +84,33 @@ def process_routed_experts_from_ret(
     if not getattr(request, "return_routed_experts", False):
         return None
     return ret_item["meta_info"].get("routed_experts", None)
+
+
+def process_cached_tokens_details_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[CachedTokensDetails]:
+    """Process cached tokens details from a ret item in non-streaming response."""
+    if not getattr(request, "return_cached_tokens_details", False):
+        return None
+
+    details = ret_item["meta_info"].get("cached_tokens_details", None)
+    if details is None:
+        return None
+
+    # Check if L3 storage fields are present
+    if "storage" in details:
+        return CachedTokensDetails(
+            device=details.get("device", 0),
+            host=details.get("host", 0),
+            storage=details.get("storage", 0),
+            storage_backend=details.get("storage_backend"),
+        )
+    else:
+        return CachedTokensDetails(
+            device=details.get("device", 0),
+            host=details.get("host", 0),
+        )

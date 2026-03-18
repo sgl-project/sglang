@@ -32,7 +32,7 @@ TEST_SUITE = dict(
 
 class EngineWrapper:
     """
-    A wrapper around Sglang engine to mock multi instance cases such as RL traing.
+    A wrapper around Sglang engine to mock multi instance cases such as RL training.
 
     """
 
