@@ -46,10 +46,10 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap import (
     ENGINE_INFO_BOOTSTRAP_PORT_OFFSET,
+    EngineInfoBootstrapServer,
 )
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
@@ -82,9 +82,6 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -205,13 +202,6 @@ class Engine(EngineBase):
             # Use bootstrap server as the source of transfer engine info
             self.remote_instance_transfer_engine_info = (
                 self.engine_info_bootstrap.transfer_engine_info
-            )
-        else:
-            # Fallback: parse from scheduler infos (backward compat)
-            self.remote_instance_transfer_engine_info = (
-                parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                    scheduler_init_result.scheduler_infos
-                )
             )
 
         # Initialize ZMQ sockets
@@ -636,28 +626,22 @@ class Engine(EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
-        # Start the engine info bootstrap server before schedulers launch
-        engine_info_bootstrap = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
-            from sglang.srt.entrypoints.engine_info_bootstrap import (
-                EngineInfoBootstrapServer,
-            )
-
-            bootstrap_port = server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
-            engine_info_bootstrap = EngineInfoBootstrapServer(
-                host="0.0.0.0", port=bootstrap_port
-            )
-
         # Launch scheduler processes
         scheduler_init_result = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
 
-        # Attach bootstrap server reference to scheduler_init_result for later access
-        scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
+        # Start the engine info bootstrap server before schedulers are ready
+        if (
+            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            and server_args.node_rank == 0
+        ):
+            # Attach bootstrap server on first node.
+            bootstrap_port = server_args.port + ENGINE_INFO_BOOTSTRAP_PORT_OFFSET
+            engine_info_bootstrap = EngineInfoBootstrapServer(
+                host="0.0.0.0", port=bootstrap_port
+            )
+            scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
 
         if (
             server_args.enable_elastic_expert_backup
@@ -669,11 +653,6 @@ class Engine(EngineBase):
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
             scheduler_init_result.wait_for_ready()
-            # Sync the scheduler infos back to zero rank node without storing locally.
-            if server_args.nnodes > 1:
-                _sync_scheduler_infos_across_nodes(
-                    server_args, scheduler_init_result.scheduler_infos
-                )
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
@@ -723,13 +702,6 @@ class Engine(EngineBase):
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
             "max_req_input_len"
         ]
-
-        if server_args.nnodes > 1:
-            scheduler_init_result.scheduler_infos[:] = (
-                _sync_scheduler_infos_across_nodes(
-                    server_args, scheduler_init_result.scheduler_infos
-                )
-            )
 
         return (
             tokenizer_manager,
@@ -1250,50 +1222,6 @@ def _wait_for_scheduler_ready(
         else:
             scheduler_infos.append(data)
     return scheduler_infos
-
-
-def _sync_scheduler_infos_across_nodes(
-    server_args: ServerArgs,
-    local_scheduler_infos: List[Dict],
-) -> List[Dict]:
-    """Sync scheduler_infos across nodes via StatelessProcessGroup all_gather."""
-    METADATA_SYNC_PORT_OFFSET = 10000
-    SYNC_TIMEOUT_SECONDS = 900  # 15 minutes for slow node startup
-    dist_host, dist_port = server_args.dist_init_addr.rsplit(":", 1)
-    sync_port = int(dist_port) + METADATA_SYNC_PORT_OFFSET
-
-    logger.info(
-        f"Syncing scheduler_infos across {server_args.nnodes} nodes "
-        f"(node_rank={server_args.node_rank}, local_ranks={len(local_scheduler_infos)})"
-    )
-
-    try:
-        pg = StatelessProcessGroup.create(
-            host=dist_host,
-            port=sync_port,
-            rank=server_args.node_rank,
-            world_size=server_args.nnodes,
-            timeout_seconds=SYNC_TIMEOUT_SECONDS,
-        )
-
-        all_node_infos = pg.all_gather_obj(local_scheduler_infos)
-
-        merged_scheduler_infos = []
-        for node_infos in all_node_infos:
-            if node_infos:
-                merged_scheduler_infos.extend(node_infos)
-
-        logger.info(
-            f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
-        )
-        return merged_scheduler_infos
-
-    except Exception as e:
-        logger.error(
-            f"Failed to sync scheduler_infos across nodes: {e}. "
-            f"Only local ranks will be available."
-        )
-        return local_scheduler_infos
 
 
 def _calculate_rank_ranges(

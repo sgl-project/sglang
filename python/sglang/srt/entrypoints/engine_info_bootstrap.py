@@ -11,13 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Lightweight aiohttp server for per-rank engine info registration.
-
-Runs in a daemon thread on node_rank==0 before schedulers start.
-Each ModelRunner registers its transfer engine info via HTTP PUT after
-initialization. The main HTTP server queries via GET or direct in-process
-access.
-"""
 
 import asyncio
 import logging
@@ -33,11 +26,14 @@ ENGINE_INFO_BOOTSTRAP_PORT_OFFSET = 100
 
 
 class EngineInfoBootstrapServer:
-    """Lightweight aiohttp server for per-rank engine info registration.
+    """Lightweight aiohttp server for per-rank transfer engine info registration.
 
-    Runs in a daemon thread on node_rank==0 before schedulers start.
-    Each ModelRunner registers its info via HTTP PUT after initialization.
-    The main HTTP server queries via GET or direct in-process access.
+    Runs in a daemon thread on node_rank==0. Each ModelRunner registers its
+    info via HTTP PUT after model initialization. The Engine
+    accesses the collected info directly in-process; external consumers can
+    query via HTTP GET.
+
+    Currently supports transfer engine memory registration info.
     """
 
     def __init__(self, host: str, port: int):
@@ -50,7 +46,6 @@ class EngineInfoBootstrapServer:
         self.transfer_engine_info: Dict[int, Tuple] = {}
         self.lock = asyncio.Lock()
 
-        # Start in daemon thread (same pattern as CommonKVBootstrapServer)
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
 
@@ -99,7 +94,7 @@ class EngineInfoBootstrapServer:
     async def _handle_get_transfer_engine_info(self, request: web.Request):
         """Handle GET /get_transfer_engine_info?rank=N.
 
-        Response matches existing consumer contract exactly:
+        Response:
         {
             "rank": N,
             "remote_instance_transfer_engine_info": [session_id, weights_info_dict]
@@ -125,8 +120,6 @@ class EngineInfoBootstrapServer:
                 text=f"No transfer engine info for rank {rank}", status=404
             )
 
-        # Return format matching the existing consumer contract
-        # (loader.py:get_remote_instance_transfer_engine_info_per_rank)
         result = {
             "rank": rank,
             "remote_instance_transfer_engine_info": list(info),
@@ -134,10 +127,7 @@ class EngineInfoBootstrapServer:
         return web.json_response(result, status=200)
 
     def _run_server(self):
-        """Run the aiohttp server in a dedicated thread.
-
-        Same pattern as CommonKVBootstrapServer._run_server().
-        """
+        """Run the aiohttp server in a dedicated thread."""
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
