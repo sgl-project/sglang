@@ -406,6 +406,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        quant_format: str = "",
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
@@ -413,6 +414,7 @@ class LayerCommunicator:
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
