@@ -966,7 +966,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         if self.use_parallel_decode and get_sp_world_size() > 1:
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
-            decoded = ParallelTiledVAE.parallel_tiled_decode(self, z)[:, :, :num_sample_frames]
+            decoded = super().parallel_tiled_decode(z)[:, :, :num_sample_frames]
             return DecoderOutput(sample=decoded)
 
         return DecoderOutput(sample=self._decode(z))
