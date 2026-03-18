@@ -7,6 +7,8 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
+import inspect
+
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -119,12 +121,21 @@ class ImageEncodingStage(PipelineStage):
         all_prompt_embeds = []
         all_neg_prompt_embeds = []
 
+        image_processor_call_params = inspect.signature(
+            self.image_processor.__call__
+        ).parameters
+        image_processor_kwargs = {
+            k: v
+            for k, v in image_processor_kwargs.items()
+            if k in image_processor_call_params
+        }
+
         for idx, prompt_images in enumerate(per_prompt_images):
             if not prompt_images:
                 continue
 
             cur_kwargs = image_processor_kwargs.copy()
-            if texts and idx < len(texts):
+            if texts and idx < len(texts) and "text" in image_processor_call_params:
                 cur_kwargs["text"] = [texts[idx]]
 
             image_inputs = self.image_processor(

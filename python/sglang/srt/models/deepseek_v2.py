@@ -33,6 +33,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
 )
 from sglang.srt.configs.model_config import (
+    compute_mla_mscale_scaling,
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
@@ -138,7 +139,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
-    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1217,10 +1217,7 @@ class DeepseekV2AttentionMLA(
             )
 
             if rope_scaling:
-                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-                scaling_factor = rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
         else:
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
@@ -1513,7 +1510,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
         if hasattr(config, "rope_parameters"):
-            rope_theta = config.rope_parameters.get("rope_theta")
+            rope_theta = config.rope_parameters["rope_theta"]
             assert rope_theta is not None, f"rope_theta not found in config: {config}"
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
