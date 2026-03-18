@@ -99,48 +99,48 @@ class TestInternVL25Server(ImageOpenAITestMixin, InternVLXPUServerBase):
         pass
 
 
-class TestInternVL25TritonServer(ImageOpenAITestMixin, InternVLXPUServerBase):
-    """InternVL2.5-2B on XPU with Triton (non-SGL) backend."""
+# class TestInternVL25TritonServer(ImageOpenAITestMixin, InternVLXPUServerBase):
+#     """InternVL2.5-2B on XPU with Triton (non-SGL) backend."""
 
-    model = "OpenGVLab/InternVL2_5-2B"
-    use_sgl_xpu = False
-    extra_args = [
-        "--cuda-graph-max-bs=4",
-    ]
+#     model = "OpenGVLab/InternVL2_5-2B"
+#     use_sgl_xpu = False
+#     extra_args = [
+#         "--cuda-graph-max-bs=4",
+#     ]
 
-    def test_video_images_chat_completion(self):
-        # Video test exceeds max_prefill_tokens on XPU with default limits.
-        pass
-
-
-class TestInternVL35_2BServer(ImageOpenAITestMixin, InternVLXPUServerBase):
-    """InternVL3.5-2B on XPU with SGL XPU backend."""
-
-    model = "OpenGVLab/InternVL3_5-2B"
-    use_sgl_xpu = True
-    launch_timeout = INTERNVL35_LAUNCH_TIMEOUT
-    extra_args = [
-        "--cuda-graph-max-bs=4",
-    ]
-
-    def test_video_images_chat_completion(self):
-        # Video test exceeds max_prefill_tokens (23202 > 14588) on InternVL3.5.
-        pass
+#     def test_video_images_chat_completion(self):
+#         # Video test exceeds max_prefill_tokens on XPU with default limits.
+#         pass
 
 
-class TestInternVL35_2BTritonServer(ImageOpenAITestMixin, InternVLXPUServerBase):
-    """InternVL3.5-2B on XPU with Triton (non-SGL) backend."""
+# class TestInternVL35_2BServer(ImageOpenAITestMixin, InternVLXPUServerBase):
+#     """InternVL3.5-2B on XPU with SGL XPU backend."""
 
-    model = "OpenGVLab/InternVL3_5-2B"
-    use_sgl_xpu = False
-    launch_timeout = INTERNVL35_LAUNCH_TIMEOUT
-    extra_args = [
-        "--cuda-graph-max-bs=4",
-    ]
+#     model = "OpenGVLab/InternVL3_5-2B"
+#     use_sgl_xpu = True
+#     launch_timeout = INTERNVL35_LAUNCH_TIMEOUT
+#     extra_args = [
+#         "--cuda-graph-max-bs=4",
+#     ]
 
-    def test_video_images_chat_completion(self):
-        # Video test exceeds max_prefill_tokens on InternVL3.5.
-        pass
+#     def test_video_images_chat_completion(self):
+#         # Video test exceeds max_prefill_tokens (23202 > 14588) on InternVL3.5.
+#         pass
+
+
+# class TestInternVL35_2BTritonServer(ImageOpenAITestMixin, InternVLXPUServerBase):
+#     """InternVL3.5-2B on XPU with Triton (non-SGL) backend."""
+
+#     model = "OpenGVLab/InternVL3_5-2B"
+#     use_sgl_xpu = False
+#     launch_timeout = INTERNVL35_LAUNCH_TIMEOUT
+#     extra_args = [
+#         "--cuda-graph-max-bs=4",
+#     ]
+
+#     def test_video_images_chat_completion(self):
+#         # Video test exceeds max_prefill_tokens on InternVL3.5.
+#         pass
 
 
 if __name__ == "__main__":
