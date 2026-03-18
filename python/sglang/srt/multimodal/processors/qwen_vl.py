@@ -368,7 +368,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             input_ids.extend(prompt[cur_idx:])
 
         return input_ids, offsets, modality_list
-    
+
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
         video_grid_thw = None
