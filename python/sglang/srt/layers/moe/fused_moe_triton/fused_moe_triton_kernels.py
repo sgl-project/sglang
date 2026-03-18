@@ -576,6 +576,8 @@ def fused_moe_kernel(
                 else:
                     accumulator += tl.dot(a, b)
         else:
+            if swap_ab:
+                a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         if a_desc is None:
@@ -720,8 +722,8 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
-
-    if use_fp8_w8a8:
+    use_bf16 = A.dtype == torch.bfloat16
+    if use_fp8_w8a8 or use_bf16:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
         swap_ab = False
