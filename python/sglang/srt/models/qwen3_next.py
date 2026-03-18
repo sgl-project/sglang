@@ -268,12 +268,12 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        # Override weight_loader for interleaved checkpoint format.
+        # Override weight_loader for packed checkpoint format.
         # Must capture original_loader BEFORE overwriting.
-        self.in_proj_qkvz.weight.weight_loader = self._make_interleaved_weight_loader(
+        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
             self.in_proj_qkvz
         )
-        self.in_proj_ba.weight.weight_loader = self._make_interleaved_weight_loader(
+        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
             self.in_proj_ba
         )
 
@@ -352,16 +352,16 @@ class Qwen3GatedDeltaNet(nn.Module):
         )
 
     @staticmethod
-    def _make_interleaved_weight_loader(module):
+    def _make_packed_weight_loader(module):
         """Create a weight_loader that does contiguous TP slicing for fused
-        (interleaved-format) checkpoint weights (shard_id=None), and delegates
+        (packed-format) checkpoint weights (shard_id=None), and delegates
         to the standard MergedColumnParallelLinear loader for split checkpoint
         weights (shard_id=int/tuple)."""
         original_loader = module.weight.weight_loader
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
             if loaded_shard_id is None:
-                # Fused checkpoint: weight is in interleaved (per-head-group)
+                # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
                 if output_dim is not None and module.tp_size > 1:
