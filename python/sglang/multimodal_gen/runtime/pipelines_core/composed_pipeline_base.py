@@ -449,7 +449,11 @@ class ComposedPipelineBase(ABC):
     ) -> "ComposedPipelineBase":
 
         return self.add_stage(
-            DecodingStage(vae=self.get_module(vae_key), pipeline=self),
+            DecodingStage(
+                vae=self.get_module(vae_key),
+                pipeline=self,
+                component_name=vae_key,
+            ),
         )
 
     def add_standard_t2i_stages(
