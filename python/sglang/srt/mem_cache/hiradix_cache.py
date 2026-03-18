@@ -1044,7 +1044,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)]
+            node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
@@ -1472,7 +1472,7 @@ class HiRadixCache(RadixCache):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len]
+                    node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)

@@ -78,7 +78,7 @@ def apply_rope_inplace(
     module.run_rope(q, k, cos_sin_cache, positions)
 
 
-@register_custom_op(mutates_args=["q", "k_cache", "v_cache"])
+@register_custom_op(mutates_args=["q", "k", "k_cache", "v_cache"])
 def apply_rope_inplace_with_kvcache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,8 +95,8 @@ def apply_rope_inplace_with_kvcache(
     """
     Fused inplace RoPE + KV cache store.
 
-    Applies rotary position embedding to q inplace. For k, applies RoPE and
-    stores the result in k_cache. The original v is also stored in v_cache.
+    Applies rotary position embedding to q and k inplace. The rotated k is also
+    stored in k_cache. The original v is also stored in v_cache.
 
     Args:
         q: Query tensor of shape [num_tokens, num_qo_heads, head_dim].

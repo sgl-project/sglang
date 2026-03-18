@@ -96,6 +96,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Show test partition assignments
+        continue-on-error: true
+        run: python3 test/show_partitions.py
+
       - name: Determine run mode
         id: run-mode
         run: |

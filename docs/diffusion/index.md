@@ -50,6 +50,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 
 - **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
 - **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
+- **[Post-Processing](api/post_processing.md)** - Frame interpolation (RIFE) and upscaling (Real-ESRGAN)
 
 ### Performance Optimization
 

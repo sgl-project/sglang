@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -52,6 +53,11 @@ class SessionSlot:
     mamba_next_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
+
+    @property
+    def is_holding_kv(self) -> bool:
+        """Whether this slot currently holds KV pool resources."""
+        return self.req_pool_idx is not None
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -178,6 +184,7 @@ class SessionAwareCache(BasePrefixCache):
             device_indices=device_indices,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
+            cache_protected_len=slot.cache_protected_len,
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
@@ -227,7 +234,7 @@ class SessionAwareCache(BasePrefixCache):
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
-        if slot.req_pool_idx is not None:
+        if slot.is_holding_kv:
             start = slot.cache_protected_len
             end = slot.kv_allocated_len
             if start < end:
@@ -241,13 +248,29 @@ class SessionAwareCache(BasePrefixCache):
         """Total KV tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.req_pool_idx is not None:
-                total += slot.kv_allocated_len - slot.cache_protected_len
+            if slot.is_holding_kv:
+                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                total += allocated - slot.cache_protected_len
+        return total
+
+    def session_held_full_tokens(self) -> int:
+        """An alias to align the naming style of SWA"""
+        return self.session_held_tokens()
+
+    def session_held_swa_tokens(self) -> int:
+        """Total SWA tokens held by session slots, not tracked by the tree."""
+        total = 0
+        for slot in self.slots.values():
+            if slot.is_holding_kv:
+                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                total += allocated - max(
+                    slot.cache_protected_len, slot.swa_evicted_seqlen
+                )
         return total
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(1 for s in self.slots.values() if s.req_pool_idx is not None)
+        return sum(s.is_holding_kv for s in self.slots.values())
 
     # -- Pass-through methods --
 
@@ -305,7 +328,14 @@ class SessionAwareCache(BasePrefixCache):
     def init_metrics_collector(self):
         return self.inner.init_metrics_collector()
 
-    # Forward attribute access for cache-specific methods (e.g. sanity_check,
+    def sanity_check(self):
+        # Skip inner sanity check when sessions hold tree locks, because
+        # the check asserts all nodes are unlocked during idle.
+        if any(s.is_holding_kv for s in self.slots.values()):
+            return
+        self.inner.sanity_check()
+
+    # Forward attribute access for cache-specific methods (e.g.
     # sliding_window_size, all_values_flatten, etc.)
     def __getattr__(self, name):
         return getattr(self.inner, name)

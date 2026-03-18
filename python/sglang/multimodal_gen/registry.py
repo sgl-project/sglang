@@ -287,7 +287,7 @@ def _get_config_info(
     for registered_model_hf_id in all_model_hf_paths:
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
-        if registered_model_name == model_short_name:
+        if registered_model_name in model_short_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )

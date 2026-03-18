@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -142,7 +145,13 @@ def maybe_load_fsdp_model(
         if quant_method is not None and hasattr(
             quant_method, "process_weights_after_loading"
         ):
+            if _is_npu:
+                # Activate the NZ format for storing weights,
+                # which is a specific optimization for Ascend NPU
+                torch.npu.config.allow_internal_format = True
             quant_method.process_weights_after_loading(module)
+            if _is_npu:
+                torch.npu.empty_cache()
 
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:

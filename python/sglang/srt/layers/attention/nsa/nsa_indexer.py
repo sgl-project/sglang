@@ -313,8 +313,8 @@ class Indexer(MultiPlatformOp):
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        query[..., : self.rope_head_dim] = q_rope
-        key[..., : self.rope_head_dim] = k_rope
+        query[..., : self.rope_head_dim] = q_rope.clone()
+        key[..., : self.rope_head_dim] = k_rope.clone()
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -352,7 +352,7 @@ class Indexer(MultiPlatformOp):
         )
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        key[..., : self.rope_head_dim] = k_rope
+        key[..., : self.rope_head_dim] = k_rope.clone()
         key = rotate_activation(key)
 
         return key

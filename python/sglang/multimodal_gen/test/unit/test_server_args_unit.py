@@ -1,8 +1,11 @@
 import os
+import sys
 import unittest
+from unittest.mock import patch
 
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 class TestServerArgsPathExpansion(unittest.TestCase):
@@ -44,6 +47,27 @@ class TestModelIdResolution(unittest.TestCase):
         # with an unresolvable path, expect RuntimeError from the detector step
         with self.assertRaises((RuntimeError, Exception)):
             _get_config_info("/data/no-such-model", model_id="NonExistentModelXYZ")
+
+
+class TestPipelineResolutionCliOverride(unittest.TestCase):
+    def setUp(self):
+        _get_config_info.cache_clear()
+
+    def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Qwen/Qwen-Image-Layered",
+            "--resolution",
+            "768",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.pipeline_config.resolution, 768)
 
 
 if __name__ == "__main__":
