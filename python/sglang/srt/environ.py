@@ -362,6 +362,14 @@ class Envs:
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
+    # Unified JIT / precompilation cache root
+    SGLANG_JIT_CACHE_ROOT = EnvStr(
+        os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+            "sglang",
+        )
+    )
+
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
@@ -525,6 +533,20 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def get_jit_cache_subdir(subdir: str, override_env: str = None) -> str:
+    """Return the path for a JIT cache subdirectory under SGLANG_JIT_CACHE_ROOT.
+
+    If *override_env* is given and that environment variable is set, its value
+    is used instead of the derived path.
+    """
+    if override_env:
+        val = os.environ.get(override_env)
+        if val:
+            return os.path.expanduser(val)
+    root = envs.SGLANG_JIT_CACHE_ROOT.get()
+    return os.path.join(root, subdir)
 
 
 def _print_deprecated_env(new_name: str, old_name: str):

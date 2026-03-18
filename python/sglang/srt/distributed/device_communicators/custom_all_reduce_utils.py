@@ -257,9 +257,9 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     if cuda_visible_devices is None:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
 
-    # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
-    # "~/.cache/vllm" -> "~/.cache/sglang"
-    SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
+    from sglang.srt.environ import envs
+
+    SGLANG_CACHE_ROOT = envs.SGLANG_JIT_CACHE_ROOT.get()
     path = os.path.join(
         SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )

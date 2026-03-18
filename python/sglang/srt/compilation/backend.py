@@ -395,16 +395,24 @@ class SGLangBackend:
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
         rank0_log(f"SGLangBackend __call__")
-        base_cache_dir = os.path.expanduser(
-            os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
-        )
+        from sglang.srt.environ import get_jit_cache_subdir
 
         cache_hash = self.compiler_manager.compute_hash()
-        cache_dir = os.path.join(
-            base_cache_dir,
-            "torch_compile_cache",
-            cache_hash,
-        )
+        sglang_cache_dir_override = os.environ.get("SGLANG_CACHE_DIR")
+
+        if sglang_cache_dir_override:
+            base_cache_dir = os.path.expanduser(sglang_cache_dir_override)
+            cache_dir = os.path.join(
+                base_cache_dir,
+                "torch_compile_cache",
+                cache_hash,
+            )
+        else:
+            base_cache_dir = get_jit_cache_subdir("torch_compile")
+            cache_dir = os.path.join(
+                base_cache_dir,
+                cache_hash,
+            )
 
         os.makedirs(cache_dir, exist_ok=True)
         rank = 0

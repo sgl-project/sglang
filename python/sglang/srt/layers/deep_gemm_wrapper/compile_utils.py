@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     disable_symmetric_memory_context,
     restore_symmetric_memory_context,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, get_jit_cache_subdir
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_available_gpu_memory
@@ -30,8 +30,8 @@ _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
 # Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
+os.environ["DG_JIT_CACHE_DIR"] = get_jit_cache_subdir(
+    "deep_gemm", override_env="SGLANG_DG_CACHE_DIR"
 )
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f

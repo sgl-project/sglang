@@ -22,11 +22,25 @@ import time
 from math import ceil
 from pathlib import Path
 
-# Configure DeepGEMM cache before importing deep_gemm
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
-)
+
+# Configure DeepGEMM cache before importing deep_gemm.
+# Mirrors the logic in sglang.srt.environ.get_jit_cache_subdir without
+# importing sglang (which pulls in torch and other heavy deps).
+def _resolve_dg_cache_dir():
+    explicit = os.environ.get("SGLANG_DG_CACHE_DIR")
+    if explicit:
+        return os.path.expanduser(explicit)
+    root = os.environ.get(
+        "SGLANG_JIT_CACHE_ROOT",
+        os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+            "sglang",
+        ),
+    )
+    return os.path.join(root, "deep_gemm")
+
+
+os.environ["DG_JIT_CACHE_DIR"] = _resolve_dg_cache_dir()
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 BLOCK_SIZE = 128
