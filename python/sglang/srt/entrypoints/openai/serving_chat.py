@@ -1415,9 +1415,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
-        # Get expected vs actual arguments
+        # Get expected vs actual arguments.
+        # Most detectors store arguments as a dict, (dsv32) as a pre-serialized string.
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = dumps_args(expected_args)
+        expected_call = (
+            expected_args
+            if isinstance(expected_args, str)
+            else dumps_args(expected_args)
+        )
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
