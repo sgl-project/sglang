@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.parser.conversation import generate_embedding_convs
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -97,13 +98,22 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     videos.append(item.video if item.video is not None else None)
 
                 generate_prompts = []
-                # Check if we have a chat template for multimodal embeddings
+                # Built-in conversation templates.
                 if self.template_manager.chat_template_name is not None:
                     convs = generate_embedding_convs(
                         texts, images, videos, self.template_manager.chat_template_name
                     )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
+                # Explicit/HF Jinja templates.
+                elif (
+                    self.tokenizer_manager.tokenizer is not None
+                    and getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
+                    is not None
+                ):
+                    generate_prompts = self._apply_jinja_template_to_embedding_inputs(
+                        texts, images, videos
+                    )
                 else:
                     generate_prompts = texts
 
@@ -139,6 +149,45 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         )
 
         return adapted_request, request
+
+    def _apply_jinja_template_to_embedding_inputs(
+        self,
+        texts: List[Optional[str]],
+        images: List[Optional[str]],
+        videos: List[Optional[str]],
+    ) -> List[str]:
+        prompts: List[str] = []
+        template_content_format = self.template_manager.jinja_template_content_format
+
+        for text, image, video in zip(texts, images, videos):
+            content_parts = []
+            if image is not None:
+                content_parts.append({"type": "image_url", "image_url": {"url": image}})
+            if video is not None:
+                content_parts.append({"type": "video_url", "video_url": {"url": video}})
+            if text is not None:
+                content_parts.append({"type": "text", "text": text})
+
+            msg_dict = {
+                "role": "user",
+                "content": content_parts if content_parts else "",
+            }
+            processed_msg = process_content_for_template_format(
+                msg_dict,
+                template_content_format,
+                image_data=[],
+                video_data=[],
+                audio_data=[],
+                modalities=[],
+            )
+            prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                [processed_msg],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompts.append(prompt)
+
+        return prompts
 
     async def _handle_non_streaming_request(
         self,
