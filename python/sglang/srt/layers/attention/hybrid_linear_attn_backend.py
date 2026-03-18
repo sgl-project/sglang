@@ -100,44 +100,6 @@ elif is_cpu():
 
 logger = logging.getLogger(__name__)
 
-_ssm_capture_dir = os.environ.get("SGLANG_CAPTURE_SSM_STATE")
-_ssm_capture_counter: dict = {}
-print("=" * 80)
-print("HYBRID_LINEAR_ATTN_BACKEND LOADED")
-print(f"SGLANG_CAPTURE_SSM_STATE={_ssm_capture_dir}")
-print("=" * 80)
-
-
-def _maybe_capture_ssm_state(
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    layer_id: int,
-    mode: str,
-) -> None:
-    """Save ssm_states[cache_indices] to disk when SGLANG_CAPTURE_SSM_STATE is set.
-
-    Set SGLANG_CAPTURE_SSM_STATE=/path/to/dir to enable. Files are written as:
-        <dir>/ssm_state_layer<layer_id>_<mode>_<step>.pt
-
-    Each saved tensor has shape [batch, num_heads, head_v_dim, key_head_dim].
-    """
-    if _ssm_capture_dir is None:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    real_indices = cache_indices[cache_indices >= 0]
-    print(f"[SSM_CAPTURE] layer={layer_id} mode={mode} cache_indices={cache_indices.tolist()} real={real_indices.tolist()}")
-    key = (layer_id, mode)
-    step = _ssm_capture_counter.get(key, 0)
-    _ssm_capture_counter[key] = step + 1
-    state = ssm_states[real_indices.long()].detach().cpu()
-    os.makedirs(_ssm_capture_dir, exist_ok=True)
-    path = os.path.join(
-        _ssm_capture_dir, f"ssm_state_layer{layer_id}_{mode}_{step:06d}.pt"
-    )
-    torch.save(state, path)
-
-
 # Kernel to track mamba states if needed based on track mask
 @triton.jit
 def track_mamba_state_if_needed_kernel(
@@ -947,7 +909,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
-        _maybe_capture_ssm_state(ssm_states, cache_indices, layer.layer_id, "decode")
 
         return core_attn_out
 
@@ -1097,7 +1058,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
             )
-            _maybe_capture_ssm_state(ssm_states, cache_indices, layer.layer_id, "extend")
 
         return core_attn_out
 
