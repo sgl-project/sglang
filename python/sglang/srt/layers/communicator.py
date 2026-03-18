@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -100,6 +101,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and not is_flashinfer_allreduce_unavailable()
     )
 
 
@@ -840,18 +842,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
