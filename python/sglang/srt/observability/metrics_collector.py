@@ -778,10 +778,10 @@ class SchedulerMetricsCollector:
         gauge.labels(**self.labels).set(data)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
-        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
+        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<bucket>".
         # NOTE: When priority scheduling is enabled, the total is recorded under
         # priority="" (the default label value). Per-priority breakdowns are recorded
-        # with priority="<int>". Grafana queries should use priority="" for totals.
+        # with priority="<bucket>". Grafana queries should use priority="" for totals.
         gauge.labels(**self.labels).set(data.total)
         if data.by_priority is not None:
             self._known_priorities.update(data.by_priority.keys())
