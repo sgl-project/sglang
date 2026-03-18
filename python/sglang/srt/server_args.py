@@ -206,6 +206,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "aiter_ck",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -4414,7 +4415,8 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). "
+            "'aiter' (ROCm only, uses AITER Triton GEMM for FP8 blockscale), "
+            "'aiter_ck' (ROCm only, uses AITER precompiled CK GEMM for FP8 blockscale — eliminates Triton JIT compilation overhead). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )
