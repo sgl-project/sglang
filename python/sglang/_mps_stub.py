@@ -47,6 +47,22 @@ class Stream:
         pass
 
 
+class StreamContext:
+    """Minimal stand-in for ``torch.cuda.StreamContext``.
+
+    MPS has no user-visible streams, so entering / exiting is a no-op.
+    """
+
+    def __init__(self, stream: Any = None) -> None:
+        self.stream = stream
+
+    def __enter__(self) -> "StreamContext":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        pass
+
+
 class Event:
     """Minimal stand-in for ``torch.cuda.Event``."""
 
@@ -235,6 +251,7 @@ def install() -> None:
     # Only patch attributes that are actually missing
     for name, obj in [
         ("Stream", Stream),
+        ("StreamContext", StreamContext),
         ("Event", Event),
         ("current_stream", current_stream),
         ("stream", stream),
