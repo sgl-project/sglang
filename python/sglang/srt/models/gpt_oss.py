@@ -91,15 +91,6 @@ class GptOssConfig(PretrainedConfig):
 
 logger = logging.getLogger(__name__)
 
-_FLASHINFER_TINYGEMM_BF16_SUPPORTED_CC = {
-    (9, 0),
-    (10, 0),
-    (10, 3),
-    (11, 0),
-    (12, 0),
-    (12, 1),
-}
-
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
@@ -111,11 +102,11 @@ class GptOssRouterLinear(ReplicatedLinear):
     """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path."""
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        device_cc = torch.cuda.get_device_capability(x.device) if x.is_cuda else None
         if (
             x.ndim == 2
             and x.is_cuda
-            and device_cc in _FLASHINFER_TINYGEMM_BF16_SUPPORTED_CC
+            and torch.cuda.get_device_capability(x.device)[0] >= 9
+            and x.shape[0] <= 128
             and x.is_contiguous()
             and self.weight.is_contiguous()
             and x.shape[1] == self.weight.shape[1]
