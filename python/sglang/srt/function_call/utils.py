@@ -11,6 +11,11 @@ from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 _JSON_DECODER = JSONDecoder()
 
 
+def dumps_args(arguments: Any) -> str:
+    """Serialize arguments to a JSON string using orjson."""
+    return orjson.dumps(arguments, option=orjson.OPT_NON_STR_KEYS).decode()
+
+
 def _find_common_prefix(s1: str, s2: str, start: int = 0) -> str:
     i = start
     min_len = min(len(s1), len(s2))

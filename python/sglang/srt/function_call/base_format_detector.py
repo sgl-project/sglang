@@ -17,6 +17,7 @@ from sglang.srt.function_call.utils import (
     _find_common_prefix,
     _is_complete_json,
     _partial_json_loads,
+    dumps_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,6 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
-
-    @staticmethod
-    def _dumps_args(arguments: Any) -> str:
-        """Serialize arguments to JSON string using orjson."""
-        return orjson.dumps(arguments, option=orjson.OPT_NON_STR_KEYS).decode()
 
     def _update_prev_tool(self, tool_id: int, tool_call: Dict, args_json: str) -> None:
         """Update cached previous tool call state for the given tool_id."""
@@ -105,7 +101,7 @@ class BaseFormatDetector(ABC):
                 ToolCallItem(
                     tool_index=tool_indices.get(name, -1),
                     name=name,
-                    parameters=self._dumps_args(
+                    parameters=dumps_args(
                         act.get("parameters") or act.get("arguments", {})
                     ),
                 )
@@ -275,7 +271,7 @@ class BaseFormatDetector(ABC):
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = self._dumps_args(cur_arguments)
+                    cur_args_json = dumps_args(cur_arguments)
                     prev_args_json = (
                         self._get_prev_args_json(self.current_tool_id) or None
                     )

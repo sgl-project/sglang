@@ -46,7 +46,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import dumps_args, get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -1418,7 +1418,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Get expected vs actual arguments
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        expected_call = dumps_args(expected_args)
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
