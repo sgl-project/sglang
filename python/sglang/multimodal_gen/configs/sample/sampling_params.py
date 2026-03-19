@@ -183,6 +183,7 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
+    diffusers_kwargs: dict | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -575,7 +576,6 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(

@@ -65,11 +65,15 @@ class TextEncodingStage(PipelineStage):
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # Get max_sequence_length from batch if available
+        max_seq_length = getattr(batch, "max_sequence_length", None)
+
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
             prompt_text,
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            max_length=max_seq_length,
         )
 
         for pe in prompt_embeds_list:
@@ -91,6 +95,7 @@ class TextEncodingStage(PipelineStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
+                max_length=max_seq_length,
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -246,6 +251,9 @@ class TextEncodingStage(PipelineStage):
                 encoder_config.tokenizer_kwargs,
                 **text_encoder_extra_arg,
             )
+            # Pass max_length to tokenizer if specified in the request
+            if max_length is not None:
+                tok_kwargs["max_length"] = max_length
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs

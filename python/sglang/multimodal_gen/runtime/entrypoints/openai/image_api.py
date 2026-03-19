@@ -30,10 +30,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
-logger = init_logger(__name__)
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -133,6 +131,7 @@ async def generations(
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
+            diffusers_kwargs=request.diffusers_kwargs,
             enable_upscaling=request.enable_upscaling,
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,

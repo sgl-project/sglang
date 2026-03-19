@@ -295,6 +295,9 @@ def prepare_request(
         diffusers_kwargs = None
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
+        # Extract max_sequence_length if provided
+        if "max_sequence_length" in diffusers_kwargs:
+            req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
     req.adjust_size(server_args)
 

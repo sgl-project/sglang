@@ -63,13 +63,15 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         # flatten to 1-d list
+        # Check if max_length is specified in tok_kwargs, otherwise default to 512
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         inputs = tokenizer.apply_chat_template(
             prompts,
             tokenize=True,
             add_generation_prompt=True,
             enable_thinking=True,
             padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
+            max_length=effective_max_length,
             truncation=True,
             return_tensors="pt",
             return_dict=True,

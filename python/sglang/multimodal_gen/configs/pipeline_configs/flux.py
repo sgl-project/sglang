@@ -441,6 +441,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         # flatten to 1-d list
         prompts = [p for prompt in prompts for p in prompt]
+        # Check if max_length is specified in tok_kwargs, otherwise default to 512
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         inputs = tokenizer.apply_chat_template(
             prompts,
             add_generation_prompt=False,
@@ -450,7 +452,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             padding="max_length",
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
-            max_length=512,
+            max_length=effective_max_length,
         )
 
         return inputs
