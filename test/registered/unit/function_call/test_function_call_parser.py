@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -13,6 +14,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -3851,6 +3853,144 @@ function call<|role_sep|>
 
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params["city"], "Rome")
+
+
+class TestMinimaxM2Detector(unittest.TestCase):
+    def setUp(self):
+        # Create sample tools for testing
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "properties": {
+                            "city": {"type": "string", "description": "City name"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = MinimaxM2Detector()
+        # Store original env value to restore in tearDown
+        self._original_env = os.environ.get("SGLANG_FORWARD_UNKNOWN_TOOLS")
+
+    def tearDown(self):
+        # Restore original environment variable
+        if self._original_env is None:
+            os.environ.pop("SGLANG_FORWARD_UNKNOWN_TOOLS", None)
+        else:
+            os.environ["SGLANG_FORWARD_UNKNOWN_TOOLS"] = self._original_env
+
+    def test_streaming_unknown_tool_without_env(self):
+        """Test that unknown tools are NOT parsed when SGLANG_FORWARD_UNKNOWN_TOOLS is not set."""
+        # Ensure env is not set
+        os.environ.pop("SGLANG_FORWARD_UNKNOWN_TOOLS", None)
+
+        chunks = [
+            "<minimax:tool_call>",
+            '<invoke name="unknown_function">',
+            '<parameter name="city">',
+            "Seattle</parameter>",
+            "</invoke></minimax:tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 0)
+
+    def test_streaming_unknown_tool_with_env(self):
+        """Test that unknown tools ARE parsed when SGLANG_FORWARD_UNKNOWN_TOOLS is set to 1."""
+        # Set env variable
+        os.environ["SGLANG_FORWARD_UNKNOWN_TOOLS"] = "1"
+
+        chunks = [
+            "<minimax:tool_call>",
+            '<invoke name="unknown_function">',
+            '<parameter name="city">',
+            "Seattle</parameter>",
+            "</invoke></minimax:tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "unknown_function")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Seattle"}')
+
+    def test_streaming_known_tool_works(self):
+        """Test that known tools still work as expected."""
+        chunks = [
+            "<minimax:tool_call>",
+            '<invoke name="get_weather">',
+            '<parameter name="city">',
+            "Seattle</parameter>",
+            "</invoke></minimax:tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Seattle"}')
 
 
 if __name__ == "__main__":
