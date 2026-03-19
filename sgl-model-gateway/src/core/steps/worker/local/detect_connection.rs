@@ -144,3 +144,85 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use axum::{routing::get, Router};
+    use tokio::{net::TcpListener, sync::oneshot, time::sleep};
+    use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
+
+    use super::DetectConnectionModeStep;
+    use crate::{
+        app_context::AppContext,
+        config::{HealthCheckConfig, RouterConfig},
+        core::{
+            steps::{create_local_worker_workflow_data, workflow_data::WorkerConfigRequest},
+            ConnectionMode,
+        },
+    };
+
+    #[tokio::test]
+    async fn test_detect_connection_uses_configured_health_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/custom-health", get(|| async { "ok" }));
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .health_check_config(HealthCheckConfig {
+                endpoint: "/custom-health".to_string(),
+                ..Default::default()
+            })
+            .build_unchecked();
+        let app_context = Arc::new(AppContext::from_config(config, 30).await.unwrap());
+
+        let worker_config = WorkerConfigRequest {
+            url: format!("http://{}", addr),
+            api_key: None,
+            worker_type: Some("regular".to_string()),
+            labels: HashMap::new(),
+            model_id: None,
+            priority: None,
+            cost: None,
+            runtime: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            health_check_timeout_secs: 1,
+            health_check_interval_secs: 1,
+            health_success_threshold: 1,
+            health_failure_threshold: 1,
+            disable_health_check: false,
+            max_connection_attempts: 1,
+            dp_aware: false,
+        };
+
+        let workflow_data = create_local_worker_workflow_data(worker_config, app_context);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), workflow_data);
+
+        let result = DetectConnectionModeStep.execute(&mut context).await;
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+
+        assert!(result.is_ok());
+        assert_eq!(context.data.connection_mode, Some(ConnectionMode::Http));
+    }
+}
