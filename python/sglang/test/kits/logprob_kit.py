@@ -296,19 +296,14 @@ def run_logprob_cross_mode_check(
     token_ids_logprob=None,
     return_text_in_logprobs=False,
     decimal_places=DEFAULT_DECIMAL_PLACES,
-    baseline_url=None,
 ):
     """Run cross-mode logprob comparison across all artifacts.
 
     1. Generate tokens from ``test_case.base_url`` (with logprob_start_len=0).
-    2. Score the full sequence via prefill on the baseline server.
+    2. Score the same full sequence via prefill on the same server
+       (``max_new_tokens=0``), so speculative decoding is not involved.
     3. Compare output_token_logprobs, input_token_logprobs, output_top_logprobs,
        input_top_logprobs, output_token_ids_logprobs, input_token_ids_logprobs.
-
-    When *baseline_url* is ``None``, the target server itself is used for the
-    scoring step.  Because scoring uses ``max_new_tokens=0`` (pure prefill),
-    speculative decoding is not involved, making the target server a valid
-    non-speculative baseline for its own decode logprobs.
 
     Args:
         test_case: ``unittest.TestCase`` instance (must have ``base_url``).
@@ -318,11 +313,8 @@ def run_logprob_cross_mode_check(
         token_ids_logprob: Token IDs for the token_ids_logprob artifact.
         return_text_in_logprobs: Whether to include token text.
         decimal_places: ``assertAlmostEqual`` precision (``places``).
-        baseline_url: URL of the baseline server.  Defaults to ``test_case.base_url``.
     """
-    target_url = test_case.base_url
-    if baseline_url is None:
-        baseline_url = target_url
+    base_url = test_case.base_url
     if prompts is None:
         prompts = list(CROSS_MODE_PROMPTS)
     if token_ids_logprob is None:
@@ -332,9 +324,8 @@ def run_logprob_cross_mode_check(
         tag_prefix = f"round {round_idx}"
         print(f"\n--- Cross-mode check {tag_prefix}: {prompt!r} ---")
 
-        # Step 1: generate from target with logprob_start_len=0
         gen_res = generate_with_logprobs(
-            target_url,
+            base_url,
             prompt,
             max_new_tokens,
             top_logprobs_num,
@@ -349,9 +340,8 @@ def run_logprob_cross_mode_check(
         output_token_ids = [t[1] for t in meta["output_token_logprobs"]]
         full_sequence = input_token_ids + output_token_ids
 
-        # Step 2: score the full sequence via prefill on baseline
         score_res = generate_with_logprobs(
-            baseline_url,
+            base_url,
             full_sequence,
             max_new_tokens=0,
             top_logprobs_num=top_logprobs_num,
