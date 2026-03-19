@@ -2016,3 +2016,24 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+@dataclass
+class BatchFinishReqACK:
+    dp_rank: int
+    rids: List[str]
+
+
+@dataclass
+class AbortReqACK(BaseReq):
+    rid: str
+
+
+@dataclass
+class RetrieveTokenBackupReq(BaseReq):
+    rids: List[str]
+
+
+@dataclass
+class RetrieveTokenBackupRes(BaseReq):
+    token_ids: Dict[str, List[int]]
+
