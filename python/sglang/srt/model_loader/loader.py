@@ -595,11 +595,19 @@ class DefaultModelLoader(BaseModelLoader):
                 "Please install it with: pip install accelerate"
             )
 
-        hf_config = AutoConfig.from_pretrained(
-            model_config.model_path,
-            trust_remote_code=True,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                model_config.model_path,
+                trust_remote_code=True,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+        except (KeyError, ValueError):
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            hf_config = get_config(
+                model_config.model_path,
+                trust_remote_code=True,
+            )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
             model = AutoModelForCausalLM.from_config(
@@ -628,6 +636,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_path,
+            config=hf_config,
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,

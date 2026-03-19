@@ -1295,9 +1295,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from transformers import AutoTokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
