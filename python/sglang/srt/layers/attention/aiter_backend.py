@@ -1952,7 +1952,7 @@ class AiterAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+        return 1 if self.num_draft_tokens is None else self.num_draft_tokens
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
