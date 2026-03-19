@@ -6,7 +6,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   # run rocm 720 pr tests once a day at 2am UTC to avoid overwhelming the CI system
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '30 17 * * *'
   # push:
   #   branches: [ main ]
   #   paths:
