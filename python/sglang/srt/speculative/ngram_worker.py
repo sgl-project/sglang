@@ -215,8 +215,8 @@ class NGRAMWorker:
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
             for i in range(bs):
                 seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones((self.draft_token_num, seq_len)).to(
-                    device=self.device, non_blocking=True
+                req_mask = torch.ones(
+                    (self.draft_token_num, seq_len), device=self.device
                 )
                 req_mask = torch.cat(
                     (
@@ -276,9 +276,7 @@ class NGRAMWorker:
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
-        accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
-            device=self.device, non_blocking=True
-        )
+        accept_length = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
 
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -357,8 +355,8 @@ class NGRAMWorker:
             new_seq_lens = model_worker_batch.seq_lens.clone()
 
             verified_tokens = torch.zeros(
-                bs, self.draft_token_num, dtype=torch.int32
-            ).to(device=self.device, non_blocking=True)
+                bs, self.draft_token_num, dtype=torch.int32, device=self.device
+            )
             verified_tokens[:, 0] = predict
             verified_tokens = verified_tokens.flatten()
             verify_done = torch.get_device_module(self.device).Event()
