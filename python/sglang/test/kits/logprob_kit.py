@@ -17,13 +17,12 @@ Verified artifacts:
 """
 
 import random
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import numpy as np
 import requests
-
-from sglang.test.test_utils import run_logprob_check
 
 CROSS_MODE_PROMPTS = [
     "The capital of France is",
@@ -182,7 +181,8 @@ def generate_with_logprobs(
         payload["token_ids_logprob"] = token_ids_logprob
 
     response = requests.post(url + "/generate", json=payload)
-    assert response.status_code == 200, f"Server error: {response.text}"
+    if response.status_code != 200:
+        raise RuntimeError(f"Server returned {response.status_code}: {response.text}")
     return response.json()
 
 
@@ -290,18 +290,17 @@ def assert_position_logprobs_match(
 
 def run_logprob_cross_mode_check(
     test_case,
-    target_url,
-    baseline_url=None,
     prompts=None,
     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     top_logprobs_num=DEFAULT_TOP_LOGPROBS_NUM,
     token_ids_logprob=None,
     return_text_in_logprobs=False,
     decimal_places=DEFAULT_DECIMAL_PLACES,
+    baseline_url=None,
 ):
     """Run cross-mode logprob comparison across all artifacts.
 
-    1. Generate tokens from the target server (with logprob_start_len=0).
+    1. Generate tokens from ``test_case.base_url`` (with logprob_start_len=0).
     2. Score the full sequence via prefill on the baseline server.
     3. Compare output_token_logprobs, input_token_logprobs, output_top_logprobs,
        input_top_logprobs, output_token_ids_logprobs, input_token_ids_logprobs.
@@ -312,16 +311,16 @@ def run_logprob_cross_mode_check(
     non-speculative baseline for its own decode logprobs.
 
     Args:
-        test_case: ``unittest.TestCase`` instance for assertions.
-        target_url: URL of the target server (e.g. speculative decoding).
-        baseline_url: URL of the baseline server.  Defaults to *target_url*.
+        test_case: ``unittest.TestCase`` instance (must have ``base_url``).
         prompts: List of prompt strings.
         max_new_tokens: Tokens to generate per prompt.
         top_logprobs_num: Top-k count for top_logprobs.
         token_ids_logprob: Token IDs for the token_ids_logprob artifact.
         return_text_in_logprobs: Whether to include token text.
         decimal_places: ``assertAlmostEqual`` precision (``places``).
+        baseline_url: URL of the baseline server.  Defaults to ``test_case.base_url``.
     """
+    target_url = test_case.base_url
     if baseline_url is None:
         baseline_url = target_url
     if prompts is None:
@@ -441,23 +440,22 @@ def run_logprob_cross_mode_check(
 
 def run_logprob_start_len_check(
     test_case,
-    target_url,
     prompts=None,
     max_new_tokens=8,
     start_lens=None,
 ):
-    """Verify logprob_start_len boundary correctness on the target server.
+    """Verify logprob_start_len boundary correctness.
 
-    For each prompt and start_len, verifies that:
+    Uses ``test_case.base_url``.  For each prompt and start_len, verifies that:
     - ``len(input_token_logprobs) == prompt_tokens - logprob_start_len``
     - ``len(input_top_logprobs)``  matches
     - ``len(output_token_logprobs) == max_new_tokens``
     """
     if prompts is None:
         prompts = list(CROSS_MODE_PROMPTS)
+    target_url = test_case.base_url
 
     for prompt in prompts:
-        # Probe to get prompt_tokens
         probe_res = generate_with_logprobs(
             target_url,
             prompt,
@@ -513,9 +511,91 @@ def run_logprob_start_len_check(
                 )
 
 
+def run_logprob_check(test_case: unittest.TestCase, arg):
+    """Verify logprob shape correctness for a single parameter combination.
+
+    Args:
+        test_case: ``unittest.TestCase`` instance (must have ``self.base_url``).
+        arg: Tuple of (input_len, output_len, temperature, logprob_start_len,
+             return_logprob, top_logprobs_num).
+    """
+    (
+        input_len,
+        output_len,
+        temperature,
+        logprob_start_len,
+        return_logprob,
+        top_logprobs_num,
+    ) = arg
+    input_ids = list(range(input_len))
+
+    response = requests.post(
+        test_case.base_url + "/generate",
+        json={
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": output_len,
+                "ignore_eos": True,
+            },
+            "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
+            "top_logprobs_num": top_logprobs_num,
+        },
+    )
+    res = response.json()
+
+    test_case.assertEqual(res["meta_info"]["prompt_tokens"], input_len)
+    test_case.assertEqual(res["meta_info"]["completion_tokens"], output_len)
+
+    if return_logprob:
+        test_case.assertEqual(
+            len(res["meta_info"]["input_token_logprobs"]) + logprob_start_len,
+            res["meta_info"]["prompt_tokens"],
+        )
+        test_case.assertEqual(
+            len(res["meta_info"]["output_token_logprobs"]), output_len
+        )
+
+        if top_logprobs_num:
+            test_case.assertEqual(
+                len(res["meta_info"]["input_top_logprobs"]) + logprob_start_len,
+                res["meta_info"]["prompt_tokens"],
+            )
+            test_case.assertEqual(
+                len(res["meta_info"]["output_top_logprobs"]), output_len
+            )
+
+            for i in range(output_len):
+                test_case.assertEqual(
+                    len(res["meta_info"]["output_top_logprobs"][i]),
+                    top_logprobs_num,
+                )
+
+                if temperature == 0:
+                    rank = 0
+                    while rank < len(res["meta_info"]["output_top_logprobs"][i]):
+                        try:
+                            test_case.assertListEqual(
+                                res["meta_info"]["output_token_logprobs"][i],
+                                res["meta_info"]["output_top_logprobs"][i][rank],
+                            )
+                            break
+                        except AssertionError:
+                            # Tie-breaking: allow next rank when values match.
+                            if (
+                                res["meta_info"]["output_top_logprobs"][i][rank][0]
+                                == res["meta_info"]["output_top_logprobs"][i][rank + 1][
+                                    0
+                                ]
+                            ):
+                                rank += 1
+                            else:
+                                raise
+
+
 def run_logprob_mixed_check(
     test_case,
-    base_url,
     input_lens=None,
     output_lens=None,
     logprob_start_lens=None,
@@ -523,13 +603,13 @@ def run_logprob_mixed_check(
 ):
     """Stress-test logprob shape correctness with many parameter combinations.
 
-    Sends concurrent requests with various (input_len, output_len,
-    logprob_start_len, return_logprob, top_logprobs_num) combos and verifies
-    that the returned array lengths are all correct.
+    Uses ``test_case.base_url``.  Sends concurrent requests with various
+    (input_len, output_len, logprob_start_len, return_logprob,
+    top_logprobs_num) combos and verifies that the returned array lengths
+    are all correct.
 
     Args:
-        test_case: ``unittest.TestCase`` instance.
-        base_url: Server URL.
+        test_case: ``unittest.TestCase`` instance (must have ``base_url``).
         input_lens: List of input lengths to test.
         output_lens: List of output lengths to test.
         logprob_start_lens: List of logprob_start_len values to test.
@@ -599,7 +679,6 @@ class LogprobCrossModeMixin:
         print(f"Testing cross-mode logprobs for {self.base_url}")
         run_logprob_cross_mode_check(
             self,
-            self.base_url,
             prompts=self.logprob_prompts,
             max_new_tokens=self.logprob_max_new_tokens,
             top_logprobs_num=self.logprob_top_k,
@@ -611,7 +690,6 @@ class LogprobCrossModeMixin:
         """Verify logprob_start_len boundary behaviour."""
         run_logprob_start_len_check(
             self,
-            self.base_url,
             prompts=self.logprob_prompts,
         )
 
@@ -619,7 +697,6 @@ class LogprobCrossModeMixin:
         """Verify return_text_in_logprobs structural correctness."""
         run_logprob_cross_mode_check(
             self,
-            self.base_url,
             prompts=(self.logprob_prompts or CROSS_MODE_PROMPTS)[:1],
             max_new_tokens=8,
             return_text_in_logprobs=True,
@@ -628,4 +705,4 @@ class LogprobCrossModeMixin:
 
     def test_cross_mode_logprob_mixed(self):
         """Stress-test logprob shape correctness with many parameter combos."""
-        run_logprob_mixed_check(self, self.base_url)
+        run_logprob_mixed_check(self)
