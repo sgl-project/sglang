@@ -2628,12 +2628,14 @@ class IncModelLoader(DefaultModelLoader):
             return quant_model.eval()
 
         model_config.hf_config = quant_model.config
+        quant_config = _get_quantization_config(model_config, self.load_config)
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             self.load_weights_and_postprocess(

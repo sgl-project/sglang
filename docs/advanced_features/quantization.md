@@ -558,8 +558,9 @@ SGLang supports quantization methods based on the advanced algorithm [auto-round
 
 ##### Available Quantization Methods
 
-- `auto-round-int8`: INT8 per-channel quantized weight with INT8 per-token dynamic quantized activation
-
+| Quantization Method | Schemes | Validated Hardware Environment |
+|:--------------------|:--------|:-------------------------------|
+| auto-round-int8     |INT8 per-channel quantized weight <br> INT8 per-token dynamic quantized activation | Intel Xeon Scalable processor <br> Nvidia A100 GPU |
 
 ## Reference
 
