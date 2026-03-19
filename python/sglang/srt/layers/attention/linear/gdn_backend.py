@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -72,7 +72,7 @@ class GDNKernelDispatcher:
             self.decode_kernel = CuteDSLGDNKernel()
         elif decode_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                 FlashInferGDNKernel,
             )
@@ -91,7 +91,7 @@ class GDNKernelDispatcher:
             )
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
-                raise ValueError("FlashInfer backend requires CUDA")
+                raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
             if decode_backend.is_flashinfer():
                 self.extend_kernel = flashinfer_kernel
@@ -111,10 +111,48 @@ class GDNKernelDispatcher:
         else:
             self.verify_kernel = triton_kernel
 
+        self.supports_packed_decode = getattr(
+            self.decode_kernel, "supports_packed_decode", False
+        )
+
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
-            f"verify={self.verify_kernel.__class__.__name__}"
+            f"verify={self.verify_kernel.__class__.__name__} "
+            f"packed_decode={self.supports_packed_decode}"
+        )
+
+    def packed_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Attempt packed decode. Returns output tensor or None if
+        the decode kernel does not support packed decode."""
+        if not self.supports_packed_decode:
+            return None
+        return self.decode_kernel.packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            **kwargs,
         )
 
     def decode(
@@ -242,6 +280,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.activation,
             conv_state_indices=cache_indices,
         )
+
+        # Skip split + reshape + separate gating kernel by consuming
+        # the packed mixed_qkv directly in a single fused Triton kernel.
+        if self.kernel_dispatcher.supports_packed_decode:
+            core_attn_out = self.kernel_dispatcher.packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
+            )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -399,6 +457,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
+
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
