@@ -28,7 +28,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
+from sglang.srt.layers.quantization.modelopt import (
     ModelOptFp4Config,
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
