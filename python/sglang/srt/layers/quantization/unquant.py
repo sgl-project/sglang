@@ -52,12 +52,14 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.tuned_gemm import tgemm
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
@@ -148,6 +150,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
 
@@ -384,6 +389,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                activation_type=(
+                    ActivationType.Relu2
+                    if moe_runner_config.activation == "relu2"
+                    else ActivationType.Swiglu
+                ),
             )[0]
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:

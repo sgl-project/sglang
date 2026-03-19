@@ -23,7 +23,6 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
-    WanI2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
@@ -80,6 +79,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -138,16 +138,28 @@ class DenoisingStage(PipelineStage):
             module, nn.Module
         ):
             return
-        try:
-            import torch._inductor.config as _inductor_cfg
+        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
 
-            _inductor_cfg.reorder_for_compute_comm_overlap = True
-        except ImportError:
-            pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info(f"Compiling transformer with mode: {mode}")
+        if current_platform.is_npu():
+            backend = get_compiler_backend()
+            compile_kwargs["backend"] = backend
+            compile_kwargs["dynamic"] = False
+            logger.info("Compiling transformer with torchair backend on NPU")
+        else:
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            compile_kwargs["mode"] = mode
+            logger.info(f"Compiling transformer with mode: {mode}")
+
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(mode=mode, fullgraph=False, dynamic=None)
+        module.compile(**compile_kwargs)
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -344,9 +356,9 @@ class DenoisingStage(PipelineStage):
             torch.full(
                 (batch_size,),
                 guidance_val,
-                dtype=torch.float32,
+                dtype=target_dtype,
                 device=device,
-            ).to(target_dtype)
+            )
             * 1000.0
         )
 
@@ -737,17 +749,6 @@ class DenoisingStage(PipelineStage):
             latents, batch
         )
 
-        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            offload_mgr.release_all()
-
-        if self.transformer_2 is not None:
-            offload_mgr_2 = getattr(
-                self.transformer_2, "_layerwise_offload_manager", None
-            )
-            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
-                offload_mgr_2.release_all()
-
         # Save STA mask search results if needed
         if (
             not is_warmup
@@ -755,6 +756,9 @@ class DenoisingStage(PipelineStage):
             and server_args.attention_backend_config.STA_mode == "STA_SEARCHING"
         ):
             self.save_sta_search_results(batch)
+
+        # Capture references before potential deletion on MPS
+        dits = list(filter(None, [self.transformer, self.transformer_2]))
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
@@ -773,7 +777,7 @@ class DenoisingStage(PipelineStage):
             )
 
         # reset offload managers with prefetching first layer for next forward
-        for dit in filter(None, [self.transformer, self.transformer_2]):
+        for dit in dits:
             if isinstance(dit, OffloadableDiTMixin):
                 # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
                 # TODO: should be make this an option?
@@ -794,13 +798,9 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, where the image latents is provided as condition, the image_latent (input image) should be
-        # replicated on all SP ranks, not sharded, as it provides global context.
-        # For Wan2_2_TI2V_5B_Config, it has very special settings
-        if (
-            isinstance(server_args.pipeline_config, WanI2V480PConfig)
-            and batch.image_latent is not None
-        ):
+        # image_latent must be sharded consistently with latents when it is
+        # concatenated along the sequence dimension in the denoising loop.
+        if batch.image_latent is not None:
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )

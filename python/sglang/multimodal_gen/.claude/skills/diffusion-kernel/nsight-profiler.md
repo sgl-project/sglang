@@ -54,8 +54,9 @@ nsys profile --gpu-metrics-device=all -o report ./cuda_program
 # Profile specific duration
 nsys profile -d 10 -o report ./cuda_program
 
-# Export to multiple formats
-nsys export -t sqlite,json report.nsys-rep
+# Export to multiple formats (one type per command)
+nsys export -t sqlite report.nsys-rep
+nsys export -t json report.nsys-rep
 
 # Generate summary statistics
 nsys stats report.nsys-rep
@@ -179,14 +180,23 @@ ncu --set full -o baseline ./program_v1
 # Step 2: Profile optimized version
 ncu --set full -o optimized ./program_v2
 
-# Step 3: Generate comparison report (CLI, no GUI needed)
-# Both --import flags required; --page diff generates a side-by-side diff
-ncu --import baseline.ncu-rep \
-    --import optimized.ncu-rep \
-    --page diff --csv > comparison.csv
-```
+# Step 3: Export both profiles to CSV, then compare with Python (no GUI needed)
+# Note: --import can only be specified once; --page diff is not a valid page value.
+ncu --import baseline.ncu-rep --page details --csv > baseline_details.csv
+ncu --import optimized.ncu-rep --page details --csv > optimized_details.csv
 
-> **Note**: `ncu --diff` (the old single-flag syntax) was removed in Nsight Compute 2022.x. Always use two `--import` flags with `--page diff` for comparisons.
+python3 -c "
+import csv
+def load(p):
+    return {r.get('Metric Name',''): r.get('Metric Value','')
+            for r in csv.DictReader(open(p))}
+b = load('baseline_details.csv')
+o = load('optimized_details.csv')
+for k in sorted(set(b) | set(o)):
+    bv, ov = b.get(k,''), o.get(k,'')
+    if bv != ov:
+        print(f'{k[:55]:<55} {bv} -> {ov}')
+"
 
 ### 8. Performance Recommendations
 

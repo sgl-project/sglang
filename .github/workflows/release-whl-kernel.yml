@@ -18,6 +18,7 @@ on:
           - 'cu129'
           - 'cu130'
           - 'rocm700'
+          - 'rocm720'
           - 'musa43'
       tag_name:
         type: string
@@ -71,7 +72,7 @@ jobs:
         working-directory: sgl-kernel
         run: |
           pip install twine
-          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -223,15 +224,15 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  build-rocm700:
+  build-rocm-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700')
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700' || github.event.inputs.target == 'rocm720')
     runs-on: amd-docker-scale
     strategy:
       matrix:
         python-version: ["3.10"]
-        rocm-version: ["700"]
+        rocm-version: ["700", "720"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -245,7 +246,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cp 3rdparty/amd/sgl-kernel/* sgl-kernel/
+          cp 3rdparty/amd/wheel/sgl-kernel/* sgl-kernel/
           cd sgl-kernel
           chmod +x ./build_rocm.sh
           ./build_rocm.sh "${{ matrix.rocm-version }}"
@@ -257,7 +258,7 @@ jobs:
           path: sgl-kernel/dist/*
 
   release-rocm700:
-    needs: build-rocm700
+    needs: build-rocm-matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -269,7 +270,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-*
+          pattern: wheel-*-rocm700
 
       - name: Set tag name
         id: set_tag_name
@@ -297,6 +298,57 @@ jobs:
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py --rocm 700
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update whl index"
+          git push
+
+  release-rocm720:
+    needs: build-rocm-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-*-rocm720
+
+      - name: Set tag name
+        id: set_tag_name
+        run: |
+          if [ -z "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            sgl-kernel/dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py --rocm 720
 
       - name: Push wheel index
         run: |
