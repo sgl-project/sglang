@@ -22,11 +22,35 @@ from sglang.srt.compilation.fusion.pattern import OpPatternBase, OpPatternRegist
 from sglang.srt.utils import is_flashinfer_rmsnorm_quant_kernels_available
 
 
+def _is_jit_rmsnorm_quant_available():
+    try:
+        from sglang.jit_kernel.norm import rmsnorm_quant  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 class _RmsnormQuantFp8Pattern(OpPatternBase):
     @staticmethod
     @abstractmethod
     def pattern(x, weight, scale, eps, output):
         pass
+
+
+# op: jit/rmsnorm_quant
+class JitRmsnormQuantFp8Pattern(_RmsnormQuantFp8Pattern):
+    @staticmethod
+    def pattern(x, weight, scale, eps, output):
+        return auto_functionalized_v2(
+            torch.ops.sglang.jit_rmsnorm_quant.default,
+            input=x,
+            weight=weight,
+            scale=scale,
+            eps=eps,
+            _out_base_index=0,
+            _all_bases=[output],
+        )
 
 
 # op: flashinfer/rmsnorm_quant
@@ -62,7 +86,9 @@ class SglangRmsnormQuantFp8Pattern(_RmsnormQuantFp8Pattern):
 
 class _RmsnormQuantFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
-        if is_flashinfer_rmsnorm_quant_kernels_available():
+        if _is_jit_rmsnorm_quant_available():
+            self.register_op_pattern(JitRmsnormQuantFp8Pattern)
+        elif is_flashinfer_rmsnorm_quant_kernels_available():
             self.register_op_pattern(FlashinferRmsnormQuantFp8Pattern)
         else:
             self.register_op_pattern(SglangRmsnormQuantFp8Pattern)
@@ -76,6 +102,23 @@ class _FusedAddRmsnormQuantFp8Pattern(OpPatternBase):
     @abstractmethod
     def pattern(x, residual, weight, scale, result, eps):
         pass
+
+
+# op: jit/fused_add_rmsnorm_quant
+class JitFusedAddRmsnormQuantFp8Pattern(_FusedAddRmsnormQuantFp8Pattern):
+    @staticmethod
+    def pattern(x, residual, weight, scale, result, eps):
+        return auto_functionalized_v2(
+            torch.ops.sglang.jit_fused_add_rmsnorm_quant.default,
+            input=x,
+            residual=residual,
+            weight=weight,
+            scale=scale,
+            eps=eps,
+            _out_base_index=0,
+            _residual_base_index=1,
+            _all_bases=[result, residual],
+        )
 
 
 # op: flashinfer/fused_add_rmsnorm_quant
@@ -113,7 +156,9 @@ class SglangFusedAddRmsnormQuantFp8Pattern(_FusedAddRmsnormQuantFp8Pattern):
 
 class _FusedAddRmsnormQuantFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
-        if is_flashinfer_rmsnorm_quant_kernels_available():
+        if _is_jit_rmsnorm_quant_available():
+            self.register_op_pattern(JitFusedAddRmsnormQuantFp8Pattern)
+        elif is_flashinfer_rmsnorm_quant_kernels_available():
             self.register_op_pattern(FlashinferFusedAddRmsnormQuantFp8Pattern)
         else:
             self.register_op_pattern(SglangFusedAddRmsnormQuantFp8Pattern)

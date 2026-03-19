@@ -3,8 +3,8 @@ import itertools
 import torch
 import triton
 import triton.testing
-from flashinfer import rmsnorm_quant as fi_rmsnorm_quant
-from sgl_kernel import rms_norm_static_fp8_quant
+from flashinfer import fused_add_rmsnorm_quant as fi_fused_add_rmsnorm_quant
+from sgl_kernel import fused_add_rms_norm_static_fp8_quant
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -12,87 +12,75 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
-from sglang.jit_kernel.norm import rmsnorm_quant as jit_rmsnorm_quant
+from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+from sglang.jit_kernel.norm import (
+    fused_add_rmsnorm_quant as jit_fused_add_rmsnorm_quant,
+)
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8 as jit_quant
 
-DEVICE = "cuda"
 FP8_DTYPE = torch.float8_e4m3fn
-# maximum value for e4m3fn for clamping in kernel
 FP8_E4M3_MAX = 448.0
-# FP8 is low precision, so the tolerance needs to be higher
-TOLERANCE = {"atol": 1.5e-1, "rtol": 1.5e-1}
-FP_TOLERANCE = {"atol": 1e-4, "rtol": 1e-4}
 
 
-def scaled_fp8_conversion_ref(
-    val: torch.Tensor, scale: torch.Tensor, fp8_dtype: torch.dtype
-) -> torch.Tensor:
-    """Helper function matching the scaled_fp8_conversion device function."""
-    quant_scale = 1.0 / scale
-
-    x = val * quant_scale
-
-    r = torch.clamp(x, min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
-
-    if r.dtype != fp8_dtype:
-        return r.to(fp8_dtype)
-    return r
-
-
-def sglang_aot_rmsnorm_quant(
+def sglang_aot_fused_add_rmsnorm_quant(
     input: torch.Tensor,
+    residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    rms_norm_static_fp8_quant(out, input, weight, scale)
+    fused_add_rms_norm_static_fp8_quant(out, input, residual, weight, scale)
 
 
-def sglang_jit_rmsnorm_quant(
+def sglang_jit_fused_add_rmsnorm_quant(
     input: torch.Tensor,
+    residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    jit_rmsnorm_quant(out, input, weight, scale)
+    jit_fused_add_rmsnorm_quant(out, input, residual, weight, scale)
+
+
+def flashinfer_fused_add_rmsnorm_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    fi_fused_add_rmsnorm_quant(out, input, residual, weight, scale)
 
 
 def sglang_unfused_jit(
     input: torch.Tensor,
+    residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    temp = input.clone()
-    jit_rmsnorm(temp, weight, output=temp)
-    jit_quant(temp, out, scale, is_static=True)
-
-
-def flashinfer_rmsnorm_quant(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    fi_rmsnorm_quant(out, input, weight, scale)
+    # fused_add_rmsnorm: residual += input, input = rmsnorm(residual)
+    jit_fused_add_rmsnorm(input, residual, weight)
+    # input now holds the normed result, quantize it
+    jit_quant(input, out, scale, is_static=True)
 
 
 @torch.compile()
-def torch_impl_rmsnorm_quant(
+def torch_impl_fused_add_rmsnorm_quant(
     input: torch.Tensor,
+    residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
     eps: float = 1e-6,
 ) -> None:
-    mean = input.float().pow(2).mean(dim=-1, keepdim=True)
+    residual.add_(input)
+    x = residual.float()
+    mean = x.pow(2).mean(dim=-1, keepdim=True)
     norm = (mean + eps).rsqrt()
-    out.copy_(
-        scaled_fp8_conversion_ref(
-            (input.float() * norm * weight.float()), scale, FP8_DTYPE
-        )
-    )
+    normed = x * norm * weight.float()
+    inv_scale = 1.0 / scale
+    out.copy_((normed * inv_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(FP8_DTYPE))
 
 
 BS_LIST = get_benchmark_range(
@@ -138,7 +126,7 @@ configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="rmsnorm-performance",
+        plot_name="fused-add-rmsnorm-quant-performance",
         args={},
     )
 )
@@ -146,17 +134,22 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     input = torch.randn(
         (batch_size, hidden_size), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
+    residual = torch.randn(
+        (batch_size, hidden_size), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+    )
     weight = torch.randn(hidden_size, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
     scale = torch.tensor([4.0], dtype=torch.float32, device=DEFAULT_DEVICE)
     out = torch.empty((batch_size, hidden_size), dtype=FP8_DTYPE, device=DEFAULT_DEVICE)
     FN_MAP = {
-        "fused_aot": sglang_aot_rmsnorm_quant,
-        "fused_jit": sglang_jit_rmsnorm_quant,
-        "fused_flashinfer": flashinfer_rmsnorm_quant,
+        "fused_aot": sglang_aot_fused_add_rmsnorm_quant,
+        "fused_jit": sglang_jit_fused_add_rmsnorm_quant,
+        "fused_flashinfer": flashinfer_fused_add_rmsnorm_quant,
         "unfused_jit": sglang_unfused_jit,
-        "unfused_torch": torch_impl_rmsnorm_quant,
+        "unfused_torch": torch_impl_fused_add_rmsnorm_quant,
     }
-    fn = lambda: FN_MAP[provider](input, weight, scale, out.clone())
+    fn = lambda: FN_MAP[provider](
+        input.clone(), residual.clone(), weight, scale, out.clone()
+    )
     return run_benchmark(fn)
 
 

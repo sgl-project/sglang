@@ -11,6 +11,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -46,6 +47,33 @@ def _jit_fused_add_rmsnorm_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["elementwise/fused_add_rmsnorm.cuh"],
         cuda_wrappers=[("fused_add_rmsnorm", f"FusedAddRMSNormKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_fused_add_rmsnorm_quant_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype)
+    return load_jit(
+        "fused_add_rmsnorm_quant",
+        *args,
+        cuda_files=["elementwise/fused_add_rmsnorm_quant.cuh"],
+        cuda_wrappers=[
+            (
+                "fused_add_rmsnorm_quant",
+                f"FusedAddRMSNormQuantKernel<{args}>::run",
+            )
+        ],
+    )
+
+
+@cache_once
+def _jit_rmsnorm_quant_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "rmsnorm_quant",
+        *args,
+        cuda_files=["elementwise/rmsnorm_quant.cuh"],
+        cuda_wrappers=[("rmsnorm_quant", f"RMSNormQuantKernel<{args}>::run")],
     )
 
 
@@ -110,6 +138,34 @@ def fused_add_rmsnorm(
 ) -> None:
     module = _jit_fused_add_rmsnorm_module(input.dtype)
     module.fused_add_rmsnorm(input, residual, weight, eps)
+
+
+@register_custom_op(op_name="jit_rmsnorm_quant", mutates_args=["out"])
+def rmsnorm_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    hidden_size = input.size(-1)
+    module = _jit_rmsnorm_quant_module(hidden_size, input.dtype)
+    module.rmsnorm_quant(input, weight, out, scale.view(-1), eps)
+
+
+@register_custom_op(
+    op_name="jit_fused_add_rmsnorm_quant", mutates_args=["out", "residual"]
+)
+def fused_add_rmsnorm_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    module = _jit_fused_add_rmsnorm_quant_module(input.dtype)
+    module.fused_add_rmsnorm_quant(input, residual, weight, out, scale.view(-1), eps)
 
 
 def fused_inplace_qknorm_across_heads(
