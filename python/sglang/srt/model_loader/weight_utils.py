@@ -43,7 +43,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import (
+from sglang.srt.layers.quantization.modelopt import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
