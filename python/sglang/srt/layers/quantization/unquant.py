@@ -16,6 +16,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.moe_runner import InductorGroupedMMRunner
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -165,6 +166,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_inductor_groupedmm = (
+            get_moe_runner_backend().is_inductor_groupedmm()
+        )
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
@@ -328,12 +332,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer_trtllm_moe:
-            backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            default_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
         elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNELS
+            default_backend = MoeRunnerBackend.TRITON_KERNELS
         else:
-            backend = MoeRunnerBackend.TRITON
-        self.runner = MoeRunner(backend, moe_runner_config)
+            default_backend = MoeRunnerBackend.TRITON
+        default_runner = MoeRunner(default_backend, moe_runner_config)
+        if self.use_inductor_groupedmm:
+            self.runner = InductorGroupedMMRunner(default_runner, moe_runner_config)
+        else:
+            self.runner = default_runner
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -344,16 +352,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        is_decode: bool = False,
     ) -> CombineInput:
         return self.forward(
             layer=layer,
             dispatch_output=dispatch_output,
+            is_decode=is_decode,
         )
 
     def forward_cuda(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        is_decode: bool = False,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -362,8 +373,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         moe_runner_config = self.moe_runner_config
 
-        backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        use_inductor_groupedmm = self.runner.runner_backend.is_inductor_groupedmm()
+        default_backend = (
+            self.runner.default_runner_backend
+            if use_inductor_groupedmm
+            else self.runner.runner_backend
+        )
+
+        def run_moe_runner(quant_info):
+            if use_inductor_groupedmm:
+                return self.runner.run(
+                    dispatch_output,
+                    quant_info,
+                    layer=layer,
+                    is_decode=is_decode,
+                )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if default_backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
@@ -374,7 +401,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w13_bias=getattr(layer, "w13_weight_bias", None),
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return run_moe_runner(quant_info)
         elif self.use_flashinfer_cutlass:
             output = flashinfer_cutlass_fused_moe(
                 input=x,
@@ -407,7 +434,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return run_moe_runner(quant_info)
         else:
             # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
             # because aiter CK kernels don't support all GEMM dimensions
@@ -448,12 +475,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
                 )
-                return self.runner.run(dispatch_output, quant_info)
+                return run_moe_runner(quant_info)
 
     def forward_cpu(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        is_decode: bool = False,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -504,6 +532,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        is_decode: bool = False,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -552,6 +581,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        is_decode: bool = False,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

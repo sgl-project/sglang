@@ -3,6 +3,8 @@ Torch-native implementation for FusedMoE. This is used for torch.compile.
 It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4f715abc33d1c5f408d204/mixtral-moe/model.py#L204
 """
 
+from typing import Callable
+
 import torch
 from torch.nn import functional as F
 
@@ -105,3 +107,105 @@ def moe_forward_native(
         .type(new_x.dtype)
     )
     return final_out
+
+
+def fused_moe_forward_native_grouped_mm(
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig,
+    activation_fn: Callable,
+    activation_fn_args: Callable,
+) -> torch.Tensor:
+    """Grouped-mm native MoE path used for inductor-backed decode."""
+    topk_weights, topk_ids, _ = topk_output
+    alpha = moe_runner_config.gemm1_alpha
+    limit = moe_runner_config.gemm1_clamp_limit
+    device = hidden_states.device
+    num_tokens, hidden_size = hidden_states.shape
+    num_top_k = topk_ids.size(-1)
+    num_experts = layer.num_experts
+
+    # Flatten topk_ids to get expert_ids per selected sample
+    expert_ids = topk_ids.reshape(-1)  # (num_tokens * top_k,)
+    token_idx = (
+        torch.arange(num_tokens, device=device)
+        .unsqueeze(1)
+        .expand(-1, num_top_k)
+        .reshape(-1)
+    )
+
+    # Get routing weights per selected sample
+    sample_weights = topk_weights.reshape(-1)  # (S,)
+
+    # TODO: handle apply_router_weight_on_input. When
+    # moe_runner_config.apply_router_weight_on_input is True, the routing weight should
+    # be multiplied into hidden_states BEFORE GEMM1 (and NOT after GEMM2). Currently we
+    # always apply it after GEMM2. Because a nonlinear activation sits between the two
+    # GEMMs, pre- vs post-multiply is not mathematically equivalent:
+    #   σ(w·x @ W1) @ W2  ≠  σ(x @ W1) @ W2 · w
+
+    # Get current hidden states for selected samples
+    current_hidden_states = hidden_states[token_idx]  # (S, hidden_size)
+
+    # Get permutation to group by expert
+    perm = torch.argsort(expert_ids)
+    # O(n) inverse permutation via scatter instead of a second argsort
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.size(0), device=device, dtype=perm.dtype)
+
+    # Group by expert for grouped_mm
+    expert_ids_g = expert_ids[perm]
+    sample_weights_g = sample_weights[perm]
+    current_states_g = current_hidden_states[perm]
+
+    # Compute offsets for grouped_mm
+    # expert_ids_g is sorted, so searchsorted gives cumulative counts directly,
+    # replacing the histc + cumsum chain with a single op.
+    boundaries = torch.arange(
+        1, num_experts + 1, device=device, dtype=expert_ids_g.dtype
+    )
+    offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
+
+    # --- Up projection per expert (grouped_mm) ---
+    # SGLang w13_weight shape: [num_experts, 2 * intermediate_size, hidden_size]
+    # grouped_mm expects: input @ weight, so we need (E, hidden_size, 2*I)
+    # Transpose w13_weight for grouped_mm
+    w13_weight_t = layer.w13_weight.transpose(-1, -2)  # (E, H, 2*I)
+    gate_up_out = torch._grouped_mm(current_states_g, w13_weight_t, offsets)
+
+    # Add bias if present
+    w13_bias = getattr(layer, "w13_weight_bias", None)
+    if w13_bias is not None:
+        gate_up_out = gate_up_out + w13_bias[expert_ids_g]
+
+    hidden_after_activation = activation_fn(*activation_fn_args(gate_up_out, alpha, limit))
+    # Cast back to original dtype (swiglu_with_alpha_and_limit may return float32 due to torch.compile)
+    hidden_after_activation = hidden_after_activation.to(hidden_states.dtype)
+
+    # --- Down projection per expert (grouped_mm) ---
+    # SGLang w2_weight shape: [num_experts, hidden_size, intermediate_size]
+    # grouped_mm expects: input @ weight, so we need (E, I, H)
+    # Transpose w2_weight for grouped_mm
+    w2_weight_t = layer.w2_weight.transpose(-1, -2)  # (E, I, H)
+    out_per_sample_g = torch._grouped_mm(hidden_after_activation, w2_weight_t, offsets)
+
+    # Add bias if present
+    w2_bias = getattr(layer, "w2_weight_bias", None)
+    if w2_bias is not None:
+        out_per_sample_g = out_per_sample_g + w2_bias[expert_ids_g]
+
+    # Apply routing weights
+    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
+
+    # Restore original order
+    out_per_sample = out_per_sample_g[inv_perm]
+
+    # TODO: apply routed_scaling_factor. The Triton path multiplies the combined output
+    # by moe_runner_config.routed_scaling_factor (defaults to 1.0 when None). Models like
+    # DeepSeek-V3 set this to a non-trivial value (e.g. 2.5), so omitting it here will
+    # produce incorrect results for those models.
+    # Reference: fused_moe.py fused_experts_impl, moe_sum_reduce(..., routed_scaling_factor)
+
+    return out_per_sample.view(num_tokens, num_top_k, hidden_size).sum(dim=1).to(hidden_states.dtype)
+

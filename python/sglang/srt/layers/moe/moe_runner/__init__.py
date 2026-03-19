@@ -1,4 +1,7 @@
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.inductor_groupedmm import (
+    InductorGroupedMMRunner,
+)
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 
-__all__ = ["MoeRunnerConfig", "MoeRunner"]
+__all__ = ["MoeRunnerConfig", "MoeRunner", "InductorGroupedMMRunner"]

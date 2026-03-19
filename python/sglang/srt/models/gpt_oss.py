@@ -163,7 +163,12 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, should_allreduce_fusion)
+            is_decode = (
+                forward_batch is not None and forward_batch.forward_mode.is_decode()
+            )
+            return self.forward_normal(
+                hidden_states, should_allreduce_fusion, is_decode=is_decode
+            )
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -181,6 +186,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        is_decode: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         if is_in_piecewise_cuda_graph():
@@ -188,7 +194,9 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             router_logits, _ = self.router(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states = self.experts(
+                hidden_states, topk_output, is_decode=is_decode
+            )
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -203,7 +211,10 @@ def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
     moe_fusion = forward_context.moe_fusions[layer_id]
     router_logits, _ = moe_fusion.router(hidden_states)
     topk_output = moe_fusion.topk(hidden_states, router_logits)
-    final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
+    is_decode = forward_context.forward_batch.forward_mode.is_decode()
+    final_hidden_states = moe_fusion.experts(
+        hidden_states, topk_output, is_decode=is_decode
+    )
     return final_hidden_states
 
 
