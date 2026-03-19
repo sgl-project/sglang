@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -769,7 +770,10 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    InitLoadBackParams(
+                        last_host_node=req.last_host_node,
+                        host_hit_length=req.host_hit_length,
+                    )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))

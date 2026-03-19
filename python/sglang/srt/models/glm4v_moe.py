@@ -281,8 +281,5 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        if not is_nextn:
-            self.visual.patch_embed.copy_conv3d_weight_to_linear()
-
 
 EntryClass = [Glm4vMoeForConditionalGeneration]

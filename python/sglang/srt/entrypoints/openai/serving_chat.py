@@ -333,6 +333,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
+        self._patch_mistral_skip_special_tokens(request)
+
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -469,19 +471,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
+            extra_template_kwargs = {}
+            if request.reasoning_effort is not None:
+                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.chat_template_kwargs:
+                extra_template_kwargs.update(request.chat_template_kwargs)
+
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
                     return_dict=False,
+                    **extra_template_kwargs,
                 )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
@@ -497,13 +500,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
-                        reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
                         return_dict=False,
+                        **extra_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1234,8 +1232,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
+    def _patch_mistral_skip_special_tokens(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
+        which get stripped when skip_special_tokens=True."""
+        if (
+            self.reasoning_parser in ["mistral"]
+            and request.reasoning_effort is not None
+            and request.reasoning_effort != "none"
+        ):
+            request.skip_special_tokens = False
+
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Judge whether the request needs reasoning"""
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
         if not self.reasoning_parser:
             return False
         if self.reasoning_parser in ["deepseek-v3"]:
@@ -1255,6 +1267,13 @@ class OpenAIServingChat(OpenAIServingBase):
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning_effort is not None
+                and request.reasoning_effort != "none"
             )
         return True  # default
 

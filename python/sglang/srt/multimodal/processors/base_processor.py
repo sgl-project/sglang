@@ -252,6 +252,14 @@ class BaseMultimodalProcessor(ABC):
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
 
+    def compute_mrope_positions(self, input_ids, mm_items):
+        """Compute M-RoPE positions from expanded input_ids and multimodal items.
+
+        Returns (mrope_positions, mrope_position_delta) or (None, None) if the
+        model does not use M-RoPE.
+        """
+        return None, None
+
     @property
     def spatial_merge_size(self):
         return self.hf_config.vision_config.spatial_merge_size
