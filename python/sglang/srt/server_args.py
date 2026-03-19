@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    is_xpu,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -83,6 +84,7 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "gguf",
     "bitsandbytes",
+    "mistral",
     "layered",
     "flash_rl",
     "remote",
@@ -700,8 +702,11 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
-    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
+    remote_instance_weight_loader_backend: Literal[
+        "transfer_engine", "nccl", "modelexpress"
+    ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -771,6 +776,7 @@ class ServerArgs:
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -1062,8 +1068,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
-        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1620,6 +1626,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_hip():
+                    self.attention_backend = "aiter"
                 else:
                     self.attention_backend = "triton"
 
@@ -1998,6 +2006,8 @@ class ServerArgs:
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "KimiK25ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
@@ -2035,6 +2045,19 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
+
+        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
+        # See https://github.com/sgl-project/sglang/issues/20791
+        if (
+            self.linear_attn_decode_backend == "flashinfer"
+            and self.mamba_scheduler_strategy == "no_buffer"
+        ):
+            raise ValueError(
+                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
+                "compatible with --mamba-scheduler-strategy no_buffer. "
+                "Please use --mamba-scheduler-strategy extra_buffer instead. "
+                "See https://github.com/sgl-project/sglang/issues/20791"
+            )
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
@@ -2444,6 +2467,23 @@ class ServerArgs:
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
 
+    def _handle_linear_attn_backend(self):
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        import torch
+
+        decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        if (
+            decode == "flashinfer"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
+
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
@@ -2600,6 +2640,15 @@ class ServerArgs:
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            fuse_mode = os.environ.get("SGLANG_NPU_FUSED_MOE_MODE", None)
+            if fuse_mode not in ["1", "2"]:
+                raise ValueError(
+                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
+                )
+            elif fuse_mode == "2":
+                assert (
+                    self.quantization == "modelslim"
+                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
             self.ep_size = self.tp_size
             logger.warning(
@@ -2918,6 +2967,12 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        if self.load_format == "auto" and self._is_mistral_native_format():
+            self.load_format = "mistral"
+            logger.info(
+                "Detected Mistral native format checkpoint, setting load_format='mistral'"
+            )
+
         if is_remote_url(self.model_path):
             self.load_format = "remote"
 
@@ -2925,7 +2980,19 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.load_format == "remote_instance":
-            if (
+            if self.remote_instance_weight_loader_backend == "modelexpress":
+                # ModelExpress backend: requires url in --modelexpress-config
+                if self.modelexpress_url is None:
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to missing 'url' in --modelexpress-config."
+                    )
+                    self.load_format = "auto"
+                elif not self.validate_transfer_engine():
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by modelexpress) not being supported."
+                    )
+                    self.load_format = "auto"
+            elif (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
@@ -2955,6 +3022,19 @@ class ServerArgs:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
             )
+
+    def _is_mistral_native_format(self) -> bool:
+        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        if os.path.isdir(self.model_path):
+            return os.path.exists(os.path.join(self.model_path, "params.json"))
+        # For hub models, check remote files
+        try:
+            from huggingface_hub import HfApi
+
+            files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
+            return "params.json" in files
+        except Exception:
+            return False
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
@@ -5525,14 +5605,20 @@ class ServerArgs:
         parser.add_argument(
             "--remote-instance-weight-loader-backend",
             type=str,
-            choices=["transfer_engine", "nccl"],
+            choices=["transfer_engine", "nccl", "modelexpress"],
             default=ServerArgs.remote_instance_weight_loader_backend,
-            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--modelexpress-config",
+            type=str,
+            default=ServerArgs.modelexpress_config,
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
         )
 
         # For PD-Multiplexing
@@ -6067,7 +6153,11 @@ class ServerArgs:
         )
 
     def validate_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
+        try:
+            mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
+        except (ModuleNotFoundError, ValueError):
+            mooncake_available = False
+        if not mooncake_available:
             logger.warning(
                 "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
@@ -6080,14 +6170,44 @@ class ServerArgs:
         else:
             return True
 
+    @property
+    def _parsed_modelexpress_config(self) -> dict:
+        cache = getattr(self, "_mx_config_cache", None)
+        if cache is not None:
+            return cache
+        if self.modelexpress_config is None:
+            result = {}
+        elif isinstance(self.modelexpress_config, str):
+            result = json.loads(self.modelexpress_config)
+        else:
+            result = self.modelexpress_config
+        object.__setattr__(self, "_mx_config_cache", result)
+        return result
+
+    @property
+    def modelexpress_url(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("url")
+
+    @property
+    def modelexpress_model_name(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("model_name")
+
+    @property
+    def modelexpress_source(self) -> bool:
+        return self._parsed_modelexpress_config.get("source", False)
+
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
+        # ModelExpress source mode also needs TransferEngine init.
+        if self.modelexpress_source:
+            return True
         # Use TransferEngine as client backend.
         elif (
             self.load_format == "remote_instance"
-            and self.remote_instance_weight_loader_backend == "transfer_engine"
+            and self.remote_instance_weight_loader_backend
+            in ("transfer_engine", "modelexpress")
         ):
             return True
         else:

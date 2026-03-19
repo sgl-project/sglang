@@ -27,6 +27,7 @@ class AccuracyTestParams:
     thinking_mode: Optional[str] = None  # e.g., "deepseek-v3"
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
     repeat: Optional[int] = None
 
 
@@ -83,6 +84,7 @@ def _run_simple_eval(
     thinking_mode: Optional[str] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     repeat: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
@@ -122,6 +124,9 @@ def _run_simple_eval(
 
         if top_p is not None:
             args.top_p = top_p
+
+        if top_k is not None:
+            args.top_k = top_k
 
         if repeat is not None:
             args.repeat = repeat
@@ -223,7 +228,7 @@ def run_accuracy_test(
     # Use simple_eval when any extended params are set that few_shot_eval doesn't support.
     has_extended_params = any(
         getattr(params, field) is not None
-        for field in ("thinking_mode", "temperature", "top_p", "repeat")
+        for field in ("thinking_mode", "temperature", "top_p", "top_k", "repeat")
     )
     if params.dataset == "gsm8k" and not has_extended_params:
         success, error, metrics = _run_few_shot_eval(
@@ -244,6 +249,7 @@ def run_accuracy_test(
             thinking_mode=params.thinking_mode,
             temperature=params.temperature,
             top_p=params.top_p,
+            top_k=params.top_k,
             repeat=params.repeat,
         )
 
