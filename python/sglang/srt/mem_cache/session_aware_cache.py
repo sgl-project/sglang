@@ -185,11 +185,17 @@ class SessionAwareCache(BasePrefixCache):
         # this turn) as the upper bound instead of the truncated key.
         # Also clamp logprob_start_len so the scheduler doesn't expect logprobs
         # for tokens that are already in the session's committed KV.
-        input_len = len(req.fill_ids) if req.fill_ids is not None else len(params.key.token_ids)
+        input_len = (
+            len(req.fill_ids) if req.fill_ids is not None else len(params.key.token_ids)
+        )
         max_prefix_len = max(input_len - 1, 0)
         prefix_len = min(req.kv_committed_len, max_prefix_len)
 
-        if req.return_logprob and req.logprob_start_len >= 0 and req.logprob_start_len < prefix_len:
+        if (
+            req.return_logprob
+            and req.logprob_start_len >= 0
+            and req.logprob_start_len < prefix_len
+        ):
             req.logprob_start_len = prefix_len
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
