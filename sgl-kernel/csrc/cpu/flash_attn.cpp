@@ -97,8 +97,11 @@ void flash_attn_kernel_impl(
     alignas(64) float m_prime[BLOCK_M];
 
     for (int i = begin; i < end; ++i) {
-      int seq_q_start_loc = bs * seqlen_q;
-      int seq_k_start_loc = bs * seqlen_k;
+      // [Note] use int64_t to avoid overflow
+      // For large inputs, for example bs = 4096, seqlen_q = 4097, m = 0, q_strideM = 128:
+      // The index calculated below: (seq_q_start_loc + m) * q_strideM = 4096 * 4097 * 128 will overflow int
+      int64_t seq_q_start_loc = bs * seqlen_q;
+      int64_t seq_k_start_loc = bs * seqlen_k;
 
       // offset and size in MB
       int m = mb * BLOCK_M;
@@ -272,8 +275,11 @@ void flash_attn_varlen_kernel_impl(
 
     for (int i = begin; i < end; ++i) {
       int32_t bs = indices[mb * 2 + 0];
-      int32_t seq_q_start_loc = cu_seqlens_q[bs];
-      int32_t seq_k_start_loc = cu_seqlens_k[bs];
+
+      // See [Note] use int64_t to avoid overflow
+      int64_t seq_q_start_loc = cu_seqlens_q[bs];
+      int64_t seq_k_start_loc = cu_seqlens_k[bs];
+
       int32_t seqlen_q = cu_seqlens_q[bs + 1] - cu_seqlens_q[bs];
 
       // offset and size in MB
