@@ -102,6 +102,8 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_sbo_enabled,
+    is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -2191,18 +2193,32 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
+        server_args = get_global_server_args()
+
+        if server_args.disable_shared_experts_fusion:
             return
 
-        # For DeepEP/Mori/Mooncake: shared expert is fused into the MoE kernel at the
-        # home EP rank's local expert slot (expanded 256+EP_size expert layout).
-        # num_fused_shared_experts=n_shared_experts enables weight remapping in
-        # deepseek_weight_loader: mlp.shared_experts → mlp.experts.256.
+        # SBO/TBO overlap shared expert with A2A dispatch/combine, which is
+        # incompatible with fusing shared expert into the MoE kernel.
+        if is_sbo_enabled() or is_tbo_enabled():
+            server_args.disable_shared_experts_fusion = True
+            log_info_on_rank0(
+                logger,
+                "SBO/TBO enabled: shared experts fusion is disabled to allow overlap.",
+            )
+            return
+
+        # For DeepEP/Mori/Mooncake: fusion is off by default because shared expert
+        # computation can overlap with A2A dispatch/combine. Users can opt-in via
+        # --enforce-shared-experts-fusion.
         if _is_deepep_class_backend():
+            if not server_args.enforce_shared_experts_fusion:
+                server_args.disable_shared_experts_fusion = True
+                return
             log_info_on_rank0(
                 logger,
                 "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                "at home EP rank local slot (expanded expert layout).",
+                "at home EP rank local slot (--enforce-shared-experts-fusion).",
             )
             self.num_fused_shared_experts = self.config.n_shared_experts
             return
@@ -2233,7 +2249,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
+            server_args.disable_shared_experts_fusion = True
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
