@@ -692,10 +692,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         import requests as http_requests
 
-        from sglang.srt.entrypoints.engine_info_bootstrap import (
-            get_engine_info_bootstrap_port,
-        )
-
         if self.server_args.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
@@ -705,9 +701,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             bootstrap_host = "127.0.0.1"
 
-        bootstrap_port = get_engine_info_bootstrap_port(self.server_args)
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
         bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
-        url = f"{bootstrap_na.to_url()}/register_engine_info"
+        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
         payload = {
             "tp_rank": self.tp_rank,

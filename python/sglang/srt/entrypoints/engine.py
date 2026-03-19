@@ -47,10 +47,7 @@ import uvloop
 import zmq
 
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
-from sglang.srt.entrypoints.engine_info_bootstrap import (
-    EngineInfoBootstrapServer,
-    get_engine_info_bootstrap_port,
-)
+from sglang.srt.entrypoints.engine_info_bootstrap import EngineInfoBootstrapServer
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -631,7 +628,7 @@ class Engine(EngineBase):
             server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
             and server_args.node_rank == 0
         ):
-            bootstrap_port = get_engine_info_bootstrap_port(server_args)
+            bootstrap_port = server_args.engine_info_bootstrap_port
             engine_info_bootstrap = EngineInfoBootstrapServer(
                 host="0.0.0.0", port=bootstrap_port
             )
