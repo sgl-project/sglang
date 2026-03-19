@@ -14,18 +14,6 @@ Verified artifacts:
     - logprob_start_len:     boundary correctness
     - return_text_in_logprobs: structural validation
 
-HF ground-truth comparison utilities:
-
-    from sglang.test.kits.logprob_kit import (
-        hf_logprobs_for_sequence,
-        assert_position_logprobs_match,
-    )
-
-    hf_lp = hf_logprobs_for_sequence(hf_model, token_ids, temperature=1.0)
-    assert_position_logprobs_match(
-        test_case, ref_lp_vec=hf_lp[pos], sgl_token_logprob=...,
-        top_k=50, rtol=0.20, atol=0.0, tag="...",
-    )
 """
 
 import random
@@ -51,56 +39,6 @@ DEFAULT_DECIMAL_PLACES = 1
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def generate_with_logprobs(
-    url,
-    prompt_or_ids,
-    max_new_tokens,
-    top_logprobs_num,
-    token_ids_logprob=None,
-    logprob_start_len=-1,
-    return_text_in_logprobs=False,
-    sampling_params=None,
-):
-    """Send a generate request with logprob options to an SGLang server.
-
-    Args:
-        url: Server base URL.
-        prompt_or_ids: Text string or list of token IDs.
-        max_new_tokens: Number of tokens to generate.
-        top_logprobs_num: Number of top logprobs to return.
-        token_ids_logprob: Optional token IDs for the token_ids_logprob artifact.
-        logprob_start_len: Starting position for input logprobs (-1 to skip).
-        return_text_in_logprobs: Include token text in logprob tuples.
-        sampling_params: Optional dict of sampling parameters.  Defaults to
-            ``{"temperature": 0, "ignore_eos": True}``.  ``max_new_tokens``
-            is always set from the explicit argument.
-    """
-    if isinstance(prompt_or_ids, str):
-        payload = {"text": prompt_or_ids}
-    else:
-        payload = {"input_ids": prompt_or_ids}
-
-    if sampling_params is None:
-        sampling_params = {"temperature": 0, "ignore_eos": True}
-    sampling_params = {**sampling_params, "max_new_tokens": max_new_tokens}
-
-    payload.update(
-        {
-            "sampling_params": sampling_params,
-            "return_logprob": True,
-            "top_logprobs_num": top_logprobs_num,
-            "logprob_start_len": logprob_start_len,
-            "return_text_in_logprobs": return_text_in_logprobs,
-        }
-    )
-    if token_ids_logprob is not None:
-        payload["token_ids_logprob"] = token_ids_logprob
-
-    response = requests.post(url + "/generate", json=payload)
-    assert response.status_code == 200, f"Server error: {response.text}"
-    return response.json()
 
 
 def _compare_token_logprobs(test_case, target_lps, baseline_lps, places, tag):
@@ -194,8 +132,58 @@ def _compare_ids_logprobs(test_case, target_ids, baseline_ids, places, tag):
 
 
 # ---------------------------------------------------------------------------
-# Public API – HF ground-truth comparison utilities
+# Public API
 # ---------------------------------------------------------------------------
+
+
+def generate_with_logprobs(
+    url,
+    prompt_or_ids,
+    max_new_tokens,
+    top_logprobs_num,
+    token_ids_logprob=None,
+    logprob_start_len=-1,
+    return_text_in_logprobs=False,
+    sampling_params=None,
+):
+    """Send a generate request with logprob options to an SGLang server.
+
+    Args:
+        url: Server base URL.
+        prompt_or_ids: Text string or list of token IDs.
+        max_new_tokens: Number of tokens to generate.
+        top_logprobs_num: Number of top logprobs to return.
+        token_ids_logprob: Optional token IDs for the token_ids_logprob artifact.
+        logprob_start_len: Starting position for input logprobs (-1 to skip).
+        return_text_in_logprobs: Include token text in logprob tuples.
+        sampling_params: Optional dict of sampling parameters.  Defaults to
+            ``{"temperature": 0, "ignore_eos": True}``.  ``max_new_tokens``
+            is always set from the explicit argument.
+    """
+    if isinstance(prompt_or_ids, str):
+        payload = {"text": prompt_or_ids}
+    else:
+        payload = {"input_ids": prompt_or_ids}
+
+    if sampling_params is None:
+        sampling_params = {"temperature": 0, "ignore_eos": True}
+    sampling_params = {**sampling_params, "max_new_tokens": max_new_tokens}
+
+    payload.update(
+        {
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "top_logprobs_num": top_logprobs_num,
+            "logprob_start_len": logprob_start_len,
+            "return_text_in_logprobs": return_text_in_logprobs,
+        }
+    )
+    if token_ids_logprob is not None:
+        payload["token_ids_logprob"] = token_ids_logprob
+
+    response = requests.post(url + "/generate", json=payload)
+    assert response.status_code == 200, f"Server error: {response.text}"
+    return response.json()
 
 
 def hf_logprobs_for_sequence(hf_model, token_ids, temperature=1.0):
@@ -298,11 +286,6 @@ def assert_position_logprobs_match(
             torch.allclose(ref_ids_vals, sgl_ids_vals, rtol=rtol, atol=atol),
             msg=f"[{tag}] token-IDs mismatch",
         )
-
-
-# ---------------------------------------------------------------------------
-# Public API – cross-mode comparison functions
-# ---------------------------------------------------------------------------
 
 
 def run_logprob_cross_mode_check(
