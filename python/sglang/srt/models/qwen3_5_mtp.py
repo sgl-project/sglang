@@ -15,14 +15,13 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
-import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -33,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)

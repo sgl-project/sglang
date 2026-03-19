@@ -202,7 +202,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import is_blackwell, is_npu
 
         if is_npu():
-            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import AscendGDNAttnBackend as GDNAttnBackend
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                AscendGDNAttnBackend as GDNAttnBackend,
+            )
         else:
             from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 

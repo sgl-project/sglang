@@ -1,12 +1,18 @@
-from typing import Tuple, Union, Optional
+from typing import Optional, Tuple, Union
+
 import torch
 import torch.nn.functional as F
 import torch_npu
+from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
+from sgl_kernel_npu.mamba.causal_conv1d import (
+    causal_conv1d_fn_npu,
+    causal_conv1d_update_npu,
+)
 
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.gdn_backend import (
-    GDNKernelDispatcher,
     GDNAttnBackend,
+    GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
@@ -19,46 +25,45 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_cpu
 
-from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-from sgl_kernel_npu.mamba.causal_conv1d import (
-    causal_conv1d_fn_npu,
-    causal_conv1d_update_npu,
-)
-
 fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
+
 def npu_causal_conv1d_update(
-        hidden_state: torch.Tensor,
-        weight: torch.Tensor,
-        conv_state: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-        silu_activation: bool = True,
-    ):
-        bsz, hidden_size, seq_len = hidden_state.shape
-        kernel_size = weight.shape[-1]
-        target_state_len = (kernel_size - 1) + (seq_len - 1)
-        full_context = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
-        computation_input = full_context[:, :, -(kernel_size - 1 + seq_len):]
-        windows = computation_input.unfold(-1, kernel_size, 1)
+    hidden_state: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    silu_activation: bool = True,
+):
+    bsz, hidden_size, seq_len = hidden_state.shape
+    kernel_size = weight.shape[-1]
+    target_state_len = (kernel_size - 1) + (seq_len - 1)
+    full_context = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
+    computation_input = full_context[:, :, -(kernel_size - 1 + seq_len) :]
+    windows = computation_input.unfold(-1, kernel_size, 1)
 
-        out = (windows * weight[None, :, None, :]).sum(dim=-1)
-        if bias is not None:
-            out = out + bias[None, :, None]
-        if silu_activation:
-            out = F.silu(out)
-        out = out.to(hidden_state.dtype)
+    out = (windows * weight[None, :, None, :]).sum(dim=-1)
+    if bias is not None:
+        out = out + bias[None, :, None]
+    if silu_activation:
+        out = F.silu(out)
+    out = out.to(hidden_state.dtype)
 
-        if target_state_len > 0:
-            new_conv_state = full_context[:, :, -target_state_len:]
-        else:
-            new_conv_state = torch.empty(bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype)
+    if target_state_len > 0:
+        new_conv_state = full_context[:, :, -target_state_len:]
+    else:
+        new_conv_state = torch.empty(
+            bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype
+        )
 
-        return out, new_conv_state
+    return out, new_conv_state
+
 
 class AscendGDNKernelDispatcher(GDNKernelDispatcher):
     pass
+
 
 class AscendGDNAttnBackend(GDNAttnBackend):
 
@@ -67,10 +72,12 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        
+
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
-        self.kernel_dispatcher = AscendGDNKernelDispatcher(decode_backend, prefill_backend)
+        self.kernel_dispatcher = AscendGDNKernelDispatcher(
+            decode_backend, prefill_backend
+        )
 
     def prepare_gdn_inputs(
         self,
@@ -104,7 +111,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         self.prepare_gdn_inputs(
             forward_batch.batch_size,
             forward_batch.forward_mode,
-            forward_batch.spec_info
+            forward_batch.spec_info,
         )
         self.graph_mode = False
 
@@ -127,7 +134,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             seq_lens,
             encoder_lens,
             forward_mode,
-            spec_info
+            spec_info,
         )
         self.prepare_gdn_inputs(bs, forward_mode, spec_info)
         self.graph_mode = True
@@ -153,7 +160,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             encoder_lens,
             forward_mode,
             spec_info,
-            seq_lens_cpu
+            seq_lens_cpu,
         )
         self.prepare_gdn_inputs(bs, forward_mode, spec_info)
         self.graph_mode = True
@@ -267,18 +274,18 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 b = b[: forward_batch.num_token_non_padded_cpu]
                 seq_len = forward_batch.num_token_non_padded_cpu
 
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
             conv_states_to_use = conv_states[cache_indices]
             mixed_qkv_processed, new_conv_state = npu_causal_conv1d_update(
                 mixed_qkv_reshaped.transpose(1, 2).contiguous(),
                 layer.conv_weights,
                 conv_states_to_use.transpose(1, 2).contiguous(),
                 layer.bias,
-                True
+                True,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+            )
             conv_states[cache_indices] = new_conv_state.transpose(1, 2).contiguous()
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
@@ -293,7 +300,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1):, :]
+            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
             conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
 
             mixed_qkv = causal_conv1d_fn(
@@ -307,7 +314,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
-            conv_states[:, -(kernel_size - 1):, :] = conv_states_tmp.transpose(1, 2).contiguous()
+            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
+                1, 2
+            ).contiguous()
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -356,7 +365,6 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                     dim=0,
                 )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -373,7 +381,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
             if not forward_batch.spec_algorithm.is_none():
-                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(ssm_states.dtype, copy=False)
+                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
+                    ssm_states.dtype, copy=False
+                )
                 intermediate_state_cache[cache_indices, 0] = last_recurrent_state
             else:
                 last_recurrent_state = last_recurrent_state.to(
@@ -404,7 +414,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         g = g.view(-1, num_value_heads).to(torch.float32)
         batch_size = cache_indices.shape[0]
         seq_len = query.shape[0] // batch_size
-        scale = 1 / (head_k_dim ** 0.5)
+        scale = 1 / (head_k_dim**0.5)
 
         if intermediate_state is not None:
             # MTP intermediate_state
@@ -419,9 +429,10 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             num_accepted_tokens = torch.ones(
                 [batch_size], dtype=torch.int32, device=cache_indices.device
             )
-            actual_seq_lengths = torch.ones(
-                [batch_size], dtype=torch.int32, device=cache_indices.device
-            ) * seq_len
+            actual_seq_lengths = (
+                torch.ones([batch_size], dtype=torch.int32, device=cache_indices.device)
+                * seq_len
+            )
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
             num_accepted_tokens = self.num_accepted_tokens

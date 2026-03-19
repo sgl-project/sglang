@@ -15,16 +15,16 @@
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
-import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import is_npu
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import is_npu
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
