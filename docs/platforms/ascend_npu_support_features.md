@@ -397,7 +397,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
 | `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
-| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
