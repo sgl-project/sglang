@@ -8,6 +8,7 @@ and without prefetch enabled.
 
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -80,13 +81,22 @@ class TestPrefetchDistributedOnlyReadsSubset(unittest.TestCase):
         for p in paths:
             os.unlink(p)
 
-    @patch("torch.distributed.barrier")
+    def _wait_for_prefetch(self, timeout=10):
+        """Wait for the background prefetch thread to complete."""
+        import threading
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            threads = [t for t in threading.enumerate() if t.daemon and t.is_alive()]
+            if not threads:
+                return
+            time.sleep(0.1)
+        raise TimeoutError("Prefetch thread did not complete in time")
+
     @patch("torch.distributed.get_world_size", return_value=4)
     @patch("torch.distributed.get_rank", return_value=1)
     @patch("torch.distributed.is_initialized", return_value=True)
-    def test_rank_only_reads_its_assigned_files(
-        self, mock_init, mock_rank, mock_world, mock_barrier
-    ):
+    def test_rank_only_reads_its_assigned_files(self, mock_init, mock_rank, mock_world):
         """Rank 1 of 4 with 12 files should only read files at indices 1, 5, 9."""
         paths = self._create_temp_files(12)
         try:
@@ -102,10 +112,10 @@ class TestPrefetchDistributedOnlyReadsSubset(unittest.TestCase):
                 side_effect=tracking_prefetch,
             ):
                 _prefetch_all_checkpoints(paths)
+                self._wait_for_prefetch()
 
             expected = [paths[i] for i in [1, 5, 9]]
             self.assertEqual(sorted(read_files), sorted(expected))
-            mock_barrier.assert_called_once()
         finally:
             self._cleanup(paths)
 
@@ -126,6 +136,7 @@ class TestPrefetchDistributedOnlyReadsSubset(unittest.TestCase):
                 side_effect=tracking_prefetch,
             ):
                 _prefetch_all_checkpoints(paths)
+                self._wait_for_prefetch()
 
             self.assertEqual(sorted(read_files), sorted(paths))
         finally:

@@ -718,15 +718,23 @@ def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
 ) -> None:
-    """Prefetch checkpoint files into OS page cache, distributed across ranks.
+    """Start prefetching checkpoint files into page cache in a background thread.
 
     When multiple ranks on the same node load the same checkpoint (e.g.
     DP-attention), each rank independently mmaps the same files, causing
     redundant NFS/Lustre reads. By distributing the prefetch across ranks
     (each rank reads 1/Nth of the shards), the total network I/O is reduced
-    from N * checkpoint_size to 1 * checkpoint_size, with all subsequent
+    from N * checkpoint_size to 1 * checkpoint_size, with subsequent
     mmap accesses hitting the shared OS page cache.
+
+    The prefetch runs in a background thread so that loading can start
+    immediately and benefit from pages that have already been cached,
+    rather than blocking until all files are prefetched. This pipelining
+    naturally adapts to any RAM size — even if the full checkpoint does
+    not fit in page cache, the prefetch thread stays ahead of the loader.
     """
+    import asyncio
+    import threading
     import time
 
     if torch.distributed.is_initialized():
@@ -737,37 +745,59 @@ def _prefetch_all_checkpoints(
         world_size = 1
 
     my_files = sorted_files[rank::world_size]
+    total_for_rank = len(my_files)
 
     if rank == 0:
         logger.info(
             "Prefetching %d/%d checkpoint shards into page cache "
-            "(%d ranks sharing the work, %d threads per rank)...",
-            len(my_files),
+            "(background, %d ranks sharing the work, %d threads per rank)...",
+            total_for_rank,
             len(sorted_files),
             world_size,
             num_threads,
         )
 
-    start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
-        list(pool.map(_prefetch_checkpoint_file, my_files))
-    elapsed = time.perf_counter() - start
+    async def _prefetch_all() -> None:
+        semaphore = asyncio.Semaphore(num_threads)
+        completed = 0
+        next_log_pct = 10
 
-    if rank == 0:
-        total_bytes = sum(os.path.getsize(f) for f in my_files)
-        logger.info(
-            "Rank 0 prefetched %.1f GB in %.1fs (%.1f GB/s)",
-            total_bytes / 1e9,
-            elapsed,
-            total_bytes / 1e9 / elapsed if elapsed > 0 else 0,
-        )
+        async def prefetch_one(path: str) -> None:
+            nonlocal completed, next_log_pct
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
+                completed += 1
+                if rank == 0 and total_for_rank > 0 and next_log_pct <= 100:
+                    pct = 100 * completed / total_for_rank
+                    if pct >= next_log_pct:
+                        logger.info(
+                            "Prefetching checkpoint files: %d%% (%d/%d)",
+                            next_log_pct,
+                            completed,
+                            total_for_rank,
+                        )
+                        next_log_pct += 10
+            except Exception:
+                logger.warning(
+                    "Failed to prefetch checkpoint file %r.",
+                    path,
+                    exc_info=True,
+                )
 
-    # Wait for all ranks to finish so the full page cache is warm.
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        await asyncio.gather(*(prefetch_one(p) for p in my_files))
 
-    if rank == 0:
-        logger.info("All ranks finished prefetching checkpoint shards.")
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        asyncio.run(_prefetch_all())
+        elapsed = time.perf_counter() - start
+        if rank == 0:
+            logger.info(
+                "Prefetching checkpoint files into page cache " "finished in %.2fs",
+                elapsed,
+            )
+
+    threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
 def safetensors_weights_iterator(
