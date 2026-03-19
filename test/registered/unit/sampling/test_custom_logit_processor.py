@@ -33,6 +33,7 @@ def _make_req(origin_input_ids=None, output_ids=None):
 class TestCustomLogitProcessorSerialization(CustomTestCase):
 
     def test_to_str_produces_valid_json(self):
+        """Test that to_str() produces valid JSON with a 'callable' field."""
         s = DisallowedTokensLogitsProcessor.to_str()
         data = json.loads(s)
         self.assertIn("callable", data)
@@ -59,6 +60,7 @@ class TestDisallowedTokensLogitsProcessor(CustomTestCase):
         self.processor = DisallowedTokensLogitsProcessor()
 
     def test_disallowed_tokens_set_to_neg_inf(self):
+        """Test that disallowed token positions are set to -inf for all batch items."""
         logits = torch.zeros(2, 10)
         params = [{"token_ids": [2, 5]}, {"token_ids": [2, 5]}]
         result = self.processor(logits, params)
@@ -67,6 +69,7 @@ class TestDisallowedTokensLogitsProcessor(CustomTestCase):
         self.assertTrue(torch.isinf(result[1, 2]) and result[1, 2] < 0)
 
     def test_allowed_tokens_unchanged(self):
+        """Test that non-disallowed tokens keep their original logit values."""
         logits = torch.ones(1, 10)
         params = [{"token_ids": [3]}]
         result = self.processor(logits, params)
@@ -161,6 +164,7 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_skips_when_budget_is_none(self):
+        """Test that thinking_budget=None is ignored even during thinking phase."""
         req = _make_req(origin_input_ids=[self.START], output_ids=[100] * 10)
         params = [{"thinking_budget": None, "__req__": req}]
         logits = self._logits()
@@ -169,6 +173,7 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_skips_when_budget_is_negative(self):
+        """Test that negative thinking_budget is treated as disabled (no enforcement)."""
         req = _make_req(origin_input_ids=[self.START], output_ids=[100] * 10)
         params = [{"thinking_budget": -1, "__req__": req}]
         logits = self._logits()
@@ -177,12 +182,14 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_none_params_returns_unchanged(self):
+        """Test that passing None as param list returns logits unchanged."""
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, None)
         self.assertTrue(torch.equal(result, original))
 
     def test_empty_params_returns_unchanged(self):
+        """Test that passing empty param list returns logits unchanged."""
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, [])
@@ -317,6 +324,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_window_size_zero_skips(self):
+        """Test that window_size=0 disables ngram checking (no modification)."""
         req = _make_req(origin_input_ids=[1, 2, 1, 2])
         params = [{"__req__": req, "ngram_size": 2, "window_size": 0}]
         logits = self._logits()
@@ -325,6 +333,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_empty_params_returns_unchanged(self):
+        """Test that None param list returns logits unchanged (early return)."""
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, None)

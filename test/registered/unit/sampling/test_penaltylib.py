@@ -53,6 +53,7 @@ def _make_batch(reqs):
 class TestBatchedPenalizerOrchestrator(CustomTestCase):
 
     def test_init_detects_required_penalizers(self):
+        """Test that orchestrator marks is_required=True when any request has nonzero penalty."""
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -61,6 +62,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertTrue(orch.is_required)
 
     def test_init_not_required_when_no_penalties(self):
+        """Test that orchestrator marks is_required=False when all penalties are zero."""
         reqs = [_make_req()]  # all defaults (0.0)
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -69,12 +71,14 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertFalse(orch.is_required)
 
     def test_batch_property_via_weakref(self):
+        """Test that batch property returns the original batch via weakref."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, set())
         self.assertIs(orch.batch, batch)
 
     def test_batch_setter_none(self):
+        """Test that setting batch to None breaks the weakref cleanly."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, set())
@@ -82,6 +86,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertIsNone(orch.batch)
 
     def test_batch_setter_new_batch(self):
+        """Test that batch can be reassigned to a different ScheduleBatch."""
         reqs = [_make_req()]
         batch1 = _make_batch(reqs)
         batch2 = _make_batch(reqs)
@@ -90,6 +95,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertIs(orch.batch, batch2)
 
     def test_context_manager_releases(self):
+        """Test that exiting the context manager releases all penalizers."""
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
         with BatchedPenalizerOrchestrator(
@@ -100,6 +106,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertEqual(len(orch.penalizers), 0)
 
     def test_filter_empty_indices_releases(self):
+        """Test that filtering with no indices left fully releases the orchestrator."""
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -109,6 +116,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         self.assertFalse(orch.is_required)
 
     def test_filter_not_required_is_noop(self):
+        """Test that filter on a not-required orchestrator does nothing."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -118,6 +126,7 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         orch.filter(torch.tensor([0]))  # should not raise
 
     def test_merge_both_not_required_is_noop(self):
+        """Test that merging two not-required orchestrators stays not-required."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch1 = BatchedPenalizerOrchestrator(
@@ -143,10 +152,12 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         return orch, pen
 
     def test_is_required_with_nonzero_penalty(self):
+        """Test that nonzero frequency_penalty makes the penalizer required."""
         _, pen = self._setup([1.5])
         self.assertTrue(pen.is_required())
 
     def test_is_not_required_with_zero_penalty(self):
+        """Test that zero frequency_penalty makes the penalizer not required."""
         _, pen = self._setup([0.0])
         self.assertFalse(pen.is_required())
 
@@ -173,6 +184,7 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         self.assertAlmostEqual(logits[0, 3].item(), -2.0, places=5)
 
     def test_filter_keeps_subset(self):
+        """Test that filter retains only the selected batch indices."""
         orch, pen = self._setup([1.0, 2.0])
         keep = torch.tensor([1])
         pen.filter(keep)
@@ -180,12 +192,14 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         self.assertAlmostEqual(pen.frequency_penalties[0, 0].item(), 2.0, places=5)
 
     def test_merge_concatenates(self):
+        """Test that merge concatenates penalty tensors from two penalizers."""
         _, pen1 = self._setup([1.0])
         _, pen2 = self._setup([2.0])
         pen1.merge(pen2)
         self.assertEqual(pen1.frequency_penalties.shape[0], 2)
 
     def test_teardown_cleans_attributes(self):
+        """Test that teardown deletes internal tensors and resets prepared state."""
         _, pen = self._setup([1.0])
         pen.teardown()
         self.assertFalse(hasattr(pen, "frequency_penalties"))
@@ -199,6 +213,7 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         pen.cumulate_output_tokens(torch.tensor([1]))  # should not raise
 
     def test_apply_when_not_prepared_is_noop(self):
+        """Test that apply on an unprepared penalizer leaves logits unchanged."""
         _, pen = self._setup([0.0])
         logits = torch.zeros(1, VOCAB_SIZE)
         original = logits.clone()
@@ -219,6 +234,7 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         return orch, pen
 
     def test_is_required_with_nonzero_penalty(self):
+        """Test that nonzero presence_penalty makes the penalizer required."""
         _, pen = self._setup([0.5])
         self.assertTrue(pen.is_required())
 
@@ -234,6 +250,7 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         self.assertAlmostEqual(logits[0, 7].item(), -1.0, places=5)
 
     def test_filter_keeps_subset(self):
+        """Test that filter retains the first request's presence penalty."""
         orch, pen = self._setup([1.0, 2.0])
         keep = torch.tensor([0])
         pen.filter(keep)
@@ -241,12 +258,14 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         self.assertAlmostEqual(pen.presence_penalties[0, 0].item(), 1.0, places=5)
 
     def test_merge_concatenates(self):
+        """Test that merge concatenates presence penalty tensors."""
         _, pen1 = self._setup([1.0])
         _, pen2 = self._setup([2.0])
         pen1.merge(pen2)
         self.assertEqual(pen1.presence_penalties.shape[0], 2)
 
     def test_teardown_cleans_attributes(self):
+        """Test that teardown removes the presence_penalties tensor."""
         _, pen = self._setup([1.0])
         pen.teardown()
         self.assertFalse(hasattr(pen, "presence_penalties"))
@@ -266,10 +285,12 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         return orch, pen
 
     def test_is_required_with_positive_min_tokens(self):
+        """Test that positive min_new_tokens makes the penalizer required."""
         _, pen = self._setup([(5, None, 2)])
         self.assertTrue(pen.is_required())
 
     def test_is_not_required_with_zero_min_tokens(self):
+        """Test that min_new_tokens=0 makes the penalizer not required."""
         _, pen = self._setup([(0, None, 2)])
         self.assertFalse(pen.is_required())
 
@@ -326,6 +347,7 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertEqual(logits[0, 0].item(), 0.0)
 
     def test_filter_keeps_subset(self):
+        """Test that filter keeps the second request (min_tokens=5) and drops the first."""
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])
         keep = torch.tensor([1])
         pen.filter(keep)
@@ -333,12 +355,14 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertEqual(pen.min_new_tokens[0, 0].item(), 5)
 
     def test_merge_concatenates(self):
+        """Test that merge combines min_new_tokens tensors from two penalizers."""
         _, pen1 = self._setup([(3, None, 2)])
         _, pen2 = self._setup([(5, None, 2)])
         pen1.merge(pen2)
         self.assertEqual(pen1.min_new_tokens.shape[0], 2)
 
     def test_teardown_cleans_attributes(self):
+        """Test that teardown removes min_new_tokens, stop_token_penalties, and len_output_tokens."""
         _, pen = self._setup([(3, None, 2)])
         pen.teardown()
         self.assertFalse(hasattr(pen, "min_new_tokens"))
@@ -350,6 +374,7 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
 class TestBatchedPenalizerBase(CustomTestCase):
 
     def test_filter_when_not_prepared_is_noop(self):
+        """Test that filter on an unprepared penalizer does not crash."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -381,6 +406,7 @@ class TestBatchedPenalizerBase(CustomTestCase):
         self.assertEqual(pen_a.frequency_penalties.shape[0], 2)
 
     def test_merge_both_unprepared_is_noop(self):
+        """Test that merging two unprepared penalizers keeps them unprepared."""
         reqs = [_make_req()]
         batch = _make_batch(reqs)
         orch1 = BatchedPenalizerOrchestrator(

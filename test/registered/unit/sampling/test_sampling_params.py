@@ -79,62 +79,66 @@ class TestSamplingParamsVerify(CustomTestCase):
         defaults.update(kwargs)
         return SamplingParams(**defaults)
 
-    # --- happy path ---
     def test_valid_params_pass(self):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
 
-    # --- temperature ---
     def test_negative_temperature_raises(self):
+        """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     # --- top_p ---
     def test_top_p_negative_raises(self):
+        """Test that verify() rejects negative top_p (valid range is (0, 1])."""
         sp = self._make(top_p=-0.5)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_top_p_zero_raises(self):
-        """top_p=0 is not in (0, 1]."""
+        """Test that verify() rejects top_p=0 (not in (0, 1])."""
         sp = self._make(top_p=0.0)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_top_p_above_one_raises(self):
+        """Test that verify() rejects top_p > 1.0."""
         sp = self._make(top_p=1.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_top_p_exactly_one_is_valid(self):
+        """Test that top_p=1.0 is accepted (inclusive upper bound)."""
         sp = self._make(top_p=1.0)
-        sp.verify(self.VOCAB_SIZE)  # should not raise
+        sp.verify(self.VOCAB_SIZE)
 
     def test_top_p_small_positive_is_valid(self):
+        """Test that a small positive top_p (0.01) is accepted."""
         sp = self._make(top_p=0.01)
         sp.verify(self.VOCAB_SIZE)
 
     # --- min_p ---
     def test_min_p_negative_raises(self):
+        """Test that verify() rejects negative min_p (valid range is [0, 1])."""
         sp = self._make(min_p=-0.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_min_p_above_one_raises(self):
+        """Test that verify() rejects min_p > 1.0."""
         sp = self._make(min_p=1.01)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_min_p_boundaries_valid(self):
-        """Both 0.0 and 1.0 are valid."""
+        """Test that both 0.0 and 1.0 are accepted."""
         self._make(min_p=0.0).verify(self.VOCAB_SIZE)
         self._make(min_p=1.0).verify(self.VOCAB_SIZE)
 
-    # --- top_k ---
     def test_top_k_zero_raises(self):
-        """top_k=0 is invalid (must be >=1 or -1 for all)."""
+        """Test that verify() rejects top_k=0 (must be >=1 or -1 for all)."""
         sp = self._make()
         sp.top_k = 0  # bypass __init__ conversion
         with self.assertRaises(ValueError):
@@ -149,58 +153,68 @@ class TestSamplingParamsVerify(CustomTestCase):
 
     # --- frequency_penalty ---
     def test_frequency_penalty_below_minus_two_raises(self):
+        """Test that verify() rejects frequency_penalty < -2.0."""
         sp = self._make(frequency_penalty=-2.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_frequency_penalty_above_two_raises(self):
+        """Test that verify() rejects frequency_penalty > 2.0."""
         sp = self._make(frequency_penalty=2.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_frequency_penalty_boundaries_valid(self):
-        """Boundary values -2.0 and 2.0 should both be accepted."""
+        """Test that both -2.0 and 2.0 are accepted."""
         self._make(frequency_penalty=-2.0).verify(self.VOCAB_SIZE)
         self._make(frequency_penalty=2.0).verify(self.VOCAB_SIZE)
 
     # --- presence_penalty ---
     def test_presence_penalty_out_of_range_raises(self):
+        """Test that verify() rejects presence_penalty outside [-2, 2]."""
         sp = self._make(presence_penalty=2.5)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     # --- repetition_penalty ---
     def test_repetition_penalty_negative_raises(self):
+        """Test that verify() rejects negative repetition_penalty (valid range is [0, 2])."""
         sp = self._make(repetition_penalty=-0.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_repetition_penalty_above_two_raises(self):
+        """Test that verify() rejects repetition_penalty > 2.0."""
         sp = self._make(repetition_penalty=2.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_repetition_penalty_boundaries_valid(self):
+        """Test that boundary values 0.0 and 2.0 are both accepted."""
         self._make(repetition_penalty=0.0).verify(self.VOCAB_SIZE)
         self._make(repetition_penalty=2.0).verify(self.VOCAB_SIZE)
 
     # --- min_new_tokens / max_new_tokens ---
     def test_negative_min_new_tokens_raises(self):
+        """Test that verify() rejects negative min_new_tokens."""
         sp = self._make(min_new_tokens=-1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_negative_max_new_tokens_raises(self):
+        """Test that verify() rejects negative max_new_tokens."""
         sp = self._make(max_new_tokens=-1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_min_exceeds_max_new_tokens_raises(self):
+        """Test that verify() rejects min_new_tokens > max_new_tokens."""
         sp = self._make(min_new_tokens=100, max_new_tokens=50)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_min_equals_max_new_tokens_valid(self):
+        """Test that min_new_tokens == max_new_tokens is accepted."""
         sp = self._make(min_new_tokens=10, max_new_tokens=10)
         sp.verify(self.VOCAB_SIZE)
 
@@ -211,30 +225,35 @@ class TestSamplingParamsVerify(CustomTestCase):
 
     # --- logit_bias ---
     def test_logit_bias_token_exceeds_vocab_raises(self):
+        """Test that verify() rejects logit_bias with token_id >= vocab_size."""
         sp = self._make(logit_bias={"99999": 1.0})
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_logit_bias_negative_token_raises(self):
+        """Test that verify() rejects logit_bias with negative token_id."""
         sp = self._make(logit_bias={"-1": 1.0})
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_logit_bias_valid_tokens(self):
+        """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
-    # --- grammar mutual exclusion ---
     def test_multiple_grammars_raises(self):
+        """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
         sp = self._make(json_schema='{"type":"object"}', regex="abc")
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
     def test_single_grammar_valid(self):
+        """Test that setting only one grammar type is accepted."""
         sp = self._make(json_schema='{"type":"object"}')
         sp.verify(self.VOCAB_SIZE)
 
     def test_all_three_grammars_set_raises(self):
+        """Test that verify() rejects setting json_schema, regex, and ebnf together."""
         sp = self._make(json_schema="{}", regex="a", ebnf="rule")
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
@@ -243,29 +262,32 @@ class TestSamplingParamsVerify(CustomTestCase):
 class TestSamplingParamsNormalize(CustomTestCase):
 
     def test_none_stop_strs_becomes_empty_list(self):
+        """Test that normalize() converts None stop to empty list with max_len=0."""
         sp = SamplingParams(stop=None)
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_strs, [])
         self.assertEqual(sp.stop_str_max_len, 0)
 
     def test_string_stop_str_wrapped_in_list(self):
+        """Test that normalize() wraps a single stop string into a list."""
         sp = SamplingParams(stop="<|end|>")
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_strs, ["<|end|>"])
 
     def test_list_stop_strs_unchanged(self):
+        """Test that normalize() preserves a list of stop strings as-is."""
         sp = SamplingParams(stop=["stop1", "stop2"])
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_strs, ["stop1", "stop2"])
 
     def test_stop_str_max_len_without_tokenizer(self):
-        """Without a tokenizer, max_len is the raw string character count."""
+        """Test that without a tokenizer, max_len is the raw string character count."""
         sp = SamplingParams(stop=["ab", "cdef"])
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_str_max_len, 4)  # len("cdef")
 
     def test_stop_str_max_len_with_tokenizer(self):
-        """With a tokenizer, max_len counts encoded token IDs."""
+        """Test that with a tokenizer, max_len counts encoded token IDs."""
         tokenizer = MagicMock()
         # "hello" encodes to 2 tokens, "world!!" to 3 tokens
         tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
@@ -277,18 +299,20 @@ class TestSamplingParamsNormalize(CustomTestCase):
         self.assertEqual(sp.stop_str_max_len, 3)
 
     def test_none_stop_regex_becomes_empty_list(self):
+        """Test that normalize() converts None stop_regex to empty list with max_len=0."""
         sp = SamplingParams(stop_regex=None)
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_regex_strs, [])
         self.assertEqual(sp.stop_regex_max_len, 0)
 
     def test_string_stop_regex_wrapped_in_list(self):
+        """Test that normalize() wraps a single stop_regex string into a list."""
         sp = SamplingParams(stop_regex=r"\d+")
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_regex_strs, [r"\d+"])
 
     def test_stop_regex_max_len_computed(self):
-        """Bounded regex should compute a finite max length."""
+        """Test that bounded regex computes a finite max length."""
         sp = SamplingParams(stop_regex=r"[a-z]{3}")
         sp.normalize(tokenizer=None)
         self.assertEqual(sp.stop_regex_max_len, 3)
@@ -297,76 +321,75 @@ class TestSamplingParamsNormalize(CustomTestCase):
 class TestRegexMaxLength(CustomTestCase):
 
     def test_literal_string(self):
-        """'abc' → 3 literals."""
+        """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)
 
     def test_character_class(self):
-        """'[a-z]' → 1 (one character from set)."""
+        """Test that character class '[a-z]' gives max length 1."""
         self.assertEqual(get_max_seq_length("[a-z]"), 1)
 
     def test_dot_any(self):
-        """'.' matches any one character → 1."""
+        """Test that dot wildcard '.' gives max length 1."""
         self.assertEqual(get_max_seq_length("."), 1)
 
     def test_unbounded_star(self):
-        """'a*' → unbounded repeat → MAX_LEN."""
+        """Test that 'a*' (zero or more, no upper bound) returns MAX_LEN."""
         result = get_max_seq_length("a*")
         self.assertEqual(result, MAX_LEN)
 
     def test_unbounded_plus(self):
-        """'a+' → at least 1, unbounded → MAX_LEN."""
+        """Test that 'a+' (one or more, no upper bound) returns MAX_LEN."""
         result = get_max_seq_length("a+")
         self.assertEqual(result, MAX_LEN)
 
     def test_bounded_repeat(self):
-        """'a{5}' → exactly 5 × 1 = 5."""
+        """Test that exact repeat 'a{5}' gives max length 5."""
         self.assertEqual(get_max_seq_length("a{5}"), 5)
 
     def test_bounded_range_repeat(self):
-        """'a{2,4}' → upper bound is 4 × 1 = 4."""
+        """Test that range repeat 'a{2,4}' uses upper bound, giving max length 4."""
         self.assertEqual(get_max_seq_length("a{2,4}"), 4)
 
     def test_branch_takes_max(self):
-        """'abc|de' → max(3, 2) = 3."""
+        """Test that alternation 'abc|de' takes the longer branch: max(3, 2) = 3."""
         self.assertEqual(get_max_seq_length("abc|de"), 3)
 
     def test_subpattern_group(self):
-        """'(abc)' → 3 from the group content."""
+        """Test that capturing group '(abc)' gives max length 3 from inner content."""
         self.assertEqual(get_max_seq_length("(abc)"), 3)
 
     def test_zero_width_assertions_ignored(self):
-        """'^abc$' → anchors contribute 0, result = 3."""
+        """Test that anchors ^ and $ in '^abc$' add 0, giving max length 3."""
         self.assertEqual(get_max_seq_length("^abc$"), 3)
 
     def test_complex_pattern(self):
-        """'(foo|bar)\\d{2}' → max(3,3) + 2 = 5."""
+        """Test combined pattern '(foo|bar)\\d{2}': branch(3) + repeat(2) = 5."""
         self.assertEqual(get_max_seq_length(r"(foo|bar)\d{2}"), 5)
 
     def test_nested_groups(self):
-        """'((ab))' → nested subpatterns still = 2."""
+        """Test that nested groups '((ab))' correctly recurse to give max length 2."""
         self.assertEqual(get_max_seq_length("((ab))"), 2)
 
     def test_question_mark_optional(self):
-        """'a?' → {0,1} repeat → 1 × 1 = 1."""
+        """Test that optional 'a?' (equivalent to a{0,1}) gives max length 1."""
         self.assertEqual(get_max_seq_length("a?"), 1)
 
     def test_mixed_unbounded_and_bounded(self):
-        """'ab+c{3}' → 1 + MAX_LEN + 3 (unbounded dominates)."""
+        """Test that 'ab+c{3}' gives >= MAX_LEN because b+ is unbounded."""
         result = get_max_seq_length("ab+c{3}")
         self.assertGreaterEqual(result, MAX_LEN)
 
     def test_empty_regex(self):
-        """Empty regex matches empty string → length 0."""
+        """Test that empty regex gives max length 0 (no tokens to match)."""
         self.assertEqual(get_max_seq_length(""), 0)
 
     def test_lookahead_triggers_unhandled_token(self):
-        """Test that lookahead (?=...) hits the unhandled ASSERT branch."""
+        """Test that lookahead (?=a) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?=a)b")
-        # ASSERT (lookahead) → MAX_LEN, LITERAL 'b' → 1
         self.assertGreaterEqual(result, MAX_LEN)
 
     def test_lookbehind_triggers_unhandled_token(self):
-        """Lookbehind (?<=...) also produces an unhandled ASSERT token."""
+        """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
 
