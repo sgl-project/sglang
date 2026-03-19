@@ -10,14 +10,6 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      version:
-        description: "FlashInfer version"
-        required: true
-        type: choice
-        default: "release"
-        options:
-          - "release"
-          - "nightly"
       target_stage:
         description: "Specific stage to run (optional, for quick testing)"
         required: false
