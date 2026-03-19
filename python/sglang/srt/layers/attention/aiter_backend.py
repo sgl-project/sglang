@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 try:
-    import aiter.ops.triton.attention.unified_attention as _aiter_ua
     from aiter import (
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
@@ -44,23 +43,6 @@ try:
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
-
-    _orig_select_2d_config = _aiter_ua.select_2d_config
-    _orig_select_3d_config = _aiter_ua.select_3d_config
-
-    def _patched_select_2d_config(*args, **kwargs):
-        cfg = _orig_select_2d_config(*args, **kwargs)
-        cfg["TILE_SIZE"] = max(cfg["TILE_SIZE"], 16)
-        return cfg
-
-    def _patched_select_3d_config(*args, **kwargs):
-        attn_cfg, reduce_cfg = _orig_select_3d_config(*args, **kwargs)
-        attn_cfg["TILE_SIZE"] = max(attn_cfg["TILE_SIZE"], 16)
-        reduce_cfg["TILE_SIZE"] = max(reduce_cfg["TILE_SIZE"], 16)
-        return attn_cfg, reduce_cfg
-
-    _aiter_ua.select_2d_config = _patched_select_2d_config
-    _aiter_ua.select_3d_config = _patched_select_3d_config
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -220,10 +202,10 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
-            self.use_triton_unified_attention = True
+            self.use_aiter_unified_attention = True
         else:
-            self.use_triton_unified_attention = get_bool_env_var(
-                "SGLANG_USE_TRITON_UNIFIED_ATTN"
+            self.use_aiter_unified_attention = get_bool_env_var(
+                "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
         # aiter kernel related initialization
@@ -233,7 +215,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        if not (self.use_mla or self.use_aiter_unified_attention):
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -660,7 +642,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention:
+                if not self.use_aiter_unified_attention:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
@@ -1257,7 +1239,7 @@ class AiterAttnBackend(AttentionBackend):
 
             if spec_info is None:
 
-                if not self.use_triton_unified_attention:
+                if not self.use_aiter_unified_attention:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -1634,7 +1616,7 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = None
 
             if spec_info is None:
-                if not self.use_triton_unified_attention:
+                if not self.use_aiter_unified_attention:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -2003,10 +1985,7 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if (
-                    self.use_triton_unified_attention
-                    and self.use_sliding_window_kv_pool
-                ):
+                if self.use_aiter_unified_attention and self.use_sliding_window_kv_pool:
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2408,7 +2387,7 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+            if self.use_aiter_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2481,7 +2460,7 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            if self.use_triton_unified_attention:
+            if self.use_aiter_unified_attention:
 
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
