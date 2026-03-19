@@ -31,7 +31,7 @@ def qr_rocm_arch_available():
     try:
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        supported_archs = ["gfx94", "gfx95"]
+        supported_archs = ["gfx94", "gfx95", "gfx103"]
         return any(gfx in gcn_arch for gfx in supported_archs)
     except Exception as e:
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)

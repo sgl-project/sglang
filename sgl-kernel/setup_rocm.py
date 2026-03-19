@@ -72,21 +72,44 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+# Supported GPU architectures with unified memory support
+# - gfx942 (MI300/MI325): 64KB LDS per workgroup
+# - gfx950 (MI350): 160KB LDS per CU
+# - gfx1030 (Radeon i8090s): 256KB LDS with enhanced unified memory
+supported_archs = ["gfx942", "gfx950", "gfx1030"]
+
+if amdgpu_target not in supported_archs:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Expected one of: {', '.join(supported_archs)}."
     )
     sys.exit(1)
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+# FP8 type configuration per architecture
+if amdgpu_target == "gfx942":
+    fp8_macro = "-DHIP_FP8_TYPE_FNUZ"
+elif amdgpu_target == "gfx950":
+    fp8_macro = "-DHIP_FP8_TYPE_E4M3"
+elif amdgpu_target == "gfx1030":
+    fp8_macro = "-DHIP_FP8_TYPE_E4M3"  # gfx1030 uses E4M3 like gfx950
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# - gfx950 (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
+# - gfx1030 (Radeon i8090s): LDS is 256KB per CU with unified memory optimizations -> allow 160KB dynamic smem.
+if amdgpu_target == "gfx942":
+    topk_dynamic_smem_bytes = 48 * 1024
+elif amdgpu_target == "gfx950":
+    topk_dynamic_smem_bytes = 32 * 1024 * 4
+elif amdgpu_target == "gfx1030":
+    topk_dynamic_smem_bytes = 160 * 1024
+
+# Unified memory support flag for gfx1030
+if amdgpu_target == "gfx1030":
+    hipcc_flags_extra = ["-DENABLE_UNIFIED_MEMORY"]
+else:
+    hipcc_flags_extra = []
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -100,7 +123,7 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
-]
+] + hipcc_flags_extra
 
 ext_modules = [
     CUDAExtension(
