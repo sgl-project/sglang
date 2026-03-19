@@ -37,10 +37,6 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import (
-    build_mooncake_session_requests,
-    get_mooncake_request_over_time,
-)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -51,6 +47,12 @@ from sglang.benchmark.utils import (
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+_MOONCAKE_DATASET_ALIASES = {
+    "mooncake-arxiv": "mooncake",
+    "mooncake-conversation": "conversation",
+    "mooncake-synthetic": "synthetic",
+    "mooncake-toolagent": "toolagent",
+}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -922,19 +924,35 @@ async def get_request(
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
         )
-        # Sort requests by timestamp for correct replay
-        input_requests.sort(key=lambda r: r.timestamp)
+        if not input_requests:
+            return
+
+        has_missing_timestamps = any(r.timestamp is None for r in input_requests)
+        if has_missing_timestamps:
+            if input_requests[0].timestamp is None:
+                raise ValueError(
+                    "The first request must have a timestamp when trace replay is enabled."
+                )
+            scheduled_requests = input_requests
+        else:
+            # Sort requests by timestamp for correct replay.
+            scheduled_requests = sorted(input_requests, key=lambda r: r.timestamp)
 
         start_time = time.perf_counter()
-        trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
+        trace_start_time_ms = next(
+            request.timestamp
+            for request in scheduled_requests
+            if request.timestamp is not None
+        )
 
-        for request in input_requests:
-            trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
-            target_arrival_time = start_time + (trace_time_s * slowdown_factor)
+        for request in scheduled_requests:
+            if request.timestamp is not None:
+                trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
+                target_arrival_time = start_time + (trace_time_s * slowdown_factor)
 
-            sleep_duration = target_arrival_time - time.perf_counter()
-            if sleep_duration > 0:
-                await asyncio.sleep(sleep_duration)
+                sleep_duration = target_arrival_time - time.perf_counter()
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
 
             yield request
     else:
@@ -1169,7 +1187,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Union[DatasetRow, Dict[str, Any]]],
+    input_requests: List[DatasetRow],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1197,9 +1215,7 @@ async def benchmark(
     # Multi-turn format: ["turn1", "turn2", ...] - list of strings
     # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
     first_request = input_requests[0]
-    first_prompt = (
-        first_request.prompt if isinstance(first_request, DatasetRow) else None
-    )
+    first_prompt = first_request.prompt
     is_multi_turn = bool(
         isinstance(first_prompt, list)
         and len(first_prompt) > 0
@@ -1220,16 +1236,7 @@ async def benchmark(
 
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
-
-    # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
-        # Mooncake traces are expanded into concrete DatasetRow objects on demand.
-        test_request = build_mooncake_session_requests(
-            input_requests[0], tokenizer, num_rounds=1, block_size=mooncake_block_size
-        )[0]
-    else:
-        # For all other datasets, input_requests is a list of DatasetRow objects
-        test_request = input_requests[0]
+    test_request = input_requests[0]
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
@@ -1306,21 +1313,24 @@ async def benchmark(
     pbar_total = len(input_requests)
     if args.dataset_name == "mooncake":
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
+        request_generator = get_request(
             input_requests,
-            tokenizer,
-            mooncake_slowdown_factor,
-            mooncake_num_rounds,
-            block_size=mooncake_block_size,
+            request_rate=float("inf"),
+            use_trace_timestamps=True,
+            slowdown_factor=mooncake_slowdown_factor,
+        )
+        session_count = (
+            len(input_requests) // mooncake_num_rounds
+            if mooncake_num_rounds > 0
+            else len(input_requests)
         )
         print(
             "Starting Mooncake trace replay. "
-            f"Sessions: {len(input_requests)}, "
+            f"Sessions: {session_count}, "
             f"Rounds per session: {mooncake_num_rounds}. "
             f"Block size: {mooncake_block_size}. "
             f"Slowdown factor: {mooncake_slowdown_factor}"
         )
-        pbar_total *= args.mooncake_num_rounds
     else:
         request_generator = get_request(input_requests, request_rate)
 
@@ -1651,6 +1661,15 @@ def set_global_args(args_: argparse.Namespace):
     args = args_
 
 
+def _normalize_mooncake_dataset_args(args: argparse.Namespace):
+    dataset_name = getattr(args, "dataset_name", None)
+    if dataset_name in _MOONCAKE_DATASET_ALIASES:
+        args.dataset_name = "mooncake"
+        args.mooncake_workload = _MOONCAKE_DATASET_ALIASES[dataset_name]
+    elif dataset_name == "mooncake":
+        args.mooncake_workload = "mooncake"
+
+
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
@@ -1697,6 +1716,8 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
+
+    _normalize_mooncake_dataset_args(args)
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -1941,9 +1962,10 @@ if __name__ == "__main__":
             "generated-shared-prefix",
             "mmmu",
             "image",
-            "mooncake",
+            *_MOONCAKE_DATASET_ALIASES.keys(),
         ],
-        help="Name of the dataset to benchmark on.",
+        help="Name of the dataset to benchmark on. Mooncake traces are selected via "
+        "mooncake-arxiv, mooncake-conversation, mooncake-synthetic, or mooncake-toolagent.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
@@ -2043,7 +2065,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-trace-timestamps",
         action="store_true",
-        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset.",
+        help="Use timestamps from the trace file for request scheduling. Only valid for Mooncake trace datasets.",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -2332,18 +2354,6 @@ if __name__ == "__main__":
         type=int,
         default=128,
         help="Number of repeated context filler tokens added for each hash id in the mooncake prompt builder.",
-    )
-    mooncake_group.add_argument(
-        "--mooncake-workload",
-        type=str,
-        default="conversation",
-        choices=[
-            "mooncake",
-            "conversation",
-            "synthetic",
-            "toolagent",
-        ],
-        help="Underlying workload for the mooncake dataset.",
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."

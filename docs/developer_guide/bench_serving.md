@@ -333,10 +333,9 @@ python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model model-name \
-  --dataset-name mooncake \
+  --dataset-name mooncake-conversation \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \
-  --mooncake-workload conversation|mooncake|agent|synthetic
   --use-trace-timestamps true \
   --random-output-len 256
 ```
