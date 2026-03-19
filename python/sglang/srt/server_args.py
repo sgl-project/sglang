@@ -570,6 +570,9 @@ class ServerArgs:
     expert_offload_resident_ids: Optional[str] = (
         None  # comma-separated IDs (manual mode)
     )
+    expert_offload_prefetch_num: int = (
+        0  # 0 = disabled; N = prefetch top-N hot offloaded experts
+    )
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -2323,6 +2326,9 @@ class ServerArgs:
                 "--expert-offload-num-resident is mutually exclusive with --kt-weight-path. "
                 "Use one strategy at a time."
             )
+
+        if self.expert_offload_prefetch_num < 0:
+            raise ValueError("--expert-offload-prefetch-num must be >= 0")
 
         logger.info(
             f"[ExpertOffload] Enabled (UVM): num_resident={self.expert_offload_num_resident}, "
@@ -4526,6 +4532,17 @@ class ServerArgs:
             type=str,
             default=None,
             help="Comma-separated expert IDs to keep resident (for manual selection).",
+        )
+        parser.add_argument(
+            "--expert-offload-prefetch-num",
+            type=int,
+            default=0,
+            help="Number of hot offloaded experts to prefetch for the next layer. "
+            "0 = disabled. When enabled, after each MoE layer's kernel is submitted, "
+            "cudaMemPrefetchAsync is issued for the next layer's most-frequently-hit "
+            "offloaded experts on a background CUDA stream. "
+            "Too high a value can cause GPU memory pressure and page thrashing, "
+            "reducing decode speed.",
         )
 
         # Diffusion LLM

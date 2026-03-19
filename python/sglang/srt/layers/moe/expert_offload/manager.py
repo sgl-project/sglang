@@ -48,6 +48,11 @@ from sglang.srt.layers.moe.expert_offload.uvm import (
     uvm_copy_from_tensor,
     uvm_prefetch_async,
 )
+from sglang.srt.utils.common import (
+    get_current_device_numa_node_cuda,
+    is_numa_available,
+    numa_bind_to_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,11 @@ class ExpertOffloadManager:
         self._expert_freq: Optional[torch.Tensor] = None
         self._warmup_tokens: int = 0
         self._warmup_done: bool = False
+
+        # Cross-layer prefetch state.
+        self.next_layer_manager: Optional["ExpertOffloadManager"] = None
+        self._prefetch_slices: Optional[List[List[torch.Tensor]]] = None
+        self._hot_offloaded_ids: List[int] = []
 
     # ------------------------------------------------------------------
     # Initialization
@@ -170,6 +180,9 @@ class ExpertOffloadManager:
         ), f"Expert param {param_name!r} must be contiguous before UVM migration"
 
         # Step 1: Allocate managed memory and copy GPU data into it.
+        # Bind to the NUMA node closest to this GPU so that CPU-resident UVM
+        # pages are allocated in local DRAM, avoiding cross-socket PCIe reads.
+        self._bind_numa_for_device()
         managed = uvm_copy_from_tensor(full_tensor)
 
         # Step 2: Apply memory advice to each expert's slice.
@@ -215,6 +228,23 @@ class ExpertOffloadManager:
         # Step 5: Set managed tensor on the layer (full shape, no slicing).
         object.__setattr__(layer, param_name, managed)
 
+    @staticmethod
+    def _coalesce_ids(sorted_ids: List[int]) -> List[tuple]:
+        """Coalesce a sorted list of IDs into contiguous (lo, hi) ranges."""
+        if not sorted_ids:
+            return []
+        ranges: List[tuple] = []
+        start = sorted_ids[0]
+        end = sorted_ids[0]
+        for eid in sorted_ids[1:]:
+            if eid == end + 1:
+                end = eid
+            else:
+                ranges.append((start, end))
+                start = end = eid
+        ranges.append((start, end))
+        return ranges
+
     def _prefetch_experts_to_device(
         self,
         managed: torch.Tensor,
@@ -229,26 +259,98 @@ class ExpertOffloadManager:
         if not expert_ids:
             return
 
-        # Coalesce into contiguous ranges.
-        sorted_ids = sorted(expert_ids)
-        ranges: List[tuple] = []
-        start = sorted_ids[0]
-        end = sorted_ids[0]
-        for eid in sorted_ids[1:]:
-            if eid == end + 1:
-                end = eid
-            else:
-                ranges.append((start, end))
-                start = end = eid
-        ranges.append((start, end))
-
-        for lo, hi in ranges:
+        for lo, hi in self._coalesce_ids(sorted(expert_ids)):
             # managed[lo : hi+1] is a contiguous slice along dim 0.
             uvm_prefetch_async(
                 managed[lo : hi + 1],
                 device_id,
                 stream=self.prefetch_stream,
             )
+
+    # ------------------------------------------------------------------
+    # Cross-layer pipeline prefetch
+    # ------------------------------------------------------------------
+
+    def _select_hot_offloaded_ids(self) -> List[int]:
+        """Select the top-N most frequently hit offloaded experts for prefetch."""
+        n = self.config.prefetch_num
+        if n <= 0 or not self.offloaded_expert_ids:
+            return []
+
+        if self._expert_freq is not None:
+            # Build (freq, eid) pairs for offloaded experts only.
+            freq_pairs = [
+                (self._expert_freq[eid].item(), eid)
+                for eid in self.offloaded_expert_ids
+            ]
+            freq_pairs.sort(key=lambda x: x[0], reverse=True)
+            return sorted([eid for _, eid in freq_pairs[:n]])
+
+        # No frequency data -- take first N from offloaded_expert_ids (sorted).
+        return sorted(self.offloaded_expert_ids[:n])
+
+    def prepare_prefetch_cache(self, layer: torch.nn.Module) -> None:
+        """Pre-compute tensor views for hot offloaded experts to minimize
+        hot-path overhead in trigger_prefetch_for_next_layer().
+
+        Called once from chain_managers() and again from _readvise_from_frequency()
+        when the resident/offloaded sets change.
+        """
+        if self.config.prefetch_num <= 0 or not self.offloaded_expert_ids:
+            self._prefetch_slices = None
+            self._hot_offloaded_ids = []
+            return
+
+        # For frequency mode: if warmup not done and freq data not available,
+        # defer -- will be called again from _readvise_from_frequency().
+        if (
+            self.config.resident_selection == "frequency"
+            and not self._warmup_done
+            and self._expert_freq is None
+        ):
+            self._prefetch_slices = None
+            self._hot_offloaded_ids = []
+            return
+
+        hot_ids = self._select_hot_offloaded_ids()
+        if not hot_ids:
+            self._prefetch_slices = None
+            self._hot_offloaded_ids = []
+            return
+
+        self._hot_offloaded_ids = hot_ids
+        ranges = self._coalesce_ids(hot_ids)
+
+        # For each managed parameter, cache tensor views for the coalesced ranges.
+        self._prefetch_slices = []
+        for param_name in self._expert_param_names:
+            managed: torch.Tensor = getattr(layer, param_name)
+            param_slices = [managed[lo : hi + 1] for lo, hi in ranges]
+            self._prefetch_slices.append(param_slices)
+
+        logger.debug(
+            f"[ExpertOffload] Layer {self.config.layer_idx}: "
+            f"prefetch cache built for {len(hot_ids)} hot offloaded experts "
+            f"({len(ranges)} coalesced ranges)"
+        )
+
+    def trigger_prefetch_for_next_layer(self) -> None:
+        """Issue cudaMemPrefetchAsync for the next layer's hot offloaded experts.
+
+        Called from wrapper.apply() after each MoE kernel. Purely opportunistic:
+        no stream synchronization. If the prefetch wins the race, the next layer's
+        kernel reads at HBM speed; otherwise, PCIe read-through (existing behavior).
+        """
+        next_mgr = self.next_layer_manager
+        if next_mgr is None or next_mgr._prefetch_slices is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        for param_slices in next_mgr._prefetch_slices:
+            for s in param_slices:
+                uvm_prefetch_async(
+                    s, next_mgr.device_id, stream=next_mgr.prefetch_stream
+                )
 
     # ------------------------------------------------------------------
     # Per-layer adaptive resident selection (warmup-then-readvise)
@@ -324,6 +426,8 @@ class ExpertOffloadManager:
                 f"[ExpertOffload] Layer {self.config.layer_idx}: "
                 f"warmup complete, resident set unchanged"
             )
+            # Build prefetch cache before clearing frequency data.
+            self.prepare_prefetch_cache(layer)
             # Free frequency tensor.
             self._expert_freq = None
             return
@@ -368,12 +472,47 @@ class ExpertOffloadManager:
             i for i in range(self.config.num_local_experts) if i not in new_resident_set
         ]
 
+        # Rebuild prefetch cache with new resident/offloaded sets.
+        # Must be done before clearing _expert_freq so frequency data is available.
+        self.prepare_prefetch_cache(layer)
+
         # Free frequency tensor.
         self._expert_freq = None
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    _numa_bound: bool = False
+
+    def _bind_numa_for_device(self) -> None:
+        """Bind the current thread to the NUMA node closest to self.device.
+
+        This ensures that cudaMallocManaged pages whose preferred location is
+        CPU land in DRAM local to the GPU's PCIe root complex, giving full
+        local PCIe bandwidth instead of cross-socket UPI bandwidth.
+        Only performed once per manager instance.
+        """
+        if self._numa_bound:
+            return
+        self._numa_bound = True
+
+        if not is_numa_available():
+            logger.debug("[ExpertOffload] NUMA not available, skipping bind")
+            return
+
+        try:
+            numa_node = get_current_device_numa_node_cuda()
+            numa_bind_to_node(numa_node)
+            logger.info(
+                f"[ExpertOffload] Bound to NUMA node {numa_node} "
+                f"for GPU {self.device_id}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[ExpertOffload] Failed to bind NUMA node for GPU "
+                f"{self.device_id}: {e}"
+            )
 
     @staticmethod
     def _select_resident_ids(cfg: ExpertOffloadConfig) -> List[int]:

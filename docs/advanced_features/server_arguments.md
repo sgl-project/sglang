@@ -382,6 +382,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--expert-offload-num-resident` | Number of experts kept resident on GPU per MoE layer. `-1` disables offloading. Expert weights are stored in CUDA Unified Memory; offloaded experts live in CPU DRAM and are accessed by the GPU transparently via PCIe read-through. Mutually exclusive with `--kt-weight-path`. See [UVM-Based Expert Weight Offloading](expert_offload.md) for details. | `-1` | Type: int |
 | `--expert-offload-resident-selection` | Strategy for choosing which experts stay resident on GPU. `first_n` = experts 0..N-1; `frequency` = adaptive selection based on routing frequency warmup; `manual` = explicit list via `--expert-offload-resident-ids`. | `first_n` | Choices: `first_n`, `frequency`, `manual` |
 | `--expert-offload-resident-ids` | Comma-separated expert IDs to keep resident on GPU (for `manual` selection mode). | `None` | Type: str |
+| `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch for the next MoE layer. After each layer's MoE kernel, `cudaMemPrefetchAsync` is issued on a background stream for the next layer's most-frequently-hit offloaded experts. Too high a value can cause GPU memory pressure and page thrashing, reducing decode speed. | `0` | Type: int |
 
 ## Diffusion LLM
 

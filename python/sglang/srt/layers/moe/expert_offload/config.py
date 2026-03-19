@@ -40,6 +40,7 @@ class ExpertOffloadConfig:
     resident_selection: str  # "first_n" | "frequency" | "manual"
     resident_expert_ids: Optional[List[int]]  # explicit IDs for "manual" mode
     warmup_tokens: int = 4096  # routed tokens to collect before readvise
+    prefetch_num: int = 0  # 0 = disabled; N = prefetch top-N hot offloaded experts
 
     @property
     def num_offloaded_experts(self) -> int:
@@ -74,4 +75,5 @@ def create_expert_offload_config_from_server_args(
         num_resident_experts=num_resident,
         resident_selection=server_args.expert_offload_resident_selection,
         resident_expert_ids=resident_ids,
+        prefetch_num=server_args.expert_offload_prefetch_num,
     )

@@ -30,14 +30,63 @@ Pass ``--expert-offload-num-resident N`` to enable.  Additional options:
   --expert-offload-resident-ids       None    Comma-separated IDs for manual selection.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Tuple
+
 from sglang.srt.layers.moe.expert_offload.config import (
     ExpertOffloadConfig,
     create_expert_offload_config_from_server_args,
 )
 from sglang.srt.layers.moe.expert_offload.wrapper import ExpertOffloadWrapperMethod
 
+if TYPE_CHECKING:
+    import torch
+
+    from sglang.srt.layers.moe.expert_offload.manager import ExpertOffloadManager
+
 __all__ = [
     "ExpertOffloadConfig",
     "ExpertOffloadWrapperMethod",
+    "chain_managers",
     "create_expert_offload_config_from_server_args",
+    "register_manager",
 ]
+
+# ---------------------------------------------------------------------------
+# Global manager registry for cross-layer prefetch chaining
+# ---------------------------------------------------------------------------
+
+_manager_registry: Dict[int, Tuple["ExpertOffloadManager", "torch.nn.Module"]] = {}
+_managers_chained: bool = False
+
+
+def register_manager(
+    layer_idx: int, manager: "ExpertOffloadManager", layer: "torch.nn.Module"
+) -> None:
+    """Called from wrapper.process_weights_after_loading()."""
+    _manager_registry[layer_idx] = (manager, layer)
+
+
+def chain_managers() -> None:
+    """Link managers[i].next_layer_manager = managers[i+1], build prefetch caches.
+
+    Guarded by ``_managers_chained`` flag -- no-op after first call.
+    """
+    global _managers_chained
+    if _managers_chained or not _manager_registry:
+        return
+    _managers_chained = True
+
+    sorted_idxs = sorted(_manager_registry.keys())
+    for i in range(len(sorted_idxs) - 1):
+        curr_mgr, _ = _manager_registry[sorted_idxs[i]]
+        next_mgr, _ = _manager_registry[sorted_idxs[i + 1]]
+        curr_mgr.next_layer_manager = next_mgr
+
+    # Build prefetch caches for all managers.
+    for idx in sorted_idxs:
+        mgr, layer = _manager_registry[idx]
+        mgr.prepare_prefetch_cache(layer)
+
+    _manager_registry.clear()
