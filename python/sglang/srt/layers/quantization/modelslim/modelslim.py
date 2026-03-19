@@ -215,20 +215,20 @@ class ModelSlimConfig(QuantizationConfig):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
         moe_quant_schemes = [
-            ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE, "ModelSlimW4A4Int4MoE"),
-            ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE, "ModelSlimW4A8Int8MoE"),
-            ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE, "ModelSlimW8A8Int8MoE"),
+            ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
+            ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
+            ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
         ]
 
-        moe_weight_suffixes = [".down_proj.weight", ".w2.weight"]
+        moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
         quant_schemes = [
-            self.quant_description.get(prefix + ".0" + suffix, "STATIC")
+            self.quant_description.get(prefix + suffix, "STATIC")
             for suffix in moe_weight_suffixes
         ]
 
-        for scheme_name, scheme_class, log_name in moe_quant_schemes:
+        for scheme_name, scheme_class in moe_quant_schemes:
             if any(s == scheme_name for s in quant_schemes):
-                logger.info_once(f"Using {log_name}")
+                logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(self)
 
         logger.warning(
