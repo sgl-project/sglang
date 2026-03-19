@@ -325,7 +325,13 @@ class ComposedPipelineBase(ABC):
             )
             return module_name, load_module_name, module, memory_usage
 
-        use_parallel = server_args.parallel_loading and len(to_load) > 1
+        is_multi_rank = (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
+        use_parallel = (
+            server_args.parallel_loading and len(to_load) > 1 and not is_multi_rank
+        )
 
         if use_parallel:
             _prior_dtype = torch.get_default_dtype()
