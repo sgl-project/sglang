@@ -95,6 +95,19 @@ else
     echo "protoc already installed: $(protoc --version)"
 fi
 
+# Remove broken dist-info directories (missing METADATA per PEP 376)
+SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+if [ -d "$SITE_PACKAGES" ]; then
+    { set +x; } 2>/dev/null
+    find "$SITE_PACKAGES" -maxdepth 1 -name "*.dist-info" -type d | while read d; do
+        if [ ! -f "$d/METADATA" ]; then
+            echo "Removing broken dist-info: $d"
+            rm -rf "$d"
+        fi
+    done
+    set -x
+fi
+
 # Install uv (use python3 -m pip for robustness since some runners only have pip3)
 python3 -m pip install --upgrade pip
 
