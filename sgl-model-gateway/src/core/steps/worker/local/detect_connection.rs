@@ -17,12 +17,13 @@ use crate::{
 async fn try_http_health_check(
     url: &str,
     timeout_secs: u64,
+    endpoint: &str,
     client: &Client,
 ) -> Result<(), String> {
     let is_https = url.starts_with("https://");
     let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
-    let health_url = format!("{}://{}/health", protocol, clean_url);
+    let health_url = format!("{}://{}{}", protocol, clean_url, endpoint);
 
     client
         .get(&health_url)
@@ -107,10 +108,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
         let client = &app_context.client;
+        let endpoint = app_context.router_config.health_check.endpoint.clone();
         let runtime_type = config.runtime.as_deref();
 
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout, client),
+            try_http_health_check(&url, timeout, &endpoint, client),
             try_grpc_health_check(&url, timeout, runtime_type)
         );
 
