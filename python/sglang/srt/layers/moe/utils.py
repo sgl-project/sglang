@@ -355,11 +355,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
         is_padded = (w2_down_dim % padding_size) > 0
         if is_padded:
             w2_down_dim = align_aiter(w2_down_dim)
-        # packed
-        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
-            w13_up_dim *= 2
         # up proj + gate fusion : 2x
         if is_concat:
             w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
