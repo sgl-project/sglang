@@ -21,14 +21,13 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
 
 
-# ---------------------------------------------------------------------------
 # Helpers: mock Req and ScheduleBatch
-# ---------------------------------------------------------------------------
 def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     """Create a mock request with sampling params."""
     req = MagicMock()
@@ -50,10 +49,8 @@ def _make_batch(reqs):
     return batch
 
 
-# ---------------------------------------------------------------------------
 # BatchedPenalizerOrchestrator
-# ---------------------------------------------------------------------------
-class TestBatchedPenalizerOrchestrator(unittest.TestCase):
+class TestBatchedPenalizerOrchestrator(CustomTestCase):
 
     def test_init_detects_required_penalizers(self):
         reqs = [_make_req(freq=1.0)]
@@ -133,10 +130,8 @@ class TestBatchedPenalizerOrchestrator(unittest.TestCase):
         self.assertFalse(orch1.is_required)
 
 
-# ---------------------------------------------------------------------------
 # BatchedFrequencyPenalizer
-# ---------------------------------------------------------------------------
-class TestBatchedFrequencyPenalizer(unittest.TestCase):
+class TestBatchedFrequencyPenalizer(CustomTestCase):
 
     def _setup(self, freq_values):
         reqs = [_make_req(freq=f) for f in freq_values]
@@ -156,7 +151,7 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
         self.assertFalse(pen.is_required())
 
     def test_cumulate_and_apply(self):
-        """After cumulating token 5 once, logits[5] should decrease by freq_penalty."""
+        """Test that cumulating a token applies frequency penalty to its logit."""
         orch, pen = self._setup([2.0])
         output_ids = torch.tensor([5])
         pen.cumulate_output_tokens(output_ids)
@@ -168,7 +163,7 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
         self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
     def test_cumulate_twice_doubles_penalty(self):
-        """Frequency penalty scales linearly with count."""
+        """Test that frequency penalty scales linearly with occurrence count."""
         orch, pen = self._setup([1.0])
         pen.cumulate_output_tokens(torch.tensor([3]))
         pen.cumulate_output_tokens(torch.tensor([3]))
@@ -198,7 +193,7 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
         self.assertFalse(pen.is_prepared())
 
     def test_cumulate_when_not_prepared_is_noop(self):
-        """Calling cumulate before prepare should not crash."""
+        """Test that cumulate before prepare does not crash."""
         _, pen = self._setup([0.0])
         # pen is not prepared (is_required=False)
         pen.cumulate_output_tokens(torch.tensor([1]))  # should not raise
@@ -211,10 +206,8 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
         self.assertTrue(torch.equal(logits, original))
 
 
-# ---------------------------------------------------------------------------
 # BatchedPresencePenalizer
-# ---------------------------------------------------------------------------
-class TestBatchedPresencePenalizer(unittest.TestCase):
+class TestBatchedPresencePenalizer(CustomTestCase):
 
     def _setup(self, presence_values):
         reqs = [_make_req(presence=p) for p in presence_values]
@@ -230,7 +223,7 @@ class TestBatchedPresencePenalizer(unittest.TestCase):
         self.assertTrue(pen.is_required())
 
     def test_presence_penalty_does_not_scale(self):
-        """Unlike frequency, presence penalty is flat — same regardless of count."""
+        """Test that presence penalty is flat (same value regardless of count)."""
         orch, pen = self._setup([1.0])
         pen.cumulate_output_tokens(torch.tensor([7]))
         pen.cumulate_output_tokens(torch.tensor([7]))  # same token again
@@ -259,10 +252,8 @@ class TestBatchedPresencePenalizer(unittest.TestCase):
         self.assertFalse(hasattr(pen, "presence_penalties"))
 
 
-# ---------------------------------------------------------------------------
 # BatchedMinNewTokensPenalizer
-# ---------------------------------------------------------------------------
-class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
+class TestBatchedMinNewTokensPenalizer(CustomTestCase):
 
     def _setup(self, configs):
         """configs: list of (min_tokens, stop_ids, eos_id)."""
@@ -283,7 +274,7 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertFalse(pen.is_required())
 
     def test_blocks_eos_before_min_tokens(self):
-        """EOS token should get -inf penalty before min_new_tokens is reached."""
+        """Test that EOS token is blocked before min_new_tokens is reached."""
         orch, pen = self._setup([(3, None, 2)])
         # Before any output: len=0 < min=3 → block EOS (token 2)
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -293,7 +284,7 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertEqual(logits[0, 0].item(), 0.0)
 
     def test_allows_eos_after_min_tokens(self):
-        """After generating min_new_tokens, EOS should no longer be blocked."""
+        """Test that EOS is allowed after generating min_new_tokens."""
         orch, pen = self._setup([(2, None, 2)])
         # Generate 2 tokens
         pen.cumulate_output_tokens(torch.tensor([10]))
@@ -304,7 +295,7 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertEqual(logits[0, 2].item(), 0.0)
 
     def test_blocks_custom_stop_tokens(self):
-        """Custom stop_token_ids should also be blocked before min_new_tokens."""
+        """Test that custom stop_token_ids are also blocked before min_new_tokens."""
         orch, pen = self._setup([(3, {5, 10}, 2)])
         logits = torch.zeros(1, VOCAB_SIZE)
         pen.apply(logits)
@@ -314,7 +305,7 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertTrue(torch.isinf(logits[0, 10]) and logits[0, 10] < 0)
 
     def test_blocks_additional_stop_tokens(self):
-        """additional_stop_token_ids from tokenizer should also be blocked."""
+        """Test that tokenizer's additional_stop_token_ids are also blocked."""
         req = _make_req(min_tokens=3, stop_ids=None, eos_id=2)
         req.tokenizer.additional_stop_token_ids = {7, 8}
         batch = _make_batch([req])
@@ -355,10 +346,8 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
         self.assertFalse(hasattr(pen, "len_output_tokens"))
 
 
-# ---------------------------------------------------------------------------
 # _BatchedPenalizer base class edge cases
-# ---------------------------------------------------------------------------
-class TestBatchedPenalizerBase(unittest.TestCase):
+class TestBatchedPenalizerBase(CustomTestCase):
 
     def test_filter_when_not_prepared_is_noop(self):
         reqs = [_make_req()]
@@ -371,7 +360,7 @@ class TestBatchedPenalizerBase(unittest.TestCase):
         pen.filter(torch.tensor([0]))  # should not raise
 
     def test_merge_prepares_both_if_needed(self):
-        """When merging, if one side is not prepared, it should get prepared first."""
+        """Test that merge prepares unprepared side before concatenating."""
         reqs_a = [_make_req(freq=0.0)]  # not required
         reqs_b = [_make_req(freq=1.0)]  # required
         batch_a = _make_batch(reqs_a)
@@ -406,7 +395,7 @@ class TestBatchedPenalizerBase(unittest.TestCase):
         self.assertFalse(pen1.is_prepared())
 
     def test_prepare_is_idempotent(self):
-        """Calling prepare() multiple times should only prepare once."""
+        """Test that calling prepare() multiple times does not crash."""
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -419,10 +408,8 @@ class TestBatchedPenalizerBase(unittest.TestCase):
         self.assertTrue(pen.is_prepared())
 
 
-# ---------------------------------------------------------------------------
 # Orchestrator with multiple penalizer types
-# ---------------------------------------------------------------------------
-class TestOrchestratorMultiplePenalizers(unittest.TestCase):
+class TestOrchestratorMultiplePenalizers(CustomTestCase):
 
     def test_all_three_penalizers(self):
         """Test orchestrator managing frequency, presence, and min_new_tokens together."""
@@ -453,7 +440,7 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         self.assertTrue(torch.isinf(logits[0, 2]) and logits[0, 2] < 0)
 
     def test_filter_with_penalizer_no_longer_required(self):
-        """After filtering, if a penalizer is no longer required, it should be torn down."""
+        """Test that penalizer is torn down when no longer required after filter."""
         reqs = [_make_req(freq=0.0), _make_req(freq=1.0)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -470,7 +457,7 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         self.assertFalse(pen.is_required())
 
     def test_filter_keeps_required_penalizer(self):
-        """Filter should keep penalizer active if it's still required."""
+        """Test that filter keeps penalizer active when still required."""
         reqs = [_make_req(freq=1.0), _make_req(freq=2.0)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
@@ -483,7 +470,7 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         self.assertTrue(orch.is_required)
 
     def test_merge_one_required(self):
-        """Merging when only one side is required should still mark as required."""
+        """Test that merge marks orchestrator as required when one side is."""
         reqs_a = [_make_req(freq=0.0)]
         reqs_b = [_make_req(freq=1.0)]
         batch_a = _make_batch(reqs_a)

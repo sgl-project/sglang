@@ -14,14 +14,13 @@ from sglang.srt.sampling.sampling_batch_info import (
     merge_bias_tensor,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
 
 
-# ---------------------------------------------------------------------------
 # Helper: construct a minimal SamplingBatchInfo
-# ---------------------------------------------------------------------------
 def _make_info(batch_size=2, **overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
     defaults = dict(
@@ -41,10 +40,7 @@ def _make_info(batch_size=2, **overrides):
     return SamplingBatchInfo(**defaults)
 
 
-# ---------------------------------------------------------------------------
-# merge_bias_tensor — standalone utility
-# ---------------------------------------------------------------------------
-class TestMergeBiasTensor(unittest.TestCase):
+class TestMergeBiasTensor(CustomTestCase):
 
     def test_both_none_returns_none(self):
         result = merge_bias_tensor(None, None, 2, 3, DEVICE, 0.0)
@@ -83,20 +79,15 @@ class TestMergeBiasTensor(unittest.TestCase):
         self.assertEqual(result[2, 0].item(), 1.0)
 
 
-# ---------------------------------------------------------------------------
 # SamplingBatchInfo.__len__
-# ---------------------------------------------------------------------------
-class TestSamplingBatchInfoLen(unittest.TestCase):
+class TestSamplingBatchInfoLen(CustomTestCase):
 
     def test_len_matches_batch_size(self):
         info = _make_info(batch_size=5)
         self.assertEqual(len(info), 5)
 
 
-# ---------------------------------------------------------------------------
-# merge_custom_logit_processor — static method
-# ---------------------------------------------------------------------------
-class TestMergeCustomLogitProcessor(unittest.TestCase):
+class TestMergeCustomLogitProcessor(CustomTestCase):
 
     def test_both_none_returns_none(self):
         result = SamplingBatchInfo.merge_custom_logit_processor(
@@ -138,10 +129,8 @@ class TestMergeCustomLogitProcessor(unittest.TestCase):
         self.assertEqual(result[10][1].shape[0], 3)
 
 
-# ---------------------------------------------------------------------------
 # apply_logits_bias
-# ---------------------------------------------------------------------------
-class TestApplyLogitsBias(unittest.TestCase):
+class TestApplyLogitsBias(CustomTestCase):
 
     def test_applies_linear_penalties(self):
         info = _make_info(batch_size=1)
@@ -186,10 +175,8 @@ class TestApplyLogitsBias(unittest.TestCase):
         self.assertTrue(torch.equal(logits, original))
 
 
-# ---------------------------------------------------------------------------
 # update_penalties
-# ---------------------------------------------------------------------------
-class TestUpdatePenalties(unittest.TestCase):
+class TestUpdatePenalties(CustomTestCase):
 
     def test_required_creates_penalties_tensor(self):
         orch = MagicMock(is_required=True)
@@ -206,10 +193,8 @@ class TestUpdatePenalties(unittest.TestCase):
         self.assertIsNone(info.acc_linear_penalties)
 
 
-# ---------------------------------------------------------------------------
 # update_regex_vocab_mask
-# ---------------------------------------------------------------------------
-class TestUpdateRegexVocabMask(unittest.TestCase):
+class TestUpdateRegexVocabMask(CustomTestCase):
 
     def test_no_grammars_clears_mask(self):
         info = _make_info(batch_size=1)
@@ -238,7 +223,7 @@ class TestUpdateRegexVocabMask(unittest.TestCase):
         grammar.move_vocab_mask.assert_called_once()
 
     def test_mixed_grammars_only_active_fills(self):
-        """Finished/terminated/None grammars should be skipped by fill loop."""
+        """Test that finished, terminated, and None grammars are skipped."""
         active = MagicMock()
         active.finished = False
         active.is_terminated.return_value = False
@@ -261,10 +246,8 @@ class TestUpdateRegexVocabMask(unittest.TestCase):
         terminated.fill_vocab_mask.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
 # filter_batch
-# ---------------------------------------------------------------------------
-class TestFilterBatch(unittest.TestCase):
+class TestFilterBatch(CustomTestCase):
 
     def test_filter_keeps_correct_indices(self):
         info = _make_info(batch_size=3)
@@ -295,7 +278,7 @@ class TestFilterBatch(unittest.TestCase):
         self.assertEqual(mask.shape[0], 2)
 
     def test_filter_removes_all_custom_processors(self):
-        """When filter removes all requests using a processor, it should be cleaned up."""
+        """Test cleanup when filter removes all requests using a processor."""
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
@@ -315,10 +298,8 @@ class TestFilterBatch(unittest.TestCase):
         self.assertIsNone(info.sampling_seed)
 
 
-# ---------------------------------------------------------------------------
 # merge_batch
-# ---------------------------------------------------------------------------
-class TestMergeBatch(unittest.TestCase):
+class TestMergeBatch(CustomTestCase):
 
     def test_merge_concatenates_tensors(self):
         info1 = _make_info(batch_size=2)
@@ -371,7 +352,7 @@ class TestMergeBatch(unittest.TestCase):
         self.assertEqual(len(info1.custom_params), 2)
 
     def test_merge_with_none_sampling_seed(self):
-        """When sampling_seed is None on both sides, it stays None."""
+        """Test that merge preserves None when both sampling_seeds are None."""
         info1 = _make_info(batch_size=1)
         info1.sampling_seed = None
         info2 = _make_info(batch_size=1)
@@ -380,7 +361,7 @@ class TestMergeBatch(unittest.TestCase):
         self.assertIsNone(info1.sampling_seed)
 
     def test_merge_with_both_sampling_seeds(self):
-        """When both sides have sampling_seed tensors, they should be concatenated."""
+        """Test that merge concatenates both sampling_seed tensors."""
         info1 = _make_info(batch_size=2)
         info1.sampling_seed = torch.tensor([10, 20], dtype=torch.int64)
         info2 = _make_info(batch_size=1)
@@ -392,10 +373,8 @@ class TestMergeBatch(unittest.TestCase):
         self.assertEqual(info1.sampling_seed[2].item(), 30)
 
 
-# ---------------------------------------------------------------------------
 # copy_for_forward
-# ---------------------------------------------------------------------------
-class TestCopyForForward(unittest.TestCase):
+class TestCopyForForward(CustomTestCase):
 
     def test_returns_copy_without_orchestrator(self):
         orch = MagicMock(is_required=False)
@@ -406,10 +385,8 @@ class TestCopyForForward(unittest.TestCase):
         self.assertIsNotNone(info.penalizer_orchestrator)
 
 
-# ---------------------------------------------------------------------------
 # from_schedule_batch
-# ---------------------------------------------------------------------------
-class TestFromScheduleBatch(unittest.TestCase):
+class TestFromScheduleBatch(CustomTestCase):
 
     def _make_req(
         self,
@@ -501,7 +478,7 @@ class TestFromScheduleBatch(unittest.TestCase):
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_from_schedule_batch_sampling_flags(self, mock_server_args):
-        """Verify need_top_p/top_k/min_p flags are computed correctly."""
+        """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
         mock_server_args.return_value.enable_deterministic_inference = False
         mock_server_args.return_value.enable_custom_logit_processor = False
 
@@ -529,8 +506,7 @@ class TestFromScheduleBatch(unittest.TestCase):
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_custom_logit_processor_merging(self, mock_server_args):
-        """When enable_custom_logit_processor=True and reqs have processors,
-        they should be deserialized and merged by type."""
+        """Test deserialization and merging of custom logit processors."""
         from sglang.srt.sampling.custom_logit_processor import (
             DisallowedTokensLogitsProcessor,
         )

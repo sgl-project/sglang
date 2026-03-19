@@ -13,70 +13,63 @@ from sglang.srt.sampling.sampling_params import (
     SamplingParams,
     get_max_seq_length,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-# ---------------------------------------------------------------------------
-# SamplingParams.__init__ — implicit conversions
-# ---------------------------------------------------------------------------
-class TestSamplingParamsInit(unittest.TestCase):
-    """Test the two implicit conversions that happen in __init__."""
+class TestSamplingParamsInit(CustomTestCase):
 
     def test_zero_temperature_becomes_greedy(self):
-        """temperature=0 should trigger greedy mode: top_k=1, temperature=1.0."""
+        """Test greedy conversion when temperature is 0."""
         sp = SamplingParams(temperature=0.0)
         self.assertEqual(sp.top_k, 1)
         self.assertEqual(sp.temperature, 1.0)
 
     def test_near_zero_temperature_becomes_greedy(self):
-        """temperature just below 1e-6 should also trigger greedy."""
+        """Test greedy conversion when temperature is near zero (1e-7)."""
         sp = SamplingParams(temperature=1e-7)
         self.assertEqual(sp.top_k, 1)
         self.assertEqual(sp.temperature, 1.0)
 
     def test_temperature_at_eps_boundary_not_greedy(self):
-        """temperature exactly at 1e-6 should NOT trigger greedy (< not <=)."""
+        """Test that temperature exactly at 1e-6 does not trigger greedy (strict <)."""
         sp = SamplingParams(temperature=1e-6)
         self.assertEqual(sp.temperature, 1e-6)
         # top_k should remain at TOP_K_ALL (from -1 default)
         self.assertEqual(sp.top_k, TOP_K_ALL)
 
     def test_negative_temperature_not_modified(self):
-        """Negative temperature is invalid but __init__ doesn't reject it —
-        that's verify()'s job. Confirm __init__ leaves it unchanged."""
+        """Test that __init__ preserves negative temperature (rejected by verify instead)."""
         sp = SamplingParams(temperature=-1.0)
         self.assertEqual(sp.temperature, -1.0)
 
     def test_top_k_minus_one_becomes_top_k_all(self):
-        """top_k=-1 means 'whole vocabulary', converted to TOP_K_ALL."""
+        """Test that top_k=-1 is converted to TOP_K_ALL (whole vocabulary)."""
         sp = SamplingParams(top_k=-1)
         self.assertEqual(sp.top_k, TOP_K_ALL)
 
     def test_positive_top_k_preserved(self):
-        """An explicit positive top_k should be kept as-is."""
+        """Test that explicit positive top_k is kept as-is."""
         sp = SamplingParams(top_k=50)
         self.assertEqual(sp.top_k, 50)
 
     def test_stop_token_ids_stored_as_set(self):
-        """stop_token_ids list should be converted to a set for O(1) lookup."""
+        """Test that stop_token_ids list is converted to set."""
         sp = SamplingParams(stop_token_ids=[1, 2, 3])
         self.assertIsInstance(sp.stop_token_ids, set)
         self.assertEqual(sp.stop_token_ids, {1, 2, 3})
 
     def test_stop_token_ids_none_stays_none(self):
+        """Test that None stop_token_ids stays None."""
         sp = SamplingParams(stop_token_ids=None)
         self.assertIsNone(sp.stop_token_ids)
 
     def test_empty_stop_token_ids_becomes_none(self):
-        """Empty list is falsy in Python — treated same as None, not as empty set."""
+        """Test that empty list is treated as None (falsy in Python)."""
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
 
-# ---------------------------------------------------------------------------
-# SamplingParams.verify — parameter validation
-# ---------------------------------------------------------------------------
-class TestSamplingParamsVerify(unittest.TestCase):
-    """Test that verify() rejects invalid values and accepts valid ones."""
+class TestSamplingParamsVerify(CustomTestCase):
 
     VOCAB_SIZE = 32000
 
@@ -88,8 +81,9 @@ class TestSamplingParamsVerify(unittest.TestCase):
 
     # --- happy path ---
     def test_valid_params_pass(self):
+        """Default valid params should pass verify() without raising."""
         sp = self._make()
-        sp.verify(self.VOCAB_SIZE)  # should not raise
+        sp.verify(self.VOCAB_SIZE)
 
     # --- temperature ---
     def test_negative_temperature_raises(self):
@@ -147,8 +141,7 @@ class TestSamplingParamsVerify(unittest.TestCase):
             sp.verify(self.VOCAB_SIZE)
 
     def test_top_k_negative_raises(self):
-        """top_k=-2 stays as-is (__init__ only converts -1 to TOP_K_ALL),
-        and verify() should reject it."""
+        """Test that top_k=-2 is rejected (__init__ only converts -1)."""
         sp = self._make()
         sp.top_k = -2  # bypass __init__ conversion
         with self.assertRaises(ValueError):
@@ -166,6 +159,7 @@ class TestSamplingParamsVerify(unittest.TestCase):
             sp.verify(self.VOCAB_SIZE)
 
     def test_frequency_penalty_boundaries_valid(self):
+        """Boundary values -2.0 and 2.0 should both be accepted."""
         self._make(frequency_penalty=-2.0).verify(self.VOCAB_SIZE)
         self._make(frequency_penalty=2.0).verify(self.VOCAB_SIZE)
 
@@ -211,7 +205,7 @@ class TestSamplingParamsVerify(unittest.TestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_max_new_tokens_none_skips_validation(self):
-        """When max_new_tokens is None, the min<=max check is skipped entirely."""
+        """Test that max_new_tokens=None skips the min<=max check."""
         sp = self._make(min_new_tokens=9999, max_new_tokens=None)
         sp.verify(self.VOCAB_SIZE)  # should not raise
 
@@ -246,11 +240,7 @@ class TestSamplingParamsVerify(unittest.TestCase):
             sp.verify(self.VOCAB_SIZE)
 
 
-# ---------------------------------------------------------------------------
-# SamplingParams.normalize — stop string processing
-# ---------------------------------------------------------------------------
-class TestSamplingParamsNormalize(unittest.TestCase):
-    """Test that normalize() correctly processes stop strings and regex."""
+class TestSamplingParamsNormalize(CustomTestCase):
 
     def test_none_stop_strs_becomes_empty_list(self):
         sp = SamplingParams(stop=None)
@@ -304,11 +294,7 @@ class TestSamplingParamsNormalize(unittest.TestCase):
         self.assertEqual(sp.stop_regex_max_len, 3)
 
 
-# ---------------------------------------------------------------------------
-# get_max_seq_length / _max_length_from_subpattern — regex analysis
-# ---------------------------------------------------------------------------
-class TestRegexMaxLength(unittest.TestCase):
-    """Test the recursive regex AST length calculator."""
+class TestRegexMaxLength(CustomTestCase):
 
     def test_literal_string(self):
         """'abc' → 3 literals."""
@@ -365,8 +351,7 @@ class TestRegexMaxLength(unittest.TestCase):
         self.assertEqual(get_max_seq_length("a?"), 1)
 
     def test_mixed_unbounded_and_bounded(self):
-        """'ab+c{3}' → 1 + MAX_LEN + 3. Since MAX_LEN dominates,
-        the total includes it."""
+        """'ab+c{3}' → 1 + MAX_LEN + 3 (unbounded dominates)."""
         result = get_max_seq_length("ab+c{3}")
         self.assertGreaterEqual(result, MAX_LEN)
 
@@ -375,8 +360,7 @@ class TestRegexMaxLength(unittest.TestCase):
         self.assertEqual(get_max_seq_length(""), 0)
 
     def test_lookahead_triggers_unhandled_token(self):
-        """Lookahead (?=...) produces an ASSERT token which is not handled —
-        the else branch should log a warning and add MAX_LEN."""
+        """Test that lookahead (?=...) hits the unhandled ASSERT branch."""
         result = get_max_seq_length("(?=a)b")
         # ASSERT (lookahead) → MAX_LEN, LITERAL 'b' → 1
         self.assertGreaterEqual(result, MAX_LEN)

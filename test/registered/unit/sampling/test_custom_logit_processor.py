@@ -18,11 +18,10 @@ from sglang.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-# ---------------------------------------------------------------------------
 # Helper: mock a Req object (used by ThinkingBudget and NGram processors)
-# ---------------------------------------------------------------------------
 def _make_req(origin_input_ids=None, output_ids=None):
     req = MagicMock()
     req.origin_input_ids = origin_input_ids or []
@@ -30,11 +29,8 @@ def _make_req(origin_input_ids=None, output_ids=None):
     return req
 
 
-# ---------------------------------------------------------------------------
 # Serialization round-trip
-# ---------------------------------------------------------------------------
-class TestCustomLogitProcessorSerialization(unittest.TestCase):
-    """Test dill-based serialization used to send processors over the network."""
+class TestCustomLogitProcessorSerialization(CustomTestCase):
 
     def test_to_str_produces_valid_json(self):
         s = DisallowedTokensLogitsProcessor.to_str()
@@ -43,14 +39,13 @@ class TestCustomLogitProcessorSerialization(unittest.TestCase):
         self.assertIsInstance(data["callable"], str)
 
     def test_round_trip_serialization(self):
-        """Serialize then deserialize — result should be a usable processor."""
+        """Test serialize then deserialize produces a usable processor."""
         s = DisallowedTokensLogitsProcessor.to_str()
         processor = CustomLogitProcessor.from_str(s)
         self.assertIsInstance(processor, DisallowedTokensLogitsProcessor)
 
     def test_from_str_is_cached(self):
-        """Calling from_str twice with the same string should return the same class
-        (from LRU cache), but different instances (because from_str calls cls())."""
+        """Test that from_str uses LRU cache for repeated calls."""
         _cache_from_str.cache_clear()
         s = DisallowedTokensLogitsProcessor.to_str()
         cls1 = _cache_from_str(s)
@@ -58,10 +53,8 @@ class TestCustomLogitProcessorSerialization(unittest.TestCase):
         self.assertIs(cls1, cls2)
 
 
-# ---------------------------------------------------------------------------
 # DisallowedTokensLogitsProcessor
-# ---------------------------------------------------------------------------
-class TestDisallowedTokensLogitsProcessor(unittest.TestCase):
+class TestDisallowedTokensLogitsProcessor(CustomTestCase):
     def setUp(self):
         self.processor = DisallowedTokensLogitsProcessor()
 
@@ -82,17 +75,15 @@ class TestDisallowedTokensLogitsProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
 
     def test_mismatched_params_raises(self):
-        """All batch items must have the same disallowed token_ids."""
+        """Test that mismatched token_ids across batch items raises AssertionError."""
         logits = torch.zeros(2, 10)
         params = [{"token_ids": [1, 2]}, {"token_ids": [3, 4]}]
         with self.assertRaises(AssertionError):
             self.processor(logits, params)
 
 
-# ---------------------------------------------------------------------------
 # ThinkingBudgetLogitProcessor (using Qwen3 variant)
-# ---------------------------------------------------------------------------
-class TestThinkingBudgetLogitProcessor(unittest.TestCase):
+class TestThinkingBudgetLogitProcessor(CustomTestCase):
     """Test thinking budget enforcement using Qwen3 token IDs.
 
     Qwen3 tokens:
@@ -113,7 +104,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         return torch.zeros(batch_size, self.VOCAB)
 
     def test_budget_not_exceeded_no_change(self):
-        """If thinking tokens < budget, logits should not be modified."""
+        """Test no modification when thinking tokens are within budget."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100, 101],  # 2 tokens after start
@@ -124,8 +115,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertEqual(result[0, 0].item(), 0.0)  # unchanged
 
     def test_budget_exceeded_forces_newline_first(self):
-        """When budget is exceeded and last token is NOT newline,
-        force the model to emit a newline."""
+        """Test forcing newline when budget exceeded and last token is not newline."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100] * 5,  # 5 tokens, budget=5 → exceeded
@@ -138,7 +128,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
 
     def test_budget_exceeded_with_newline_forces_end_token(self):
-        """When budget exceeded and last token IS newline, force thinking end."""
+        """Test forcing end token when budget exceeded and last token is newline."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100] * 5 + [self.NL],  # 6 tokens, last is newline
@@ -150,7 +140,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
 
     def test_skips_when_not_in_thinking(self):
-        """If THINKING_START not in token ids, skip (no thinking phase)."""
+        """Test skip when THINKING_START is absent (no thinking phase)."""
         req = _make_req(origin_input_ids=[100, 101], output_ids=[102])
         params = [{"thinking_budget": 0, "__req__": req}]
         logits = self._logits()
@@ -159,7 +149,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_skips_when_thinking_already_ended(self):
-        """If THINKING_END already in token ids, skip."""
+        """Test skip when THINKING_END already appeared."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100, self.END, 200],
@@ -199,7 +189,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_budget_zero_forces_immediate_end(self):
-        """Budget=0 means end thinking immediately (0 tokens allowed)."""
+        """Test that budget=0 forces thinking to end immediately."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100],  # 1 token after start > budget=0
@@ -211,7 +201,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertEqual(result[0, self.NL].item(), 0.0)
 
     def test_none_param_dict_in_list_skipped(self):
-        """A None entry in the param list should be skipped gracefully."""
+        """Test that None entry in param list is skipped gracefully."""
         req = _make_req(
             origin_input_ids=[self.START],
             output_ids=[100] * 10,
@@ -226,8 +216,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[1, 0]) and result[1, 0] < 0)
 
     def test_multiple_thinking_start_counts_from_first(self):
-        """When multiple THINKING_START tokens exist, .index() finds the first.
-        Budget is counted from the *first* START, not the last."""
+        """Test that budget counts from the first THINKING_START occurrence."""
         req = _make_req(
             origin_input_ids=[self.START, 100, 101],
             output_ids=[self.START, 200, 201],  # second START in output
@@ -242,7 +231,7 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_deepseek_r1_variant_forces_end(self):
-        """Verify DeepSeekR1 variant works with its own token IDs."""
+        """Test DeepSeekR1 variant with its own token IDs."""
         proc = DeepSeekR1ThinkingBudgetLogitProcessor()
         START = proc.THINKING_START_TOKEN_ID  # 128798
         NL = proc.NEW_LINE_TOKEN_ID  # 201
@@ -257,10 +246,8 @@ class TestThinkingBudgetLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
 
 
-# ---------------------------------------------------------------------------
 # DeepseekOCRNoRepeatNGramLogitProcessor
-# ---------------------------------------------------------------------------
-class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
+class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
     VOCAB = 100
 
     def setUp(self):
@@ -270,8 +257,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         return torch.zeros(batch_size, self.VOCAB)
 
     def test_bans_repeated_bigrams(self):
-        """Sequence [1,2,3,1,2] with ngram_size=2 — last bigram prefix is (2),
-        which appeared at index 1 followed by 3. So token 3 should be banned."""
+        """Test banning token that completes a repeated bigram."""
         req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
         params = [
             {
@@ -285,7 +271,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
 
     def test_non_repeated_tokens_unchanged(self):
-        """Tokens that DON'T complete a repeated ngram should remain at 0."""
+        """Test that tokens not completing a repeated ngram are unchanged."""
         req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
         params = [{"__req__": req, "ngram_size": 2, "window_size": 100}]
         logits = self._logits()
@@ -294,7 +280,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertEqual(result[0, 1].item(), 0.0)
 
     def test_window_size_limits_search(self):
-        """With a small window, older ngrams should NOT cause banning."""
+        """Test that ngrams outside the window are not considered."""
         # Sequence: [1,2,3,...,1,2] but window only covers the last 3 tokens
         req = _make_req(origin_input_ids=[1, 2, 3, 4, 5, 1, 2])
         params = [{"__req__": req, "ngram_size": 2, "window_size": 3}]
@@ -306,7 +292,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertEqual(result[0, 3].item(), 0.0)
 
     def test_whitelist_protects_tokens(self):
-        """Whitelisted tokens should not be banned even if they form repeated ngrams."""
+        """Test that whitelisted tokens are not banned despite repeated ngrams."""
         req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
         params = [
             {
@@ -395,8 +381,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[1, 1]) and result[1, 1] < 0)
 
     def test_search_end_leq_search_start_skips(self):
-        """When window_size is small relative to ngram_size, search_end <= search_start
-        and the item should be skipped."""
+        """Test skip when window is too small for the ngram_size."""
         # sequence length=4, ngram_size=3, window_size=2
         # search_start = max(0, 4-2) = 2
         # search_end = 4 - 3 + 1 = 2
@@ -409,7 +394,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.equal(result, original))
 
     def test_invalid_whitelist_type_handled(self):
-        """Non-iterable whitelist_token_ids should be handled gracefully (TypeError)."""
+        """Test graceful handling of non-iterable whitelist_token_ids."""
         req = _make_req(origin_input_ids=[1, 2, 1, 2])
         params = [
             {
@@ -425,7 +410,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
         self.assertTrue(torch.isinf(result[0, 1]) and result[0, 1] < 0)
 
     def test_batch_processing(self):
-        """Multiple batch items should be processed independently."""
+        """Test that multiple batch items are processed independently."""
         req1 = _make_req(
             origin_input_ids=[1, 2, 1, 2]
         )  # will ban token 2 (bigram repeat)
