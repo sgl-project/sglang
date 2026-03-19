@@ -148,12 +148,6 @@ STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
 )
 XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
-EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-)
-DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
-)
 TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
 
 # VLM model weights path

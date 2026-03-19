@@ -8,9 +8,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="nightly-2-npu-a3",
     nightly=True,
-    disabled="run failed",
 )
 
 
@@ -46,5 +45,4 @@ class TestTrinityMini(GSM8KAscendMixin, CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"] = "1"
     unittest.main()
