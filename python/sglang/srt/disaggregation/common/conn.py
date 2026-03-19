@@ -901,9 +901,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
             site = web.TCPSite(self._runner, host=self.host, port=self.port)
             self._loop.run_until_complete(site.start())
+            logger.info(
+                f"CommonKVBootstrapServer started successfully on {self.host}:{self.port}"
+            )
             self._loop.run_forever()
         except Exception as e:
-            logger.error(f"Server error: {str(e)}")
+            logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())

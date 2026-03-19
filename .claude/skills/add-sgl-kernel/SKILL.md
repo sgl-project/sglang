@@ -106,6 +106,7 @@ void scale(at::Tensor& out, const at::Tensor& input, double factor) {
 **Key points:**
 
 - Use `at::Tensor` (PyTorch tensors), `TORCH_CHECK` for validation, `at::cuda::getCurrentCUDAStream()` for stream
+- Keep Python wrappers thin; do shape/dtype/device validation in C++ right around the launch path
 - `DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16` covers `float`, `half` (FP16), `__nv_bfloat16` (BF16)
 - Add device error checking after every kernel launch
 - If a kernel only works on certain architectures, enforce that with `TORCH_CHECK` and skip logic in tests
@@ -136,7 +137,7 @@ m.impl("scale", torch::kCUDA, &scale);
 
 - `Tensor!` means in-place / mutable output argument
 - The schema is important for `torch.compile` and for consistent call signatures
-- If your underlying C++ API uses `float` but PyTorch bindings expect `double`, the implicit cast is fine for scalars; use shims if needed for other types
+- Keep the torch schema in PyTorch scalar types (`float` here), but note that the C++ launcher signature still needs `double` for scalar arguments accepted by `torch::Library`
 
 ---
 
