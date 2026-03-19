@@ -17,7 +17,6 @@ from sglang.srt.sampling.penaltylib.min_new_tokens import (
 )
 from sglang.srt.sampling.penaltylib.orchestrator import (
     BatchedPenalizerOrchestrator,
-    _BatchedPenalizer,
 )
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
@@ -30,11 +29,11 @@ DEVICE = "cpu"
 # ---------------------------------------------------------------------------
 # Helpers: mock Req and ScheduleBatch
 # ---------------------------------------------------------------------------
-def _make_req(freq=0.0, pres=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
-    req.sampling_params.presence_penalty = pres
+    req.sampling_params.presence_penalty = presence
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.tokenizer.additional_stop_token_ids = None
@@ -59,13 +58,17 @@ class TestBatchedPenalizerOrchestrator(unittest.TestCase):
     def test_init_detects_required_penalizers(self):
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         self.assertTrue(orch.is_required)
 
     def test_init_not_required_when_no_penalties(self):
         reqs = [_make_req()]  # all defaults (0.0)
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         self.assertFalse(orch.is_required)
 
     def test_batch_property_via_weakref(self):
@@ -92,7 +95,9 @@ class TestBatchedPenalizerOrchestrator(unittest.TestCase):
     def test_context_manager_releases(self):
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
-        with BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}) as orch:
+        with BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        ) as orch:
             self.assertTrue(orch.is_required)
         self.assertFalse(orch.is_required)
         self.assertEqual(len(orch.penalizers), 0)
@@ -100,22 +105,30 @@ class TestBatchedPenalizerOrchestrator(unittest.TestCase):
     def test_filter_empty_indices_releases(self):
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         orch.filter(torch.tensor([], dtype=torch.long))
         self.assertFalse(orch.is_required)
 
     def test_filter_not_required_is_noop(self):
         reqs = [_make_req()]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         self.assertFalse(orch.is_required)
         orch.filter(torch.tensor([0]))  # should not raise
 
     def test_merge_both_not_required_is_noop(self):
         reqs = [_make_req()]
         batch = _make_batch(reqs)
-        orch1 = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
-        orch2 = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch1 = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
+        orch2 = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         orch1.merge(orch2)  # should not raise
         self.assertFalse(orch1.is_required)
 
@@ -128,7 +141,9 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
     def _setup(self, freq_values):
         reqs = [_make_req(freq=f) for f in freq_values]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         pen = orch.penalizers[BatchedFrequencyPenalizer]
         return orch, pen
 
@@ -201,10 +216,12 @@ class TestBatchedFrequencyPenalizer(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestBatchedPresencePenalizer(unittest.TestCase):
 
-    def _setup(self, pres_values):
-        reqs = [_make_req(pres=p) for p in pres_values]
+    def _setup(self, presence_values):
+        reqs = [_make_req(presence=p) for p in presence_values]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedPresencePenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedPresencePenalizer}
+        )
         pen = orch.penalizers[BatchedPresencePenalizer]
         return orch, pen
 
@@ -249,12 +266,11 @@ class TestBatchedMinNewTokensPenalizer(unittest.TestCase):
 
     def _setup(self, configs):
         """configs: list of (min_tokens, stop_ids, eos_id)."""
-        reqs = [
-            _make_req(min_tokens=c[0], stop_ids=c[1], eos_id=c[2])
-            for c in configs
-        ]
+        reqs = [_make_req(min_tokens=c[0], stop_ids=c[1], eos_id=c[2]) for c in configs]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
         pen = orch.penalizers[BatchedMinNewTokensPenalizer]
         return orch, pen
 
@@ -347,7 +363,9 @@ class TestBatchedPenalizerBase(unittest.TestCase):
     def test_filter_when_not_prepared_is_noop(self):
         reqs = [_make_req()]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         pen = orch.penalizers[BatchedFrequencyPenalizer]
         # pen is not prepared (frequency_penalty=0 → not required)
         pen.filter(torch.tensor([0]))  # should not raise
@@ -358,8 +376,12 @@ class TestBatchedPenalizerBase(unittest.TestCase):
         reqs_b = [_make_req(freq=1.0)]  # required
         batch_a = _make_batch(reqs_a)
         batch_b = _make_batch(reqs_b)
-        orch_a = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_a, {BatchedFrequencyPenalizer})
-        orch_b = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_b, {BatchedFrequencyPenalizer})
+        orch_a = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch_a, {BatchedFrequencyPenalizer}
+        )
+        orch_b = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch_b, {BatchedFrequencyPenalizer}
+        )
         pen_a = orch_a.penalizers[BatchedFrequencyPenalizer]
         pen_b = orch_b.penalizers[BatchedFrequencyPenalizer]
         self.assertFalse(pen_a.is_prepared())
@@ -372,8 +394,12 @@ class TestBatchedPenalizerBase(unittest.TestCase):
     def test_merge_both_unprepared_is_noop(self):
         reqs = [_make_req()]
         batch = _make_batch(reqs)
-        orch1 = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
-        orch2 = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch1 = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
+        orch2 = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         pen1 = orch1.penalizers[BatchedFrequencyPenalizer]
         pen2 = orch2.penalizers[BatchedFrequencyPenalizer]
         pen1.merge(pen2)  # both not prepared → noop
@@ -383,7 +409,9 @@ class TestBatchedPenalizerBase(unittest.TestCase):
         """Calling prepare() multiple times should only prepare once."""
         reqs = [_make_req(freq=1.0)]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         pen = orch.penalizers[BatchedFrequencyPenalizer]
         self.assertTrue(pen.is_prepared())
         # Calling prepare again should not crash or reinitialize
@@ -398,11 +426,16 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
 
     def test_all_three_penalizers(self):
         """Test orchestrator managing frequency, presence, and min_new_tokens together."""
-        reqs = [_make_req(freq=1.0, pres=0.5, min_tokens=2, eos_id=2)]
+        reqs = [_make_req(freq=1.0, presence=0.5, min_tokens=2, eos_id=2)]
         batch = _make_batch(reqs)
         orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE, batch,
-            {BatchedFrequencyPenalizer, BatchedPresencePenalizer, BatchedMinNewTokensPenalizer},
+            VOCAB_SIZE,
+            batch,
+            {
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedMinNewTokensPenalizer,
+            },
         )
         self.assertTrue(orch.is_required)
 
@@ -423,7 +456,9 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         """After filtering, if a penalizer is no longer required, it should be torn down."""
         reqs = [_make_req(freq=0.0), _make_req(freq=1.0)]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         self.assertTrue(orch.is_required)
 
         # Keep only the request with freq=0 (index 0)
@@ -438,7 +473,9 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         """Filter should keep penalizer active if it's still required."""
         reqs = [_make_req(freq=1.0), _make_req(freq=2.0)]
         batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {BatchedFrequencyPenalizer})
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
         self.assertTrue(orch.is_required)
 
         batch.reqs = [reqs[1]]
@@ -451,8 +488,12 @@ class TestOrchestratorMultiplePenalizers(unittest.TestCase):
         reqs_b = [_make_req(freq=1.0)]
         batch_a = _make_batch(reqs_a)
         batch_b = _make_batch(reqs_b)
-        orch_a = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_a, {BatchedFrequencyPenalizer})
-        orch_b = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_b, {BatchedFrequencyPenalizer})
+        orch_a = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch_a, {BatchedFrequencyPenalizer}
+        )
+        orch_b = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch_b, {BatchedFrequencyPenalizer}
+        )
         self.assertFalse(orch_a.is_required)
         self.assertTrue(orch_b.is_required)
 

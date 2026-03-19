@@ -12,8 +12,8 @@ import torch
 
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
-    DeepSeekR1ThinkingBudgetLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
+    DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
@@ -377,9 +377,7 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
     def test_invalid_ngram_size_type_skips(self):
         """Non-numeric ngram_size should be handled gracefully."""
         req = _make_req(origin_input_ids=[1, 2, 1, 2])
-        params = [
-            {"__req__": req, "ngram_size": "invalid", "window_size": 100}
-        ]
+        params = [{"__req__": req, "ngram_size": "invalid", "window_size": 100}]
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, params)
@@ -428,7 +426,9 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(unittest.TestCase):
 
     def test_batch_processing(self):
         """Multiple batch items should be processed independently."""
-        req1 = _make_req(origin_input_ids=[1, 2, 1, 2])  # will ban token 2 (bigram repeat)
+        req1 = _make_req(
+            origin_input_ids=[1, 2, 1, 2]
+        )  # will ban token 2 (bigram repeat)
         req2 = _make_req(origin_input_ids=[3, 4, 5])  # no repeat
         params = [
             {"__req__": req1, "ngram_size": 2, "window_size": 100},

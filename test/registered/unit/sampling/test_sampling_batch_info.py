@@ -108,23 +108,19 @@ class TestMergeCustomLogitProcessor(unittest.TestCase):
         proc = MagicMock()
         lhs = {42: (proc, torch.tensor([True, False]))}
         rhs = {42: (proc, torch.tensor([False, True, True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(
-            lhs, rhs, 2, 3, DEVICE
-        )
+        result = SamplingBatchInfo.merge_custom_logit_processor(lhs, rhs, 2, 3, DEVICE)
         self.assertIn(42, result)
         self.assertEqual(result[42][1].shape[0], 5)
-        self.assertTrue(result[42][1][0].item())   # from lhs
-        self.assertFalse(result[42][1][1].item())   # from lhs
-        self.assertTrue(result[42][1][3].item())    # from rhs
+        self.assertTrue(result[42][1][0].item())  # from lhs
+        self.assertFalse(result[42][1][1].item())  # from lhs
+        self.assertTrue(result[42][1][3].item())  # from rhs
 
     def test_disjoint_keys(self):
         proc_a = MagicMock()
         proc_b = MagicMock()
         lhs = {1: (proc_a, torch.tensor([True, False]))}
         rhs = {2: (proc_b, torch.tensor([True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(
-            lhs, rhs, 2, 1, DEVICE
-        )
+        result = SamplingBatchInfo.merge_custom_logit_processor(lhs, rhs, 2, 1, DEVICE)
         # Key 1: lhs mask [True, False] + zero-filled rhs [False]
         self.assertEqual(result[1][1].shape[0], 3)
         self.assertTrue(result[1][1][0].item())
@@ -137,9 +133,7 @@ class TestMergeCustomLogitProcessor(unittest.TestCase):
     def test_lhs_none_rhs_present(self):
         proc = MagicMock()
         rhs = {10: (proc, torch.tensor([True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(
-            None, rhs, 2, 1, DEVICE
-        )
+        result = SamplingBatchInfo.merge_custom_logit_processor(None, rhs, 2, 1, DEVICE)
         self.assertIn(10, result)
         self.assertEqual(result[10][1].shape[0], 3)
 
@@ -292,9 +286,7 @@ class TestFilterBatch(unittest.TestCase):
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
-        info.custom_logit_processor = {
-            42: (proc, torch.tensor([True, False, True]))
-        }
+        info.custom_logit_processor = {42: (proc, torch.tensor([True, False, True]))}
         info.custom_params = [{"a": 1}, {"b": 2}, {"c": 3}]
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
@@ -307,9 +299,7 @@ class TestFilterBatch(unittest.TestCase):
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
-        info.custom_logit_processor = {
-            42: (proc, torch.tensor([False, True, False]))
-        }
+        info.custom_logit_processor = {42: (proc, torch.tensor([False, True, False]))}
         info.custom_params = [None, {"x": 1}, None]
         # Keep only index 0 and 2 — processor 42's mask becomes [False, False]
         keep = torch.tensor([0, 2])
@@ -353,10 +343,10 @@ class TestMergeBatch(unittest.TestCase):
             need_min_p_sampling=True,
         )
         info1.merge_batch(info2)
-        self.assertFalse(info1.is_all_greedy)       # AND semantics
-        self.assertTrue(info1.need_top_p_sampling)   # OR semantics
-        self.assertTrue(info1.need_top_k_sampling)   # OR semantics
-        self.assertTrue(info1.need_min_p_sampling)   # OR semantics
+        self.assertFalse(info1.is_all_greedy)  # AND semantics
+        self.assertTrue(info1.need_top_p_sampling)  # OR semantics
+        self.assertTrue(info1.need_top_k_sampling)  # OR semantics
+        self.assertTrue(info1.need_min_p_sampling)  # OR semantics
 
     def test_merge_with_logit_bias(self):
         info1 = _make_info(batch_size=1)
@@ -421,16 +411,27 @@ class TestCopyForForward(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestFromScheduleBatch(unittest.TestCase):
 
-    def _make_req(self, temp=1.0, top_p=1.0, top_k=-1, min_p=0.0,
-                  freq=0.0, pres=0.0, min_tokens=0, logit_bias=None,
-                  seed=None, stop_ids=None, eos_id=2):
+    def _make_req(
+        self,
+        temp=1.0,
+        top_p=1.0,
+        top_k=-1,
+        min_p=0.0,
+        freq=0.0,
+        presence=0.0,
+        min_tokens=0,
+        logit_bias=None,
+        seed=None,
+        stop_ids=None,
+        eos_id=2,
+    ):
         req = MagicMock()
         req.sampling_params.temperature = temp
         req.sampling_params.top_p = top_p
         req.sampling_params.top_k = top_k
         req.sampling_params.min_p = min_p
         req.sampling_params.frequency_penalty = freq
-        req.sampling_params.presence_penalty = pres
+        req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
         req.sampling_params.logit_bias = logit_bias
         req.sampling_params.sampling_seed = seed
@@ -509,10 +510,10 @@ class TestFromScheduleBatch(unittest.TestCase):
         batch.reqs = reqs
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertTrue(info.need_top_p_sampling)   # 0.9 != 1.0
-        self.assertTrue(info.need_top_k_sampling)   # 50 != TOP_K_ALL
-        self.assertTrue(info.need_min_p_sampling)   # 0.1 > 0
-        self.assertFalse(info.is_all_greedy)        # top_k=50 > 1
+        self.assertTrue(info.need_top_p_sampling)  # 0.9 != 1.0
+        self.assertTrue(info.need_top_k_sampling)  # 50 != TOP_K_ALL
+        self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
+        self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_no_logit_bias_when_all_none(self, mock_server_args):

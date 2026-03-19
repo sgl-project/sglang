@@ -11,7 +11,6 @@ from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
     TOP_K_ALL,
     SamplingParams,
-    _max_length_from_subpattern,
     get_max_seq_length,
 )
 
@@ -242,7 +241,7 @@ class TestSamplingParamsVerify(unittest.TestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_all_three_grammars_set_raises(self):
-        sp = self._make(json_schema='{}', regex="a", ebnf="rule")
+        sp = self._make(json_schema="{}", regex="a", ebnf="rule")
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
