@@ -2320,48 +2320,48 @@ class AiterAttnBackend(AttentionBackend):
                     logit_cap=layer.logit_cap,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            else:
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
 
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+                bs0 = forward_batch.batch_size + 1
 
-            bs0 = forward_batch.batch_size + 1
+                # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                window_size = (-1, -1)
+                page_table = self.forward_metadata.kv_indices
 
-            window_size = (-1, -1)
-            page_table = self.forward_metadata.kv_indices
+                if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                    window_size = (layer.sliding_window_size, -1)
+                    # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    #    page_table
+                    # )
+                    page_table = self.forward_metadata.swa_page_table
 
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size, -1)
-                # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                #    page_table
-                # )
-                page_table = self.forward_metadata.swa_page_table
+                o = mha_batch_prefill_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    page_table,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                )
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                page_table,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-            )
-
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
