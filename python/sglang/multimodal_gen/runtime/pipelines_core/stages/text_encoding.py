@@ -251,8 +251,12 @@ class TextEncodingStage(PipelineStage):
                 encoder_config.tokenizer_kwargs,
                 **text_encoder_extra_arg,
             )
-            # Pass max_length to tokenizer if specified in the request
-            if max_length is not None:
+            # Pass max_length to tokenizer if specified in the request. Flux v1 encoder 0
+            # is CLIP with a fixed 77-token context; overriding breaks tokenization.
+            is_flux_v1 = isinstance(
+                server_args.pipeline_config, FluxPipelineConfig
+            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
+            if max_length is not None and not (is_flux_v1 and i == 0):
                 tok_kwargs["max_length"] = max_length
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
@@ -260,9 +264,6 @@ class TextEncodingStage(PipelineStage):
             ).to(target_device)
 
             input_ids = text_inputs["input_ids"]
-            is_flux_v1 = isinstance(
-                server_args.pipeline_config, FluxPipelineConfig
-            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
             is_flux_t5 = is_flux_v1 and i == 1
 
             if is_flux_t5:

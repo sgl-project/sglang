@@ -134,7 +134,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
-                padding="max_length",
+                padding=True,
                 truncation=True,
             ),
             None,
@@ -142,9 +142,13 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        effective_max_length = tok_kwargs.pop("max_length", 1024)
-        # Set max_length back into tok_kwargs for the tokenizer
-        tok_kwargs["max_length"] = effective_max_length
+        tok_kwargs.setdefault("truncation", True)
+
+        if tok_kwargs.get("max_length") is not None:
+            tok_kwargs["padding"] = "max_length"
+        else:
+            tok_kwargs.setdefault("max_length", 1024)
+            tok_kwargs["padding"] = True
         return tokenizer(prompts, **tok_kwargs)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
