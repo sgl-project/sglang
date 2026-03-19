@@ -1626,6 +1626,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_hip():
+                    self.attention_backend = "aiter"
                 else:
                     self.attention_backend = "triton"
 
