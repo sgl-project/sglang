@@ -199,6 +199,9 @@ class Engine(EngineBase):
             self.remote_instance_transfer_engine_info = (
                 scheduler_init_result.engine_info_bootstrap.transfer_engine_info
             )
+            self.parallelism_config = (
+                scheduler_init_result.engine_info_bootstrap.parallelism_config
+            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
