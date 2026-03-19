@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch_server,
 )
 
-register_cuda_ci(est_time=500, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=650, suite="stage-c-test-4-gpu-h100")
 
 
 class TestPPAccuracy(unittest.TestCase):
