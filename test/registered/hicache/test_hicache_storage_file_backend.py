@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    flush_cache_with_retry,
     is_in_ci,
     popen_launch_server,
 )
@@ -168,12 +169,8 @@ class HiCacheStorageBaseMixin:
         return int(meta.get("cached_tokens", 0))
 
     def flush_cache(self) -> bool:
-        """Flush device cache to force remote storage access"""
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+        """Flush device cache to force remote storage access."""
+        return flush_cache_with_retry(self.base_url)
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""

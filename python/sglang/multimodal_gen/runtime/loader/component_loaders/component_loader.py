@@ -125,13 +125,13 @@ class ComponentLoader(ABC):
             if isinstance(component, nn.Module):
                 component = component.eval()
             current_gpu_mem = current_platform.get_available_gpu_memory()
-            consumed = get_memory_usage_of_component(component)
-            if consumed is None or consumed == 0.0:
-                consumed = gpu_mem_before_loading - current_gpu_mem
+            model_size = get_memory_usage_of_component(component) or "NA"
+            consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %.2f GB, avail mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
+                model_size,
                 consumed,
                 current_gpu_mem,
             )

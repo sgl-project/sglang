@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/activation.py
 """Custom activation functions."""
+
 import math
 from typing import Any
 
@@ -53,6 +54,9 @@ class SiluAndMul(CustomOp):
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         out = torch_npu.npu_swiglu(x)
         return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.SwishGLU()(x)
 
 
 @CustomOp.register("gelu_and_mul")

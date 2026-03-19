@@ -798,6 +798,11 @@ class Qwen2_5_VLModel(nn.Module):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if not isinstance(image_embeds, torch.Tensor):
+            # In transformers v5, the visual encoder returns BaseModelOutputWithPooling.
+            # pooler_output contains the spatially merged embeddings (what we need),
+            # while last_hidden_state contains the raw unmerged output.
+            image_embeds = image_embeds.pooler_output
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()

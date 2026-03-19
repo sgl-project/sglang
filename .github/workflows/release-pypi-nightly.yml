@@ -54,28 +54,26 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          # Parse git describe output to detect exact tag builds (distance=0)
+          # Parse git describe output to get latest tag
           # Use same command as pyproject.toml to ensure version consistency
           DESC=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long 2>/dev/null || echo 'v0.0.0-0-g0000000')
-          DIST=$(echo "$DESC" | cut -d- -f2)
+          TAG=$(echo "$DESC" | cut -d- -f1)
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
 
-          # If building at exact tag (distance=0), force dev0 version for unique wheel names
-          if [ "$DIST" = "0" ]; then
-            TAG=$(echo "$DESC" | cut -d- -f1)
-            HASH="g$(git rev-parse --short HEAD)"
+          # Increment patch version for nightlies (e.g., v0.5.8 -> 0.5.9)
+          VERSION=${TAG#v}  # Remove 'v' prefix
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
 
-            # Increment patch version for nightlies (e.g., v0.5.8 -> 0.5.9.dev0)
-            VERSION=${TAG#v}  # Remove 'v' prefix
-            MAJOR=$(echo "$VERSION" | cut -d. -f1)
-            MINOR=$(echo "$VERSION" | cut -d. -f2)
-            PATCH=$(echo "$VERSION" | cut -d. -f3)
-            NEXT_PATCH=$((PATCH + 1))
-            NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
-
-            FORCE_VERSION="${NEXT_VERSION}.dev0+${HASH}"
-            echo "Building at exact tag $TAG, forcing nightly version to: $FORCE_VERSION"
-            export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
-          fi
+          # Use date-based dev number for correct chronological sorting
+          # e.g., 0.5.9.dev20260215+g4cf4f0859 > 0.5.9.dev20260214+g45a4697d4
+          FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
 
           # Build wheel
           python3 -m build --wheel

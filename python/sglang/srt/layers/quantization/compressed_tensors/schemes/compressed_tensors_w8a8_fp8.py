@@ -14,7 +14,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -42,7 +42,7 @@ strategy_to_parameter_type = {
 }
 
 
-class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
+class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
     def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
         self.weight_quant = weight_quant
         self.strategy = self.weight_quant.strategy

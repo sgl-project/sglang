@@ -2,7 +2,6 @@ import dataclasses
 from dataclasses import field
 from typing import Callable
 
-import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2Config
@@ -116,7 +115,8 @@ def _gemma_postprocess_func(
 class LTX2PipelineConfig(PipelineConfig):
     """Configuration for LTX-Video pipeline."""
 
-    task_type: ModelTaskType = ModelTaskType.T2V
+    task_type: ModelTaskType = ModelTaskType.TI2V
+    skip_input_image_preprocess: bool = True
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
     # Model architecture
@@ -139,6 +139,23 @@ class LTX2PipelineConfig(PipelineConfig):
     def vae_temporal_compression(self):
         return getattr(self.vae_config.arch_config, "temporal_compression_ratio", 8)
 
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        """Return packed latent shape [B, seq, C] directly."""
+        height = batch.height // self.vae_scale_factor
+        width = batch.width // self.vae_scale_factor
+
+        post_patch_num_frames = num_frames // self.patch_size_t
+        post_patch_height = height // self.patch_size
+        post_patch_width = width // self.patch_size
+        seq_len = post_patch_num_frames * post_patch_height * post_patch_width
+
+        num_channels = (
+            self.in_channels * self.patch_size_t * self.patch_size * self.patch_size
+        )
+
+        shape = (batch_size, seq_len, num_channels)
+        return shape
+
     def prepare_audio_latent_shape(self, batch, batch_size, num_frames):
         # Adapted from diffusers pipeline prepare_audio_latents
         duration_s = num_frames / batch.fps
@@ -159,7 +176,7 @@ class LTX2PipelineConfig(PipelineConfig):
         # Default to 8
         num_channels_latents = self.audio_vae_config.arch_config.latent_channels
 
-        shape = (batch_size, num_channels_latents, latent_length, latent_mel_bins)
+        shape = (batch_size, latent_length, num_channels_latents * latent_mel_bins)
 
         return shape
 
@@ -184,7 +201,7 @@ class LTX2PipelineConfig(PipelineConfig):
             steps = int(num_inference_steps)
             if steps <= 0:
                 raise ValueError(f"num_inference_steps must be positive, got {steps}")
-            return np.linspace(1.0, 1.0 / float(steps), steps).tolist()
+            return [1.0 - i / steps for i in range(steps)]
         return sigmas
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
@@ -210,6 +227,10 @@ class LTX2PipelineConfig(PipelineConfig):
         return text_inputs
 
     def maybe_pack_latents(self, latents, batch_size, batch):
+        # If already packed (3D shape [B, seq, C]), skip packing
+        if latents.dim() == 3:
+            return latents
+
         # Unpacked latents of shape are [B, C, F, H, W] are patched into tokens of shape [B, C, F // p_t, p_t, H // p, p, W // p, p].
         # The patch dimensions are then permuted and collapsed into the channel dimension of shape:
         # [B, F // p_t * H // p * W // p, C * p_t * p * p] (an ndim=3 tensor).
@@ -338,6 +359,10 @@ class LTX2PipelineConfig(PipelineConfig):
         return super().gather_latents_for_sp(latents)
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
+        # If already packed (3D shape [B, T, C*F]), skip packing
+        if latents.dim() == 3:
+            return latents
+
         # Audio latents shape: [B, C, L, M], where L is the latent audio length and M is the number of mel bins
         # We need to pack them if patch_size/patch_size_t are defined for audio (not standard DiT patch size)
 

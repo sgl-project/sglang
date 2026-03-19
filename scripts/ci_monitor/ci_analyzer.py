@@ -618,7 +618,9 @@ class SGLangCIAnalyzer:
                                         if change_pct < -10:
                                             trend_indicator = f"📈 {change_pct:.1f}%"
                                         elif change_pct > 10:
-                                            trend_indicator = f"⚠️ 📉 +{change_pct:.1f}%"
+                                            trend_indicator = (
+                                                f"⚠️ 📉 +{change_pct:.1f}%"
+                                            )
                                         else:
                                             trend_indicator = f"➡️ {change_pct:+.1f}%"
                                     else:
