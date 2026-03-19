@@ -8,7 +8,6 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,37 +41,6 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 logger = init_logger(__name__)
-
-
-def _clear_hunyuan3d_rasterizer_jit_cache() -> None:
-    try:
-        import torch.utils.cpp_extension
-
-        cache_root = Path(torch.utils.cpp_extension.get_default_build_root())
-    except (ImportError, AttributeError):
-        cache_root = Path.home() / ".cache" / "torch_extensions"
-
-    if not cache_root.exists():
-        return
-
-    matched_paths = sorted(
-        (path for path in cache_root.rglob("custom_rasterizer_kernel*")),
-        key=lambda p: len(p.parts),
-        reverse=True,
-    )
-    failed_paths: list[tuple[Path, str]] = []
-
-    for path in matched_paths:
-        try:
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-        except OSError as exc:
-            failed_paths.append((path, str(exc)))
-
-    for path, msg in failed_paths:
-        logger.warning("Failed to remove JIT cache path %s: %s", path, msg)
 
 
 @pytest.fixture
@@ -138,9 +106,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars = {}
     if server_args.enable_cache_dit:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
-
-    if server_args.modality == "3d":
-        _clear_hunyuan3d_rasterizer_jit_cache()
 
     # start server
     manager = ServerManager(
