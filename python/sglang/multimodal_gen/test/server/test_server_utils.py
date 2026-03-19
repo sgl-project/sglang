@@ -737,6 +737,28 @@ VALIDATOR_REGISTRY = {
 }
 
 
+def _extract_async_job_error_message(job: Any) -> str | None:
+    error = getattr(job, "error", None)
+    if error is None and isinstance(job, dict):
+        error = job.get("error")
+
+    if error is None:
+        return None
+
+    if isinstance(error, dict):
+        for key in ("message", "detail", "error"):
+            value = error.get(key)
+            if value:
+                return str(value)
+        return str(error)
+
+    message = getattr(error, "message", None)
+    if message:
+        return str(message)
+
+    return str(error)
+
+
 def get_generate_fn(
     model_path: str,
     modality: str,
@@ -796,10 +818,24 @@ def get_generate_fn(
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
+            status = getattr(item, "status", None) if item is not None else None
 
-            if item and getattr(item, "status", None) == "completed":
+            if status == "completed":
                 job_completed = True
                 break
+
+            if status == "failed":
+                error_message = (
+                    _extract_async_job_error_message(item) or "unknown error"
+                )
+                pytest.fail(
+                    f"{case_id}: video job {video_id} failed early: {error_message}"
+                )
+
+            if status in {"cancelled", "deleted"}:
+                pytest.fail(
+                    f"{case_id}: video job {video_id} ended with status={status}"
+                )
 
             if time.time() > deadline:
                 break
