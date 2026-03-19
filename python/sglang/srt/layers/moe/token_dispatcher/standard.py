@@ -86,6 +86,9 @@ class StandardDispatcher(BaseDispatcher):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
+        self.enable_flashinfer_trtllm_routed_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
@@ -142,6 +145,7 @@ class StandardDispatcher(BaseDispatcher):
         if (
             self.moe_ep_size > 1
             and not self.enable_flashinfer_cutlass_moe
+            and not self.enable_flashinfer_trtllm_routed_moe
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:

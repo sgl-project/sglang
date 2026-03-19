@@ -8,12 +8,9 @@ from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm as jit_fn
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.test.test_marlin_utils import marlin_quantize
 
-try:
-    from sgl_kernel import moe_wna16_marlin_gemm as _aot_import  # noqa: F401
-
-    AOT_AVAILABLE = True
-except (ImportError, AttributeError):
-    AOT_AVAILABLE = False
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
+    torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
+)
 
 IS_CI = is_in_ci()
 

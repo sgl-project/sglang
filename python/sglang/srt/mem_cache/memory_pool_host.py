@@ -23,12 +23,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if not (_is_npu or _is_xpu):
+_is_mps = is_mps()
+if not (_is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
@@ -1208,7 +1209,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        else:
+        elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.index_k_with_scale_buffer[layer_id]],
@@ -1228,6 +1229,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def _backup_indexer_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1258,7 +1261,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        else:
+        elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.index_k_with_scale_buffer,
@@ -1277,6 +1280,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def load_to_device_per_layer(
         self,
