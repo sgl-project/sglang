@@ -7,12 +7,9 @@ from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack as jit_fn
 from sglang.srt.layers.quantization.utils import gptq_quantize_weights, pack_rows
 
-try:
-    from sgl_kernel import gptq_marlin_repack as aot_fn
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "gptq_marlin_repack") and hasattr(
+    torch.ops.sgl_kernel.gptq_marlin_repack, "default"
+)
 
 IS_CI = is_in_ci()
 
@@ -44,7 +41,9 @@ def check_correctness():
     size_k = 4096
     q_w_gptq, sort_indices = _get_inputs(size_k)
     out_jit = jit_fn(q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS)
-    out_aot = aot_fn(q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS)
+    out_aot = torch.ops.sgl_kernel.gptq_marlin_repack.default(
+        q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS
+    )
     torch.testing.assert_close(out_jit, out_aot, rtol=0, atol=0)
     print("Correctness check passed (JIT vs AOT)")
 
@@ -83,7 +82,9 @@ def benchmark(size_k, provider):
     if provider == "jit":
         fn = lambda: jit_fn(q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS)
     elif provider == "aot":
-        fn = lambda: aot_fn(q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS)
+        fn = lambda: torch.ops.sgl_kernel.gptq_marlin_repack.default(
+            q_w_gptq, sort_indices, size_k, SIZE_N, NUM_BITS
+        )
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

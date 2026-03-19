@@ -217,7 +217,11 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
-            if self.num_head == 32:
+            # current mla_decode_fwd onln support fake-nps in self.num_head == 16
+            # so all num_head size does not use qh16 kernel to simulate
+            # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
+            # it will cause gpu-fault or accuracy issue
+            if self.num_head == 32 or self.num_head == 128:
                 fast_mode = True
                 intra_batch_mode = False
 
@@ -1313,7 +1317,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            if self.use_mla and _use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(
@@ -1656,7 +1660,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            if self.use_mla and _use_mla_ps_kernel:
 
                 num_kv_splits = self.max_split_per_batch
 
@@ -1974,8 +1978,12 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
-                    q_scale=layer.k_scale,
-                    kv_scale=layer.k_scale,
+                    q_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
+                    kv_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
@@ -2028,8 +2036,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=layer.k_scale,
-                        kv_scale=layer.k_scale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2059,8 +2071,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=layer.k_scale,
-                        kv_scale=layer.k_scale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2195,8 +2211,8 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=reduce_indptr,
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
-                q_scale=layer.k_scale,
-                kv_scale=layer.k_scale,
+                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
