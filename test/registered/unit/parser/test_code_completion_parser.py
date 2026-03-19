@@ -1,12 +1,8 @@
 """Unit tests for srt/parser/code_completion_parser.py"""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
-
 import unittest
-from unittest.mock import MagicMock
 
+from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
@@ -18,7 +14,10 @@ from sglang.srt.parser.code_completion_parser import (
     register_completion_template,
     set_completion_template,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
 class TestFimPosition(CustomTestCase):
@@ -139,9 +138,7 @@ class TestGenerateCompletionPrompt(CustomTestCase):
 class TestGenerateCompletionPromptFromRequest(CustomTestCase):
     def test_empty_suffix_returns_prompt_directly(self):
         """Test that empty suffix bypasses FIM formatting."""
-        request = MagicMock()
-        request.prompt = "just code"
-        request.suffix = ""
+        request = CompletionRequest(prompt="just code", suffix="")
         result = generate_completion_prompt_from_request(request)
         self.assertEqual(result, "just code")
 
@@ -152,9 +149,7 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
         old_name = module.completion_template_name
         try:
             module.completion_template_name = "deepseek_coder"
-            request = MagicMock()
-            request.prompt = "prefix"
-            request.suffix = "suffix"
+            request = CompletionRequest(prompt="prefix", suffix="suffix")
             result = generate_completion_prompt_from_request(request)
             t = completion_templates["deepseek_coder"]
             expected = (

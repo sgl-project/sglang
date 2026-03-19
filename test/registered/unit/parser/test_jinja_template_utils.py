@@ -1,6 +1,4 @@
-"""
-Unit tests for Jinja chat template utils.
-"""
+"""Unit tests for srt/parser/jinja_template_utils.py"""
 
 import unittest
 

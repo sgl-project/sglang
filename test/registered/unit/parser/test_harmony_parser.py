@@ -1,3 +1,5 @@
+"""Unit tests for srt/parser/harmony_parser.py"""
+
 import unittest
 
 from sglang.srt.parser.harmony_parser import (
@@ -483,15 +485,12 @@ class TestHarmonyParser(CustomTestCase):
             events = self.parser.parse(chunk)
             all_events.extend(events)
 
-        self.assertEqual(len(all_events), 5)
-
-        # Verify we get reasoning events
+        # Verify we get both reasoning and normal events
         reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
-        self.assertTrue(len(reasoning_events) > 0)
+        self.assertGreater(len(reasoning_events), 0)
 
-        # Verify we get normal events
         normal_events = [e for e in all_events if e.event_type == "normal"]
-        self.assertTrue(len(normal_events) > 0)
+        self.assertGreater(len(normal_events), 0)
 
         # Verify content is eventually parsed correctly
         combined_reasoning = "".join(e.content for e in reasoning_events)

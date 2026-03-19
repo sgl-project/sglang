@@ -1,3 +1,5 @@
+"""Unit tests for srt/parser/reasoning_parser.py"""
+
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
@@ -483,8 +485,11 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning
-        # Note: buffer preserves original text including <think> tag
+        # Tool interruption should still work - flushes buffered reasoning.
+        # Note: when stream_reasoning=False, the <think> tag is stripped from the
+        # local `current_text` variable but NOT from `self._buffer` (which is never
+        # cleared in the non-streaming path). So the flushed reasoning content
+        # includes the raw <think> tag.
         result = detector.parse_streaming_increment("<tool_call>tool call")
         self.assertEqual(result.reasoning_text, "<think>thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
@@ -1027,6 +1032,33 @@ class TestReasoningParserAdvanced(CustomTestCase):
         parser = ReasoningParser("qwen3-thinking")
         self.assertTrue(parser.detector._in_reasoning)
 
+    def test_minimax_forces_reasoning(self):
+        """Test that minimax model type forces reasoning mode.
+
+        minimax maps to Qwen3Detector but ReasoningParser overrides
+        force_reasoning=True, unlike the default Qwen3Detector behavior.
+        """
+        parser = ReasoningParser("minimax")
+        self.assertIsInstance(parser.detector, Qwen3Detector)
+        self.assertTrue(parser.detector._in_reasoning)
+
+    def test_detector_map_aliases(self):
+        """Test that all DetectorMap alias keys create the correct detector type."""
+        # These are aliases that map to existing detector classes
+        alias_tests = {
+            "deepseek-v3": Qwen3Detector,
+            "step3": DeepSeekR1Detector,
+            "step3p5": DeepSeekR1Detector,
+            "interns1": Qwen3Detector,
+        }
+        for model_type, expected_class in alias_tests.items():
+            parser = ReasoningParser(model_type)
+            self.assertIsInstance(
+                parser.detector,
+                expected_class,
+                f"{model_type} should create {expected_class.__name__}",
+            )
+
     def test_continue_final_message_with_request(self):
         """Test continue_final_message passes previous content to detector."""
         from sglang.srt.entrypoints.openai.protocol import (
@@ -1050,11 +1082,18 @@ class TestReasoningParserAdvanced(CustomTestCase):
 
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
-        from unittest.mock import MagicMock
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
 
-        request = MagicMock()
-        request.continue_final_message = False
-        request.chat_template_kwargs = {"force_nonempty_content": True}
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+            ],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
         parser = ReasoningParser("nemotron_3", request=request)
         self.assertTrue(parser.detector._force_nonempty_content)
 
