@@ -49,7 +49,12 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
-from sglang.srt.utils.network import config_socket, get_local_ip_auto, get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    config_socket,
+    get_local_ip_auto,
+    get_zmq_socket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1002,11 +1007,10 @@ class MMEncoder:
             mm_data.embedding = None
 
         # Send ack/data
-        endpoint = (
-            f"tcp://{url}"
-            if url is not None
-            else f"tcp://{prefill_host}:{embedding_port}"
-        )
+        if url is not None:
+            endpoint = NetworkAddress.parse(url).to_tcp()
+        else:
+            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
@@ -1303,9 +1307,12 @@ def launch_server(server_args: ServerArgs):
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
     if server_args.dist_init_addr:
-        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+        na = NetworkAddress.parse(server_args.dist_init_addr)
+        dist_init_method = na.to_tcp()
     else:
-        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+        dist_init_method = NetworkAddress(
+            server_args.host or "127.0.0.1", port_args.nccl_port
+        ).to_tcp()
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
