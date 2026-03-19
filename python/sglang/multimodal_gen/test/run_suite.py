@@ -29,14 +29,19 @@ _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
 )
 
 SUITES = {
+    # no GPU required; safe to run on any CPU-only runner
+    "unit": [
+        "../unit/test_sampling_params.py",
+        "../unit/test_storage.py",
+        "../unit/test_lora_format_adapter.py",
+        "../unit/test_server_args.py",
+        # add new unit tests here
+    ],
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
-        "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
-        # unit tests (no server needed)
-        "../test_sampling_params_validate.py",
         "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
@@ -51,10 +56,19 @@ suites_ascend = {
     "1-npu": [
         "ascend/test_server_1_npu.py",
         # add new 1-npu test files here
-    ]
+    ],
+    "2-npu": [
+        "ascend/test_server_2_npu.py",
+        # add new 2-npu test files here
+    ],
+    "8-npu": [
+        "ascend/test_server_8_npu.py",
+        # add new 8-npu test files here
+    ],
 }
 
 SUITES.update(suites_ascend)
+STRICT_SUITES = {"unit"}
 
 
 def parse_args():
@@ -275,13 +289,17 @@ def main():
     for f_rel in suite_files_rel:
         f_abs = target_dir / f_rel
         if not f_abs.exists():
-            print(f"Warning: Test file {f_rel} not found in {target_dir}. Skipping.")
+            msg = f"Test file {f_rel} not found in {target_dir}."
+            if args.suite in STRICT_SUITES:
+                print(f"Error: {msg}")
+                sys.exit(1)
+            print(f"Warning: {msg} Skipping.")
             continue
         suite_files_abs.append(str(f_abs))
 
     if not suite_files_abs:
         print(f"No valid test files found for suite '{args.suite}'.")
-        sys.exit(0)
+        sys.exit(1 if args.suite in STRICT_SUITES else 0)
 
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)

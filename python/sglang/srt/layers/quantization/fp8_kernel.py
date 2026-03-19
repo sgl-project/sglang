@@ -37,6 +37,8 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -62,6 +64,10 @@ if _is_cuda:
         from sgl_kernel import sgl_per_token_group_quant_fp8
 
         enable_sgl_per_token_group_quant_8bit = False
+
+    from sglang.jit_kernel.per_token_group_quant_8bit import (
+        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+    )
 
 if _is_hip:
     _has_vllm = False
@@ -501,19 +507,31 @@ def sglang_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            sgl_per_token_group_quant_8bit(
-                x,
-                x_q,
-                x_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                fuse_silu_and_mul,
-                masked_m,
-                enable_v2=enable_v2,
-            )
+            if enable_v2:
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=True,
+                )
+            else:
+                sgl_per_token_group_quant_8bit_jit(
+                    input=x,
+                    output_q=x_q,
+                    output_s=x_s,
+                    group_size=group_size,
+                    eps=eps,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    scale_ue8m0=scale_ue8m0,
+                )
         else:
             assert not enable_v2
             sgl_per_token_group_quant_fp8(
@@ -1270,9 +1288,16 @@ def mxfp8_block_scaled_matmul_triton(
     block_m: int = 128,
     block_n: int = 256,
     block_k: int = 128,
-    num_stages: int = 4,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
-    """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
+    """Block-scaled matmul for MXFP8 using Triton dot_scaled.
+
+    Args:
+        num_stages: Number of pipeline stages. If None, auto-selects based on GPU:
+            SM120: 1, SM100: 4.
+    """
+    if num_stages is None:
+        num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b

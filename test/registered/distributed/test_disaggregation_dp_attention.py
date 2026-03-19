@@ -126,5 +126,43 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 1000)
 
 
+@unittest.skip(
+    "Skip this test until new testing logic in mini-lb has been updated in docker image."
+)
+class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention):
+    """Test external DP rank assignment via mini-lb --test-external-dp-routing.
+
+    NOTE: In PD disaggregation the response comes from the decode server,
+    so meta_info["dp_rank"] reflects the decode-side DP rank. Prefill DP
+    rank correctness is verified implicitly — if the wrong prefill DP
+    worker were used, KV transfer would fail and the request would error.
+    The mini-lb internally verifies meta_info["dp_rank"] matches the
+    assigned decode dp_rank; a mismatch returns HTTP 500.
+    """
+
+    @classmethod
+    def launch_lb(cls):
+        from sglang.test.test_utils import popen_with_error_check
+
+        lb_command = [
+            "python3",
+            "-m",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",
+            "--test-external-dp-routing",
+            "--prefill",
+            cls.prefill_url,
+            "--decode",
+            cls.decode_url,
+            "--host",
+            cls.base_host,
+            "--port",
+            cls.lb_port,
+        ]
+        cls.process_lb = popen_with_error_check(lb_command)
+        cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
+
+
 if __name__ == "__main__":
     unittest.main()

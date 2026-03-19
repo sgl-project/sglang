@@ -1,5 +1,7 @@
 import json
 import random
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
@@ -9,6 +11,7 @@ from sglang.benchmark.datasets.common import (
     ASSISTANT_SUFFIX,
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
+    BaseDataset,
     DatasetRow,
 )
 from sglang.benchmark.utils import (
@@ -16,6 +19,41 @@ from sglang.benchmark.utils import (
     is_file_valid_json,
     remove_suffix,
 )
+
+
+@dataclass
+class ShareGPTDataset(BaseDataset):
+    dataset_path: str
+    num_requests: int
+    fixed_output_len: Optional[int]
+    context_len: Optional[int]
+    prompt_suffix: str
+    apply_chat_template: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "ShareGPTDataset":
+        assert not getattr(args, "tokenize_prompt", False)
+        return cls(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            fixed_output_len=args.sharegpt_output_len,
+            context_len=args.sharegpt_context_len,
+            prompt_suffix=args.prompt_suffix,
+            apply_chat_template=args.apply_chat_template,
+        )
+
+    def load(
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
+    ) -> List[DatasetRow]:
+        return sample_sharegpt_requests(
+            dataset_path=self.dataset_path,
+            num_requests=self.num_requests,
+            tokenizer=tokenizer,
+            fixed_output_len=self.fixed_output_len,
+            context_len=self.context_len,
+            prompt_suffix=self.prompt_suffix,
+            apply_chat_template=self.apply_chat_template,
+        )
 
 
 def sample_sharegpt_requests(

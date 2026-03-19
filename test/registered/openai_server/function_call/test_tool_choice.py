@@ -12,7 +12,7 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -860,7 +860,6 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #         cls.tokenizer = get_tokenizer(cls.model)
 
 
-@unittest.skipIf(is_hip(), "Disabled for AMD")
 class TestToolChoiceLfm2(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2 model"""
 

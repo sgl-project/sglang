@@ -61,6 +61,7 @@ Its core features include:
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
    advanced_features/cuda_graph_for_multi_modal_encoder.md
+   advanced_features/piecewise_cuda_graph.md
    advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
@@ -130,6 +131,7 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/post_training_integration.md
+   references/release_lookup
    references/learn_more.md
 
 .. toctree::

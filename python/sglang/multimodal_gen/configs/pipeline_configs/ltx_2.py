@@ -115,7 +115,8 @@ def _gemma_postprocess_func(
 class LTX2PipelineConfig(PipelineConfig):
     """Configuration for LTX-Video pipeline."""
 
-    task_type: ModelTaskType = ModelTaskType.T2V
+    task_type: ModelTaskType = ModelTaskType.TI2V
+    skip_input_image_preprocess: bool = True
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
     # Model architecture
