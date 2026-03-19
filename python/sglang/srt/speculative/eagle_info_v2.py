@@ -232,6 +232,19 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                batch.mamba_track_indices = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -297,7 +310,7 @@ class EagleVerifyInputV2Mixin:
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu:
+        if sampling_info.is_all_greedy or _is_npu or _is_hip:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(

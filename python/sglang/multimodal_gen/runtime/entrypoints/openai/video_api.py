@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import time
 from typing import Any, Dict, Optional
 
@@ -30,9 +32,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
+    DEFAULT_FPS,
+    DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
-    adjust_output_quality,
+    build_sampling_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -46,65 +49,39 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
-# NOTE(mick): the sampling params needs to be further adjusted
-# FIXME: duplicated with the one in `image_api.py`
-def _build_sampling_params_from_request(
-    request_id: str, request: VideoGenerationsRequest
-) -> SamplingParams:
-    if request.size is None:
-        width, height = None, None
-    else:
-        width, height = _parse_size(request.size)
-    seconds = request.seconds if request.seconds is not None else 4
-    fps_default = 24
-    fps = request.fps if request.fps is not None else fps_default
-    derived_num_frames = fps * seconds
-    num_frames = (
-        request.num_frames if request.num_frames is not None else derived_num_frames
+def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
+    """Resolve video-specific defaults (fps, seconds → num_frames) then
+    delegate to the shared build_sampling_params."""
+    seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+    fps = request.fps if request.fps is not None else DEFAULT_FPS
+    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+
+    return build_sampling_params(
+        request_id,
+        prompt=request.prompt,
+        size=request.size,
+        num_frames=num_frames,
+        fps=fps,
+        image_path=request.input_reference,
+        output_file_name=request_id,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        guidance_scale_2=request.guidance_scale_2,
+        negative_prompt=request.negative_prompt,
+        enable_teacache=request.enable_teacache,
+        enable_frame_interpolation=request.enable_frame_interpolation,
+        frame_interpolation_exp=request.frame_interpolation_exp,
+        frame_interpolation_scale=request.frame_interpolation_scale,
+        frame_interpolation_model_path=request.frame_interpolation_model_path,
+        enable_upscaling=request.enable_upscaling,
+        upscaling_model_path=request.upscaling_model_path,
+        upscaling_scale=request.upscaling_scale,
+        output_path=request.output_path,
+        output_compression=request.output_compression,
+        output_quality=request.output_quality,
     )
-
-    server_args = get_global_server_args()
-    sampling_kwargs = {
-        "request_id": request_id,
-        "prompt": request.prompt,
-        "num_frames": num_frames,
-        "fps": fps,
-        "width": width,
-        "height": height,
-        "image_path": request.input_reference,
-        "save_output": True,
-        "output_file_name": request_id,
-        "seed": request.seed,
-        "generator_device": request.generator_device,
-    }
-    if request.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = request.guidance_scale
-    if request.guidance_scale_2 is not None:
-        sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
-    if request.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = request.negative_prompt
-    if request.enable_teacache is not None:
-        sampling_kwargs["enable_teacache"] = request.enable_teacache
-    if request.output_path is not None:
-        sampling_kwargs["output_path"] = request.output_path
-    if request.output_compression is not None:
-        sampling_kwargs["output_compression"] = request.output_compression
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        **sampling_kwargs,
-    )
-
-    if request.num_inference_steps is not None:
-        sampling_params.num_inference_steps = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_params.guidance_scale = request.guidance_scale
-    if request.seed is not None:
-        sampling_params.seed = request.seed
-
-    return sampling_params
 
 
 # extract metadata which http_server needs to know
@@ -127,7 +104,29 @@ def _video_job_from_sampling(
     }
 
 
-async def _dispatch_job_async(job_id: str, batch: Req) -> None:
+async def _save_first_input_image(
+    image_sources, request_id: str, uploads_dir: str
+) -> str | None:
+    """Save the first input image from a list of sources and return its path."""
+    image_list = merge_image_input_list(image_sources)
+    if not image_list:
+        return None
+    image = image_list[0]
+
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    filename = image.filename if hasattr(image, "filename") else "url_image"
+    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    return await save_image_to_path(image, target_path)
+
+
+async def _dispatch_job_async(
+    job_id: str,
+    batch: Req,
+    *,
+    temp_dirs: list[str] | None = None,
+    output_persistent: bool = True,
+) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
@@ -138,12 +137,15 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
+        persistent_path = (
+            save_file_path if not cloud_url and output_persistent else None
+        )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
             "url": cloud_url,
-            "file_path": save_file_path if not cloud_url else None,
+            "file_path": persistent_path,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -154,10 +156,12 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
+    finally:
+        for td in temp_dirs or []:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 # TODO: support image to video generation
-# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
@@ -176,6 +180,13 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_frame_interpolation: Optional[bool] = Form(False),
+    frame_interpolation_exp: Optional[int] = Form(1),
+    frame_interpolation_scale: Optional[float] = Form(1.0),
+    frame_interpolation_model_path: Optional[str] = Form(None),
+    enable_upscaling: Optional[bool] = Form(False),
+    upscaling_model_path: Optional[str] = Form(None),
+    upscaling_scale: Optional[int] = Form(4),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -186,30 +197,40 @@ async def create_video(
     server_args = get_global_server_args()
     task_type = server_args.pipeline_config.task_type
 
+    # Resolve input upload directory (may be a temp dir when saving is disabled)
+    temp_dirs: list[str] = []
+    if server_args.input_save_path is not None:
+        uploads_dir = server_args.input_save_path
+        os.makedirs(uploads_dir, exist_ok=True)
+    else:
+        uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+        temp_dirs.append(uploads_dir)
+
+    # Resolve output directory
+    effective_output_path = server_args.output_path
+    output_persistent = True
+    if "multipart/form-data" not in content_type:
+        # JSON body may carry a per-request output_path; checked after parsing below
+        pass
+
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
         # Validate image input based on model task type
-        image_list = merge_image_input_list(input_reference, reference_url)
-        if task_type.requires_image_input() and not image_list:
+        image_sources = merge_image_input_list(input_reference, reference_url)
+        if task_type.requires_image_input() and not image_sources:
             raise HTTPException(
                 status_code=400,
                 detail="input_reference or reference_url is required for image-to-video generation",
             )
-        input_path = None
-        if image_list:
-            # Save first input image for image-to-video generation
-            image = image_list[0]
-            uploads_dir = os.path.join("outputs", "uploads")
-            os.makedirs(uploads_dir, exist_ok=True)
-            filename = image.filename if hasattr(image, "filename") else "url_image"
-            input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
-            try:
-                input_path = await save_image_to_path(image, input_path)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400, detail=f"Failed to process image source: {str(e)}"
-                )
+        try:
+            input_path = await _save_first_input_image(
+                image_sources, request_id, uploads_dir
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
+            )
 
         # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
         extra_from_form: Dict[str, Any] = {}
@@ -237,6 +258,13 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_frame_interpolation=enable_frame_interpolation,
+            frame_interpolation_exp=frame_interpolation_exp,
+            frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
             output_compression=output_compression,
             output_quality=output_quality,
             **(
@@ -268,17 +296,12 @@ async def create_video(
                     status_code=400,
                     detail="input_reference or reference_url is required for image-to-video generation",
                 )
-            # for not multipart/form-data type
+            # for non-multipart/form-data type
             if payload.get("reference_url"):
-                image_list = merge_image_input_list(payload.get("reference_url"))
-                # Save first input image
-                image = image_list[0]
-                uploads_dir = os.path.join("outputs", "uploads")
-                os.makedirs(uploads_dir, exist_ok=True)
-                filename = image.filename if hasattr(image, "filename") else "url_image"
-                input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
                 try:
-                    input_path = await save_image_to_path(image, input_path)
+                    input_path = await _save_first_input_image(
+                        payload.get("reference_url"), request_id, uploads_dir
+                    )
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,
@@ -289,9 +312,24 @@ async def create_video(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
+    # Resolve per-request output_path override
+    effective_output_path = req.output_path or server_args.output_path
+    if effective_output_path is None:
+        output_tmp = tempfile.mkdtemp(prefix="sglang_output_")
+        temp_dirs.append(output_tmp)
+        effective_output_path = output_tmp
+        output_persistent = False
+
+    # Inject resolved output_path so _build_video_sampling_params picks it up
+    req.output_path = effective_output_path
+
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
-    sampling_params = _build_sampling_params_from_request(request_id, req)
+    try:
+        sampling_params = _build_video_sampling_params(request_id, req)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 
@@ -300,15 +338,18 @@ async def create_video(
         server_args=server_args,
         sampling_params=sampling_params,
     )
-    if batch.output_compression is None:
-        batch.output_compression = adjust_output_quality(
-            req.output_quality, batch.data_type
-        )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(_dispatch_job_async(request_id, batch))
+    asyncio.create_task(
+        _dispatch_job_async(
+            request_id,
+            batch,
+            temp_dirs=temp_dirs or None,
+            output_persistent=output_persistent,
+        )
+    )
     return VideoResponse(**job)
 
 

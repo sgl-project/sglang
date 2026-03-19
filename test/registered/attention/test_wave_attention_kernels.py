@@ -155,6 +155,8 @@ class TestWaveAttention(unittest.TestCase):
             is_causal,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         o_wave = torch.empty(
@@ -240,6 +242,7 @@ class TestWaveAttention(unittest.TestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
             logit_cap,
         )
 

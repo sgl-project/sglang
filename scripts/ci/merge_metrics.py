@@ -22,8 +22,14 @@ from datetime import datetime, timezone
 
 def find_partition_files(input_dir: str) -> list[str]:
     """Find all partition metric files in the input directory."""
-    pattern = os.path.join(input_dir, "**/metrics-*.json")
-    return glob.glob(pattern, recursive=True)
+    patterns = [
+        os.path.join(input_dir, "**/metrics-*.json"),
+        os.path.join(input_dir, "**/diffusion-metrics-*.json"),
+    ]
+    files = set()
+    for pattern in patterns:
+        files.update(glob.glob(pattern, recursive=True))
+    return list(files)
 
 
 def load_partition_metrics(filepath: str) -> dict | None:

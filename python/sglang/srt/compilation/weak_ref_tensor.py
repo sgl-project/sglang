@@ -13,7 +13,7 @@ else:
 
 
 def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
+    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
 ) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
     """
     Convenience function to create weak references to tensors,

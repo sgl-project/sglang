@@ -7,7 +7,12 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
 - **Broad Model Support**: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image, and more
 - **Fast Inference**: Optimized kernels, efficient scheduler loop, and Cache-DiT acceleration
 - **Ease of Use**: OpenAI-compatible API, CLI, and Python SDK
-- **Multi-Platform**: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
+- **Multi-Platform**:
+  - NVIDIA GPUs (H100, H200, A100, B200, 4090)
+  - AMD GPUs (MI300X, MI325X)
+  - Ascend NPU (A2, A3)
+  - Apple Silicon (M-series via MPS)
+  - Moore Threads GPUs (MTT S5000)
 
 ---
 
@@ -50,6 +55,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 
 - **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
 - **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
+- **[Post-Processing](api/post_processing.md)** - Frame interpolation (RIFE) and upscaling (Real-ESRGAN)
 
 ### Performance Optimization
 

@@ -381,24 +381,19 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             "ComfyUIZImagePipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage"
         )
 
-        # Add ComfyUILatentPreparationStage to handle latents properly for SP
-        # This stage includes device mismatch fix for ComfyUI pipelines in multi-GPU scenarios
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=ComfyUILatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
+        self.add_stages(
+            [
+                ComfyUILatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                ),
+                DenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                ),
+            ]
         )
 
-        # Add DenoisingStage for the actual denoising process
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
         logger.info(
             f"ComfyUIZImagePipeline stages created: {list(self._stage_name_mapping.keys())}"
         )

@@ -102,7 +102,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 ```
 
 > **Note**
-> The `response_format=url` option is not supported for `POST /v1/images/generations` and will return a `400` error.
+> If `response_format=url` is used and cloud storage is not configured, the API returns
+> a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
 **Edit an image**
 
@@ -136,7 +137,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 
 **Download image content**
 
-When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
+When `response_format=url` is used with `POST /v1/images/generations` or `POST /v1/images/edits`,
+the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
 **Endpoint:** `GET /v1/images/{image_id}/content`
 

@@ -331,7 +331,20 @@ def copy_trace_files(source_dir, target_base_path):
 
 
 def publish_traces(traces_dir, run_id, run_number):
-    """Publish traces to GitHub repository in a single commit"""
+    """Publish traces from a single directory to GitHub repository in a single commit"""
+    target_base_path = f"traces/{run_id}"
+    files_to_upload = copy_trace_files(traces_dir, target_base_path)
+
+    if not files_to_upload:
+        print("No trace files found to upload")
+        return
+
+    print(f"Found {len(files_to_upload)} files to upload")
+    publish_traces_from_files(files_to_upload, run_id, run_number)
+
+
+def publish_traces_from_files(files_to_upload, run_id, run_number):
+    """Publish pre-collected trace files to GitHub repository in a single commit"""
     # Get environment variables
     token = os.getenv("GITHUB_TOKEN")
     if not token:
@@ -342,16 +355,6 @@ def publish_traces(traces_dir, run_id, run_number):
     repo_owner = "sglang-bot"
     repo_name = "sglang-ci-data"
     branch = "main"
-    target_base_path = f"traces/{run_id}"
-
-    # Copy trace files
-    files_to_upload = copy_trace_files(traces_dir, target_base_path)
-
-    if not files_to_upload:
-        print("No trace files found to upload")
-        return
-
-    print(f"Found {len(files_to_upload)} files to upload")
 
     # Verify token permissions before proceeding
     permission_check = verify_token_permissions(repo_owner, repo_name, token)
@@ -475,8 +478,10 @@ def main():
     parser.add_argument(
         "--traces-dir",
         type=str,
+        action="append",
+        dest="traces_dirs",
         required=True,
-        help="Traces directory to publish",
+        help="Traces directory to publish (can be specified multiple times)",
     )
     args = parser.parse_args()
 
@@ -490,12 +495,22 @@ def main():
         )
         sys.exit(1)
 
-    # Use traces directory
-    traces_dir = args.traces_dir
-    print(f"Processing traces from directory: {traces_dir}")
+    # Collect trace files from all directories
+    target_base_path = f"traces/{run_id}"
+    all_files = []
+    for traces_dir in args.traces_dirs:
+        print(f"Processing traces from directory: {traces_dir}")
+        files = copy_trace_files(traces_dir, target_base_path)
+        all_files.extend(files)
 
-    # Publish traces
-    publish_traces(traces_dir, run_id, run_number)
+    if not all_files:
+        print("No trace files found to upload across all directories")
+        return
+
+    print(f"Found {len(all_files)} total files to upload")
+
+    # Publish all collected traces in a single commit
+    publish_traces_from_files(all_files, run_id, run_number)
 
 
 if __name__ == "__main__":

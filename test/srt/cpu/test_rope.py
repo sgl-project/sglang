@@ -3,9 +3,9 @@ import unittest
 import torch
 from utils import precision
 
-from sglang.srt.layers.rotary_embedding import (
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
-    RotaryEmbedding,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase

@@ -77,7 +77,7 @@ class MultiPlatformOp(nn.Module):
         raise NotImplementedError
 
     def forward_npu(self, *args, **kwargs):
-        raise NotImplementedError
+        return self.forward_native(*args, **kwargs)
 
     def forward_hip(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)

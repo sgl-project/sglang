@@ -43,12 +43,9 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         cls.short_context_prompt = "The capital of France is"
 
         # Test prompt longer than window size
-        cls.long_context_prompt = (
-            """
+        cls.long_context_prompt = """
         Once upon a time, there was a mountain. In the mountain, there was a temple. In the temple, there was an old monk telling a story. The story was:
-        """
-            * 100
-        )
+        """ * 100
         cls.long_context_prompt += "\nNow, summarize the story in one sentence:"
 
     def _test_mmlu(self):

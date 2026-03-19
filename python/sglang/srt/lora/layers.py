@@ -21,7 +21,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -67,6 +67,23 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+
+        # Embedding LoRA with TP > 1 keeps weights fully replicated
+        # (unsharded) on every rank.  This works correctly because the
+        # base VocabParallelEmbedding all-reduces its output before the
+        # LoRA delta is added, but it means each rank holds the full
+        # LoRA A (rank, vocab_size) and LoRA B (embed_dim, rank) tensors,
+        # which may cause OOM on large vocabularies or high LoRA ranks.
+        #
+        # input_scattered mode (DeepSeek-v2 MLA) skips the base
+        # all-reduce, making the unsharded LoRA approach mathematically
+        # incorrect — a sharded LoRA kernel would be needed.
+        if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            assert (
+                not get_attn_tp_context().allow_input_scattered
+            ), "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
 
         self.output_offset = torch.tensor(
             [0, self.embed_dim],
@@ -186,33 +203,28 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # LoRA A weights (rank, vocab_size) are not sliced for embedding
-        # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA A weights (rank, vocab_size) are kept unsharded.
+        # Each rank does a full embedding lookup; the result is complete
+        # on every rank and added to the already all-reduced base output.
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # LoRA B weights (embedding_dim, rank) would be sliced along embedding dimension for TP>1
-        # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA B weights (embedding_dim, rank) are kept unsharded.
+        # The base embedding output is all-reduced (full embedding_dim),
+        # so LoRA B must also produce full embedding_dim.
+        return B
 
 
 class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     """
-    Parallel LM Head layer with LoRA support (simplified for TP=1).
+    Parallel LM Head layer with LoRA support.
 
     The LM head computes logits = hidden_states @ (W + B @ A)^T
+
+    With TP > 1, lm_head is column-parallel: each rank holds
+    weight (vocab_size/tp_size, hidden_size) and produces a shard
+    of logits.  LoRA A is kept unsharded (rank, hidden_size) while
+    LoRA B is sliced along the vocab dimension to (vocab_size/tp_size, rank).
     """
 
     def __init__(
@@ -224,11 +236,40 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
-        self.output_offset = torch.tensor(
-            [0, self.vocab_size],
-            dtype=torch.int32,
-            device=next(base_layer.parameters()).device,
-        )
+
+        tp_size = base_layer.tp_size if hasattr(base_layer, "tp_size") else 1
+
+        # lm_head LoRA keeps A unsharded and shards B along the vocab
+        # dimension, matching the column-parallel base output.  This is
+        # incompatible with input_scattered mode where the all-reduce is
+        # skipped.
+        if tp_size > 1:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            if get_attn_tp_context().allow_input_scattered:
+                raise ValueError(
+                    "ParallelLMHeadWithLoRA is not compatible with "
+                    "input_scattered mode (e.g., DeepSeek-v2 MLA with "
+                    "--enable-attn-tp-input-scattered). Please disable "
+                    "input_scattered or remove lm_head from LoRA "
+                    "target modules."
+                )
+
+            self.shard_vocab_size = get_lm_head_lora_b_shard_size(
+                self.vocab_size,
+                shard_indices=base_layer.shard_indices,
+            )
+            self.output_offset = torch.tensor(
+                [0, self.shard_vocab_size],
+                dtype=torch.int32,
+                device=next(base_layer.parameters()).device,
+            )
+        else:
+            self.output_offset = torch.tensor(
+                [0, self.vocab_size],
+                dtype=torch.int32,
+                device=next(base_layer.parameters()).device,
+            )
 
     def set_lora_info(
         self,
@@ -240,8 +281,46 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
         self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
 
+    def _get_lm_head_batch_info(self, num_tokens: int):
+        """Resolve and validate the active lm_head batch_info.
+
+        When the logits processor calls lm_head in multiple passes
+        (chunked logprobs), _lm_head_pass_idx selects a precomputed
+        per-pass batch_info.  Otherwise the full-pruned batch_info is used.
+
+        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
+        """
+        pass_idx = self.lora_backend._lm_head_pass_idx
+        if (
+            pass_idx is not None
+            and self.lora_backend.lm_head_pass_batch_infos is not None
+        ):
+            batch_info = self.lora_backend.lm_head_pass_batch_infos[pass_idx]
+        else:
+            batch_info = self.lora_backend.lm_head_batch_info
+
+        if batch_info is not None:
+            if batch_info.use_cuda_graph:
+                raise RuntimeError(
+                    "lm_head LoRA with pruned batch info is not supported "
+                    "under CUDA graph. lm_head pruning should only occur "
+                    "during extend, which does not use CUDA graph."
+                )
+            if num_tokens != batch_info.expected_tokens:
+                raise RuntimeError(
+                    f"lm_head LoRA input token count mismatch: got "
+                    f"{num_tokens} tokens but lm_head_batch_info expects "
+                    f"{batch_info.expected_tokens}. This likely means "
+                    f"a pruning step in LogitsProcessor._get_pruned_states is "
+                    f"not reflected in get_lm_head_pruned_lens()."
+                )
+
+        return batch_info
+
     def apply_lora(
-        self, base_output: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        base_output: torch.Tensor,
+        hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """
         Apply LoRA to LM head layer.
@@ -250,9 +329,13 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
         """
+        lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
+
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
-            hidden_states, self.lm_head_A_buffer
+            hidden_states,
+            self.lm_head_A_buffer,
+            pruned_batch_info=lm_head_batch_info,
         )
 
         # Apply lora_B^T: lora_a_output @ B^T
@@ -261,6 +344,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             weights=self.lm_head_B_buffer,
             output_offset=self.output_offset,
             base_output=base_output,
+            pruned_batch_info=lm_head_batch_info,
         )
 
         return lora_output
@@ -277,25 +361,40 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
         return base_output
 
+    # ------------------------------------------------------------------
+    # Multi-pass lm_head support (chunked logprobs)
+    # ------------------------------------------------------------------
+
+    def set_lm_head_pass(self, pass_idx: int):
+        """Set the active lm_head pass index before a logprobs chunk.
+
+        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        each chunk's _get_logits call.  _get_lm_head_batch_info() will
+        resolve to lm_head_pass_batch_infos[pass_idx].
+        """
+        self.lora_backend._lm_head_pass_idx = pass_idx
+
+    def reset_lm_head_pass(self):
+        """Reset the lm_head pass index after all passes are done."""
+        self.lora_backend._lm_head_pass_idx = None
+
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA A weights (rank, hidden_size) are kept unsharded.
+        # Each rank receives full hidden_states, so A operates on full input.
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # lm_head is column-parallel: each rank produces vocab_size/tp_size (shard_vocab_size)
+        # logits.  LoRA B (vocab_size, rank) must be sliced along the vocab
+        # dimension to match the sharded base output.
+        # Uses the base layer's shard_indices for the actual vocab range on
+        # this rank, staying consistent with base model weight sharding.
+        tp_size = self.base_layer.tp_size if hasattr(self.base_layer, "tp_size") else 1
+        if tp_size <= 1:
+            return B
+        start_idx = self.base_layer.shard_indices.org_vocab_start_index
+        end_idx = self.base_layer.shard_indices.org_vocab_end_index
+        return B[start_idx:end_idx, :]
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -541,17 +640,31 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
-
-        if (
+        should_reduce = (
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
-        ):
+        )
+
+        if self.set_lora and should_reduce:
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                input_parallel, self.A_buffer
+            )
             output_ = tensor_model_parallel_all_reduce(output_parallel)
+            lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
+            output_ = self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output,
+                weights=self.B_buffer,
+                output_offset=self.output_offset,
+                base_output=output_,
+            )
         else:
-            output_ = output_parallel
+            if self.set_lora:
+                output_parallel = self.apply_lora(output_parallel, input_parallel)
+            if should_reduce:
+                output_ = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output_ = output_parallel
 
         if not self.base_layer.skip_bias_add:
             output = (
