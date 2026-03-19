@@ -137,6 +137,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -511,6 +512,24 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                )
+
+        # Load multimodal processor for M-RoPE fallback computation.
+        self._mm_processor = None
+        if self.model_config.is_multimodal and self.processor is not None:
+            try:
+                import_processors("sglang.srt.multimodal.processors")
+                self._mm_processor = get_mm_processor(
+                    self.model_config.hf_config,
+                    server_args,
+                    self.processor,
+                    "default",
+                    skip_mm_pool=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load multimodal processor in scheduler; "
+                    "M-RoPE fallback will not be available."
                 )
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
@@ -1326,12 +1345,21 @@ class Scheduler(
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
+        # In DP attention mode, use the globally synchronized is_extend_in_batch
+        # so all DP ranks make the same overlap decision (avoiding deadlock).
+        # In non-DP mode, use the local forward_mode directly.
+        if self.require_mlp_sync:
+            is_extend = lambda b: b and b.is_extend_in_batch
+        else:
+            is_extend = lambda b: b and b.forward_mode.is_extend()
+
+        batch_is_extend = is_extend(batch)
+        last_batch_is_extend = is_extend(self.last_batch)
+
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch
-            and batch.forward_mode.is_extend()
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and batch_is_extend
+            and last_batch_is_extend
         )
 
         # We do not support overlap + spec + grammar yet,
@@ -1596,6 +1624,23 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_compute_mrope_positions(self, req) -> None:
+        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+        if self._mm_processor is None:
+            return
+        mm = req.multimodal_inputs
+        if mm is None or mm.mrope_positions is not None:
+            return
+
+        mrope_positions, mrope_position_delta = (
+            self._mm_processor.compute_mrope_positions(
+                req.origin_input_ids, mm.mm_items
+            )
+        )
+        if mrope_positions is not None:
+            mm.mrope_positions = mrope_positions
+            mm.mrope_position_delta = mrope_position_delta
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1727,6 +1772,7 @@ class Scheduler(
                 req.origin_input_ids, image_inputs
             )
             req.extend_image_inputs(image_inputs)
+            self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1980,6 +2026,7 @@ class Scheduler(
                 )
 
             req.extend_image_inputs(image_inputs)
+            self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -2284,9 +2331,8 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

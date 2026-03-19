@@ -676,6 +676,74 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
         ).to_host_port_str()
 
+    def _publish_modelexpress_metadata(self):
+        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        try:
+            from modelexpress import p2p_pb2
+            from modelexpress.client import MxClient
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress support requires the 'modelexpress' package. "
+                "Install it with: pip install modelexpress"
+            ) from exc
+
+        model_name = (
+            self.server_args.modelexpress_model_name or self.server_args.model_path
+        )
+        mx_url = self.server_args.modelexpress_url
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return
+
+        # Build tensor descriptors from weight_info dict
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+
+        mx_client = MxClient(server_url=mx_url)
+        try:
+            logger.info(
+                "ModelExpress source: publishing metadata for model=%s, "
+                "tp_rank=%d, session=%s, %d tensors",
+                model_name,
+                self.tp_rank,
+                session_id,
+                len(tensors),
+            )
+            mx_client.publish_metadata(model_name, [worker])
+            mx_client.publish_ready(
+                model_name,
+                worker_id=self.tp_rank,
+                session_id=mx_client.session_id,
+                metadata_hash="",
+            )
+            logger.info(
+                "ModelExpress source: published ready for model=%s, tp_rank=%d",
+                model_name,
+                self.tp_rank,
+            )
+        finally:
+            mx_client.close()
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
@@ -963,6 +1031,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            modelexpress_url=self.server_args.modelexpress_url,
+            modelexpress_model_name=self.server_args.modelexpress_model_name
+            or self.server_args.model_path,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -1014,6 +1085,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
         monkey_patch_vllm_parallel_state(reverse=True)
+
+        # Publish metadata to ModelExpress if running as seed source
+        if self.server_args.modelexpress_source:
+            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
+            # call register_memory_region(). Do it here so weight_info is populated.
+            if (
+                self.remote_instance_transfer_engine_weight_info is None
+                and self.remote_instance_transfer_engine is not None
+            ):
+                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+                    register_memory_region,
+                )
+
+                self.remote_instance_transfer_engine_weight_info = (
+                    register_memory_region(
+                        self.model, self.remote_instance_transfer_engine
+                    )
+                )
+            self._publish_modelexpress_metadata()
 
         get_offloader().post_init()
 
