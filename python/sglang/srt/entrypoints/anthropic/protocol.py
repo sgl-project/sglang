@@ -96,11 +96,13 @@ class AnthropicCountTokensResponse(BaseModel):
 
     input_tokens: int
 
+
 class AnthropicThinking(BaseModel):
     """Thinking configuration for extended thinking"""
 
     type: Literal["enabled", "disabled"] = "enabled"
     budget_tokens: Optional[int] = None
+
 
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""

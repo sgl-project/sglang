@@ -408,7 +408,9 @@ class AnthropicServing:
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
                         cache_read_input_tokens=(
-                            usage_info.get("cache_read_input_tokens", 0) if usage_info else 0
+                            usage_info.get("cache_read_input_tokens", 0)
+                            if usage_info
+                            else 0
                         ),
                     ),
                 )
@@ -476,7 +478,8 @@ class AnthropicServing:
             if not chunk.choices and chunk.usage:
                 cached = (
                     chunk.usage.prompt_tokens_details.cached_tokens
-                    if chunk.usage.prompt_tokens_details else 0
+                    if chunk.usage.prompt_tokens_details
+                    else 0
                 )
                 usage_info = {
                     "input_tokens": chunk.usage.prompt_tokens,
