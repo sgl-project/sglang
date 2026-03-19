@@ -213,6 +213,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -4546,7 +4547,8 @@ class ServerArgs:
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
             "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
             "NOTE: This replaces the deprecated environment variable "
             "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
