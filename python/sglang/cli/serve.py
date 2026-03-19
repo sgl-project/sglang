@@ -6,6 +6,9 @@ import os
 
 from sglang.cli.utils import get_is_diffusion_model, get_model_path
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
 
 logger = logging.getLogger(__name__)
 
