@@ -7,6 +7,8 @@ import pickle
 from collections import deque
 from typing import Any, List
 
+from sglang.srt.utils.common import safe_pickle_loads
+
 import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -271,7 +273,7 @@ class Scheduler:
                     identity, payload = parts[0], parts[-1]
 
                     # Ignore malformed probes or non-pickle data
-                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                    recv_reqs = safe_pickle_loads(payload) if len(parts) > 2 else []
                 except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:

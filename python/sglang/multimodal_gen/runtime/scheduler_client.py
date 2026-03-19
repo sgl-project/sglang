@@ -6,6 +6,7 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import safe_pickle_loads
 
 logger = init_logger(__name__)
 
@@ -26,7 +27,7 @@ async def run_zeromq_broker(server_args: ServerArgs):
         try:
             # 1. Receive a request from an offline client
             payload = await socket.recv()
-            request_batch = pickle.loads(payload)
+            request_batch = safe_pickle_loads(payload)
             logger.info("Broker received an offline job from a client.")
 
             # 2. Forward the request to the main Scheduler via the shared client
@@ -80,7 +81,7 @@ class SchedulerClient:
         """Sends a batch or request to the scheduler and waits for the response."""
         try:
             self.scheduler_socket.send_pyobj(batch)
-            output_batch = self.scheduler_socket.recv_pyobj()
+            output_batch = safe_pickle_loads(self.scheduler_socket.recv())
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
@@ -103,7 +104,7 @@ class SchedulerClient:
         try:
             ping_socket.connect(endpoint)
             ping_socket.send_pyobj({"method": "ping"})
-            ping_socket.recv_pyobj()
+            safe_pickle_loads(ping_socket.recv())
             return True
         except zmq.error.Again:
             return False
@@ -163,7 +164,7 @@ class AsyncSchedulerClient:
         try:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
-            return pickle.loads(payload)
+            return safe_pickle_loads(payload)
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")

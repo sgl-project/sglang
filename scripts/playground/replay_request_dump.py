@@ -19,6 +19,7 @@ from datetime import datetime
 import requests
 
 from sglang.benchmark.utils import set_ulimit
+from sglang.srt.utils.common import safe_pickle_load
 from sglang.utils import get_exception_traceback
 
 
@@ -54,7 +55,7 @@ def normalize_request_data(json_data):
 def read_records(files):
     records = []
     for f in files:
-        tmp = pickle.load(open(f, "rb"))
+        tmp = safe_pickle_load(open(f, "rb"))
         if isinstance(tmp, dict) and "requests" in tmp:
             records.extend(tmp["requests"])
         else:

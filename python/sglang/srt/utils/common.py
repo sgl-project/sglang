@@ -2244,6 +2244,8 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "sglang.srt.disaggregation.",
+        "sglang.multimodal_gen.",
         "torch_npu.",
     }
 
@@ -2277,6 +2279,16 @@ class SafeUnpickler(pickle.Unpickler):
             f"Blocked unsafe class loading ({module}.{name}), "
             f"to prevent exploitation of CVE-2025-10164"
         )
+
+
+def safe_pickle_loads(data: bytes):
+    """Drop-in replacement for pickle.loads() that blocks unsafe class loading."""
+    return SafeUnpickler(io.BytesIO(data)).load()
+
+
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
 
 
 def debug_timing(func):
