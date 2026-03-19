@@ -723,6 +723,10 @@ impl RouterTrait for Router {
         self.proxy_get_request(req, "health_generate").await
     }
 
+    fn use_router_health_generate(&self) -> bool {
+        true
+    }
+
     async fn get_server_info(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "get_server_info").await
     }
