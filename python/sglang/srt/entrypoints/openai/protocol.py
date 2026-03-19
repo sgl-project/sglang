@@ -164,6 +164,7 @@ class StructuresResponseFormat(BaseModel):
 class JSONObjectFormat(BaseModel):
     type: Literal["json_object"]
 
+
 class JSONSchemaFormat(BaseModel):
     type: Literal["json_schema"]
     name: str
@@ -171,6 +172,7 @@ class JSONSchemaFormat(BaseModel):
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
     strict: Optional[bool] = False
+
 
 class ResponseTextFormat(BaseModel):
     format: Union[JSONSchemaFormat, JSONObjectFormat]
@@ -1289,9 +1291,7 @@ class ResponsesRequest(BaseModel):
         }
 
         if self.text and self.text.format and self.text.format.type == "json_schema":
-            params["json_schema"] = convert_json_schema_to_str(
-                self.text.format.schema_
-            )
+            params["json_schema"] = convert_json_schema_to_str(self.text.format.schema_)
         elif self.text and self.text.format and self.text.format.type == "json_object":
             params["json_schema"] = '{"type": "object"}'
 
@@ -1323,10 +1323,12 @@ class PromptTokenUsageInfo(BaseModel):
 
     cached_tokens: int = 0
 
+
 class OutputTokenUsageInfo(BaseModel):
     """Output token usage details."""
 
     reasoning_tokens: int = 0
+
 
 class ResponseUsageInfo(BaseModel):
     input_tokens: int = 0

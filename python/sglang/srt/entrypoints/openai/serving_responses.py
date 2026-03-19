@@ -49,24 +49,24 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
     Function,
+    OutputTokenUsageInfo,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseUsageInfo,
     Tool,
     ToolChoice,
-    ResponseUsageInfo,
-    OutputTokenUsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import parse_tool_calls_from_content
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import _is_complete_json
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
-from sglang.srt.function_call.utils import _is_complete_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -231,8 +231,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts, processed_messages = await self._make_request(
-                    request, prev_response, tokenizer
+                messages, request_prompts, engine_prompts, processed_messages = (
+                    await self._make_request(request, prev_response, tokenizer)
                 )
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
@@ -304,7 +304,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     sampling_params = request.to_sampling_params(
                         default_max_tokens=default_max_tokens,
                         default_params=self.default_sampling_params,
-                        tool_call_constraint=processed_messages.tool_call_constraint if processed_messages else None,
+                        tool_call_constraint=(
+                            processed_messages.tool_call_constraint
+                            if processed_messages
+                            else None
+                        ),
                     )
 
                     context: ConversationContext
@@ -526,8 +530,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 num_generated_tokens = (
                     len(final_res["outputs"][0]["token_ids"])
-                    if (final_res.get("outputs") and
-                        final_res["outputs"][0].get("token_ids"))
+                    if (
+                        final_res.get("outputs")
+                        and final_res["outputs"][0].get("token_ids")
+                    )
                     else 0
                 )
                 num_cached_tokens = final_res.get("num_cached_tokens", 0)
@@ -686,7 +692,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "content": content.text,
                             }
                         )
-
 
         # Append the new input
         # Responses API supports simple text inputs without chat format
@@ -996,7 +1001,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         simple_ctx_prev_text = current_text
 
                         if reasoning_parser:
-                            reasoning_content, new_chunk = reasoning_parser.parse_stream_chunk(new_chunk)
+                            reasoning_content, new_chunk = (
+                                reasoning_parser.parse_stream_chunk(new_chunk)
+                            )
                             if reasoning_content:
                                 yield _send_event(
                                     openai_responses_types.ResponseReasoningTextDeltaEvent(
@@ -1026,16 +1033,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 )
                                 simple_ctx_sent_reasoning_done = True
 
-
                         if new_chunk:
                             # Parse for function calls if parser is available
                             if streaming_fc_parser:
                                 if isinstance(streaming_fc_parser, JsonArrayParser):
-                                    result = streaming_fc_parser.parse_streaming_increment(new_chunk, function_tools)
-                                    normal_text, tool_calls = result.normal_text, result.calls
+                                    result = (
+                                        streaming_fc_parser.parse_streaming_increment(
+                                            new_chunk, function_tools
+                                        )
+                                    )
+                                    normal_text, tool_calls = (
+                                        result.normal_text,
+                                        result.calls,
+                                    )
                                 else:
-                                    normal_text, tool_calls = streaming_fc_parser.parse_stream_chunk(
-                                        new_chunk
+                                    normal_text, tool_calls = (
+                                        streaming_fc_parser.parse_stream_chunk(
+                                            new_chunk
+                                        )
                                     )
 
                                 # Emit text delta for normal text
@@ -1097,12 +1112,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         fc_item_id = f"fc_{random_uuid()[:16]}"
                                         fc_call_id = f"call_{random_uuid()[:24]}"
                                         tool_call_states[tool_index] = {
-                                            'item_id': fc_item_id,
-                                            'call_id': fc_call_id,
-                                            'name': function_name,
-                                            'arguments': args_str,
-                                            'emitted_added': False,
-                                            'emitted_done': False
+                                            "item_id": fc_item_id,
+                                            "call_id": fc_call_id,
+                                            "name": function_name,
+                                            "arguments": args_str,
+                                            "emitted_added": False,
+                                            "emitted_done": False,
                                         }
                                         yield _send_event(
                                             openai_responses_types.ResponseOutputItemAddedEvent(
@@ -1119,14 +1134,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                                                 ),
                                             )
                                         )
-                                        tool_call_states[tool_index]['emitted_added'] = True
+                                        tool_call_states[tool_index][
+                                            "emitted_added"
+                                        ] = True
                                     else:
                                         # update existing function calls
                                         state = tool_call_states[tool_index]
-                                        if function_name and not state['name']:
-                                            state['name'] = function_name
+                                        if function_name and not state["name"]:
+                                            state["name"] = function_name
                                         if args_str:
-                                            state['arguments'] += args_str
+                                            state["arguments"] += args_str
 
                                     current_state = tool_call_states[tool_index]
                                     # Emit arguments delta
@@ -1135,28 +1152,30 @@ class OpenAIServingResponses(OpenAIServingChat):
                                             openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
                                                 type="response.function_call_arguments.delta",
                                                 sequence_number=-1,
-                                                item_id=current_state['item_id'],
+                                                item_id=current_state["item_id"],
                                                 output_index=current_output_index,
-                                                call_id=current_state['call_id'],
+                                                call_id=current_state["call_id"],
                                                 delta=args_str,
                                             )
                                         )
 
                                     if (
-                                        not current_state['emitted_done']
-                                        and current_state['arguments']
-                                        and _is_complete_json(current_state['arguments'])
+                                        not current_state["emitted_done"]
+                                        and current_state["arguments"]
+                                        and _is_complete_json(
+                                            current_state["arguments"]
+                                        )
                                     ):
                                         # Emit function call done
                                         yield _send_event(
                                             openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
                                                 type="response.function_call_arguments.done",
                                                 sequence_number=-1,
-                                                item_id=current_state['item_id'],
+                                                item_id=current_state["item_id"],
                                                 output_index=current_output_index,
-                                                call_id=current_state['call_id'],
-                                                name=current_state['name'],
-                                                arguments=current_state['arguments'],
+                                                call_id=current_state["call_id"],
+                                                name=current_state["name"],
+                                                arguments=current_state["arguments"],
                                             )
                                         )
                                         yield _send_event(
@@ -1165,16 +1184,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                                                 sequence_number=-1,
                                                 output_index=current_output_index,
                                                 item=ResponseFunctionToolCall(
-                                                    id=current_state['item_id'],
+                                                    id=current_state["item_id"],
                                                     type="function_call",
-                                                    call_id=current_state['call_id'],
-                                                    name=current_state['name'],
-                                                    arguments=current_state['arguments'],
+                                                    call_id=current_state["call_id"],
+                                                    name=current_state["name"],
+                                                    arguments=current_state[
+                                                        "arguments"
+                                                    ],
                                                     status="completed",
                                                 ),
                                             )
                                         )
-                                        current_state['emitted_done'] = True
+                                        current_state["emitted_done"] = True
                             else:
                                 # No function call parser, just emit text deltas
                                 if not simple_ctx_sent_message_added:
@@ -1563,10 +1584,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if isinstance(context, SimpleContext) and simple_ctx_sent_message_added:
             content = openai_responses_types.ResponseOutputText(
-                        type="output_text",
-                        text=simple_ctx_accumulated_text,
-                        annotations=[],
-                    )
+                type="output_text",
+                text=simple_ctx_accumulated_text,
+                annotations=[],
+            )
             yield _send_event(
                 openai_responses_types.ResponseContentPartDoneEvent(
                     type="response.content_part.done",

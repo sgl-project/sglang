@@ -10,7 +10,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     Tool,
 )
-
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.utils import random_uuid
 
@@ -121,6 +120,7 @@ def process_cached_tokens_details_from_ret(
             host=details.get("host", 0),
         )
 
+
 def parse_tool_calls_from_content(
     content: str,
     tools: List[Tool],
@@ -166,4 +166,3 @@ def parse_tool_calls_from_content(
             remaining_text = content
 
     return remaining_text, tool_calls
-
