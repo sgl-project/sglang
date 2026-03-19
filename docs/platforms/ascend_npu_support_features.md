@@ -163,7 +163,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |----------------------------------------|---------------|-----------------------------------------------------------|:----------------:|
 | `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                 |      A2, A3      |
 | `--load-balance-method`                | `auto` | `auto`,<br/> `round_robin`,<br/> `follow_bootstrap_room`,<br/> `total_requests`,<br/> `total_tokens` |      A2, A3      |
-| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                            |      A2, A3      |
 
 ## Multi-node distributed serving
 

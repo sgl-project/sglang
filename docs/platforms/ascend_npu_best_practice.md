@@ -148,7 +148,7 @@ do
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 12 14 16 18 20 22 24 26 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3  \
-        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
         --load-balance-method decode_round_robin
         NODE_RANK=$i
         break
@@ -265,7 +265,7 @@ do
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
-        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
         --load-balance-method decode_round_robin
         NODE_RANK=$i
         break
@@ -549,8 +549,8 @@ do
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
         --cuda-graph-bs 8 10 12 14 16 18 20 22 24 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
-        --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		    --load-balance-method decode_round_robin
+        --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
+		--load-balance-method decode_round_robin
         NODE_RANK=$i
         break
     fi
@@ -750,8 +750,8 @@ do
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
         --cuda-graph-bs 8 10 12 14 16 18 20 22 24 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
-        --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		    --load-balance-method decode_round_robin
+        --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
+		--load-balance-method decode_round_robin
         NODE_RANK=$i
         break
     fi
@@ -964,7 +964,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
 --disaggregation-transfer-backend ascend \
 --disaggregation-mode decode \
---prefill-round-robin-balance \
 --load-balance-method round_robin \
 --nnodes $nnodes --node-rank $VC_TASK_INDEX \
 --dist-init-addr ${IPs[0]}:10000 --load-balance-method decode_round_robin
@@ -1097,7 +1096,7 @@ do
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --dist-init-addr xxx:5000 \
         --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
-        --prefill-round-robin-balance --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 \
+        --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 \
         --load-balance-method decode_round_robin
         NODE_RANK=$i
         break
@@ -2016,8 +2015,8 @@ do
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend ascend_fuseep --cuda-graph-bs 16 32 48 56 64 72 80 88 96 \
         --dist-init-addr DIP1:5000 \
-	      --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
-        --prefill-round-robin-balance --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 --load-balance-method decode_round_robin
+	    --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 --load-balance-method decode_round_robin
         NODE_RANK=$i
         break
     fi
