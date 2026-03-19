@@ -17,7 +17,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+# Register this test for CUDA CI in stage-b (fast attention/kernel tests)
+register_cuda_ci(est_time=25, suite="stage-b-test-large-1-gpu")
 
 
 def reference_normal_decode_set_metadata(
@@ -304,7 +308,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         self._run_test(batch_size=1, max_seq_len=128, page_size=1, has_swa=False)
         self._run_test(batch_size=1, max_seq_len=256, page_size=64, has_swa=False)
 
-    def test_max_seq_pages_zero(self):
+    def test_max_seq_pages_small(self):
         """Test edge case where max_seq_pages could be very small."""
         # This tests when sequences are very short
         test_data = self._create_test_data(
