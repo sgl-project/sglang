@@ -8,6 +8,7 @@ register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
 
+import unittest
 from typing import Optional
 
 import pytest
@@ -119,6 +120,7 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
@@ -151,6 +153,7 @@ def causal_conv1d_opcheck_fn(
     bias = bias.contiguous() if bias is not None else None
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -183,6 +186,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -262,6 +266,7 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
