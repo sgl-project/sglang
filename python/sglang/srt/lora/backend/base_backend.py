@@ -2,10 +2,11 @@ from typing import Tuple, Union
 
 import torch
 
+from sglang.srt.lora.backend.lmhead_mixing import LoRABackendLmHeadMixing
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class BaseLoRABackend:
+class BaseLoRABackend(LoRABackendLmHeadMixing):
     """Base class for different Lora backends.
        Each backend has its own implementation of Lora kernels.
 
@@ -18,6 +19,7 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        self.init_lm_head_config()
 
     def run_lora_a_embedding(
         self,
