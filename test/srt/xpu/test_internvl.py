@@ -92,6 +92,7 @@ class TestInternVL25Server(ImageOpenAITestMixin, InternVLXPUServerBase):
     use_sgl_xpu = True
     extra_args = [
         "--cuda-graph-max-bs=4",
+        "--schedule-conservativeness=1.3",
     ]
 
     def test_video_images_chat_completion(self):
@@ -142,6 +143,8 @@ class TestInternVL35_2BTritonServer(ImageOpenAITestMixin, InternVLXPUServerBase)
         # Video test exceeds max_prefill_tokens on InternVL3.5.
         pass
 
+# Delete the mixin classes so that they are not collected by pytest
+del ImageOpenAITestMixin
 
 if __name__ == "__main__":
     unittest.main()
