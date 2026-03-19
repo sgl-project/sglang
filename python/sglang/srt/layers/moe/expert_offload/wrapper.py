@@ -115,6 +115,11 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
         self.manager = ExpertOffloadManager(self.config, device)
         self.manager.initialize_from_weights(layer)
 
+        # Register manager for cross-layer prefetch chaining.
+        from sglang.srt.layers.moe.expert_offload import register_manager
+
+        register_manager(self.config.layer_idx, self.manager, layer)
+
         logger.info(
             f"[ExpertOffload] Layer {self.config.layer_idx}: "
             f"{self.config.num_resident_experts}/{self.config.num_local_experts} resident "
@@ -143,7 +148,17 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
           - Decode (CUDA graph replay): resident -> VRAM, offloaded -> PCIe.
         Full correctness in all phases.
         """
-        return self.gpu_method.apply(layer, dispatch_output)
+        result = self.gpu_method.apply(layer, dispatch_output)
+
+        if self.manager is not None:
+            # One-shot lazy chaining (no-op after first call).
+            from sglang.srt.layers.moe.expert_offload import chain_managers
+
+            chain_managers()
+
+            self.manager.trigger_prefetch_for_next_layer()
+
+        return result
 
     # ------------------------------------------------------------------
     # Transparent attribute delegation

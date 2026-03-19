@@ -71,16 +71,41 @@ If fewer IDs are provided than `--expert-offload-num-resident`, the remaining sl
 ## Example: GLM-5-FP8 on 8x H20 (96 GB)
 
 ```bash
+pip install --upgrade transformers
+
 python3 -m sglang.launch_server --model-path /models/GLM-5-FP8 \
   --host 0.0.0.0 --port 8080 \
   --mem-fraction-static 0.85 --tensor-parallel-size 8 \
+  --hicache-io-backend kernel \
   --attention-backend flashinfer \
   --reasoning-parser glm45 \
   --tool-call-parser glm47 \
   --expert-offload-num-resident 200 \
   --expert-offload-resident-selection frequency \
-  --enable-flashinfer-allreduce-fusion
+  --enable-flashinfer-allreduce-fusion \
+  --decode-log-interval 2 \
+  --expert-offload-prefetch-num 3 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-num-steps 5
 ```
+
+## Cross-Layer Pipeline Prefetch
+
+When a decode token is routed to an offloaded expert, the MoE kernel stalls while reading weight pages at PCIe bandwidth instead of HBM bandwidth. Cross-layer prefetch mitigates this by issuing `cudaMemPrefetchAsync` for the next layer's hot offloaded experts on a background CUDA stream, overlapping the PCIe transfer with the current layer's attention and layernorm computation.
+
+Enable it with `--expert-offload-prefetch-num N`:
+
+```bash
+--expert-offload-num-resident 200 \
+--expert-offload-resident-selection frequency \
+--expert-offload-prefetch-num 3
+```
+
+If the prefetch completes before the next MoE kernel launches, the kernel reads at HBM speed. If not, the kernel falls back to PCIe read-through (existing behavior). However, prefetching too many experts can cause GPU memory pressure and page thrashing, which degrades decode speed.
+
+**Tuning**: Start with `--expert-offload-prefetch-num 2`. Higher values prefetch more experts but consume more PCIe bandwidth and GPU memory, which can cause page thrashing. Typical sweet spot is 2-4 depending on model size and available GPU memory headroom.
 
 ## How It Works
 
@@ -107,3 +132,4 @@ python3 -m sglang.launch_server --model-path /models/GLM-5-FP8 \
 | `--expert-offload-num-resident` | Number of experts kept resident on GPU per MoE layer. `-1` disables offloading. | `-1` |
 | `--expert-offload-resident-selection` | Strategy for choosing resident experts: `first_n`, `frequency`, or `manual`. | `first_n` |
 | `--expert-offload-resident-ids` | Comma-separated expert IDs for `manual` selection mode. | `None` |
+| `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch for the next layer on a background stream. `0` disables. | `0` |
