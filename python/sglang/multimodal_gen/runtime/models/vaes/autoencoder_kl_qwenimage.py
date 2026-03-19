@@ -977,7 +977,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
 
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
-            return self.tiled_decode(z)
+            return self.tiled_decode(z).sample
 
         self.clear_cache()
         x = self.post_quant_conv(z)
@@ -1100,15 +1100,19 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
         return enc
 
-    def tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
+    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         r"""
         Decode a batch of images using a tiled decoder.
 
         Args:
             z (`torch.Tensor`): Input batch of latent vectors.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
 
         Returns:
-            `torch.Tensor`: The decoded images.
+            [`~models.vae.DecoderOutput`] or `tuple`:
+                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
+                returned.
         """
         _, _, num_frames, height, width = z.shape
         sample_height = height * self.spatial_compression_ratio
@@ -1153,7 +1157,11 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 result_row.append(tile[:, :, :, : self.tile_sample_stride_height, : self.tile_sample_stride_width])
             result_rows.append(torch.cat(result_row, dim=-1))
 
-        return torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+        dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+
+        if not return_dict:
+            return (dec,)
+        return DecoderOutput(sample=dec)
 
     def forward(
         self,
@@ -1161,7 +1169,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         sample_posterior: bool = False,
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Args:
             sample (`torch.Tensor`): Input sample.
