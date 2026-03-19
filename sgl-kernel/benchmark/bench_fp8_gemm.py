@@ -7,7 +7,8 @@ from typing import Optional, Tuple
 import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
-from sgl_kernel import sgl_per_tensor_quant_fp8
+
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 # Optional vLLM import
 try:
@@ -97,7 +98,7 @@ def sglang_scaled_fp8_quant(
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         is_static = False
-    sgl_per_tensor_quant_fp8(input, output, scale, is_static)
+    per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 

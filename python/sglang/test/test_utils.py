@@ -38,11 +38,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
     is_cuda,
-    is_port_available,
     is_xpu,
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
@@ -165,6 +165,25 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
                     f"Failed to download image after {max_retries} retries: {image_url}"
                 ) from e
             time.sleep(2**i)
+
+
+def flush_cache_with_retry(
+    base_url: str, retries: int = 5, interval: float = 2.0
+) -> bool:
+    """Flush device cache with retry.
+
+    The scheduler may still have in-flight HiCache async ops (GPU↔Host↔L3)
+    that prevent is_fully_idle() from returning True, so we retry.
+    """
+    for _ in range(retries):
+        try:
+            response = requests.post(f"{base_url}/flush_cache", timeout=10)
+            if response.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(interval)
+    return False
 
 
 def is_in_ci():
@@ -2056,6 +2075,7 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 
 class CustomTestCase(unittest.TestCase):
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
