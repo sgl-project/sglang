@@ -146,6 +146,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    create_shared_pause_flag,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
@@ -602,7 +603,6 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
@@ -1946,7 +1946,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
+            logger.info("Start of pd disaggregation warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -2188,6 +2188,7 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
+        pause_flag_shm = create_shared_pause_flag(os.getpid())
 
     try:
         # Update logging configs
@@ -2289,6 +2290,8 @@ def _setup_and_run_http_server(
         if server_args.tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()
+            pause_flag_shm.close()
+            pause_flag_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 

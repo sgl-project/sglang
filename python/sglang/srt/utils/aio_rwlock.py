@@ -68,6 +68,7 @@ class RWLock:
             finally:
                 # Decrement waiting writers only after we've acquired the writer lock
                 self._waiting_writers -= 1
+                self._cond.notify_all()
 
     async def release_writer(self):
         async with self._lock:

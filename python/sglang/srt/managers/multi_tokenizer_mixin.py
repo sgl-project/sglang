@@ -404,6 +404,9 @@ class TokenizerWorker(TokenizerManager):
             self.send_to_scheduler, 2
         )
 
+        main_pid = get_main_process_id()
+        self._init_shared_pause(get_shared_pause_shm_name(main_pid))
+
     def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
 
         if isinstance(req, BaseReq):
@@ -475,6 +478,28 @@ def read_from_shared_memory(name: str) -> Any:
         return data
     except FileNotFoundError:
         raise FileNotFoundError(f"Shared memory {name} not found")
+
+
+SHARED_PAUSE_SHM_PREFIX = "sglang_pause_"
+
+
+def get_shared_pause_shm_name(pid: int) -> str:
+    return f"{SHARED_PAUSE_SHM_PREFIX}{pid}"
+
+
+def create_shared_pause_flag(pid: int) -> shared_memory.SharedMemory:
+    """Returns a SharedMemory object, which the caller must close and unlink on shutdown."""
+    name = get_shared_pause_shm_name(pid)
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        if shm.size < 1:
+            shm.close()
+            shm.unlink()
+            shm = shared_memory.SharedMemory(create=True, size=1, name=name)
+    except FileNotFoundError:
+        shm = shared_memory.SharedMemory(create=True, size=1, name=name)
+    shm.buf[0] = 0
+    return shm
 
 
 def write_data_for_multi_tokenizer(

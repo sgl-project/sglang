@@ -1,4 +1,8 @@
+import concurrent.futures
+import time
 import unittest
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -72,6 +76,46 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
+
+    def test_pause_continue_generation(self):
+        """Test that pause/continue works across all tokenizer workers."""
+
+        def generate(timeout=30):
+            return requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                },
+                timeout=timeout,
+            )
+
+        requests.post(
+            self.base_url + "/pause_generation",
+            json={"mode": "in_place"},
+            timeout=30,
+        ).raise_for_status()
+
+        num_requests = 16
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as pool:
+            futures = [pool.submit(generate, timeout=60) for _ in range(num_requests)]
+
+            time.sleep(2)
+
+            done = [f for f in futures if f.done()]
+            self.assertEqual(
+                len(done),
+                0,
+                f"{len(done)}/{num_requests} requests completed while paused",
+            )
+
+            requests.post(
+                self.base_url + "/continue_generation", json={}
+            ).raise_for_status()
+
+            for f in concurrent.futures.as_completed(futures, timeout=60):
+                resp = f.result()
+                self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":
