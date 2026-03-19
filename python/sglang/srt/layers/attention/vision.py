@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     print_info_once,
 )
 from sglang.srt.utils.multi_stream_utils import (
@@ -36,6 +37,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -372,8 +374,8 @@ class VisionTritonAttention(nn.Module):
                 k,
                 v,
                 output,
-                cu_seqlens.cuda(),
-                seq_lens.cuda(),
+                cu_seqlens.to(q.device),
+                seq_lens.to(q.device),
                 max_seqlen,
                 is_causal=False,
             )
@@ -972,6 +974,8 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
+        elif _is_xpu:
+            backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():

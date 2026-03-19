@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
@@ -106,7 +107,9 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
+            distributed_init_method=NetworkAddress(
+                "127.0.0.1", self.master_port
+            ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
 
@@ -254,8 +257,8 @@ class GPUWorker:
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only and self.rank == 0:
-                if output_batch.output is not None:
+            if req.save_output and req.return_file_paths_only:
+                if self.rank == 0 and output_batch.output is not None:
                     output_paths = save_outputs(
                         output_batch.output,
                         req.data_type,
@@ -274,7 +277,15 @@ class GPUWorker:
                         upscaling_scale=req.upscaling_scale,
                     )
                     output_batch.output_file_paths = output_paths
-                    output_batch.output = None
+
+                # No rank needs to hold on to generated tensors once the file-path
+                # response has been materialized on rank 0
+                output_batch.output = None
+                output_batch.audio = None
+                output_batch.audio_sample_rate = None
+
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

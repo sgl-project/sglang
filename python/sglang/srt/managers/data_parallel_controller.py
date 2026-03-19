@@ -47,13 +47,11 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
-    bind_port,
     configure_logger,
-    get_zmq_socket,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, bind_port, get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -290,7 +288,8 @@ class DataParallelController:
         # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
             na = NetworkAddress(
-                "127.0.0.1", server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+                server_args.host or "127.0.0.1",
+                server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
             )
         else:
             na = NetworkAddress.parse(server_args.dist_init_addr)

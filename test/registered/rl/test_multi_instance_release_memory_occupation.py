@@ -1,3 +1,4 @@
+import gc
 import multiprocessing
 import os
 import time
@@ -216,10 +217,20 @@ def _run_sglang_subprocess(
         # 5 - release hf model
         _mem_usage = get_gpu_memory_gb(rank)
         print(f"GPU{rank} Memory usage after resuming Sgl weights: {_mem_usage}")
+        # In transformers v5, from_pretrained with device_map attaches accelerate
+        # dispatch hooks that hold strong refs to parameters. Remove them first.
+        try:
+            from accelerate.hooks import remove_hook_from_submodules
+
+            remove_hook_from_submodules(hf_model)
+        except (ImportError, Exception):
+            pass
         del hf_model
         hf_model = None
+        gc.collect()
         torch.cuda.empty_cache()
         time.sleep(3)
+        gc.collect()
         torch.cuda.empty_cache()
         _curr_usage = get_gpu_memory_gb(rank)
         assert (
