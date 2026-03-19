@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       model_list:
-        description: 'Model list to benchmark on MI350X (JSON array format, default: ["Qwen3.5-397B-A17B"])'
+        description: 'Model list to benchmark on MI355X (JSON array format, default: ["Qwen3.5-397B-A17B", "Qwen3.5-397B-A17B-FP8"])'
         required: false
-        default: '["Qwen3.5-397B-A17B"]'
+        default: '["Qwen3.5-397B-A17B", "Qwen3.5-397B-A17B-FP8"]'
       image:
         description: 'Image to use for the benchmark (default: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301")'
         required: true
@@ -26,11 +26,11 @@ env:
 
 jobs:
   benchmark:
-    runs-on: mi350x-1node-8gpus
+    runs-on: mi355x-1node-8gpus
     strategy:
       fail-fast: false
       matrix:
-        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3.5-397B-A17B"]') }} 
+        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3.5-397B-A17B", "Qwen3.5-397B-A17B-FP8"]') }} 
 
     steps:
       - name: Checkout code
@@ -117,6 +117,7 @@ jobs:
           fi
 
           echo "Starting container: sglang_test:ci"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --device=/dev/mem \
             --ipc=host \
@@ -126,10 +127,12 @@ jobs:
             --privileged \
             --cap-add=CAP_SYS_ADMIN \
             --cap-add=SYS_PTRACE \
-            -v /data/models:/models \
+            -v /mnt/nfs/huggingface/:/models \
+            -e HF_HOME=/models/ \
+            -e HF_HUB_OFFLINE=1 \
             --security-opt seccomp=unconfined \
-            -w /sglang-checkout \
             --name sglang_test \
+            -w /sglang-checkout \
             sglang_test:ci
 
       - name: Show Aiter version
@@ -147,6 +150,8 @@ jobs:
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B/ 8 60"
+          elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B-FP8/ 8 60"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -159,6 +164,8 @@ jobs:
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B/ 8"
+          elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B-FP8/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -171,18 +178,20 @@ jobs:
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B/ 8"
+          elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B-FP8/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
           fi
 
-      - name: Clean Up
-        if: always()
-        run: |
-          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
-          docker stop sglang_test 2>/dev/null || true
-          docker rm sglang_test 2>/dev/null || true
-          docker image rm sglang_test:ci 2>/dev/null || true
-          docker rmi -f $(docker images -f "dangling=true" -q) || true
-          docker image prune -f 2>/dev/null || true
-          docker builder prune -f 2>/dev/null || true
+      # - name: Clean Up
+      #   if: always()
+      #   run: |
+      #     docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
+      #     docker stop sglang_test 2>/dev/null || true
+      #     docker rm sglang_test 2>/dev/null || true
+      #     docker image rm sglang_test:ci 2>/dev/null || true
+      #     docker rmi -f $(docker images -f "dangling=true" -q) || true
+      #     docker image prune -f 2>/dev/null || true
+      #     docker builder prune -f 2>/dev/null || true
