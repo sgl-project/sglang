@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_alike
+from sglang.srt.utils import is_cuda_alike, get_bool_env_var
 
 _is_cuda_alike = is_cuda_alike()
 
@@ -132,6 +132,13 @@ def cutlass_w4a8_moe(
         dtype=torch.float8_e4m3fn,
     )
 
+    if get_bool_env_var("DYNAMIC_W4AFP8_QUANT", False):
+        a_q = torch.empty(
+            a.shape, dtype=torch.float8_e4m3fn, device=device
+        )
+        a1_scale = torch.empty((1), dtype=torch.float32, device=device)
+        per_tensor_quant_fp8(a, a_q, a1_scale, False)
+
     pre_reorder_for_cutlass_moe(
         a,
         gateup_input,
@@ -176,16 +183,25 @@ def cutlass_w4a8_moe(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        32,     # TODO : as para input
         topk,
     )
-
-    intermediate_q = torch.empty(
-        (m * topk, n), dtype=torch.float8_e4m3fn, device=device
-    )
-    silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
-    )
+    
+    if get_bool_env_var("DYNAMIC_W4AFP8_QUANT", False):
+        intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
+        silu_and_mul(c1, intermediate)
+        intermediate_q = torch.empty(
+            intermediate.shape, dtype=torch.float8_e4m3fn, device=device
+        )
+        a2_scale = torch.empty((1), dtype=torch.float32, device=device)
+        per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale, False)
+    else:
+        intermediate_q = torch.empty(
+            (m * topk, n), dtype=torch.float8_e4m3fn, device=device
+        )
+        silu_mul_static_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+        )
 
     cutlass_w4a8_moe_mm(
         c2,
@@ -199,7 +215,7 @@ def cutlass_w4a8_moe(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        32,     # # TODO : as para input
         topk,
     )
 

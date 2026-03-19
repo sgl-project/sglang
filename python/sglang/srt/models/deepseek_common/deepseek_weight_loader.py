@@ -233,6 +233,17 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
+                        # TODO need load from config.json or add another patten
+                        _is_kimi = get_bool_env_var("IS_KIMI", False)
+                        if _is_kimi:
+                            # weight_packed -> weight
+                            # if weight_packed in name replave with weight
+                            if "weight_packed" in name:
+                                name = name.replace("weight_packed", "weight")
+                            # weight_scale -> weight_scale_inv
+                            # if weight_scale in name replave with weight_scale_inv
+                            if "weight_scale" in name:
+                                name = name.replace("weight_scale", "weight_scale_inv")
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
                             continue
