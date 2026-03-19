@@ -152,9 +152,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -194,16 +191,6 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
-    # Dict{
-    #   rank: Tuple(
-    #           session_id,
-    #           Dict{
-    #               name: Tuple (d_ptr, numel, element_size)
-    #           }
-    #         )
-    # }
-    remote_instance_transfer_engine_info: Optional[Dict] = None
-    engine_info_bootstrap_port: Optional[int] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -1030,38 +1017,21 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
-    # Try bootstrap server first (preferred path for transfer engine info)
-    bootstrap_port = _global_state.engine_info_bootstrap_port
-    if bootstrap_port is not None:
-        try:
-            resp = requests.get(
-                f"http://127.0.0.1:{bootstrap_port}/get_transfer_engine_info",
-                params={"rank": rank},
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            pass
-
-    # Fallback to old _global_state path for backward compat
-    if (
-        _global_state.remote_instance_transfer_engine_info is None
-        or len(_global_state.remote_instance_transfer_engine_info) == 0
-    ):
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
+    bootstrap_port = (
+        _global_state.tokenizer_manager.server_args.engine_info_bootstrap_port
+    )
     try:
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
-                rank
-            ],
-        }
-        return result
-    except Exception as e:
-        logger.error(f"Exception: {e}")
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        resp = requests.get(
+            f"http://127.0.0.1:{bootstrap_port}/get_transfer_engine_info",
+            params={"rank": rank},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+
+    return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/init_weights_update_group")
@@ -1991,25 +1961,17 @@ def _setup_and_run_http_server(
     scheduler_infos: List[Dict],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
-    engine_info_bootstrap_port: Optional[int] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
     Called by launch_server after subprocesses have been launched.
     """
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-            engine_info_bootstrap_port=engine_info_bootstrap_port,
         )
     )
 
@@ -2192,11 +2154,6 @@ def launch_server(
         )
     )
 
-    # Determine bootstrap port if bootstrap server was started
-    engine_info_bootstrap_port = None
-    if scheduler_init_result.engine_info_bootstrap is not None:
-        engine_info_bootstrap_port = server_args.engine_info_bootstrap_port
-
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,
@@ -2205,5 +2162,4 @@ def launch_server(
         scheduler_init_result.scheduler_infos,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
-        engine_info_bootstrap_port=engine_info_bootstrap_port,
     )
