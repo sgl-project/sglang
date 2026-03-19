@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -20,13 +20,17 @@ async fn try_http_health_check(
     endpoint: &str,
     client: &Client,
 ) -> Result<(), String> {
-    let is_https = url.starts_with("https://");
-    let protocol = if is_https { "https" } else { "http" };
-    let clean_url = strip_protocol(url);
-    let health_url = format!("{}://{}{}", protocol, clean_url, endpoint);
+    let base_url = if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("http://{}", strip_protocol(url))
+    };
+    let health_url = Url::parse(&base_url)
+        .and_then(|base| base.join(endpoint))
+        .map_err(|e| format!("Invalid health check URL: {}", e))?;
 
     client
-        .get(&health_url)
+        .get(health_url)
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
@@ -108,11 +112,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
         let client = &app_context.client;
-        let endpoint = app_context.router_config.health_check.endpoint.clone();
+        let endpoint = &app_context.router_config.health_check.endpoint;
         let runtime_type = config.runtime.as_deref();
 
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout, &endpoint, client),
+            try_http_health_check(&url, timeout, endpoint, client),
             try_grpc_health_check(&url, timeout, runtime_type)
         );
 
@@ -150,7 +154,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use axum::{routing::get, Router};
-    use tokio::{net::TcpListener, sync::oneshot, time::sleep};
+    use tokio::{net::TcpListener, sync::oneshot};
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
     use super::DetectConnectionModeStep;
@@ -179,7 +183,19 @@ mod tests {
                 .unwrap();
         });
 
-        sleep(Duration::from_millis(50)).await;
+        let client = reqwest::Client::new();
+        let health_url = format!("http://{}/custom-health", addr);
+        for _ in 0..10 {
+            if let Ok(response) = client.get(&health_url).send().await {
+                if response.status().is_success() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = client.get(&health_url).send().await.unwrap();
+        assert!(response.status().is_success(), "server did not start in time");
 
         let config = RouterConfig::builder()
             .regular_mode(vec![])
