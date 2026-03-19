@@ -177,7 +177,7 @@ class GenerateSubcommand(CLISubcommand):
         generate_parser = subparsers.add_parser(
             "generate",
             help="Run inference on a model",
-            usage="sgl_diffusion generate (--model-path MODEL_PATH_OR_ID --prompt PROMPT) | --config CONFIG_FILE [OPTIONS]",
+            usage="sglang generate (--model-path MODEL_PATH_OR_ID --prompt PROMPT) | --config CONFIG_FILE [OPTIONS]",
         )
 
         generate_parser = add_multimodal_gen_generate_args(generate_parser)

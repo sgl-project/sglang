@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
+        # Init backend (XQA or TRTLLM-GEN)
+        # We need to specify q_type and out_type for different backend
+        # XQA: (q_type must be bf16)
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = bf16, out_type=model_runner.dtype
+        # TRTLLM-GEN:
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = fp8, out_type=model_runner.dtype
+        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -168,6 +179,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return
         swa_indices = self._maybe_translate_swa(page_indices)
         metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
+
+    def _get_layer_cache_loc(
+        self,
+        layer: RadixAttention,
+        cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return cache locations in the correct index space for the given layer."""
+        if self.use_sliding_window_kv_pool:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return self._swa_kv_pool.translate_loc_from_full_to_swa(cache_loc)
+        return cache_loc
 
     def _bind_swa_page_table(
         self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
@@ -540,7 +563,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         """Fused FP8 quantization and KV cache write."""
-        cache_loc = forward_batch.out_cache_loc
+        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
 
         # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -702,7 +725,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
+        # For XQA, q_dtype should be bf16
+        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

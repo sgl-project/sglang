@@ -316,8 +316,7 @@ The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode
 
 Note that in sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
-- Multi-node/PD disaggregation is still not supported
-- `moe_dense_tp_size=1`, `kv_cache_dtype = "bf16"`, `moe_a2a_backend = "deepep"`
+- `moe_dense_tp_size=1`, `moe_a2a_backend = "deepep"`
 - To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
 
 For more details, please refer to PR https://github.com/sgl-project/sglang/pull/12065.

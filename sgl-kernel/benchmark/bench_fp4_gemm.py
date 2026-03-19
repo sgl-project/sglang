@@ -5,8 +5,8 @@ import os
 import torch
 import triton
 from flashinfer import mm_fp4
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
+from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import get_device_capability, is_sm100_supported
 
 # CI environment detection

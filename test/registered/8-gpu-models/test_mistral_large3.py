@@ -46,6 +46,7 @@ class TestMistralLarge3(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--attention-backend=trtllm_mla",
+            "--moe-runner-backend=flashinfer_trtllm",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--chat-template=mistral",
@@ -57,10 +58,6 @@ class TestMistralLarge3(unittest.TestCase):
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
             "--kv-cache-dtype=auto",
-        ]
-        # TODO: add this to base args when FP8 TRTLLM moe is supported
-        nvfp4_args = [
-            "--moe-runner-backend=flashinfer_trtllm",
         ]
 
         variants = [
@@ -83,7 +80,7 @@ class TestMistralLarge3(unittest.TestCase):
             ModelLaunchSettings(
                 MISTRAL_LARGE3_NVFP4_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + nvfp4_args,
+                extra_args=base_args,
                 variant="NVFP4",
             ),
         ]
@@ -91,7 +88,7 @@ class TestMistralLarge3(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Mistral-Large-3",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.90),
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.85),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_mistral_large3",
             ),

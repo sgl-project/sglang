@@ -25,7 +25,7 @@ class AttentionBackendRegistry:
 def _dispatch_mla_subtype(attn, forward_batch):
     if _is_hip:
         if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA_FUSED_ROPE
+            return AttnForwardMethod.MLA_FUSED_ROPE_ROCM
         else:
             return AttnForwardMethod.MLA
     else:

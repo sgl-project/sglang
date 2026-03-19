@@ -47,11 +47,11 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
     load_token_map,
+    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
@@ -86,7 +86,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -143,6 +142,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
                 is_multi_layer_eagle=True,
             )
 
@@ -249,9 +249,12 @@ class MultiLayerEagleWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
-                batch
-            )
+            (
+                logits_output,
+                next_token_ids,
+                seq_lens_cpu,
+                can_run_cuda_graph,
+            ) = self.forward_target_extend(batch)
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
@@ -262,7 +265,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
             with self.draft_tp_context(
@@ -312,7 +315,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
     def forward_target_extend(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
         """Run the target extend.
 
         Args:
@@ -321,6 +324,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         Returns:
             logits_output: The output of logits. It will contain the full hidden states.
             next_token_ids: Next token ids generated.
+            seq_lens_cpu: CPU copy of sequence lengths for the draft prefill path.
+            can_run_cuda_graph: Whether the target prefill ran with cuda graph.
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
@@ -336,6 +341,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             logits_output,
             next_token_ids,
             model_worker_batch.seq_lens_cpu,
+            batch_result.can_run_cuda_graph,
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
@@ -381,6 +387,8 @@ class MultiLayerEagleWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        maybe_detect_nan(topk_p, "draft: NaN in initial topk_p from spec_info")
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -515,8 +523,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -623,8 +630,10 @@ class MultiLayerEagleWorker(TpModelWorker):
             logits_output = (
                 self.mtp_model_runner(step).forward(forward_batch).logits_output
             )
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -718,8 +727,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                     .logits_output
                 )
 
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_after_decode step {step} (cuda_graph={can_cuda_graph})",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)

@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -33,13 +35,18 @@ jobs:
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
           docker pull "${IMAGE}"
-          BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD)
-          echo "Image built from commit: ${BASE_SHA}"
+          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+            echo "Image built from commit: ${BASE_SHA}"
+          else
+            BASE_SHA=""
+            echo "::warning::Image has no .git directory — cannot extract base commit"
+          fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
       - name: Generate patches
         run: |
-          git fetch origin "${BASE_SHA}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch origin main
           mkdir -p /tmp/patch-ctx
 
           if [ -n "${{ inputs.pr_numbers }}" ]; then
@@ -48,14 +55,19 @@ jobs:
               pr=$(echo "${pr}" | xargs)
               echo "Fetching PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
-              git diff "${BASE_SHA}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
+              MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
+              echo "  PR #${pr}: merge-base=${MERGE_BASE}"
+              git diff "${MERGE_BASE}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
               echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
             done
-          else
+          elif [ -n "${BASE_SHA}" ]; then
             echo "Generating diff: image ${BASE_SHA} → latest main"
-            git fetch origin main
+            git fetch origin "${BASE_SHA}"
             git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
             echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
+          else
+            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+            exit 1
           fi
 
           TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
@@ -75,9 +87,13 @@ jobs:
           COPY *.patch /tmp/patches/
           RUN cd /sgl-workspace/sglang \
               && for p in /tmp/patches/*.patch; do \
-                   echo "Applying ${p}..." \
-                   && git apply --stat "${p}" \
-                   && git apply "${p}"; \
+                   if [ ! -s "${p}" ]; then \
+                     echo "Skipping ${p} (empty)"; \
+                   else \
+                     echo "Applying ${p}..." \
+                     && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
+                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
+                   fi; \
                  done \
               && rm -rf /tmp/patches
           DOCKERFILE
@@ -95,5 +111,5 @@ jobs:
           docker push "${IMAGE}"
 
           echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"

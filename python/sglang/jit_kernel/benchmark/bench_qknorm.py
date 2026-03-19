@@ -91,7 +91,7 @@ HEAD_DIM_RANGE = get_benchmark_range(
     ci_range=[128],
 )
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
+LINE_VALS = ["aot", "jit", "flashinfer", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
@@ -126,7 +126,7 @@ def benchmark(
     FN_MAP = {
         "aot": sglang_aot_qknorm,
         "jit": sglang_jit_qknorm,
-        "fi": flashinfer_qknorm,
+        "flashinfer": flashinfer_qknorm,
         "torch": torch_impl_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)

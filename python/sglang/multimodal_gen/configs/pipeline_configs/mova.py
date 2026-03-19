@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 class MOVAPipelineConfig(PipelineConfig):
     """Configuration for MOVA (text+image -> video+audio) pipelines."""
 
-    task_type: ModelTaskType = ModelTaskType.T2V
+    task_type: ModelTaskType = ModelTaskType.I2V
 
     # Model configs
     dit_config: MOVAVideoConfig = field(default_factory=MOVAVideoConfig)

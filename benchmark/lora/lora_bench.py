@@ -36,7 +36,7 @@ from sglang.bench_serving import (
     calculate_metrics,
     get_request,
 )
-from sglang.benchmark.datasets import sample_random_requests
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 global args

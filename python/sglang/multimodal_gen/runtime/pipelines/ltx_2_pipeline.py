@@ -1,6 +1,11 @@
 import inspect
 import json
+import math
 import os
+
+import numpy as np
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -50,14 +55,9 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
         vae_arch, "temporal_compression_ratio", None
     ) or getattr(server_args.pipeline_config, "vae_temporal_compression", None)
 
-    latent_num_frames = (int(num_frames) - 1) // int(vae_temporal_compression) + 1
-    latent_height = int(height) // int(vae_scale_factor)
-    latent_width = int(width) // int(vae_scale_factor)
-    video_sequence_length = latent_num_frames * latent_height * latent_width
-
     # Values from LTX2Pipeline in diffusers
     mu = calculate_shift(
-        video_sequence_length,
+        4096,
         base_seq_len=1024,
         max_seq_len=4096,
         base_shift=0.95,
@@ -101,6 +101,17 @@ def _filter_kwargs_for_cls(cls, kwargs):
     return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
 
+class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
+    """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
+
+    def _time_shift_exponential(self, mu, sigma, t):
+        if isinstance(t, np.ndarray):
+            t_torch = torch.from_numpy(t).to(torch.float32)
+            result = math.exp(mu) / (math.exp(mu) + (1 / t_torch - 1) ** sigma)
+            return result.numpy()
+        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+
 class LTX2Pipeline(ComposedPipelineBase):
     # NOTE: must match `model_index.json`'s `_class_name` for native dispatch.
     pipeline_name = "LTX2Pipeline"
@@ -115,6 +126,10 @@ class LTX2Pipeline(ComposedPipelineBase):
         "vocoder",
         "connectors",
     ]
+
+    def initialize_pipeline(self, server_args: ServerArgs):
+        orig = self.get_module("scheduler")
+        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stages(

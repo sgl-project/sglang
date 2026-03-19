@@ -154,6 +154,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 dtype=torch.int64,
                 device=batch.device,
             )
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
         self,

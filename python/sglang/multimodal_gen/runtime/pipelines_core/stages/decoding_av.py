@@ -37,7 +37,12 @@ class LTX2AVDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        latents = self.scale_and_shift(latents, server_args)
+        original_dtype = vae_dtype
+        self.vae.to(torch.bfloat16)
+        latents = latents.to(torch.bfloat16)
+        std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
+        mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
+        latents = latents * std + mean
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )
@@ -52,8 +57,6 @@ class LTX2AVDecodingStage(DecodingStage):
                     self.vae.enable_tiling()
             except Exception:
                 pass
-            if not vae_autocast_enabled:
-                latents = latents.to(vae_dtype)
             decode_output = self.vae.decode(latents)
             if isinstance(decode_output, tuple):
                 video = decode_output[0]
@@ -62,6 +65,7 @@ class LTX2AVDecodingStage(DecodingStage):
             else:
                 video = decode_output
 
+        self.vae.to(original_dtype)
         video = self.video_processor.postprocess_video(video, output_type="np")
 
         output_batch = OutputBatch(

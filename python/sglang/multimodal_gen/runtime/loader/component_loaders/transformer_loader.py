@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import os
@@ -23,13 +22,18 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
-    get_metadata_from_safetensors_file,
-    get_quant_config,
-    get_quant_config_from_safetensors_metadata,
     maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    get_metadata_from_safetensors_file,
+    get_quant_config,
+    get_quant_config_from_safetensors_metadata,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -76,9 +80,10 @@ class TransformerLoader(ComponentLoader):
         hf_config: Dict[str, List[str]],
         server_args: ServerArgs,
         safetensors_list: list[str],
+        component_model_path: str,
     ) -> Optional[dict]:
         # priority: model config.json → safetensors metadata → nunchaku config
-        quant_config = get_quant_config(hf_config)
+        quant_config = get_quant_config(hf_config, component_model_path)
         if quant_config is None and server_args.transformer_weights_path:
             # try to read quantization_config from the safetensors metadata header
             for safetensors_file in safetensors_list:
@@ -130,7 +135,10 @@ class TransformerLoader(ComponentLoader):
         safetensors_list = self.get_list_of_safetensors_to_load(
             server_args, component_model_path
         )
-        quant_config = self._resolve_quant_config(config, server_args, safetensors_list)
+
+        quant_config = self._resolve_quant_config(
+            config, server_args, safetensors_list, component_model_path
+        )
 
         # 3. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -146,12 +154,6 @@ class TransformerLoader(ComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
-        if cls_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported."
-            )
-
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
@@ -167,20 +169,21 @@ class TransformerLoader(ComponentLoader):
             param_dtype,
         )
 
-        init_params: dict[str, Any] = {"config": dit_config, "hf_config": config}
         # prepare init_param
-        if "quant_config" in inspect.signature(model_cls.__init__).parameters:
-            init_params.update(
-                {
-                    "quant_config": (quant_config if quant_config else nunchaku_config),
-                }
+        init_params: dict[str, Any] = {
+            "config": dit_config,
+            "hf_config": config,
+            "quant_config": (quant_config if quant_config else nunchaku_config),
+        }
+        if (
+            init_params["quant_config"] is None
+            and server_args.transformer_weights_path is not None
+        ):
+            logger.warning(
+                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
-            if init_params["quant_config"] is None:
-                logger.warning(
-                    f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
-                )
-            else:
-                logger.debug("quantization config: %s", init_params["quant_config"])
+        else:
+            logger.debug("quantization config: %s", init_params["quant_config"])
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
