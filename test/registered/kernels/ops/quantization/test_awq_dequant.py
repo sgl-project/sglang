@@ -80,6 +80,7 @@ class TestAWQTriton(CustomTestCase):
                             group_size=group_size,
                         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def _run_dequant_case(self, qweight_rows, qweight_cols, group_size):
         if group_size == -1:
             group_size = qweight_rows
@@ -113,7 +114,6 @@ class TestAWQTriton(CustomTestCase):
         # sanity
         self.assertFalse(torch.any(torch.isinf(tri)) or torch.any(torch.isnan(tri)))
         torch.testing.assert_close(ref, tri)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
