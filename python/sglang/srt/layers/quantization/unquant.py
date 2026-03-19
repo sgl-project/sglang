@@ -52,6 +52,7 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.tuned_gemm import tgemm
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -149,6 +150,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
 

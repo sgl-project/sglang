@@ -4,9 +4,8 @@ name: PR Test ROCm 7.2 (AMD)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
-  # run rocm 720 pr tests once a day at 2am UTC to avoid overwhelming the CI system
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '30 17 * * *'
   # push:
   #   branches: [ main ]
   #   paths:
