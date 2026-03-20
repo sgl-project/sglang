@@ -5,7 +5,7 @@ This script reads diffusion test results from the pytest stash and saves them
 with metadata for the performance dashboard.
 
 Usage:
-    python3 scripts/ci/save_diffusion_metrics.py \
+    python3 scripts/ci/utils/save_diffusion_metrics.py \
         --gpu-config 1-gpu-runner \
         --run-id 12345678 \
         --output test/diffusion-metrics-1gpu.json \

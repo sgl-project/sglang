@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.dp_utils import (
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="stage-a-cpu-only", nightly=True)
 
 
 def _make_sglang_meta(

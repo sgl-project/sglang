@@ -55,7 +55,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only", nightly=True)
 
 
 # Snapshot strings below are intentionally spelled out in full per test.
