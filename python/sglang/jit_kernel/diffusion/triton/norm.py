@@ -618,3 +618,12 @@ def rms_norm_fn(
         out,
         residual_out,
     )
+
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+if current_platform.is_mps():
+    from .mps_fallback import norm_infer_native, rms_norm_fn_native
+
+    norm_infer = norm_infer_native
+    rms_norm_fn = rms_norm_fn_native

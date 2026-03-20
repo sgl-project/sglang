@@ -22,6 +22,7 @@ from torch.distributed.fsdp import (
 )
 from torch.nn.modules.module import _IncompatibleKeys
 
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
@@ -145,7 +146,7 @@ def maybe_load_fsdp_model(
         if quant_method is not None and hasattr(
             quant_method, "process_weights_after_loading"
         ):
-            if _is_npu:
+            if _is_npu and not isinstance(quant_method, UnquantizedLinearMethod):
                 # Activate the NZ format for storing weights,
                 # which is a specific optimization for Ascend NPU
                 torch.npu.config.allow_internal_format = True
@@ -369,15 +370,16 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # for nunchaku
+    # for nunchaku; norm_q/norm_k for SANA QK normalization layers
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
         "wtscale",
         "bias",
+        "norm_q",
+        "norm_k",
     ]
     for new_param_name in unused_keys:
-        # check unallowed missing params
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error(
                 "Unsupported new parameter: %s. Allowed patterns: %s",
@@ -392,7 +394,9 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param = meta_sd.get(new_param_name)
         meta_sharded_param_dtype = meta_sharded_param.dtype
 
-        if "wcscales" in new_param_name or "wtscale" in new_param_name:
+        if any(
+            p in new_param_name for p in ("wcscales", "wtscale", "norm_q", "norm_k")
+        ):
             init_like = torch.ones_like
         else:
             init_like = torch.zeros_like

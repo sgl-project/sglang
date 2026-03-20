@@ -35,11 +35,11 @@ The control path is:
 
 ## 2. Idle-state requirement (strict)
 
-The Scheduler uses a stricter `_is_idle_for_hicache_storage_op()`:
+The Scheduler uses `is_fully_idle()` which checks:
 
-- `_is_no_request()` is true (covers running/overlap/pp/disagg and other active states)
-- `waiting_queue` is empty
-- `grammar_queue` is empty (if the grammar backend is enabled)
+- No running batches (including chunked prefill, overlap, pipeline-parallel, and disaggregation paths)
+- No waiting requests in any queue (waiting, grammar, disagg bootstrap/prealloc/transfer/inflight)
+- No DLLM staging requests
 
 If the condition is not met, attach/detach returns an error like:
 
