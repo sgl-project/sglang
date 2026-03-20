@@ -224,7 +224,9 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_cuda and scale.is_cuda
+    # Support CUDA, XPU, and NPU devices
+    assert x.is_cuda or x.device.type == "xpu" or x.device.type == "npu"
+    assert scale.is_cuda or scale.device.type == "xpu" or scale.device.type == "npu"
     assert x.is_contiguous()
 
     B, L, C = x.shape
