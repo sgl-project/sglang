@@ -28,7 +28,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
-    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -38,7 +37,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
+if is_flashinfer_available():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
