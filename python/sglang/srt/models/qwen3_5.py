@@ -22,7 +22,9 @@ import torch
 import torch.nn as nn
 import triton
 
-from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
+from sglang.jit_kernel.triton.gdn_fused_proj import (
+    fused_qkvzba_split_reshape_cat_contiguous,
+)
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -384,7 +386,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
                 triton.cdiv(self.num_k_heads, self.attn_tp_size),
