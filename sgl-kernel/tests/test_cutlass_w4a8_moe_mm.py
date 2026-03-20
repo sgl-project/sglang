@@ -214,7 +214,7 @@ def _per_tensor_quant_fp8(
     not is_hopper(),
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
-@pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32, 10240])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 4096, 7168])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
