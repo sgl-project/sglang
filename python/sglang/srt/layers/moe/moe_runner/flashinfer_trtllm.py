@@ -644,7 +644,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
         routed_scaling_factor=runner_config.routed_scaling_factor,
-        tile_tokens_dim=None,
         routing_method_type=(
             routing_method_type
             if routing_method_type is not None
