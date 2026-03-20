@@ -1015,23 +1015,27 @@ async def send_weights_to_remote_instance(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
-    bootstrap_port = (
-        _global_state.tokenizer_manager.server_args.engine_info_bootstrap_port
-    )
+    server_args = _global_state.tokenizer_manager.server_args
     try:
         resp = requests.get(
-            f"http://127.0.0.1:{bootstrap_port}/get_transfer_engine_info",
+            f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
             params={"rank": rank},
             timeout=5,
         )
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
-        pass
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
 
-    return Response(status_code=HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(
+        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.get("/parallelism_config")

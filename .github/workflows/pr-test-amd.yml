@@ -539,7 +539,7 @@ jobs:
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-1gpu-sglang]
-        part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
+        part: [0, 1, 2, 3]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -621,7 +621,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 70
+        timeout-minutes: 90
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -644,7 +644,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2 \
+              --total-partitions 4 \
               -k "not flux_2"
 
           # Post-test diagnostics

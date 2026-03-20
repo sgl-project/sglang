@@ -90,6 +90,9 @@ class EngineInfoBootstrapServer:
 
             return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
 
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self._server = uvicorn.Server(config)
+
         @app.put("/register_parallelism_config")
         def register_parallelism_config(data: dict):
             try:
@@ -122,13 +125,15 @@ class EngineInfoBootstrapServer:
             return config
 
         self._thread = threading.Thread(
-            target=uvicorn.run,
-            args=(app,),
-            kwargs={"host": host, "port": port, "log_level": "warning"},
+            target=self._server.run,
             daemon=True,
         )
         self._thread.start()
         logger.info(f"EngineInfoBootstrapServer started on {host}:{port}")
+
+    def close(self):
+        self._server.should_exit = True
+        self._thread.join(timeout=5)
 
     def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
