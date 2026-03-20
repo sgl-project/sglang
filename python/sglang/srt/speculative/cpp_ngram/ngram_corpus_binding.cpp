@@ -2,20 +2,18 @@
 #include <pybind11/stl.h>
 
 #include "ngram.h"
-#include "trie_cache.h"
 
 PYBIND11_MODULE(ngram_corpus_cpp, m) {
   using namespace ngram;
   namespace py = pybind11;
   m.doc() = "";
 
-  using NgramTrie = Ngram<TrieCache>;
-  py::class_<NgramTrie>(m, "NgramTrie")
+  py::class_<Ngram>(m, "NgramTrie")
       .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
-      .def("asyncInsert", &NgramTrie::asyncInsert, "")
-      .def("batchMatch", &NgramTrie::batchMatch, "")
-      .def("reset", &NgramTrie::reset, "")
-      .def("synchronize", &NgramTrie::synchronize, "");
+      .def("asyncInsert", &Ngram::asyncInsert, "")
+      .def("batchMatch", &Ngram::batchMatch, "")
+      .def("reset", &Ngram::reset, "")
+      .def("synchronize", &Ngram::synchronize, "");
 
   py::class_<Param>(m, "Param")
       .def(py::init<>())
