@@ -3,6 +3,46 @@ from typing import Optional
 import torch
 
 
+def sgemm_lora_a_embedding_fwd(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    weight_indices: torch.Tensor,
+    seg_len_tensor: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    scaling_tensor: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    total_seq_len = inputs.shape[0]
+    if weights.numel() == 0:
+        return torch.zeros(total_seq_len, 0, dtype=weights.dtype, device=weights.device)
+
+    num_loras, max_rank, _ = weights.shape
+
+    output = torch.zeros(
+        total_seq_len, max_rank, dtype=weights.dtype, device=weights.device
+    )
+
+    token_offset = 0
+    for lora_idx, seq_len in zip(weight_indices, seg_len_tensor):
+        if seq_len == 0:
+            continue
+
+        rank = lora_ranks[lora_idx]
+        if rank > 0:
+
+            x_seq = inputs[token_offset : token_offset + seq_len]
+            w_seq = weights[lora_idx, :rank]
+
+            result = torch.nn.functional.embedding(x_seq, w_seq.T)
+            output[token_offset : token_offset + seq_len, :rank] = (
+                scaling_tensor[lora_idx] * result
+            )
+
+        token_offset += seq_len
+
+    return output
+
+
 def sgemm_lora_a_fwd(
     inputs: torch.Tensor,
     weights: torch.Tensor,
@@ -31,8 +71,8 @@ def sgemm_lora_a_fwd(
         rank = lora_ranks[lora_idx]
         if rank > 0:
 
-            x_seq = inputs[token_offset : token_offset + seq_len, ...]
-            w_seq = weights[lora_idx, : num_slices * rank, ...]
+            x_seq = inputs[token_offset : token_offset + seq_len]
+            w_seq = weights[lora_idx, : num_slices * rank]
 
             result = torch.mm(x_seq, w_seq.T)
             output[token_offset : token_offset + seq_len, : num_slices * rank] = (

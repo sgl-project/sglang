@@ -3,12 +3,76 @@ import unittest
 
 import torch
 
-from sglang.srt.lora.torch_ops.lora_ops import sgemm_lora_a_fwd, sgemm_lora_b_fwd
-from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
+from sglang.srt.lora.torch_ops.lora_ops import (
+    sgemm_lora_a_embedding_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
+from sglang.test.lora_utils import (
+    reference_embedding_lora_a_shrink,
+    reference_sgmv_expand,
+    reference_sgmv_shrink,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestLoraOps(CustomTestCase):
+    def test_sgemm_lora_a_embedding_fwd(self):
+        batch_size = 64
+        input_dim = 1024
+        num_loras = 3
+        dtype = torch.float32
+        vocab_size = 32000
+
+        possible_lora_ranks = [8, 16, 32, 64, 128, 256]
+        lora_ranks = random.sample(
+            possible_lora_ranks,
+            counts=[num_loras] * len(possible_lora_ranks),
+            k=num_loras,
+        )
+
+        max_lora_rank = max(lora_ranks)
+
+        possible_lora_scaling = [0.25, 0.5, 1.0, 2.0, 4.0]
+        lora_scaling = random.sample(
+            possible_lora_scaling,
+            counts=[num_loras] * len(possible_lora_scaling),
+            k=num_loras,
+        )
+
+        inputs = torch.randint(vocab_size, (batch_size,), dtype=torch.int32)
+        lora_a_weights = torch.randn(num_loras, max_lora_rank, vocab_size, dtype=dtype)
+        lora_indices_tensor = torch.randint(
+            num_loras, (batch_size,), dtype=torch.int32, device="cpu"
+        )
+        seq_len_tensor = torch.ones(batch_size, dtype=torch.int32, device="cpu")
+        lora_ranks_tensor = torch.tensor(lora_ranks, dtype=torch.int32, device="cpu")
+        lora_scaling_tensor = torch.tensor(
+            lora_scaling, dtype=torch.float16, device="cpu"
+        )
+
+        expect_output = reference_embedding_lora_a_shrink(
+            inputs,
+            lora_a_weights,
+            lora_indices_tensor,
+            seq_len_tensor,
+            lora_ranks_tensor,
+            lora_scaling_tensor,
+            vocab_size,
+        )
+
+        actual_output = sgemm_lora_a_embedding_fwd(
+            inputs,
+            lora_a_weights,
+            lora_indices_tensor,
+            seq_len_tensor,
+            lora_ranks_tensor,
+            lora_scaling_tensor,
+            vocab_size,
+        )
+
+        self.assertTrue(torch.allclose(actual_output, expect_output))
+
     def test_sgemm_lora_a_fwd(self):
         batch_size = 2
         input_dim = 1024
@@ -102,6 +166,67 @@ class TestLoraOps(CustomTestCase):
             seq_len_tensor,
             lora_ranks_tensor,
             slice_offsets,
+        )
+
+        self.assertTrue(torch.allclose(actual_output, expect_output))
+
+    def test_sgemm_lora_a_embedding_fwd_expand(self):
+        batch_size = 2
+        input_dim = 1024
+        num_loras = 3
+        dtype = torch.float32
+        vocab_size = 32000
+
+        possible_lora_ranks = [8, 16, 32, 64, 128, 256]
+        lora_ranks = random.sample(
+            possible_lora_ranks,
+            counts=[num_loras] * len(possible_lora_ranks),
+            k=num_loras,
+        )
+
+        max_lora_rank = max(lora_ranks)
+
+        possible_lora_scaling = [0.25, 0.5, 1.0, 2.0, 4.0]
+        lora_scaling = random.sample(
+            possible_lora_scaling,
+            counts=[num_loras] * len(possible_lora_scaling),
+            k=num_loras,
+        )
+
+        seq_len_tensor = torch.randint(
+            num_loras, (batch_size,), dtype=torch.int32, device="cpu"
+        )
+
+        seq_len = sum(seq_len_tensor)
+
+        inputs = torch.randint(vocab_size, (seq_len,), dtype=torch.int32)
+        lora_a_weights = torch.randn(num_loras, max_lora_rank, vocab_size, dtype=dtype)
+        lora_indices_tensor = torch.randint(
+            num_loras, (batch_size,), dtype=torch.int32, device="cpu"
+        )
+        lora_ranks_tensor = torch.tensor(lora_ranks, dtype=torch.int32, device="cpu")
+        lora_scaling_tensor = torch.tensor(
+            lora_scaling, dtype=torch.float16, device="cpu"
+        )
+
+        expect_output = reference_embedding_lora_a_shrink(
+            inputs,
+            lora_a_weights,
+            lora_indices_tensor,
+            seq_len_tensor,
+            lora_ranks_tensor,
+            lora_scaling_tensor,
+            vocab_size,
+        )
+
+        actual_output = sgemm_lora_a_embedding_fwd(
+            inputs,
+            lora_a_weights,
+            lora_indices_tensor,
+            seq_len_tensor,
+            lora_ranks_tensor,
+            lora_scaling_tensor,
+            vocab_size,
         )
 
         self.assertTrue(torch.allclose(actual_output, expect_output))

@@ -4,7 +4,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.torch_ops import sgemm_lora_a_fwd, sgemm_lora_b_fwd
+from sglang.srt.lora.torch_ops import (
+    sgemm_lora_a_embedding_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
 from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -34,6 +38,30 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert (
+            extra_embeddings is None
+        ), "Extra embeddings for lora a is not supported yet in chunked backend"
+        output_tensor = sgemm_lora_a_embedding_fwd(
+            inputs=input_ids,
+            weights=weights,
+            weight_indices=self.batch_info.weight_indices_cpu,
+            seg_len_tensor=self.batch_info.seg_lens_cpu,
+            lora_ranks=self.batch_info.lora_ranks_cpu,
+            scaling_tensor=self.batch_info.scalings,
+            vocab_size=vocab_size,
+        )
+
+        return output_tensor
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
