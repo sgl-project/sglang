@@ -20,7 +20,11 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -49,6 +53,24 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+def _shard_sequence_for_sp(sequence: torch.Tensor) -> torch.Tensor:
+    sp_world_size = get_sp_world_size()
+    if sp_world_size <= 1:
+        return sequence
+
+    seq_len = sequence.shape[0]
+    if seq_len % sp_world_size != 0:
+        pad_len = sp_world_size - (seq_len % sp_world_size)
+        pad = sequence[-1:].repeat(pad_len)
+        sequence = torch.cat([sequence, pad], dim=0)
+
+    local_len = sequence.shape[0] // sp_world_size
+    rank = get_sp_parallel_rank()
+    start = rank * local_len
+    end = start + local_len
+    return sequence[start:end]
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -793,7 +815,7 @@ class QwenImageTransformerBlock(nn.Module):
         is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        if index is not None:
+        if index is not None and x.is_cuda:
             actual_batch = x.shape[0]
             shift0, shift1 = (
                 shift[:actual_batch],
@@ -847,9 +869,34 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 return x, gate_result
         else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
+            if index is not None:
+                actual_batch = x.shape[0]
+                shift0, shift1 = (
+                    shift[:actual_batch],
+                    shift[actual_batch : 2 * actual_batch],
+                )
+                scale0, scale1 = (
+                    scale[:actual_batch],
+                    scale[actual_batch : 2 * actual_batch],
+                )
+                gate0, gate1 = (
+                    gate[:actual_batch],
+                    gate[actual_batch : 2 * actual_batch],
+                )
+                index = index.to(dtype=torch.bool).unsqueeze(-1)
+                shift_result = torch.where(
+                    index, shift1.unsqueeze(1), shift0.unsqueeze(1)
+                )
+                scale_result = torch.where(
+                    index, scale1.unsqueeze(1), scale0.unsqueeze(1)
+                )
+                gate_result = torch.where(
+                    index, gate1.unsqueeze(1), gate0.unsqueeze(1)
+                )
+            else:
+                shift_result = shift.unsqueeze(1)
+                scale_result = scale.unsqueeze(1)
+                gate_result = gate.unsqueeze(1)
             if is_scale_residual:
                 modulated, residual_out = norm_module(
                     residual=residual_x,
@@ -1090,9 +1137,17 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
         modulate_index_list = []
         for sample in img_shapes:
-            first_size = sample[0][0] * sample[0][1] * sample[0][2]
-            total_size = sum(s[0] * s[1] * s[2] for s in sample)
-            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            segment_indices = []
+            for segment_idx, shape in enumerate(sample):
+                segment_size = shape[0] * shape[1] * shape[2]
+                segment_index = torch.full(
+                    (segment_size,),
+                    segment_idx,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                segment_indices.append(_shard_sequence_for_sp(segment_index))
+            idx = torch.cat(segment_indices, dim=0)
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)
