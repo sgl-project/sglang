@@ -269,6 +269,28 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.backend.set_cache(("regex", "r1"), obj2)
         self.assertEqual(len(self.backend.cache), 2)
 
+    def test_cache_miss_duplicate_key_submits_separate_futures(self):
+        """Two cache misses for the same key each get their own Future.
+
+        The backend does not deduplicate in-flight compilations — that is
+        handled at the GrammarManager level via grammar_queue. Each call
+        to get_cached_or_future_value with an uncached key submits a new
+        task to the executor."""
+        key = ("json", "schema")
+        result1, hit1 = self.backend.get_cached_or_future_value(key, False)
+        result2, hit2 = self.backend.get_cached_or_future_value(key, False)
+
+        self.assertFalse(hit1)
+        self.assertFalse(hit2)
+        self.assertIsInstance(result1, Future)
+        self.assertIsInstance(result2, Future)
+        # They are independent futures, not shared
+        self.assertIsNot(result1, result2)
+
+        # Both should complete successfully
+        self.assertIsInstance(result1.result(timeout=5), InvalidGrammarObject)
+        self.assertIsInstance(result2.result(timeout=5), InvalidGrammarObject)
+
 
 class TestRegisterGrammarBackend(unittest.TestCase):
     """Test grammar backend registry."""
