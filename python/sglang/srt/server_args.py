@@ -2021,6 +2021,17 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
 
+        if (
+            model_arch in ["Qwen3VLForConditionalGeneration"]
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_UNIFIED_ATTN")
+            and self.page_size is None
+        ):
+            self.page_size = 16
+            logger.info(
+                "Setting page_size=16 for aiter unified attention on Qwen3VLForConditionalGeneration."
+            )
+
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
             logger.warning(
