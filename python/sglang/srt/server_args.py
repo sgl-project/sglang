@@ -213,6 +213,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -1068,7 +1069,7 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, XPU, etc.)
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
@@ -1196,10 +1197,28 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         # Set cuda graph batch sizes
-        if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+        if self.device != "cpu":
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+            else:
+                self.cuda_graph_max_bs = max(self.cuda_graph_bs)
         else:
-            self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+            # Reuse cuda_graph_bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
+            # as cpu graph is based on torch.compile
+            if self.cuda_graph_bs is not None:
+                self.torch_compile_max_bs = max(self.cuda_graph_bs)
+            else:
+                # If cuda_graph_bs is not set, we will preferentially use torch_compile_max_bs
+                # to generate cuda_graph_bs
+                self.torch_compile_max_bs = (
+                    self.torch_compile_max_bs or self.cuda_graph_max_bs
+                )
+                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
+
+            assert (
+                self.torch_compile_max_bs > 0
+            ), "cuda_graph_bs should contain positive batch sizes"
+            self.cuda_graph_max_bs = self.torch_compile_max_bs
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
@@ -1318,6 +1337,26 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
+        return capture_bs
+
+    def _generate_cpu_graph_batch_sizes(self):
+        """
+        Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
+        """
+        if self.disable_cuda_graph_padding:
+            capture_bs = list(range(1, self.torch_compile_max_bs + 1))
+        else:
+            capture_bs = sorted(
+                set().union(
+                    range(1, 17),
+                    range(18, 31, 2),
+                    range(32, 81, 4),
+                    range(84, self.torch_compile_max_bs + 1, 8),
+                    {self.torch_compile_max_bs},
+                )
+            )
+        capture_bs = [bs for bs in capture_bs if bs <= self.torch_compile_max_bs]
 
         return capture_bs
 
@@ -4508,7 +4547,8 @@ class ServerArgs:
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
             "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
             "NOTE: This replaces the deprecated environment variable "
             "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
@@ -6244,7 +6284,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="sglang serve")
     ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present
