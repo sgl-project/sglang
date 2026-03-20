@@ -1012,6 +1012,7 @@ async def send_weights_to_remote_instance(
 
 
 @app.get("/get_remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
     """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
     logger.warning(
