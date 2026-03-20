@@ -2121,7 +2121,7 @@ class TestEntrypointReplicatedAxis:
 
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
-        assert "not orthogonal" in errors[0].traceback_str
+        assert "not orthogonal" in errors[0].exception_message
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -3745,7 +3745,7 @@ class TestEntrypointDpFilter:
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
         assert errors[0].exception_type == "AssertionError"
-        assert "Expected exactly 1 non-empty dp_rank" in errors[0].traceback_str
+        assert "Expected exactly 1 non-empty dp_rank" in errors[0].exception_message
         assert exit_code == 1
 
 
@@ -4905,7 +4905,8 @@ class TestErrorResilience:
         assert len(errors) == 1
         assert errors[0].name == "tensor_b"
         assert errors[0].exception_type == "RuntimeError"
-        assert "intentional test error" in errors[0].traceback_str
+        assert "intentional test error" in errors[0].exception_message
+        assert "--override-dims" in errors[0].traceback_str
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -4947,6 +4948,49 @@ class TestErrorResilience:
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
         assert errors[0].exception_type == "TypeError"
+
+    def test_error_record_contains_dims_hint(self, tmp_path, capsys, monkeypatch):
+        """Error record includes --override-dims hint with all variant flags."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _raise(**kwargs):
+            raise ValueError("Invalid dim token: 'zzz'")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _raise)
+
+        records, _ = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+
+        assert "Invalid dim token: 'zzz'" in errors[0].exception_message
+        tb = errors[0].traceback_str
+        assert "--override-dims" in tb
+        assert "--override-baseline-dims" in tb
+        assert "--override-target-dims" in tb
+        assert "--override-config" in tb
+        assert "do NOT re-run expensive dumps" in tb
+
+    def test_error_record_hint_appears_before_traceback(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Hint appears before the full stack trace in traceback_str."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _raise(**kwargs):
+            raise RuntimeError("some dims problem")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _raise)
+
+        records, _ = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+
+        tb = errors[0].traceback_str
+        hint_pos = tb.index("--override-dims")
+        traceback_pos = tb.index("Traceback (most recent call last)")
+        assert hint_pos < traceback_pos
 
 
 if __name__ == "__main__":
