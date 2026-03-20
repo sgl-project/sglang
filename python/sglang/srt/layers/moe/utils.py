@@ -62,7 +62,6 @@ class MoeRunnerBackend(Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
-    INDUCTOR_GROUPEDMM = "inductor_groupedmm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
@@ -78,9 +77,6 @@ class MoeRunnerBackend(Enum):
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
-
-    def is_inductor_groupedmm(self):
-        return self == MoeRunnerBackend.INDUCTOR_GROUPEDMM
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON

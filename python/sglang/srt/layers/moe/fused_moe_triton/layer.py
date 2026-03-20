@@ -966,24 +966,7 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def _resolve_is_decode(self, is_decode: Optional[bool]) -> bool:
-        if is_decode is not None:
-            return is_decode
-
-        forward_context = get_forward_context()
-        return (
-            forward_context is not None
-            and forward_context.forward_batch is not None
-            and forward_context.forward_batch.forward_mode.is_decode()
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-        is_decode: Optional[bool] = None,
-    ):
-        is_decode = self._resolve_is_decode(is_decode)
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1006,18 +989,11 @@ class FusedMoE(torch.nn.Module):
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(
-                    hidden_states, topk_output, is_decode=is_decode
-                )
+                return self.forward_impl(hidden_states, topk_output)
         else:
-            return self.forward_impl(hidden_states, topk_output, is_decode=is_decode)
+            return self.forward_impl(hidden_states, topk_output)
 
-    def forward_impl(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-        is_decode: Optional[bool] = None,
-    ):
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1036,7 +1012,6 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
-            is_decode=self._resolve_is_decode(is_decode),
         )
 
         with use_symmetric_memory(
@@ -1054,17 +1029,8 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(
-        self, dispatch_output: DispatchOutput, is_decode: bool = False
-    ) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
-        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            return self.quant_method.apply(
-                layer=self,
-                dispatch_output=dispatch_output,
-                is_decode=is_decode,
-            )
-
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
@@ -1453,8 +1419,7 @@ def moe_forward_piecewise_cuda_graph_impl(
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    is_decode = forward_context.forward_batch.forward_mode.is_decode()
-    return moe_layer.forward_impl(hidden_states, topk_output, is_decode=is_decode)
+    return moe_layer.forward_impl(hidden_states, topk_output)
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -1481,8 +1446,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    is_decode = forward_context.forward_batch.forward_mode.is_decode()
-    return moe_layer.forward_impl(hidden_states, topk_output, is_decode=is_decode)
+    return moe_layer.forward_impl(hidden_states, topk_output)
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -1509,8 +1473,7 @@ def flashinfer_bf16_moe_forward_piecewise_cuda_graph_impl(
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    is_decode = forward_context.forward_batch.forward_mode.is_decode()
-    return moe_layer.forward_impl(hidden_states, topk_output, is_decode=is_decode)
+    return moe_layer.forward_impl(hidden_states, topk_output)
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -1535,5 +1498,4 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    is_decode = forward_context.forward_batch.forward_mode.is_decode()
-    return moe_layer.forward_impl(hidden_states, topk_output, is_decode=is_decode)
+    return moe_layer.forward_impl(hidden_states, topk_output)
