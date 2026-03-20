@@ -181,26 +181,10 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        # For streaming sessions, ignore the logprob_start_len truncation on
-        # the key and reuse the full committed KV from the slot. The key may
-        # have been truncated (e.g. to length 0 when logprob_start_len=0), but
-        # the session slot already holds those KV tokens — skipping them would
-        # orphan allocated memory. Use fill_ids length (the actual input for
-        # this turn) as the upper bound instead of the truncated key.
-        # Also clamp logprob_start_len so the scheduler doesn't expect logprobs
-        # for tokens that are already in the session's committed KV.
-        input_len = (
-            len(req.fill_ids) if req.fill_ids is not None else len(params.key.token_ids)
-        )
-        max_prefix_len = max(input_len - 1, 0)
-        prefix_len = min(req.kv_committed_len, max_prefix_len)
-
-        if (
-            req.return_logprob
-            and req.logprob_start_len >= 0
-            and req.logprob_start_len < prefix_len
-        ):
-            req.logprob_start_len = prefix_len
+        # logprob_start_len is already forced to -1 for streaming sessions
+        # (in Req.init_next_round_input), so the prefix key is not truncated
+        # and we can directly reuse the committed KV length.
+        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
