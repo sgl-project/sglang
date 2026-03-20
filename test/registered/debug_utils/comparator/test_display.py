@@ -11,6 +11,7 @@ from rich.console import Console
 from sglang.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
+    _extract_parallel_info,
     _render_polars_as_text,
     _extract_parallel_info,
 )
@@ -20,7 +21,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only", nightly=True)
 
 
 def _render_rich(renderable: object) -> str:
