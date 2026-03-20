@@ -11,8 +11,8 @@ from rich.console import Console
 from sglang.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
+    _extract_parallel_info,
     _render_polars_as_text,
-    extract_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -408,26 +408,26 @@ class TestExtractParallelInfo:
             "pp_size": 2,
         }
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info=info)
+        _extract_parallel_info(row_data=row_data, info=info)
 
         assert row_data["tp"] == "1/4"
         assert row_data["pp"] == "0/2"
 
     def test_skips_error_info(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(
+        _extract_parallel_info(
             row_data=row_data, info={"error": True, "tp_rank": 0, "tp_size": 1}
         )
         assert row_data == {}
 
     def test_skips_empty_info(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info={})
+        _extract_parallel_info(row_data=row_data, info={})
         assert row_data == {}
 
     def test_ignores_rank_without_size(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
+        _extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
         assert "tp" not in row_data
 
 
