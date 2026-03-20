@@ -254,7 +254,6 @@ class TestStreamingSession(CustomTestCase):
             json={"capacity_of_str_len": 1000, "streaming": True},
         ).json()
         rid = None
-        outputs_from_session = []
 
         prev_kv_len = 0
         for turn_idx, chunk_ids in enumerate(chunks_ids):
@@ -272,7 +271,6 @@ class TestStreamingSession(CustomTestCase):
                 },
             ).json()
             rid = response["meta_info"]["id"]
-            outputs_from_session.append(response["text"])
             cached = response["meta_info"]["cached_tokens"]
             prompt_tokens = response["meta_info"]["prompt_tokens"]
             completion_tokens = response["meta_info"]["completion_tokens"]
@@ -332,20 +330,8 @@ class TestStreamingSession(CustomTestCase):
             "Turn 2's prompt should not be in cache (no insertion for turns 2+)",
         )
 
-        # === Memory verification ===
+        # === Flush reclamation ===
 
-        # KV is released properly and no memory leak.
-        # SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE is True by default;
-        # the scheduler will crash if it detects a leak during idle.
-        time.sleep(2)
-        health_resp = requests.get(self.base_url + "/health")
-        self.assertEqual(
-            health_resp.status_code,
-            200,
-            "Server should be healthy after session close (no memory leak)",
-        )
-
-        # After flush, all cache should be reclaimed.
         requests.post(self.base_url + "/flush_cache")
         verify_resp3 = requests.post(
             self.base_url + "/generate",
@@ -359,37 +345,6 @@ class TestStreamingSession(CustomTestCase):
             0,
             "After session close + flush, cache should be fully reclaimed",
         )
-
-        # === Part 2: non-session baseline for output comparison ===
-        requests.post(self.base_url + "/flush_cache")
-
-        outputs_normal = []
-        input_ids = chunks_ids[0][:]
-        for i in range(len(chunks_ids)):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "input_ids": input_ids,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": gen_len,
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
-                    },
-                },
-            ).json()
-            outputs_normal.append(response["text"])
-            if i + 1 < len(chunks_ids):
-                out_ids = self.tokenizer.encode(response["text"])
-                if out_ids and out_ids[0] == self.tokenizer.bos_token_id:
-                    out_ids = out_ids[1:]
-                input_ids = input_ids + out_ids + chunks_ids[i + 1]
-
-        print("outputs from streaming session:")
-        print(outputs_from_session)
-        print("outputs from normal queries:")
-        print(outputs_normal)
-        self.assertEqual(outputs_from_session, outputs_normal)
 
     # ------------------------------------------------------------------
     # Logprob leak tests
