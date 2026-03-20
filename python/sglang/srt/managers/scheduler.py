@@ -25,6 +25,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
+
 import psutil
 import setproctitle
 import torch
@@ -201,7 +205,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_numa_node,
-    get_zmq_socket,
     is_mps,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -217,6 +220,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1326,12 +1330,21 @@ class Scheduler(
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
+        # In DP attention mode, use the globally synchronized is_extend_in_batch
+        # so all DP ranks make the same overlap decision (avoiding deadlock).
+        # In non-DP mode, use the local forward_mode directly.
+        if self.require_mlp_sync:
+            is_extend = lambda b: b and b.is_extend_in_batch
+        else:
+            is_extend = lambda b: b and b.forward_mode.is_extend()
+
+        batch_is_extend = is_extend(batch)
+        last_batch_is_extend = is_extend(self.last_batch)
+
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch
-            and batch.forward_mode.is_extend()
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and batch_is_extend
+            and last_batch_is_extend
         )
 
         # We do not support overlap + spec + grammar yet,
@@ -2145,6 +2158,9 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2168,9 +2184,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2284,9 +2297,8 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2361,6 +2373,11 @@ class Scheduler(
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
+
+        # Eagerly release lock_ref on completed write-through nodes so they
+        # become evictable, improving batch scheduling headroom.
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
@@ -2649,6 +2666,11 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
+        # Health check piggybacks on running requests in process_output.
+        # Only running_batch + waiting_queue guarantee active GPU processing;
+        # disagg queues (bootstrap/prealloc/transfer) may have items without
+        # any request actually running on GPU — e.g. stuck handshake, full
+        # KV cache, or stalled transfer — so they can't carry health info.
         # Batch running status
         idle = (
             self.running_batch.is_empty()
@@ -2662,20 +2684,28 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            idle &= (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
-                and len(self.disagg_decode_transfer_queue.queue) == 0
-            )
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch results
-            # instantly, but they still indicate the server is not fully idle.
+            # Grammar queue and prefill inflight queue may not produce batch
+            # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+
+            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
+            # destructive operations like attach/detach/flush_cache.
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                idle &= len(tc.ongoing_write_through) == 0
+                idle &= len(tc.ongoing_load_back) == 0
+                if tc.enable_storage:
+                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= len(tc.ongoing_backup) == 0
 
         return idle
 
