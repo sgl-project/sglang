@@ -142,6 +142,11 @@ SGL_DEVICE void PDLTriggerSecondary() {
 #endif
 }
 
+template <std::integral T, std::integral U>
+SGL_DEVICE constexpr auto div_ceil(T a, U b) {
+  return (a + b - 1) / b;
+}
+
 /**
  * \brief Load data with the specified type and offset from a void pointer.
  * \tparam T The type to load.
