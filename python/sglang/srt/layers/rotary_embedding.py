@@ -851,12 +851,10 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
         # Compute long range cache based on scaling type
         if scaling_type == "yarn":
             # Use existing YaRNScalingRotaryEmbedding
-            print(f"scaling_factor---: {scaling_factor}，original_max_position_embeddings: {original_max_position_embeddings}")
             long_rope = YaRNScalingRotaryEmbedding(
                 head_size, rotary_dim, original_max_position_embeddings, base, is_neox_style,
                 scaling_factor, dtype, **kwargs
             )
-            print(f"long_cos_sin_cache type---: {scaling_type}")
         elif scaling_type == "dynamic":
             # Use existing DynamicNTKScalingRotaryEmbedding
             long_rope = DynamicNTKScalingRotaryEmbedding(
@@ -883,8 +881,20 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        total_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with dynamic position encoding switching."""
+        """Forward pass with dynamic position encoding switching.
+
+        Args:
+            positions: Position indices for the current chunk
+            query: Query tensor
+            key: Key tensor
+            offsets: Optional offsets to add to positions
+            fused_set_kv_buffer_arg: Optional fused KV buffer argument
+            total_seq_len: Total sequence length of the entire sequence (not just current chunk).
+                           If provided and exceeds original_max_position_embeddings,
+                           the entire batch will use long_cos_sin_cache.
+        """
         # Reshape query and key for consistent processing
         query = query.unflatten(1, (-1, self.head_size))
         key = key.unflatten(1, (-1, self.head_size))
@@ -894,10 +904,17 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
             positions = positions + offsets
 
         # Determine which cache to use based on position
+        # total_seq_len is the original prefill sequence length (not cumulative)
+        # CUDA Graph compatible: always use tensor operations
         k = self.original_max_position_embeddings
-        print(f"positions: {positions}")
+        # Convert to tensor if needed, default to 0 if None
+        total_seq_len_val = (
+            total_seq_len if total_seq_len is not None else 0
+        )
+        if not isinstance(total_seq_len_val, torch.Tensor):
+            total_seq_len_val = torch.tensor(total_seq_len_val, device=positions.device, dtype=torch.long)
         long_prompt_offset = (
-            torch.any(positions > k).float() * torch.full_like(positions, k)
+            (total_seq_len_val > k).float() * torch.full_like(positions, k)
         ).long()
         idx = torch.add(positions, long_prompt_offset)
 
@@ -1799,6 +1816,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        total_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -1856,6 +1874,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        total_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with optional Triton kernel acceleration.
         Args:
@@ -3656,7 +3675,6 @@ def get_rope(
                     **extra_kwargs,
                 )
         elif scaling_type == "minimax_long_rope":
-            print("---------------use minimax long rope---------------")
             # MiniMax M2.5 specific long rope implementation
             scaling_factor = rope_scaling.get("factor", 5.0)  # Approximately 1M / 196608
             original_max_position = rope_scaling.get("original_max_position_embeddings", 196608)

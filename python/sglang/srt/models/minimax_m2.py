@@ -656,7 +656,16 @@ class MiniMaxM2Attention(nn.Module):
             )
         else:
             q, k = q.contiguous(), k.contiguous()
-        q, k = self.rotary_emb(positions, q, k)
+        
+        # Get original prefill sequence length from forward_batch to determine which cache to use
+        # For chunk prefill, use orig_seq_lens which is the original length without chunking (Qwen-1M related)
+        # CUDA Graph compatible: keep as tensor, don't use .item()
+        if forward_batch.orig_seq_lens is not None:
+            total_seq_len = forward_batch.orig_seq_lens.max()
+        else:
+            # Fallback for decode mode
+            total_seq_len = 0
+        q, k = self.rotary_emb(positions, q, k, total_seq_len=total_seq_len)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
