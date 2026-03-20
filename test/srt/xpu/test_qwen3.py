@@ -37,6 +37,7 @@ class TestQwen3(CustomTestCase):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--trust-remote-code",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
@@ -75,6 +76,10 @@ class TestQwen3(CustomTestCase):
         print(json.dumps(ret, indent=2))
 
         def assert_one_item(item):
+            decoded = self.tokenizer.decode(
+                item["output_ids"], skip_special_tokens=True
+            )
+            print("decoded:", decoded)
             if item["meta_info"]["finish_reason"]["type"] == "stop":
                 self.assertEqual(
                     item["meta_info"]["finish_reason"]["matched"],
