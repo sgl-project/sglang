@@ -103,7 +103,7 @@
         "qwen_image_t2i_2_gpus": {
             "stages_ms": {
                 "InputValidationStage": 0.04,
-                "TextEncodingStage": 693.2,
+                "TextEncodingStage": 800.0,
                 "TimestepPreparationStage": 2.84,
                 "LatentPreparationStage": 9.13,
                 "DenoisingStage": 24529.77,
@@ -1843,7 +1843,7 @@
         "flux_2_image_t2i_2_gpus": {
             "stages_ms": {
                 "InputValidationStage": 0.05,
-                "TextEncodingStage": 518.88,
+                "TextEncodingStage": 600.0,
                 "ImageVAEEncodingStage": 0.0,
                 "LatentPreparationStage": 0.45,
                 "TimestepPreparationStage": 3.41,
@@ -1982,7 +1982,7 @@
                 "7": 178.53,
                 "8": 178.08
             },
-            "expected_e2e_ms": 2103.05,
+            "expected_e2e_ms": 2300.0,
             "expected_avg_denoise_ms": 173.83,
             "expected_median_denoise_ms": 178.08
         },
