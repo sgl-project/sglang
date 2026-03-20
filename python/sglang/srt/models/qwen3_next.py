@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -245,28 +246,38 @@ class Qwen3GatedDeltaNet(nn.Module):
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
-        projection_size_ba = self.num_v_heads * 2
 
-        self.in_proj_qkvz = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=projection_size_qkvz,
-            bias=False,
+        # projection of the input hidden states
+        self.in_proj_qkvz = self.create_qkvz_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
             prefix=add_prefix("in_proj_qkvz", prefix),
-        )
-        self.in_proj_ba = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=projection_size_ba,
-            bias=False,
-            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_ba", prefix),
         )
 
+        self.in_proj_ba = MergedColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_sizes=[self.num_v_heads] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("in_proj_ba", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
+
+        # Override weight_loader for packed checkpoint format.
+        # Must capture original_loader BEFORE overwriting.
+        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
+            self.in_proj_qkvz
+        )
+        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
+            self.in_proj_ba
+        )
+
+        # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
@@ -340,7 +351,61 @@ class Qwen3GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
+    @staticmethod
+    def _make_packed_weight_loader(module):
+        """Create a weight_loader that does contiguous TP slicing for fused
+        (packed-format) checkpoint weights (shard_id=None), and delegates
+        to the standard MergedColumnParallelLinear loader for split checkpoint
+        weights (shard_id=int/tuple)."""
+        original_loader = module.weight.weight_loader
+
+        def weight_loader(param, loaded_weight, loaded_shard_id=None):
+            if loaded_shard_id is None:
+                # Fused checkpoint: weight is in packed (per-head-group)
+                # format. Do contiguous TP slice like ColumnParallelLinear.
+                output_dim = getattr(param, "output_dim", None)
+                if output_dim is not None and module.tp_size > 1:
+                    shard_size = param.data.shape[output_dim]
+                    start_idx = module.tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
+                assert param.data.shape == loaded_weight.shape, (
+                    f"Shape mismatch: param {param.data.shape} vs "
+                    f"loaded {loaded_weight.shape}"
+                )
+                param.data.copy_(loaded_weight)
+            else:
+                # Split checkpoint (int or tuple shard_id) → standard path
+                original_loader(param, loaded_weight, loaded_shard_id)
+
+        return weight_loader
+
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[key_dim, key_dim, value_dim, value_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
+
+    def fix_query_key_value_ordering(
+        self,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
+    ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
@@ -1032,11 +1097,18 @@ class Qwen3NextForCausalLM(nn.Module):
     ) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
+            # self attention
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            # mlp
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            # GDN
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
