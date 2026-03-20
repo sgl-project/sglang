@@ -523,16 +523,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
+            # Register memory and upstream the transfer engine info to the bootstrap server
             self.remote_instance_transfer_engine_weight_info = register_memory_region(
                 self.model, self.remote_instance_transfer_engine
             )
-
-        # Register transfer engine info with the bootstrap server
-        if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
-            and self.remote_instance_transfer_engine is not None
-            and self.remote_instance_transfer_engine_weight_info is not None
-        ):
             self._register_to_engine_info_bootstrap()
 
         # Register parallelism config with the bootstrap server

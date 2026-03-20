@@ -47,7 +47,9 @@ import uvloop
 import zmq
 
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
-from sglang.srt.entrypoints.engine_info_bootstrap import EngineInfoBootstrapServer
+from sglang.srt.entrypoints.engine_info_bootstrap_server import (
+    EngineInfoBootstrapServer,
+)
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -111,7 +113,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
-    engine_info_bootstrap: Optional[Any] = None
+    engine_info_bootstrap_server: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -195,9 +197,9 @@ class Engine(EngineBase):
         self._scheduler_init_result = scheduler_init_result
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap is not None:
+        if scheduler_init_result.engine_info_bootstrap_server is not None:
             self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap.transfer_engine_info
+                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
             )
             self.parallelism_config = (
                 scheduler_init_result.engine_info_bootstrap.parallelism_config
