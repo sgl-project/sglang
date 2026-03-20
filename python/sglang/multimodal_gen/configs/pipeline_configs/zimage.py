@@ -108,7 +108,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         H_tok = H // self.PATCH_SIZE
         W_tok = W // self.PATCH_SIZE
 
-        candidate_plans = []
+        shard_options = []
         for shard_axis, axis_tok, other_tok, tie_break in (
             ("h", H_tok, W_tok, 0),
             ("w", W_tok, H_tok, 1),
@@ -119,7 +119,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 max(local_seq_lens), self.SEQ_LEN_MULTIPLE
             )
             total_pad_tokens = img_seq_target * sp_size - (H_tok * W_tok)
-            candidate_plans.append(
+            shard_options.append(
                 (
                     total_pad_tokens,
                     -axis_tok,
@@ -130,7 +130,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 )
             )
 
-        _, _, _, shard_axis, axis_sizes, img_seq_target = min(candidate_plans)
+        _, _, _, shard_axis, axis_sizes, img_seq_target = min(shard_options)
         axis_start_tok = sum(axis_sizes[:rank])
         axis_local_tok = axis_sizes[rank]
 
@@ -163,7 +163,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             "H_tok": H_tok,
             "W_tok": W_tok,
             "shard_axis": shard_axis,
-            "axis_sizes_tok": axis_sizes,
+            "shard_sizes_tok": axis_sizes,
             "h0_tok": h0_tok,
             "w0_tok": w0_tok,
             "local_h_tok": local_h_tok,
@@ -226,7 +226,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
         plan = self._get_zimage_sp_plan(batch)
         shard_dim = 3 if plan["shard_axis"] == "h" else 4
-        max_axis_tok = max(plan["axis_sizes_tok"])
+        max_axis_tok = max(plan["shard_sizes_tok"])
         max_axis_lat = max_axis_tok * self.PATCH_SIZE
 
         pad_shape = list(latents.shape)
@@ -243,7 +243,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
         pieces = []
         for rank, tensor in enumerate(gathered):
-            axis_lat = plan["axis_sizes_tok"][rank] * self.PATCH_SIZE
+            axis_lat = plan["shard_sizes_tok"][rank] * self.PATCH_SIZE
             if shard_dim == 3:
                 pieces.append(tensor[:, :, :, :axis_lat, :])
             else:
