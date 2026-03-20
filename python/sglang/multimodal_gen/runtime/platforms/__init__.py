@@ -119,6 +119,24 @@ def npu_platform_plugin() -> str | None:
     )
 
 
+def xpu_platform_plugin() -> str | None:
+    is_xpu = False
+
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            is_xpu = True
+            logger.info("Intel XPU is available")
+    except Exception as e:
+        logger.info("XPU detection failed: %s", e)
+    return (
+        "sglang.multimodal_gen.runtime.platforms.xpu.XPUPlatform"
+        if is_xpu
+        else None
+    )
+
+
 def musa_platform_plugin() -> str | None:
     is_musa = False
 
@@ -144,6 +162,7 @@ builtin_platform_plugins = {
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
     "npu": npu_platform_plugin,
+    "xpu": xpu_platform_plugin,
     "musa": musa_platform_plugin,
 }
 
@@ -164,6 +183,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to CUDA
     platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to Intel XPU
+    platform_cls_qualname = xpu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
