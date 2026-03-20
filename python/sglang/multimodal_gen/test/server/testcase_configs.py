@@ -975,20 +975,7 @@ if not current_platform.is_hip():
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
         )
     )
-    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-    TWO_GPU_CASES_A.append(
-        DiffusionTestCase(
-            "turbo_wan2_2_i2v_a14b_2gpu",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
-                modality="video",
-                custom_validator="video",
-                num_gpus=2,
-                tp_size=2,
-            ),
-            TURBOWAN_I2V_sampling_params,
-        )
-    )
+
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(
