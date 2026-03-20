@@ -1718,6 +1718,157 @@ class TestEntrypointAxisAligner:
         assert comp.target.shape == [4, 8]
 
 
+class TestEntrypointSeqTokenEquivalence:
+    """Test s≡t dim name equivalence through the full entrypoint pipeline."""
+
+    def test_s_t_squeeze_single_rank(self, tmp_path, capsys):
+        """Baseline dims='t h' (2D [4,8]), target dims='s 1 h' (3D [4,1,8]) → comparator passes."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="t h",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.unsqueeze(1),
+            dims="s 1 h",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 8]
+        assert comp.target.shape == [4, 8]
+
+    def test_s_t_squeeze_with_tp_unshard(self, tmp_path, capsys):
+        """Baseline TP=2 dims='t h[tp]', target TP=2 dims='s 1 h[tp]' → unshard + squeeze + s≡t."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="t h[tp]",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor.unsqueeze(1),
+            name="hidden",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="s 1 h[tp]",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_s_t_fused_with_squeeze(self, tmp_path, capsys):
+        """Baseline dims='t (num_heads*head_dim)[tp]' (2D), target dims='s 1 num_heads[tp] head_dim' (4D)."""
+        torch.manual_seed(42)
+        num_heads = 8
+        head_dim = 16
+        full_tensor_2d = torch.randn(4, num_heads * head_dim)
+        full_tensor_4d = full_tensor_2d.reshape(4, num_heads, head_dim).unsqueeze(1)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor_2d,
+            name="attn_pre_o_proj",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="t (num_heads*head_dim)[tp]",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor_4d,
+            name="attn_pre_o_proj",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="s 1 num_heads[tp] head_dim",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_pre_o_proj"
+
+    def test_s_t_mismatch_with_named_batch_fails(self, tmp_path, capsys):
+        """Baseline dims='t h', target dims='s b h' (named b, not constant 1) → dim mismatch → skip/error."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="t h",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.unsqueeze(1).expand(4, 1, 8).contiguous(),
+            dims="s b h",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comparisons = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(comparisons) == 1
+        comp = comparisons[0]
+        assert (
+            comp.shape_mismatch
+            or (comp.diff is not None and not comp.diff.passed)
+            or len(comp.errors) > 0
+        )
+
+
 class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
