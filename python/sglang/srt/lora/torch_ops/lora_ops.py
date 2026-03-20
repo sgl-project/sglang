@@ -10,7 +10,8 @@ def sgemm_lora_a_embedding_fwd(
     seg_len_tensor: torch.Tensor,
     lora_ranks: torch.Tensor,
     scaling_tensor: torch.Tensor,
-):
+    vocab_size: int,
+) -> torch.Tensor:
     total_seq_len = inputs.shape[0]
     if weights.numel() == 0:
         return torch.zeros(total_seq_len, 0, dtype=weights.dtype, device=weights.device)

@@ -48,6 +48,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        assert (
+            extra_embeddings is None
+        ), "Extra embeddings for lora a is not supported yet in chunked backend"
         output_tensor = sgemm_lora_a_embedding_fwd(
             inputs=input_ids,
             weights=weights,
@@ -55,6 +58,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
             scaling_tensor=self.batch_info.scalings,
+            vocab_size=vocab_size,
         )
 
         return output_tensor
