@@ -632,6 +632,7 @@ class ServerArgs:
     enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
+    torch_compile_override_layers: Optional[List[str]] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
@@ -5276,6 +5277,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--torch-compile-override-layers",
+            type=str,
+            nargs="+",
+            help="Override decode torch.compile layer switching with an exact-class-name "
+            "allowlist (for example `TopK` or `UnquantizedFusedMoEMethod`).",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",

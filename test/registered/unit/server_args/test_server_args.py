@@ -19,18 +19,36 @@ _mock_device.start()
 
 class TestPrepareServerArgs(CustomTestCase):
     def test_prepare_server_args(self):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--json-model-override-args",
-                '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
-            ]
-        )
+        with patch.object(ServerArgs, "__post_init__", lambda self: None):
+            server_args = prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--json-model-override-args",
+                    '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
+                ]
+            )
         self.assertEqual(server_args.model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
+        )
+
+    def test_prepare_server_args_with_torch_compile_override_layers(self):
+        with patch.object(ServerArgs, "__post_init__", lambda self: None):
+            server_args = prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--torch-compile-override-layers",
+                    "TopK",
+                    "UnquantizedFusedMoEMethod",
+                ]
+            )
+
+        self.assertEqual(
+            server_args.torch_compile_override_layers,
+            ["TopK", "UnquantizedFusedMoEMethod"],
         )
 
 

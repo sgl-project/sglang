@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Collection, Optional, Tuple
 
 from torch import nn
 
@@ -30,7 +30,35 @@ class MultiPlatformOp(nn.Module):
         self._original_forward_method = None
         self.is_torch_compile = False
 
-    def enter_torch_compile(self, num_tokens: int):
+    def _get_torch_compile_forward_method(
+        self,
+        num_tokens: int,
+        override_layers: Optional[Collection[str]] = None,
+    ) -> Tuple[bool, Optional[Callable]]:
+        class_name = self.__class__.__name__
+
+        if override_layers is not None:
+            if class_name not in override_layers:
+                return False, None
+            return True, self.forward_native
+
+        if "FusedMoE" in class_name:
+            if num_tokens == 1:
+                return True, self.forward_native
+            return True, self._forward_method
+
+        if "TopK" in class_name:
+            if num_tokens == 1:
+                return True, self.forward_native
+            return True, self._forward_method
+
+        return True, self.forward_native
+
+    def enter_torch_compile(
+        self,
+        num_tokens: int,
+        override_layers: Optional[Collection[str]] = None,
+    ):
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
@@ -39,22 +67,16 @@ class MultiPlatformOp(nn.Module):
         if self.is_torch_compile:
             return
 
-        self._original_forward_method = self._forward_method
-        # NOTE: Temporarily workaround MoE
-        # The performance of torch.compile on this layer is not always good when bs > 1,
-        # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
-                    fused_moe_forward_native,
-                )
+        should_switch, forward_method = self._get_torch_compile_forward_method(
+            num_tokens=num_tokens, override_layers=override_layers
+        )
+        if not should_switch:
+            return
 
-                self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
-                self._forward_method = self.forward_native
-        else:
-            self._forward_method = self.forward_native
+        self._original_forward_method = self._forward_method
+        # NOTE: By default we keep the existing bs=1-only special handling for MoE
+        # and TopK, unless a CLI allowlist explicitly opts a class into compile mode.
+        self._forward_method = forward_method
         self.is_torch_compile = True
 
     def leave_torch_compile(self):

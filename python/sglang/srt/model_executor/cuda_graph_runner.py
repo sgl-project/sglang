@@ -23,7 +23,16 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import tqdm
@@ -391,15 +400,27 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+def _to_torch(
+    model: torch.nn.Module,
+    reverse: bool,
+    num_tokens: int,
+    override_layers: Optional[Collection[str]] = None,
+):
     for sub in model._modules.values():
         if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
-                sub.enter_torch_compile(num_tokens=num_tokens)
+                sub.enter_torch_compile(
+                    num_tokens=num_tokens, override_layers=override_layers
+                )
         if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse, num_tokens)
+            _to_torch(
+                sub,
+                reverse,
+                num_tokens,
+                override_layers=override_layers,
+            )
 
 
 @contextmanager
@@ -408,13 +429,22 @@ def patch_model(
     enable_compile: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
+    override_layers: Optional[List[str]] = None,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
+    override_layer_set = (
+        frozenset(override_layers) if override_layers is not None else None
+    )
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            _to_torch(
+                model,
+                reverse=False,
+                num_tokens=num_tokens,
+                override_layers=override_layer_set,
+            )
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -431,7 +461,12 @@ def patch_model(
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            _to_torch(
+                model,
+                reverse=True,
+                num_tokens=num_tokens,
+                override_layers=override_layer_set,
+            )
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -779,6 +814,7 @@ class CudaGraphRunner:
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
+                    override_layers=self.model_runner.server_args.torch_compile_override_layers,
                 ) as forward:
                     (
                         graph,
