@@ -637,7 +637,9 @@ class Engine(EngineBase):
         scheduler_init_result = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
-        scheduler_init_result.engine_info_bootstrap_server = engine_info_bootstrap_server
+        scheduler_init_result.engine_info_bootstrap_server = (
+            engine_info_bootstrap_server
+        )
 
         if (
             server_args.enable_elastic_expert_backup

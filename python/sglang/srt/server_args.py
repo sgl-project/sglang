@@ -5662,7 +5662,9 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        return NetworkAddress(host, port if port is not None else self.port).to_url(scheme)
+        return NetworkAddress(host, port if port is not None else self.port).to_url(
+            scheme
+        )
 
     @property
     def engine_info_bootstrap_url(self):
