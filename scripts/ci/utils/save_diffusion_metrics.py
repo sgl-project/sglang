@@ -6,7 +6,7 @@ with metadata for the performance dashboard.
 
 Usage:
     python3 scripts/ci/utils/save_diffusion_metrics.py \
-        --gpu-config 1-gpu-runner \
+        --gpu-config 1-gpu-h100 \
         --run-id 12345678 \
         --output test/diffusion-metrics-1gpu.json \
         --results-json test/diffusion-results.json
@@ -129,7 +129,7 @@ def main():
     parser.add_argument(
         "--gpu-config",
         required=True,
-        help="GPU configuration (e.g., 1-gpu-runner, 2-gpu-runner)",
+        help="GPU configuration (e.g., 1-gpu-h100, 2-gpu-h100)",
     )
     parser.add_argument(
         "--run-id",
