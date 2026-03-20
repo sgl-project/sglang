@@ -60,7 +60,7 @@ register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 
 # Multi-backend test
 register_cuda_ci(est_time=80, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=120, suite="stage-a-test-1")
+register_amd_ci(est_time=120, suite="stage-a-test-small-1-gpu-amd")
 
 # Temporarily disabled test
 register_cuda_ci(est_time=80, suite="stage-b-test-small-1-gpu", disabled="flaky - see #12345")
@@ -72,8 +72,10 @@ When adding 1-GPU tests, choose the appropriate suite based on hardware compatib
 
 | Suite | Runner | GPU | When to Use |
 |-------|--------|-----|-------------|
+| `stage-a-test-small-1-gpu` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | Stage A per-commit smoke on 5090 (CUDA) |
+| `stage-a-test-small-1-gpu-amd` | AMD CI runners | ROCm | Stage A per-commit smoke (AMD) |
 | `stage-b-test-small-1-gpu` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | 5090-compatible tests (preferred) |
-| `stage-b-test-large-1-gpu` | `1-gpu-runner` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
+| `stage-b-test-large-1-gpu` | `1-gpu-h100` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
 
 **Use `stage-b-test-small-1-gpu` (5090) whenever possible** - this is the preferred suite for most 1-GPU tests.
 
@@ -98,13 +100,13 @@ If a test cannot run on 5090 due to any of the above, use `stage-b-test-large-1-
 ### Available Suites
 
 **Per-Commit (CUDA)**:
-- Stage A: `stage-a-test-1` (locked), `stage-a-test-2`, `stage-a-test-cpu`
+- Stage A: `stage-a-test-small-1-gpu` (5090), `stage-a-test-2`, `stage-a-test-cpu`
 - Stage B: `stage-b-test-small-1-gpu` (5090), `stage-b-test-large-1-gpu` (H100), `stage-b-test-large-2-gpu`
 - Stage C (4-GPU): `stage-c-test-4-gpu-h100`, `stage-c-test-4-gpu-b200`, `stage-c-test-4-gpu-gb200`, `stage-c-test-deepep-4-gpu`
 - Stage C (8-GPU): `stage-c-test-8-gpu-h20`, `stage-c-test-8-gpu-h200`, `stage-c-test-8-gpu-b200`, `stage-c-test-deepep-8-gpu-h200`
 
 **Per-Commit (AMD)**:
-- `stage-a-test-1`, `stage-b-test-small-1-gpu-amd`, `stage-b-test-large-2-gpu-amd`
+- `stage-a-test-small-1-gpu-amd`, `stage-b-test-small-1-gpu-amd`, `stage-b-test-large-2-gpu-amd`
 
 **Nightly**:
 - `nightly-1-gpu`, `nightly-2-gpu`, `nightly-4-gpu`, `nightly-8-gpu`, etc.
