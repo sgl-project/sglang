@@ -124,7 +124,7 @@ def compute_per_step_sub_plans(
         parallel_infos=parallel_infos,
         explicit_replicated_axes=replicated_axes,
         thd_global_seq_lens=thd_global_seq_lens,
-        dp_filtered_axis=dp_axis,
+        dp_filtered_axis=dims_spec.dp_axis,
     )
     reorderer_plans = compute_reorderer_plans(
         dim_specs=dim_specs,
