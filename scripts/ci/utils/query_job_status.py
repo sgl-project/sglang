@@ -3,9 +3,9 @@
 Query GitHub Actions job status for specific jobs.
 
 Usage:
-    python scripts/ci/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x"
-    python scripts/ci/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --hours 48
-    python scripts/ci/query_job_status.py --job "AMD" --workflow pr-test-amd.yml
+    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x"
+    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --hours 48
+    python scripts/ci/utils/query_job_status.py --job "AMD" --workflow pr-test-amd.yml
 
 Requirements:
     pip install tabulate
