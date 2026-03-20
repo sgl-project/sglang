@@ -34,6 +34,7 @@ def compute_unsharder_plan(
     *,
     explicit_replicated_axes: frozenset[ParallelAxis] = frozenset(),
     thd_global_seq_lens: Optional[list[int]] = None,
+    dp_filtered_axis: Optional[ParallelAxis] = None,
 ) -> list[UnsharderPlan]:
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
@@ -68,6 +69,8 @@ def compute_unsharder_plan(
         explicit_replicated_axes=effective_replicated,
         sharded_axes=sharded_axes,
         all_axes=all_axes,
+        parallel_infos=parallel_infos,
+        dp_filtered_axis=dp_filtered_axis,
     )
     replicated_axes: frozenset[ParallelAxis] = effective_replicated
 
@@ -116,6 +119,8 @@ def _validate_explicit_replicated(
     explicit_replicated_axes: frozenset[ParallelAxis],
     sharded_axes: set[ParallelAxis],
     all_axes: set[ParallelAxis],
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    dp_filtered_axis: Optional[ParallelAxis] = None,
 ) -> None:
     """Validate explicit replicated declarations against sharded axes and parallel_infos."""
     invalid: frozenset[ParallelAxis] = explicit_replicated_axes - all_axes
@@ -133,7 +138,29 @@ def _validate_explicit_replicated(
             f"Axes {{{conflict_names}}} declared as both sharded and replicated"
         )
 
-    undeclared: set[ParallelAxis] = all_axes - sharded_axes - explicit_replicated_axes
+    candidate_axes: set[ParallelAxis] = (
+        all_axes - sharded_axes - explicit_replicated_axes
+    )
+    implicitly_replicated: frozenset[ParallelAxis] = _compute_dependent_axes(
+        parent_axes=explicit_replicated_axes,
+        candidate_axes=candidate_axes,
+        parallel_infos=parallel_infos,
+    )
+    implicitly_sharded: frozenset[ParallelAxis] = _compute_dependent_axes(
+        parent_axes=sharded_axes,
+        candidate_axes=candidate_axes - implicitly_replicated,
+        parallel_infos=parallel_infos,
+    )
+
+    declared_axes: frozenset[ParallelAxis] = frozenset(
+        sharded_axes
+        | explicit_replicated_axes
+        | implicitly_replicated
+        | implicitly_sharded
+        | ({dp_filtered_axis} if dp_filtered_axis is not None else set())
+    )
+    undeclared: set[ParallelAxis] = all_axes - declared_axes
+
     if undeclared:
         undeclared_names: str = ", ".join(sorted(a.value for a in undeclared))
         raise ValueError(
@@ -175,6 +202,40 @@ def _validate(
                 f"axis_rank coverage for {axis.value} is incomplete: "
                 f"got {sorted(seen_ranks)}, expected 0..{expected_size - 1}"
             )
+
+
+def _compute_dependent_axes(
+    parent_axes: set[ParallelAxis] | frozenset[ParallelAxis],
+    candidate_axes: set[ParallelAxis],
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+) -> frozenset[ParallelAxis]:
+    """Return candidate axes whose rank is uniquely determined by some parent axis."""
+    return frozenset(
+        child
+        for child in candidate_axes
+        if any(
+            _is_dependent_axis(parallel_infos, parent=parent, child=child)
+            for parent in parent_axes
+        )
+    )
+
+
+def _is_dependent_axis(
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    *,
+    parent: ParallelAxis,
+    child: ParallelAxis,
+) -> bool:
+    """True if child's rank is uniquely determined by parent's rank."""
+    parent_rank_to_child_rank: dict[int, int] = {}
+    for info in parallel_infos:
+        if parent not in info or child not in info:
+            continue
+        parent_rank = info[parent].axis_rank
+        child_rank = info[child].axis_rank
+        if parent_rank_to_child_rank.setdefault(parent_rank, child_rank) != child_rank:
+            return False
+    return True
 
 
 def _group_and_project(

@@ -16,11 +16,20 @@ class TokenLayout(Enum):
     BS = "bs"  # separate batch + seq dims, need collapse
 
 
+# TODO: allow arbitrary string
 class ParallelAxis(Enum):
     TP = "tp"
     CP = "cp"
     EP = "ep"
     SP = "sp"
+    DP = "dp"
+    ETP = "etp"
+    EDP = "edp"
+    ATTN_TP = "attn_tp"
+    ATTN_DP = "attn_dp"
+    MOE_EP = "moe_ep"
+    MOE_TP = "moe_tp"
+    MOE_DP = "moe_dp"
     RECOMPUTE_PSEUDO = "recompute_pseudo"
 
 
