@@ -30,6 +30,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -195,11 +197,21 @@ class DataParallelController:
         self.dispatching(req)
         req.time_stats.set_dp_dispatch_finish_time()
 
+    def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        for req in batch_req:
+            self.dispatching_with_trace(req)
+
+    def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
+        for req in batch_req:
+            self.dispatching_with_trace(req)
+
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
+                (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
+                (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),

@@ -188,6 +188,10 @@ def load_jit(
     if is_hip_runtime():
         selected_cuda_cflags = DEFAULT_HIP_CFLAGS
         extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
+    else:
+        extra_cuda_cflags = [
+            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
+        ] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:
@@ -213,6 +217,14 @@ def is_arch_support_pdl() -> bool:
 
     device = torch.cuda.current_device()
     return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+@cache_once
+def _get_cuda_arch_value() -> int:
+    """Get CUDA arch value for -DSGL_CUDA_ARCH (e.g. 900 for SM 9.0)."""
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 100 + minor * 10
 
 
 @cache_once

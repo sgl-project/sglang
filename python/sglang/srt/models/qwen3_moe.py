@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 
@@ -115,12 +116,19 @@ def compute_yarn_parameters(
         attention_factor: float, the post-processing scaling factor applied to the computed cos/sin
     """
 
-    # The config does not contain rope_scaling, which means the model is not using yarn
-    rope_scaling = getattr(config, "rope_scaling", None)
+    # The config does not contain rope_scaling, which means the model is not using yarn.
+    # In transformers v5, rope_parameters is never None (even for default rope), so also
+    # check rope_type to distinguish actual yarn configs from plain rotary embeddings.
+    rope_scaling = getattr(config, "rope_parameters", None)
+    if rope_scaling is None:
+        rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling is None:
         return 1.0, 0, 0, 1.0
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
+    if rope_type == "default":
+        return 1.0, 0, 0, 1.0
 
-    base = config.rope_theta
+    base = rope_scaling.get("rope_theta") or getattr(config, "rope_theta", 10000)
     partial_rotary_factor = (
         config.partial_rotary_factor
         if hasattr(config, "partial_rotary_factor")
@@ -130,7 +138,7 @@ def compute_yarn_parameters(
         config, "head_dim", config.hidden_size // config.num_attention_heads
     )
     dim = int(head_dim * partial_rotary_factor)
-    factor = getattr(rope_scaling, "factor", 1.0)
+    factor = rope_scaling.get("factor", 1.0)
     attention_factor = rope_scaling.get("attention_factor")
     mscale = rope_scaling.get("mscale")
     mscale_all_dim = rope_scaling.get("mscale_all_dim")
@@ -559,7 +567,7 @@ class Qwen3MoeAttention(nn.Module):
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
-            theta = getattr(self.config, "rope_theta", 10000.0)
+            theta = self.rope_theta
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
             )
@@ -684,8 +692,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
+        self.rope_theta = rope_theta
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads

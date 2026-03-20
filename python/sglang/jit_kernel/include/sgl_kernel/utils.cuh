@@ -88,6 +88,29 @@ namespace device {
 /// \brief Macro: forced-inline device function qualifier.
 #define SGL_DEVICE __forceinline__ __device__
 
+// Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
+// available in both host and device compilation passes, whereas __CUDA_ARCH__
+// is only defined by nvcc during the device pass.
+#if !defined(USE_ROCM)
+#if !defined(SGL_CUDA_ARCH)
+#error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
+#endif
+#if defined(__CUDA_ARCH__)
+static_assert(
+    __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
+#endif
+#define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
+#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#else  // USE_ROCM
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#endif
+
+// Maximum vector size in bytes supported by current architecture.
+// Pre-Blackwell / AMD: 128-bit (16 bytes)
+// Blackwell or greater: 256-bit (32 bytes)
+inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
+
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
@@ -102,7 +125,7 @@ inline constexpr auto kFullMask = 0xffffffffu;
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -117,11 +140,16 @@ SGL_DEVICE void PDLWaitPrimary() {
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
+}
+
+template <std::integral T, std::integral U>
+SGL_DEVICE constexpr auto div_ceil(T a, U b) {
+  return (a + b - 1) / b;
 }
 
 /**
