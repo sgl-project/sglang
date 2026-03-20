@@ -825,8 +825,6 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
-          # temporarily put backend-independent cpu tests here
-          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
