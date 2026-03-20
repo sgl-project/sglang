@@ -571,7 +571,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
     This function handles the FP4 TRTLLM MoE path that was previously in
-    FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+    ModelOptNvFp4FusedMoEMethod.apply.
     """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
