@@ -218,6 +218,44 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("not supported", req.set_finish_with_abort.call_args[0][0])
 
+    def test_json_takes_priority_over_other_constraints(self):
+        """When json_schema is set, it should be used regardless of other fields."""
+        mgr = self._make_mgr()
+        future = Future()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
+
+        req = _make_req(json_schema='{"type": "object"}', regex="[a-z]+")
+        mgr.process_req_with_grammar(req)
+        self.assertEqual(req.grammar_key, ("json", '{"type": "object"}'))
+
+    def test_require_reasoning_forwarded_to_backend(self):
+        """require_reasoning from the request should be passed to the backend."""
+        mgr = self._make_mgr()
+        grammar_obj = MagicMock(spec=BaseGrammarObject)
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (
+            grammar_obj,
+            True,
+        )
+
+        req = _make_req(json_schema="schema")
+        req.require_reasoning = True
+        mgr.process_req_with_grammar(req)
+
+        mgr.grammar_backend.get_cached_or_future_value.assert_called_once_with(
+            ("json", "schema"), True
+        )
+
+    def test_has_waiting_grammars_after_enqueue(self):
+        mgr = self._make_mgr()
+        future = Future()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
+
+        self.assertFalse(mgr.has_waiting_grammars())
+        req = _make_req(json_schema="schema")
+        mgr.process_req_with_grammar(req)
+        self.assertTrue(mgr.has_waiting_grammars())
+        self.assertEqual(len(mgr), 1)
+
 
 class TestAbortRequests(unittest.TestCase):
     """Test abort_requests handling."""
@@ -273,6 +311,28 @@ class TestAbortRequests(unittest.TestCase):
         mgr.abort_requests(abort_req)
         for req in reqs:
             req.set_finish_with_abort.assert_called_once()
+
+    def test_abort_empty_queue(self):
+        """Aborting on an empty queue should not raise."""
+        mgr = self._make_mgr_with_queue()
+        abort_req = MagicMock()
+        abort_req.abort_all = True
+        abort_req.rid = ""
+        mgr.abort_requests(abort_req)  # Should not raise
+
+    def test_abort_prefix_match(self):
+        """rid.startswith means prefix matching, not exact matching."""
+        mgr = self._make_mgr_with_queue()
+        req = _make_req(rid="req-123-suffix")
+        req.grammar = MagicMock(spec=Future)
+        mgr.grammar_queue.append(req)
+
+        abort_req = MagicMock()
+        abort_req.abort_all = False
+        abort_req.rid = "req-123"
+
+        mgr.abort_requests(abort_req)
+        req.set_finish_with_abort.assert_called_once()
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):
@@ -409,6 +469,46 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(mgr.grammar_queue), 1)
         self.assertIs(mgr.grammar_queue[0], pending_req)
 
+    def test_empty_queue(self):
+        """get_ready_grammar_requests on empty queue should return empty list."""
+        mgr = self._make_mgr()
+        result = mgr.get_ready_grammar_requests()
+        self.assertEqual(len(result), 0)
+        self.assertEqual(len(mgr.grammar_queue), 0)
+
+    def test_progressive_timeout(self):
+        """Request with partial wait_ct should timeout after remaining iterations."""
+        mgr = self._make_mgr()
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 3
+
+        future = Future()  # Never completes
+        req = _make_req(json_schema="slow")
+        req.grammar = future
+        req.grammar_key = ("json", "slow")
+        req.grammar_wait_ct = 2  # Already waited 2 iterations
+        mgr.grammar_queue.append(req)
+
+        # wait_ct increments to 3 (== max), should timeout
+        result = mgr.get_ready_grammar_requests()
+        self.assertEqual(len(result), 1)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
+
+    def test_future_exception_propagates(self):
+        """A future that raised an exception should propagate on .result()."""
+        mgr = self._make_mgr()
+
+        future = Future()
+        future.set_exception(RuntimeError("compilation crashed"))
+
+        req = _make_req(json_schema="crash")
+        req.grammar = future
+        req.grammar_key = ("json", "crash")
+        mgr.grammar_queue.append(req)
+
+        with self.assertRaises(RuntimeError):
+            mgr.get_ready_grammar_requests()
+
     def test_multiple_reqs_sharing_same_future(self):
         """Multiple requests sharing a Future all resolve when it completes.
 
@@ -441,6 +541,75 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertIs(req1.grammar, copied_grammar1)
         self.assertIs(req2.grammar, copied_grammar2)
         self.assertIsNot(req1.grammar, req2.grammar)
+        self.assertEqual(len(mgr.grammar_queue), 0)
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_multi_rank_sync_intersects_ready_unions_failed(self, mock_all_gather):
+        """With multiple ranks, ready = intersection, failed = union."""
+        mgr = self._make_mgr()
+        mgr.grammar_sync_size = 2  # Enable multi-rank path
+
+        # Two requests: idx 0 ready on both ranks, idx 1 ready only on rank 0
+        grammar_obj = MagicMock(spec=BaseGrammarObject)
+        grammar_obj.copy.return_value = grammar_obj
+        done_future = Future()
+        done_future.set_result(grammar_obj)
+
+        req0 = _make_req(json_schema="s0", rid="r0")
+        req0.grammar = done_future
+        req0.grammar_key = ("json", "s0")
+
+        pending_future = Future()
+        req1 = _make_req(json_schema="s1", rid="r1")
+        req1.grammar = pending_future
+        req1.grammar_key = ("json", "s1")
+        req1.grammar_wait_ct = 0
+
+        mgr.grammar_queue = [req0, req1]
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
+
+        # Simulate all_gather: rank 0 has {0} ready, rank 1 has {0,1} ready
+        def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
+            output_list[0] = ({0}, set())  # rank 0: only idx 0 ready
+            output_list[1] = ({0, 1}, set())  # rank 1: both ready
+
+        mock_all_gather.side_effect = fake_all_gather
+
+        result = mgr.get_ready_grammar_requests()
+        # Intersection of ready: {0} ∩ {0,1} = {0}
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], req0)
+        # req1 stays in queue
+        self.assertEqual(len(mgr.grammar_queue), 1)
+        self.assertIs(mgr.grammar_queue[0], req1)
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_multi_rank_sync_unions_failed(self, mock_all_gather):
+        """Failed requests from any rank should be unioned."""
+        mgr = self._make_mgr()
+        mgr.grammar_sync_size = 2
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+
+        pending_future = Future()  # Never completes
+        req = _make_req(json_schema="slow", rid="r0")
+        req.grammar = pending_future
+        req.grammar_key = ("json", "slow")
+        req.grammar_wait_ct = 0
+
+        mgr.grammar_queue = [req]
+
+        # Simulate: rank 0 has no ready and idx 0 failed, rank 1 has no ready/failed
+        def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
+            output_list[0] = (set(), {0})  # rank 0: idx 0 timed out
+            output_list[1] = (set(), set())  # rank 1: nothing
+
+        mock_all_gather.side_effect = fake_all_gather
+
+        result = mgr.get_ready_grammar_requests()
+        # Union of failed: {} ∪ {0} = {0}
+        self.assertEqual(len(result), 1)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
         self.assertEqual(len(mgr.grammar_queue), 0)
 
 

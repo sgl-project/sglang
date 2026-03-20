@@ -190,6 +190,33 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         grammar.rollback.assert_called_once_with(3)
         self.assertEqual(obj.tokens_after_think_end, 0)
 
+    def test_rollback_far_beyond_all_tokens(self):
+        """Rollback k much larger than tokens_after_think_end clamps grammar rollback."""
+        obj, grammar = self._make()
+        obj.tokens_after_think_end = 2
+        obj.rollback(100)
+        # Inner grammar only rolls back the 2 post-thinking tokens
+        grammar.rollback.assert_called_once_with(2)
+        # State bottoms out at -1
+        self.assertEqual(obj.tokens_after_think_end, -1)
+
+    def test_accept_then_rollback_roundtrip(self):
+        """Accept tokens then rollback should restore original state."""
+        obj, grammar = self._make()
+        obj.tokens_after_think_end = 0  # Just finished thinking
+
+        # Accept 3 generation tokens
+        obj.accept_token(10)
+        obj.accept_token(20)
+        obj.accept_token(30)
+        self.assertEqual(obj.tokens_after_think_end, 3)
+        self.assertEqual(grammar.accept_token.call_count, 3)
+
+        # Rollback all 3
+        obj.rollback(3)
+        self.assertEqual(obj.tokens_after_think_end, 0)
+        grammar.rollback.assert_called_once_with(3)
+
 
 class TestReasonerGrammarObjectVocabMask(unittest.TestCase):
     """Test vocab mask gating based on thinking state."""
@@ -214,6 +241,15 @@ class TestReasonerGrammarObjectVocabMask(unittest.TestCase):
         obj.tokens_after_think_end = 5
         obj.fill_vocab_mask("mask", 2)
         grammar.fill_vocab_mask.assert_called_once_with("mask", 2)
+
+    def test_fill_at_think_end_boundary(self):
+        """After accepting think_end token, fill_vocab_mask should delegate."""
+        obj, grammar = self._make()
+        # Simulate: accept think_end, state goes from -1 to 0
+        obj.accept_token(THINK_END_ID)
+        self.assertEqual(obj.tokens_after_think_end, 0)
+        obj.fill_vocab_mask("mask", 0)
+        grammar.fill_vocab_mask.assert_called_once_with("mask", 0)
 
     def test_allocate_delegates(self):
         obj, grammar = self._make()
@@ -282,6 +318,16 @@ class TestReasonerGrammarObjectDelegation(unittest.TestCase):
         self.assertIs(copied.grammar, grammar_copy)
         self.assertEqual(copied.think_end_id, THINK_END_ID)
 
+    def test_copy_does_not_share_state(self):
+        """Modifying copy's state should not affect the original."""
+        obj, grammar = self._make()
+        grammar_copy = MagicMock(spec=BaseGrammarObject)
+        grammar.copy.return_value = grammar_copy
+
+        copied = obj.copy()
+        copied.tokens_after_think_end = 5
+        self.assertEqual(obj.tokens_after_think_end, -1)
+
 
 class TestReasonerGrammarObjectMaybeInitReasoning(unittest.TestCase):
     """Test maybe_init_reasoning state initialization."""
@@ -295,6 +341,18 @@ class TestReasonerGrammarObjectMaybeInitReasoning(unittest.TestCase):
     def test_reasoning_false_skips_thinking(self):
         grammar = MagicMock(spec=BaseGrammarObject)
         obj = ReasonerGrammarObject(grammar, THINK_END_ID)
+        obj.maybe_init_reasoning(False)
+        self.assertEqual(obj.tokens_after_think_end, 0)
+
+    def test_reasoning_toggle(self):
+        """Toggling reasoning resets state regardless of current position."""
+        grammar = MagicMock(spec=BaseGrammarObject)
+        obj = ReasonerGrammarObject(grammar, THINK_END_ID)
+        obj.tokens_after_think_end = 5  # Deep into generation
+
+        obj.maybe_init_reasoning(True)
+        self.assertEqual(obj.tokens_after_think_end, -1)
+
         obj.maybe_init_reasoning(False)
         self.assertEqual(obj.tokens_after_think_end, 0)
 

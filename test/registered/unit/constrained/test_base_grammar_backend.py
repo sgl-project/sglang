@@ -17,7 +17,7 @@ Usage:
 
 import unittest
 from concurrent.futures import Future
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
@@ -269,6 +269,44 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.backend.set_cache(("regex", "r1"), obj2)
         self.assertEqual(len(self.backend.cache), 2)
 
+    def test_cache_overwrite_replaces_value(self):
+        """Setting the same key twice should overwrite the first value."""
+        key = ("json", "schema")
+        obj1 = BaseGrammarObject()
+        obj2 = BaseGrammarObject()
+        self.backend.set_cache(key, obj1)
+        self.backend.set_cache(key, obj2)
+        self.assertIs(self.backend.cache[key], obj2)
+        self.assertEqual(len(self.backend.cache), 1)
+
+    def test_reset_then_miss(self):
+        """After reset, previously cached keys should be misses."""
+        key = ("json", "schema")
+        obj = MagicMock(spec=BaseGrammarObject)
+        obj.copy.return_value = obj
+        self.backend.set_cache(key, obj)
+
+        _, hit = self.backend.get_cached_or_future_value(key, False)
+        self.assertTrue(hit)
+
+        self.backend.reset()
+        result, hit = self.backend.get_cached_or_future_value(key, False)
+        self.assertFalse(hit)
+        self.assertIsInstance(result, Future)
+
+    def test_dispatch_fallback_error_message_content(self):
+        """dispatch_fallback error should include the key type and value."""
+        with self.assertRaises(ValueError) as ctx:
+            self.backend.dispatch_fallback("custom_type", "custom_value")
+        self.assertIn("custom_type", str(ctx.exception))
+        self.assertIn("custom_value", str(ctx.exception))
+
+    def test_init_value_dispatch_none_grammar(self):
+        """When dispatch returns None, should not crash on stats check."""
+        self.backend.dispatch_json = MagicMock(return_value=None)
+        result = self.backend._init_value_dispatch(("json", "schema"), False)
+        self.assertIsNone(result)
+
     def test_cache_miss_duplicate_key_submits_separate_futures(self):
         """Two cache misses for the same key each get their own Future.
 
@@ -379,6 +417,108 @@ class TestCreateGrammarBackend(unittest.TestCase):
         result = create_grammar_backend(args, tokenizer, 32000)
         # Custom backends return early, no reasoner wrapping applied
         self.assertIs(result, mock_inner)
+
+    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    def test_outlines_backend(self, mock_outlines_cls):
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_outlines_cls.return_value = mock_backend
+        args = self._make_server_args("outlines")
+        args.constrained_json_whitespace_pattern = r"\s*"
+
+        result = create_grammar_backend(args, "tok", 32000)
+        mock_outlines_cls.assert_called_once_with("tok", whitespace_pattern=r"\s*")
+        self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_backend(self, mock_xgrammar_cls):
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_xgrammar_cls.return_value = mock_backend
+        args = self._make_server_args("xgrammar")
+        args.constrained_json_disable_any_whitespace = True
+
+        result = create_grammar_backend(args, "tok", 32000, {1, 2})
+        mock_xgrammar_cls.assert_called_once_with(
+            "tok", vocab_size=32000, model_eos_token_ids=[1, 2], any_whitespace=False
+        )
+        self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
+        from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
+
+        mock_xgrammar_cls.side_effect = TokenizerNotSupportedError(
+            "unsupported tokenizer"
+        )
+        args = self._make_server_args("xgrammar")
+
+        result = create_grammar_backend(args, "tok", 32000, {1})
+        self.assertIsNone(result)
+        self.assertEqual(args.grammar_backend, "none")
+
+    @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
+    def test_llguidance_backend(self, mock_guidance_cls):
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_guidance_cls.return_value = mock_backend
+        args = self._make_server_args("llguidance")
+        args.constrained_json_disable_any_whitespace = False
+        args.constrained_json_whitespace_pattern = r"\s+"
+
+        result = create_grammar_backend(args, "tok", 32000)
+        mock_guidance_cls.assert_called_once_with(
+            tokenizer="tok", any_whitespace=True, whitespace_pattern=r"\s+"
+        )
+        self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    def test_reasoner_wrapping_on_builtin_backend(self, mock_outlines_cls):
+        """Non-custom backends get wrapped with ReasonerGrammarBackend."""
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarBackend,
+        )
+
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_outlines_cls.return_value = mock_backend
+        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        tokenizer = MagicMock()
+        tokenizer.think_end_id = 42
+
+        result = create_grammar_backend(args, tokenizer, 32000)
+        self.assertIsInstance(result, ReasonerGrammarBackend)
+        self.assertEqual(result.think_end_id, 42)
+        self.assertIs(result.grammar_backend, mock_backend)
+
+    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    def test_no_reasoner_wrapping_without_think_end_id(self, mock_outlines_cls):
+        """Without think_end_id on tokenizer, no reasoner wrapping."""
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_outlines_cls.return_value = mock_backend
+        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        tokenizer = MagicMock(spec=[])  # No think_end_id attribute
+
+        result = create_grammar_backend(args, tokenizer, 32000)
+        self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    def test_no_reasoner_wrapping_without_reasoning_parser(self, mock_outlines_cls):
+        """Without reasoning_parser, no reasoner wrapping even with think_end_id."""
+        mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_outlines_cls.return_value = mock_backend
+        args = self._make_server_args("outlines", reasoning_parser=None)
+        tokenizer = MagicMock()
+        tokenizer.think_end_id = 42
+
+        result = create_grammar_backend(args, tokenizer, 32000)
+        self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_eos_none(self, mock_xgrammar_cls):
+        """eos_token_ids=None should pass None, not an empty list."""
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        args = self._make_server_args("xgrammar")
+
+        create_grammar_backend(args, "tok", 32000, None)
+        _, kwargs = mock_xgrammar_cls.call_args
+        self.assertIsNone(kwargs["model_eos_token_ids"])
 
 
 if __name__ == "__main__":
