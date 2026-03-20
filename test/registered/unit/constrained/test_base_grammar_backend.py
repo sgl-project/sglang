@@ -154,7 +154,7 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.backend = BaseGrammarBackend()
 
     def tearDown(self):
-        self.backend.executor.shutdown(wait=False)
+        self.backend.executor.shutdown(wait=True)
 
     def test_initial_cache_empty(self):
         self.assertEqual(len(self.backend.cache), 0)
