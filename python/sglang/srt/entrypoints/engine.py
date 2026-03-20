@@ -610,7 +610,7 @@ class Engine(EngineBase):
 
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
-            engine_info_bootstrap is stored on scheduler_init_result if started.
+            engine_info_bootstrap_server is stored on scheduler_init_result if started.
         """
         # Configure global environment
         configure_logger(server_args)
@@ -623,21 +623,23 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Start the engine info bootstrap server if per-rank info is needed.
-        engine_info_bootstrap = None
+        engine_info_bootstrap_server = None
         if (
             server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
             and server_args.node_rank == 0
         ):
             bootstrap_port = server_args.engine_info_bootstrap_port
-            engine_info_bootstrap = EngineInfoBootstrapServer(
-                host="0.0.0.0", port=bootstrap_port
+            engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                host=server_args.host, port=bootstrap_port
             )
 
         # Launch scheduler processes
         scheduler_init_result = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
-        scheduler_init_result.engine_info_bootstrap = engine_info_bootstrap
+        scheduler_init_result.engine_info_bootstrap_server = (
+            engine_info_bootstrap_server
+        )
 
         if (
             server_args.enable_elastic_expert_backup
