@@ -157,7 +157,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-h200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -257,7 +257,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-b200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -434,7 +434,7 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
+          python3 scripts/ci/utils/save_diffusion_metrics.py \
             --gpu-config 1-gpu-runner \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-1gpu-partition-${{ matrix.part }}.json \
@@ -490,7 +490,7 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
+          python3 scripts/ci/utils/save_diffusion_metrics.py \
             --gpu-config 2-gpu-runner \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-2gpu-partition-${{ matrix.part }}.json \
@@ -589,7 +589,7 @@ jobs:
 
       - name: Merge metrics
         run: |
-          python3 scripts/ci/merge_metrics.py \
+          python3 scripts/ci/utils/merge_metrics.py \
             --input-dir metrics/ \
             --output consolidated-metrics-${{ github.run_id }}.json \
             --run-id ${{ github.run_id }} \
