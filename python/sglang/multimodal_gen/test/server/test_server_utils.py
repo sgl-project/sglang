@@ -837,6 +837,15 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(size)
+        if (
+            extra_body is not None
+            and extra_body.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            scale = extra_body.get("upscaling_scale", 4)
+            expected_width *= scale
+            expected_height *= scale
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
