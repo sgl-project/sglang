@@ -25,7 +25,7 @@ permissions:
 jobs:
   multimodal-diffusion-gen-1gpu:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     strategy:
       matrix:
         part: [0, 1]
@@ -59,7 +59,7 @@ jobs:
 
   multimodal-diffusion-gen-2gpu:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     strategy:
       matrix:
         part: [0, 1]
@@ -96,13 +96,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sgl-test-files
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          repository: sgl-project/sgl-test-files
-          path: sgl-test-files
-          ref: main
-          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -111,19 +106,12 @@ jobs:
           path: combined
           merge-multiple: true
 
-      - name: Copy image and video frame files
+      - name: Collect image files
         run: |
-          mkdir -p sgl-test-files/diffusion-ci/consistency_gt
-          find combined \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \) -type f -exec cp -f {} sgl-test-files/diffusion-ci/consistency_gt/ \;
+          mkdir -p gt_images
+          find combined \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \) -type f -exec cp -f {} gt_images/ \;
 
-      - name: Git commit and push
+      - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: |
-          cd sgl-test-files
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}@github.com/sgl-project/sgl-test-files.git"
-          git add diffusion-ci/consistency_gt/
-          git diff --staged --quiet || git commit -m "diffusion-ci: update consistency_gt images [automated]"
-          git push origin main
+        run: python scripts/ci/utils/publish_diffusion_gt.py --source-dir gt_images

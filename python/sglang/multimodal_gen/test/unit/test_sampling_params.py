@@ -1,3 +1,4 @@
+import argparse
 import math
 import unittest
 
@@ -5,6 +6,7 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
@@ -65,6 +67,62 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+
+class TestSamplingParamsCliArgs(unittest.TestCase):
+    def _parse_cli_kwargs(self, argv: list[str]) -> dict:
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(argv)
+        return SamplingParams.get_cli_args(args)
+
+    def _make_qwen_image_params(self, argv: list[str]) -> QwenImageSamplingParams:
+        return QwenImageSamplingParams(**self._parse_cli_kwargs(argv))
+
+    def test_get_cli_args_drops_unset_sampling_params(self):
+        self.assertEqual(self._parse_cli_kwargs([]), {})
+
+    def test_get_cli_args_keeps_explicit_sampling_params(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+                "--save-output",
+            ]
+        )
+
+        self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
+        self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
+        self.assertTrue(kwargs["save_output"])
+
+    def test_qwen_image_cli_path_preserves_model_defaults(self):
+        params = self._make_qwen_image_params([])
+
+        self.assertEqual(params.negative_prompt, " ")
+        self.assertEqual(params.guidance_scale, 4.0)
+
+    def test_qwen_image_cli_path_allows_explicit_override_to_base_defaults(self):
+        params = self._make_qwen_image_params(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+            ]
+        )
+
+        self.assertEqual(params.guidance_scale, SamplingParams.guidance_scale)
+        self.assertEqual(params.negative_prompt, SamplingParams.negative_prompt)
+
+    def test_merge_allows_explicit_field_matching_base_default(self):
+        target = DiffusersGenericSamplingParams()
+        user = SamplingParams(negative_prompt=SamplingParams.negative_prompt)
+
+        target._merge_with_user_params(user, explicit_fields={"negative_prompt"})
+
+        self.assertEqual(target.negative_prompt, SamplingParams.negative_prompt)
 
 
 if __name__ == "__main__":

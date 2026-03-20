@@ -19,10 +19,11 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -163,6 +164,26 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.mrope_section if self.mrope_section else None,
+                self.mrope_interleaved,
+                self.is_neox_style,
+            )
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_cuda(
         self,

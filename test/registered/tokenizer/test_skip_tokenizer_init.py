@@ -36,7 +36,7 @@ class TestSkipTokenizerInit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-tokenizer-init", "--stream-output"],
+            other_args=["--skip-tokenizer-init", "--incremental-streaming-output"],
         )
         cls.eos_token_id = [119690]
         cls.tokenizer = AutoTokenizer.from_pretrained(
