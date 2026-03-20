@@ -274,9 +274,7 @@ class DiffusionTestCase:
                 f"{self.id}: run_lora_dynamic_switch_check requires second_lora_path"
             )
 
-        if self.run_multi_lora_api_check and not (
-            has_startup_lora and has_second_lora
-        ):
+        if self.run_multi_lora_api_check and not (has_startup_lora and has_second_lora):
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
