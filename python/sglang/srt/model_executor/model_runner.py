@@ -615,6 +615,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        # Collect attention and MoE layers from the model
+        self.collect_attention_and_moe_layers()
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -2241,36 +2244,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-    def init_piecewise_cuda_graphs(self):
-        """Initialize piecewise CUDA graph runner."""
-        self.piecewise_cuda_graph_runner = None
-
-        if self.server_args.disable_piecewise_cuda_graph:
-            logger.info(
-                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
-            )
-            return
-
-        # Disable piecewise CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
-            logger.warning(
-                "Disable piecewise CUDA graph because the model is not a language model"
-            )
-            return
-
-        # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.piecewise_cuda_graph_tokens:
-            logger.warning(
-                "Disable piecewise CUDA graph because the capture size is not set"
-            )
-            return
-
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+    def collect_attention_and_moe_layers(self):
+        """Collect attention layers and MoE layers from the model for use by
+        CudaGraphRunner and PiecewiseCudaGraphRunner."""
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
+
+        if not hasattr(self.model, "model"):
+            return
+
+        self.model.model = resolve_language_model(self.model)
+        language_model = getattr(self.model, "language_model", self.model)
         for layer in language_model.model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -2321,6 +2306,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+
+    def init_piecewise_cuda_graphs(self):
+        """Initialize piecewise CUDA graph runner."""
+        self.piecewise_cuda_graph_runner = None
+
+        if self.server_args.disable_piecewise_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
+            )
+            return
+
+        # Disable piecewise CUDA graph for non-language models
+        if not hasattr(self.model, "model"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model is not a language model"
+            )
+            return
+
+        # Disable piecewise CUDA graph for non capture size
+        if not self.server_args.piecewise_cuda_graph_tokens:
+            logger.warning(
+                "Disable piecewise CUDA graph because the capture size is not set"
+            )
+            return
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA

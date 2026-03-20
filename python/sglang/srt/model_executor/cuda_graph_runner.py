@@ -30,6 +30,7 @@ import tqdm
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -407,6 +408,7 @@ def _torch_compile_wrapper(forward):
         torch.no_grad()(forward),
         mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
         dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
+        fullgraph=True,
     )
 
 
@@ -656,6 +658,12 @@ class CudaGraphRunner:
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+        # Forward context for unified attention op
+        self.attention_layers = model_runner.attention_layers
+        self.quant_config = getattr(model_runner.model, "quant_config", None)
+        self.moe_layers = model_runner.moe_layers
+        self.moe_fusions = model_runner.moe_fusions
 
         # Speculative_inference
         if (
@@ -1020,12 +1028,19 @@ class CudaGraphRunner:
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
 
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
+            with set_forward_context(
                 forward_batch,
-                **kwargs,
-            )
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ):
+                logits_output_or_pp_proxy_tensors = forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1167,7 +1182,15 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
+
+        with set_forward_context(
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+        ):
+            self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

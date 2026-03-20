@@ -115,14 +115,27 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
-            else:
-                output = torch.empty_like(q)
-            unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+            return unified_attention_with_output(
+                q,
+                k,
+                v,
+                self.tp_q_head_num * self.v_head_dim,
+                save_kv_cache,
+                self.layer_id,
+                **kwargs,
             )
-            return output
+        elif (
+            forward_batch.forward_mode.is_decode() and get_forward_context() is not None
+        ):
+            return unified_attention_with_output(
+                q,
+                k,
+                v,
+                self.tp_q_head_num * self.v_head_dim,
+                save_kv_cache,
+                self.layer_id,
+                **kwargs,
+            )
         else:
             return forward_batch.attn_backend.forward(
                 q,
@@ -135,20 +148,35 @@ class RadixAttention(nn.Module):
             )
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_attention_with_output(
+def _unified_attention_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    output: torch.Tensor,
+    num_out_features: int,
     save_kv_cache: bool,
     layer_id: int,
     *,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
-) -> None:
+) -> torch.Tensor:
+    return query.new_empty(query.shape[0], num_out_features)
+
+
+@register_custom_op(fake_impl=_unified_attention_fake)
+@register_split_op()
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    num_out_features: int,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
@@ -162,12 +190,6 @@ def unified_attention_with_output(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    ret = forward_batch.attn_backend.forward(
+    return forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
     )
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return
