@@ -12,12 +12,6 @@ from github import Auth, Github
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
-# Maps /rerun-stage-only names to workflow_dispatch target_stage for PR Test (AMD).
-# Needed where the suite/job input matches NVIDIA (e.g. stage-a-test-small-1-gpu).
-AMD_RERUN_STAGE_INPUT = {
-    "stage-a-test-small-1-gpu-amd": "stage-a-test-small-1-gpu",
-}
-
 
 def find_workflow_run_url(
     gh_repo,
@@ -295,12 +289,6 @@ def handle_rerun_stage(
     valid_stages = nvidia_stages + amd_stages
     is_amd_stage = stage_name in amd_stages
 
-    dispatch_target_stage = (
-        AMD_RERUN_STAGE_INPUT.get(stage_name, stage_name)
-        if is_amd_stage
-        else stage_name
-    )
-
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
         pr.create_issue_comment(
@@ -347,7 +335,7 @@ def handle_rerun_stage(
             )
             if is_amd_stage:
                 inputs = {
-                    "target_stage": dispatch_target_stage,
+                    "target_stage": stage_name,
                     "pr_head_sha": pr_head_sha,
                 }
             else:
@@ -362,7 +350,7 @@ def handle_rerun_stage(
             ref = pr.head.ref
             print(f"Triggering {workflow_name} workflow on branch: {ref}")
             if is_amd_stage:
-                inputs = {"target_stage": dispatch_target_stage}
+                inputs = {"target_stage": stage_name}
             else:
                 inputs = {"version": "release", "target_stage": stage_name}
 
@@ -396,7 +384,7 @@ def handle_rerun_stage(
                     gh_repo,
                     target_workflow.id,
                     ref,
-                    dispatch_target_stage,
+                    stage_name,
                     token,
                     dispatch_time,
                     pr_head_sha=pr_head_sha,
