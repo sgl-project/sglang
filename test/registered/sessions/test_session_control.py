@@ -43,7 +43,6 @@ class TestSessionControl(unittest.TestCase):
             other_args=[
                 "--attention-backend",
                 "triton",
-                "--enable-streaming-session",
             ],
         )
 
