@@ -253,7 +253,7 @@ def handle_rerun_stage(
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
-        "stage-a-test-1",
+        "stage-a-test-small-1-gpu",
         "stage-a-cpu-only",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
@@ -274,7 +274,7 @@ def handle_rerun_stage(
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-1-amd",
+        "stage-a-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd-nondeterministic",
         "stage-b-test-small-1-gpu-amd-mi35x",
@@ -334,7 +334,10 @@ def handle_rerun_stage(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
             if is_amd_stage:
-                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+                inputs = {
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
             else:
                 inputs = {
                     "version": "release",
@@ -410,11 +413,11 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
-    "stage-a-test-1": "1-gpu-runner",
+    "stage-a-test-small-1-gpu": "1-gpu-5090",
     "stage-a-cpu-only": "ubuntu-latest",
     "stage-b-test-small-1-gpu": "1-gpu-5090",
-    "stage-b-test-large-1-gpu": "1-gpu-runner",
-    "stage-b-test-large-2-gpu": "2-gpu-runner",
+    "stage-b-test-large-1-gpu": "1-gpu-h100",
+    "stage-b-test-large-2-gpu": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
@@ -513,6 +516,20 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     Handles the /rerun-ut <file>::<TestClass.test_method> command.
     Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
     """
+    # SECURITY: Block /rerun-ut entirely for fork PRs. This command checks out and
+    # executes code from the PR branch on self-hosted GPU runners, which would bypass
+    # the run-ci label gate that requires maintainer review for fork PRs.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if is_fork:
+        print("Permission denied: /rerun-ut is not allowed on fork PRs.")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ `/rerun-ut` is not available for fork PRs (security restriction).\n\n"
+            "Please ask a maintainer to add the `run-ci` label and use the normal CI flow, "
+            "or use `/rerun-failed-ci` to rerun workflows that have already passed the gate."
+        )
+        return False
+
     if not (
         user_perms.get("can_rerun_ut", False)
         or user_perms.get("can_rerun_stage", False)
@@ -680,6 +697,7 @@ def main():
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
+    # Note: /rerun-ut is blocked entirely for fork PRs in handle_rerun_ut() itself.
     if pr.user.login == user_login:
         if user_perms is None:
             print(

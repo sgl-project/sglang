@@ -1,6 +1,6 @@
 import pytest
 import torch
-from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
+from sgl_kernel import cutlass_w4a8_moe_mm
 from utils import is_hopper
 
 from sglang.srt.layers.moe.ep_moe.kernels import deepep_ll_get_cutlass_w4a8_moe_mm_data
@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_8bit,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -206,7 +207,7 @@ def _per_tensor_quant_fp8(
         device=x.device,
         dtype=torch.float32,
     )
-    sgl_per_tensor_quant_fp8(x, x_q, x_s, is_static=False)
+    per_tensor_quant_fp8(x, x_q, x_s, is_static=False)
     return x_q, x_s
 
 

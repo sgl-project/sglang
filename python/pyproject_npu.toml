@@ -26,8 +26,6 @@ dependencies = [
   "einops",
   "fastapi",
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -57,13 +55,12 @@ dependencies = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "mistral_common>=1.9.0",
+  "transformers==5.3.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.4.1",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -71,7 +68,7 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
     "PyYAML==6.0.1",
     "cloudpickle",
-    "diffusers==0.36.0",
+    "diffusers==0.37.0",
     "imageio==2.36.0",
     "imageio-ffmpeg==0.5.1",
     "moviepy>=2.0.0",
@@ -98,7 +95,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft",
+  "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
   "tabulate",

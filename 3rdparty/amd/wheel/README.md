@@ -1,10 +1,10 @@
-# sgl-kernel
+# sglang-kernel (prior sgl-kernel)
 
-Building and releasing sgl-kernel as a wheel is a part of the release workflow.  Check [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml) for details.
+Building and releasing `sglang-kernel` as a wheel is a part of the release workflow. Check [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml) for details.
 
 # sglang
 
-`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel.  It extends `python/pyproject_other.toml` with two ROCm-version extras (`rocm700`, `rocm720`) that pin the matching torch/triton/torchaudio/torchvision/sgl-kernel wheels, and renames the package to `amd-sglang`.
+`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel. It extends `python/pyproject_other.toml` with two ROCm-version extras (`rocm700`, `rocm720`) that pin the matching torch/triton/torchaudio/torchvision/`sglang-kernel` wheels, and renames the package to `amd-sglang`.
 
 ## Operation to build sglang wheel
 
@@ -20,13 +20,13 @@ $ cd python && python -m build
 
 ROCm 7.0.0:
 ```
-pip uninstall sgl-kernel sglang amd-sglang
+pip uninstall sglang-kernel sglang amd-sglang
 pip install "amd-sglang[all-hip,rocm700]" -i https://pypi.amd.com/rocm-7.0.0/simple --extra-index-url https://pypi.org/simple
 ```
 
 ROCm 7.2.0:
 ```
-pip uninstall sgl-kernel sglang amd-sglang
+pip uninstall sglang-kernel sglang amd-sglang
 pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
 ```
 
