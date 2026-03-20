@@ -44,7 +44,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -74,6 +73,7 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -326,7 +326,11 @@ class MoEGate(nn.Module):
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
-            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+            elif (
+                _use_aiter_gfx95
+                and hidden_states.shape[0] <= 256
+                and self.weight.shape[0] <= 256
+            ):
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
@@ -1994,7 +1998,7 @@ class DeepseekV2Model(nn.Module):
             with ctx:
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = tensor_model_parallel_all_gather(
+                        aux_hidden_state = get_attention_tp_group().all_gather(
                             hidden_states + residual, dim=0
                         )
                         aux_hidden_states.append(aux_hidden_state)
