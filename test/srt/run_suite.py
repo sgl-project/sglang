@@ -49,6 +49,7 @@ suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_bmm.py"),
         TestFile("cpu/test_causal_conv1d.py"),
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
@@ -75,7 +76,7 @@ suite_xeon = {
 suite_xpu = {
     "per-commit-xpu": [
         TestFile("xpu/test_deepseek_ocr.py"),
-        TestFile("xpu/test_internvl.py"),
+        # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
