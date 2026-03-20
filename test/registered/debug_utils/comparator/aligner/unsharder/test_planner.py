@@ -3,6 +3,7 @@ import pytest
 from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     _compute_dependent_axes,
     _is_dependent_axis,
+    _is_jointly_determined,
     _validate_explicit_replicated,
     compute_unsharder_plan,
 )
@@ -417,6 +418,48 @@ class TestComputeUnsharderPlan:
         assert ParallelAxis.TP in axes_in_plan
         assert ParallelAxis.EP in axes_in_plan
         assert ParallelAxis.ETP not in axes_in_plan
+
+    def test_edp_jointly_determined_by_tp_and_cp(self) -> None:
+        """dims=t[cp:zigzag,sp] h # tp:replicated, EDP determined by (TP,CP) jointly → plan succeeds.
+
+        Simulates tp=2, cp=2, ep=1, etp=1 on 4 GPUs.
+        """
+        dim_specs = parse_dims("t[cp:zigzag,sp] h # tp:replicated").dims
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=2, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=3, axis_size=4),
+            },
+        ]
+        plans = compute_unsharder_plan(
+            dim_specs,
+            parallel_infos,
+            explicit_replicated_axes=frozenset({ParallelAxis.TP}),
+        )
+        axes_in_plan = [p.axis for p in plans]
+        assert ParallelAxis.CP in axes_in_plan
+        assert ParallelAxis.TP in axes_in_plan
+        assert ParallelAxis.EDP not in axes_in_plan
 
 
 class TestExplicitReplicatedAxes:
@@ -1352,4 +1395,483 @@ class TestValidateExplicitReplicated:
             sharded_axes=set(),
             all_axes=set(),
             parallel_infos=[{}],
+        )
+
+    def test_jointly_determined_axis_passes(self) -> None:
+        """EDP determined by (TP, CP) jointly but not by either alone → no error.
+
+        Simulates tp=2, cp=2, ep=1, etp=1 on 4 GPUs where edp_size=4
+        and edp_rank = unique per (tp_rank, cp_rank) combination.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=2, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=3, axis_size=4),
+            },
+        ]
+        _validate_explicit_replicated(
+            explicit_replicated_axes=frozenset({ParallelAxis.TP}),
+            sharded_axes={ParallelAxis.CP, ParallelAxis.SP},
+            all_axes={
+                ParallelAxis.TP,
+                ParallelAxis.CP,
+                ParallelAxis.SP,
+                ParallelAxis.EDP,
+            },
+            parallel_infos=parallel_infos,
+        )
+
+    def test_jointly_undetermined_axis_still_raises(self) -> None:
+        """Axis not determined even by the combination of all declared axes → raises.
+
+        DP is orthogonal to TP (each TP rank pairs with both DP ranks),
+        so (TP,) cannot determine DP.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                ParallelAxis.DP: AxisInfo(axis_rank=dp_rank, axis_size=2),
+            }
+            for tp_rank in range(2)
+            for dp_rank in range(2)
+        ]
+        with pytest.raises(ValueError, match="dp.*not declared"):
+            _validate_explicit_replicated(
+                explicit_replicated_axes=frozenset(),
+                sharded_axes={ParallelAxis.TP},
+                all_axes={ParallelAxis.TP, ParallelAxis.DP},
+                parallel_infos=parallel_infos,
+            )
+
+
+class TestIsJointlyDetermined:
+    def test_edp_determined_by_tp_and_cp(self) -> None:
+        """EDP rank = unique per (TP, CP) combination → True."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=2, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=3, axis_size=4),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_dp_not_determined_by_tp_alone(self) -> None:
+        """DP is orthogonal to TP → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                ParallelAxis.DP: AxisInfo(axis_rank=dp_rank, axis_size=2),
+            }
+            for tp_rank in range(2)
+            for dp_rank in range(2)
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.DP,
+        )
+
+    def test_empty_parallel_infos_returns_false(self) -> None:
+        """No parallel_info entries → False (no evidence)."""
+        assert not _is_jointly_determined(
+            [],
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_child_absent_from_infos_returns_false(self) -> None:
+        """Child axis not present in any info → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_empty_parent_axes_returns_false(self) -> None:
+        """Empty parent_axes → False (no parents to determine child)."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset(),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_single_parent_determines_child(self) -> None:
+        """Single parent tp_rank uniquely maps to edp_rank → True (degenerate joint case)."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_conflict_returns_false(self) -> None:
+        """Same (tp_rank, cp_rank) maps to different edp_rank → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_two_parents_jointly_determine_child(self) -> None:
+        """(tp_rank, cp_rank) tuple uniquely determines edp_rank → True."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=2, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=3, axis_size=4),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_three_parents_jointly_determine_child(self) -> None:
+        """(tp, cp, ep) triple uniquely determines edp → True."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=tp, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=cp, axis_size=2),
+                ParallelAxis.EP: AxisInfo(axis_rank=ep, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=tp * 4 + cp * 2 + ep, axis_size=8),
+            }
+            for tp in range(2)
+            for cp in range(2)
+            for ep in range(2)
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP, ParallelAxis.EP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_parent_partially_absent_causes_ambiguity(self) -> None:
+        """Some infos lack a parent axis → False, even if child values differ.
+
+        When cp is missing from some infos, the joint determination is
+        incomplete because we cannot construct a full parent key.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=4),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                # cp absent — parent key is incomplete
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=4),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_partial_parent_first_info_missing_returns_false(self) -> None:
+        """First info lacks a parent axis; second info has all parents → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                # cp absent
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_universally_absent_parent_ignored_remaining_determines(self) -> None:
+        """Parent axis absent from ALL infos is ignored; remaining parent determines child → True.
+
+        Models the real scenario where DP (size 1) is in declared_axes but
+        filtered out of all parallel_infos by normalize_parallel_info.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_all_parents_universally_absent_returns_false(self) -> None:
+        """Every parent axis absent from ALL infos → no active parents → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_universally_absent_parent_remaining_conflict_returns_false(self) -> None:
+        """Parent axis absent from ALL infos ignored, but remaining parent has conflict → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_partial_parent_matching_child_still_returns_false(self) -> None:
+        """Even when child values match across infos, incomplete parent → False.
+
+        Ensures the check is about parent completeness, not child conflict.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                # cp absent — but edp_rank is SAME as first info
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_many_infos_consistent_joint_mapping(self) -> None:
+        """8 ranks with (tp, cp) consistently mapping to edp → True."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=tp, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=cp, axis_size=2),
+                ParallelAxis.EP: AxisInfo(axis_rank=ep, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=tp * 2 + cp, axis_size=4),
+            }
+            for tp in range(2)
+            for cp in range(2)
+            for ep in range(2)
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_partial_parent_middle_info_missing_returns_false(self) -> None:
+        """Middle info in a 3-info list lacks a parent → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=3),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                # cp absent
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=3),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=2, axis_size=3),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_child_absent_from_some_infos_still_true(self) -> None:
+        """Child absent from some infos but consistent where present → True.
+
+        Infos without the child are skipped; no parent completeness issue.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                # edp absent — this info is skipped
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_child_absent_from_all_infos_returns_false(self) -> None:
+        """Child not present in any info → mapping is empty → False."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.CP,
+        )
+
+    def test_parent_present_in_some_but_missing_with_child_returns_false(self) -> None:
+        """Parent present in some infos but absent in an info that has child.
+
+        This is the potential false-positive scenario: an info has child but
+        not all active parents, so the parent key cannot be fully constructed.
+        """
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                # TP present in first info so it's active, but absent here
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.EDP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        assert not _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            child=ParallelAxis.EDP,
+        )
+
+    def test_single_info_with_all_axes_returns_true(self) -> None:
+        """Single info entry with parent and child → trivially determined → True."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=1),
+                ParallelAxis.EDP: AxisInfo(axis_rank=0, axis_size=1),
+            },
+        ]
+        assert _is_jointly_determined(
+            parallel_infos,
+            parent_axes=frozenset({ParallelAxis.TP}),
+            child=ParallelAxis.EDP,
         )

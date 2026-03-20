@@ -4511,6 +4511,179 @@ class TestEntrypointAutoDescend:
             run(parse_args(argv))
 
 
+class TestPartialParallelInfo:
+    """Regression tests for _is_jointly_determined with incomplete parallel_info.
+
+    When some ranks lack a parallel axis that other ranks have, the unsharder
+    planner must detect the inconsistency and report the axis as undeclared
+    rather than silently accepting it as jointly determined.
+    """
+
+    def test_missing_parent_axis_triggers_undeclared_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Ranks with inconsistent parallel_info → undeclared axis error.
+
+        # Step 1: Create 4 target ranks where moe_tp is absent from ranks 2-3.
+        #   This makes moe_tp implicitly-sharded (dependent on tp for ranks 0-1),
+        #   but edp is NOT dependent on tp alone (tp=0 maps to edp=0 AND edp=2).
+        # Step 2: _is_jointly_determined is called with parent_axes={tp, moe_tp}
+        #   for child=edp. Ranks 2-3 lack moe_tp → returns False.
+        # Step 3: edp remains undeclared → ValueError emitted as error record.
+        """
+        torch.manual_seed(42)
+        full_tensor = torch.randn(2, 8)
+        shard0 = full_tensor[:, :4]
+        shard1 = full_tensor[:, 4:]
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h",
+        )
+
+        # Ranks 0-1: have tp + moe_tp + edp
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=shard0,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 0,
+                "tp_size": 2,
+                "moe_tp_rank": 0,
+                "moe_tp_size": 2,
+                "edp_rank": 0,
+                "edp_size": 4,
+            },
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=1,
+            name="hidden",
+            tensor=shard1,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 1,
+                "tp_size": 2,
+                "moe_tp_rank": 1,
+                "moe_tp_size": 2,
+                "edp_rank": 1,
+                "edp_size": 4,
+            },
+        )
+
+        # Ranks 2-3: have tp + edp but NO moe_tp
+        _create_rank_dump(
+            target_dir,
+            rank=2,
+            name="hidden",
+            tensor=shard0,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 0,
+                "tp_size": 2,
+                "edp_rank": 2,
+                "edp_size": 4,
+            },
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=3,
+            name="hidden",
+            tensor=shard1,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 1,
+                "tp_size": 2,
+                "edp_rank": 3,
+                "edp_size": 4,
+            },
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 1
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) >= 1
+        assert any("not declared" in e.traceback_str for e in errors)
+
+    def test_consistent_parallel_info_allows_joint_determination(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """All ranks have complete parallel_info → edp is jointly determined, comparison succeeds.
+
+        # Step 1: 4 target ranks with TP=2, CP=2 (replicated), EDP=4.
+        #   edp is NOT dependent on tp alone (tp=0→edp=0,2) or cp alone (cp=0→edp=0,1).
+        # Step 2: _is_jointly_determined is called with parent_axes={tp, cp}, child=edp.
+        #   All infos have both tp and cp → joint mapping is consistent → True.
+        # Step 3: CP replicated picks one rank per tp group → TP concat → correct shape.
+        """
+        torch.manual_seed(42)
+        full_tensor = torch.randn(2, 8)
+        shard0 = full_tensor[:, :4]
+        shard1 = full_tensor[:, 4:]
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h",
+        )
+
+        # CP=replicated → ranks with different cp_rank have same tensor shard
+        for rank, tp, cp, edp, shard in [
+            (0, 0, 0, 0, shard0),
+            (1, 1, 0, 1, shard1),
+            (2, 0, 1, 2, shard0),
+            (3, 1, 1, 3, shard1),
+        ]:
+            _create_rank_dump(
+                target_dir,
+                rank=rank,
+                name="hidden",
+                tensor=shard,
+                dims="b h[tp] # cp:replicated",
+                parallel_info={
+                    "tp_rank": tp,
+                    "tp_size": 2,
+                    "cp_rank": cp,
+                    "cp_size": 2,
+                    "edp_rank": edp,
+                    "edp_size": 4,
+                },
+            )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 0
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+
 class TestErrorResilience:
     """Bundle comparison exception → continue with remaining bundles."""
 

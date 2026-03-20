@@ -161,6 +161,15 @@ def _validate_explicit_replicated(
     )
     undeclared: set[ParallelAxis] = all_axes - declared_axes
 
+    jointly_determined: frozenset[ParallelAxis] = frozenset(
+        child
+        for child in undeclared
+        if _is_jointly_determined(
+            parallel_infos, parent_axes=declared_axes, child=child
+        )
+    )
+    undeclared -= jointly_determined
+
     if undeclared:
         undeclared_names: str = ", ".join(sorted(a.value for a in undeclared))
         raise ValueError(
@@ -236,6 +245,47 @@ def _is_dependent_axis(
         if parent_rank_to_child_rank.setdefault(parent_rank, child_rank) != child_rank:
             return False
     return True
+
+
+def _is_jointly_determined(
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    *,
+    parent_axes: frozenset[ParallelAxis],
+    child: ParallelAxis,
+) -> bool:
+    """True if child's rank is uniquely determined by the joint tuple of parent ranks.
+
+    Unlike ``_is_dependent_axis`` which checks single-parent dependency, this
+    checks whether the *combination* of all parent axes jointly determines the
+    child.  For example, ``edp_rank`` may not be a function of ``tp_rank`` alone
+    or ``cp_rank`` alone, but it *is* a function of ``(tp_rank, cp_rank)``.
+
+    Parent axes that are absent from *every* info are ignored (they carry no
+    information — e.g. DP with size 1 filtered by ``normalize_parallel_info``).
+    However, a parent axis present in *some* infos but missing from an info
+    that contains the child makes the determination incomplete → ``False``.
+    """
+    if not parent_axes:
+        return False
+
+    active_parents: frozenset[ParallelAxis] = frozenset(
+        ax for ax in parent_axes if any(ax in info for info in parallel_infos)
+    )
+    if not active_parents:
+        return False
+
+    mapping: dict[frozenset, int] = {}
+    for info in parallel_infos:
+        if child not in info:
+            continue
+        if not active_parents.issubset(info):
+            return False
+        parent_key = frozenset((ax, info[ax].axis_rank) for ax in active_parents)
+        child_rank: int = info[child].axis_rank
+        if mapping.setdefault(parent_key, child_rank) != child_rank:
+            return False
+
+    return bool(mapping)
 
 
 def _group_and_project(

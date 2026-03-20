@@ -13,6 +13,7 @@ from sglang.srt.debug_utils.comparator.display import (
     _collect_rank_info,
     _extract_parallel_info,
     _render_polars_as_text,
+    _extract_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
