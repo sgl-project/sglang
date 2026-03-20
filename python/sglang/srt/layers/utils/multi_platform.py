@@ -42,9 +42,14 @@ class MultiPlatformOp(nn.Module):
                 return False, None
             return True, self.forward_native
 
+        # Default fallback
         if "FusedMoE" in class_name:
             if num_tokens == 1:
-                return True, self.forward_native
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                return True, fused_moe_forward_native
             return True, self._forward_method
 
         if "TopK" in class_name:
