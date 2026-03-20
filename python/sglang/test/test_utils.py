@@ -880,8 +880,6 @@ def popen_launch_server(
         merged.update(env)
         env = merged
 
-    offline_force_disabled = env.get("HF_HUB_OFFLINE") == "0"
-
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
     try:
