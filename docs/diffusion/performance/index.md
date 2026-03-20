@@ -66,6 +66,12 @@ To diagnose performance bottlenecks, SGLang-Diffusion supports profiling tools:
 
 See [Profiling Guide](profiling.md) for detailed instructions.
 
+## Current Baseline Snapshot
+
+For Ring SP benchmark details, see:
+
+- [Ring SP Performance](ring_sp_performance.md)
+
 ## References
 
 - [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
