@@ -16,7 +16,7 @@ Usage:
 
 import unittest
 from concurrent.futures import Future
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -47,7 +47,9 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     return scheduler
 
 
-def _make_req(json_schema=None, regex=None, ebnf=None, structural_tag=None, rid="req-1"):
+def _make_req(
+    json_schema=None, regex=None, ebnf=None, structural_tag=None, rid="req-1"
+):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.rid = rid
@@ -177,7 +179,10 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         """Cache hit should NOT add to grammar queue."""
         mgr = self._make_mgr()
         grammar_obj = MagicMock(spec=BaseGrammarObject)
-        mgr.grammar_backend.get_cached_or_future_value.return_value = (grammar_obj, True)
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (
+            grammar_obj,
+            True,
+        )
 
         req = _make_req(json_schema='{"type": "object"}')
         result = mgr.process_req_with_grammar(req)

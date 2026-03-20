@@ -288,7 +288,9 @@ class TestRegisterGrammarBackend(unittest.TestCase):
     def test_overwrite_registration(self):
         register_grammar_backend("dup", lambda *a: "first")
         register_grammar_backend("dup", lambda *a: "second")
-        self.assertEqual(GRAMMAR_BACKEND_REGISTRY["dup"](None, None, None, None), "second")
+        self.assertEqual(
+            GRAMMAR_BACKEND_REGISTRY["dup"](None, None, None, None), "second"
+        )
 
 
 class TestCreateGrammarBackend(unittest.TestCase):
