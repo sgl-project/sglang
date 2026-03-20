@@ -1985,6 +1985,11 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+                # both unified attention and sliding window kv pool are active.
+                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+                # use standard set_kv_buffer, as they lack SWA-specific attributes
+                # like full_to_swa_index_mapping.
                 if (
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
@@ -2390,6 +2395,11 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
+            # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+            # both unified attention and sliding window kv pool are active.
+            # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+            # use standard set_kv_buffer, as they lack SWA-specific attributes
+            # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
