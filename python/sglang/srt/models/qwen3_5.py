@@ -724,23 +724,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         pp_rank = self.pp_group.rank_in_group
         pp_size = self.pp_group.world_size
-        self.layers = make_layers(
+        self.layers, self._start_layer, self._end_layer = make_layers(
             config.num_hidden_layers,
             get_layer,
             pp_rank=pp_rank,
             pp_size=pp_size,
             prefix=f"{prefix}.layers",
-        )
-
-        num_layers = config.num_hidden_layers
-        self._start_layer, self._end_layer = (
-            get_pp_indices(
-                num_layers,
-                pp_rank,
-                pp_size,
-            )
-            if pp_rank is not None and pp_size is not None
-            else (0, num_layers)
         )
 
         # Final normalization
