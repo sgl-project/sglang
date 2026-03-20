@@ -3,9 +3,10 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack as jit_fn
 from sglang.srt.layers.quantization.utils import gptq_quantize_weights, pack_rows
+from sglang.utils import is_in_ci
 
 AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "gptq_marlin_repack") and hasattr(
     torch.ops.sgl_kernel.gptq_marlin_repack, "default"
