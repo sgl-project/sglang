@@ -1040,17 +1040,19 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
 
 @app.get("/parallelism_config")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_parallelism_config(rank: int = None):
+async def parallelism_config(rank: int = None):
     """Get per-rank parallelism config from the bootstrap server."""
     if rank is None or rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
-    bootstrap_port = (
-        _global_state.tokenizer_manager.server_args.engine_info_bootstrap_port
-    )
+    server_args = _global_state.tokenizer_manager.server_args
     try:
+
         resp = requests.get(
-            f"http://127.0.0.1:{bootstrap_port}/get_parallelism_config",
+            f"{server_args.engine_info_bootstrap_url}/get_parallelism_config",
             params={"rank": rank},
             timeout=5,
         )
