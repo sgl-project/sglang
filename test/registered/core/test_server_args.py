@@ -48,6 +48,16 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestCudaGraphBatchSizes(unittest.TestCase):
+    def test_generate_cuda_graph_batch_sizes_includes_max_bs(self):
+        server_args = ServerArgs(model_path="dummy", cuda_graph_max_bs=500)
+
+        capture_bs = server_args._generate_cuda_graph_batch_sizes()
+
+        self.assertIn(500, capture_bs)
+        self.assertEqual(capture_bs[-1], 500)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -1299,6 +1299,9 @@ class ServerArgs:
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
+
         return capture_bs
 
     def _generate_piecewise_cuda_graph_tokens(self):
