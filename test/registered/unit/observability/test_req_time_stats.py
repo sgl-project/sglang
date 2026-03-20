@@ -127,15 +127,14 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+import sglang.srt.observability.req_time_stats as rts_module
+import sglang.srt.observability.trace as trace_module
 from sglang.srt.observability.trace import SpanAttributes
 
 DisaggregationMode = _DisaggregationMode
 ForwardMode = _ForwardMode
 
 
-# ---------------------------------------------------------------------------
-# Module-level utility functions
-# ---------------------------------------------------------------------------
 class TestUtilityFunctions(unittest.TestCase):
     def test_real_time_and_monotonic_time(self):
         self.assertGreater(real_time(), 0)
@@ -159,9 +158,6 @@ class TestUtilityFunctions(unittest.TestCase):
         calibrate_time_diff()  # should not raise
 
 
-# ---------------------------------------------------------------------------
-# RequestStageConfig / RequestStage
-# ---------------------------------------------------------------------------
 class TestRequestStage(unittest.TestCase):
     def test_stage_config_defaults(self):
         cfg = RequestStageConfig("test_stage")
@@ -176,9 +172,6 @@ class TestRequestStage(unittest.TestCase):
         self.assertEqual(RequestStage.ANONYMOUS.stage_name, "")
 
 
-# ---------------------------------------------------------------------------
-# ReqTimeStatsBase
-# ---------------------------------------------------------------------------
 class TestReqTimeStatsBase(unittest.TestCase):
     def test_disagg_mode_str(self):
         base = ReqTimeStatsBase()
@@ -256,8 +249,6 @@ class TestReqTimeStatsBase(unittest.TestCase):
         self.assertFalse(state["enable_metrics"])
 
     def test_setstate_converts_time_fields(self):
-        import sglang.srt.observability.req_time_stats as rts
-
         base = ReqTimeStatsBase()
         state = {
             "created_time": 100.0,
@@ -268,14 +259,11 @@ class TestReqTimeStatsBase(unittest.TestCase):
         self.assertEqual(base.disagg_mode, DisaggregationMode.NULL)
         # created_time ends with "time" → converted via convert_time_cross_thread
         expected = convert_time_cross_thread(
-            100.0, 50.0, rts.global_diff_realtime_monotonic
+            100.0, 50.0, rts_module.global_diff_realtime_monotonic
         )
         self.assertAlmostEqual(base.created_time, expected)
 
 
-# ---------------------------------------------------------------------------
-# APIServerReqTimeStats
-# ---------------------------------------------------------------------------
 class TestAPIServerReqTimeStats(unittest.TestCase):
     def test_setters_auto_timestamp(self):
         """All setters work with default ts=None (auto perf_counter)."""
@@ -381,9 +369,6 @@ class TestAPIServerReqTimeStats(unittest.TestCase):
         self.assertEqual(len(attrs), 0)
 
 
-# ---------------------------------------------------------------------------
-# DPControllerReqTimeStats
-# ---------------------------------------------------------------------------
 class TestDPControllerReqTimeStats(unittest.TestCase):
     def test_setters(self):
         s = DPControllerReqTimeStats()
@@ -405,9 +390,6 @@ class TestDPControllerReqTimeStats(unittest.TestCase):
         self.assertIn("disagg_mode", state)
 
 
-# ---------------------------------------------------------------------------
-# SchedulerReqTimeStats
-# ---------------------------------------------------------------------------
 class TestSchedulerReqTimeStats(unittest.TestCase):
     def _make_stats(self, **kwargs):
         defaults = dict(disagg_mode=DisaggregationMode.NULL)
@@ -419,7 +401,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.set_metrics_collector(MagicMock())
         return s
 
-    # -- __getstate__ --
     def test_getstate_metrics_disabled(self):
         s = self._make_stats()
         self.assertEqual(s.__getstate__(), {})
@@ -432,7 +413,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         self.assertIn("wait_queue_entry_time", state)
         self.assertIn("forward_entry_time", state)
 
-    # -- simple setters --
     def test_set_scheduler_recv_time(self):
         s = self._make_stats()
         s.set_scheduler_recv_time()
@@ -499,7 +479,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.set_prefill_bootstrap_queue_entry_time(2.0)
         self.assertEqual(s.prefill_bootstrap_queue_entry_time, 2.0)
 
-    # -- auto-timestamp setters --
     def test_auto_timestamp_setters(self):
         """All setters default to perf_counter() when called without args."""
         s = self._make_stats()
@@ -525,7 +504,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         self.assertGreater(s.scheduler_recv_time, 0)
         self.assertGreater(s.completion_time, 0)
 
-    # -- set_retract_time --
     def test_set_retract_time(self):
         s = self._make_stats()
         s.last_forward_entry_time = 1.0
@@ -534,7 +512,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         self.assertEqual(s.last_forward_entry_time, 0.0)
         self.assertEqual(s.last_prefill_finished_time, 0.0)
 
-    # -- set_wait_queue_entry_time --
     def test_set_wait_queue_entry_time_first_call_null(self):
         s = self._make_enabled_stats()
         s.scheduler_recv_time = 1.0
@@ -562,7 +539,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         # retract resets these
         self.assertEqual(s.last_forward_entry_time, 0.0)
 
-    # -- set_forward_entry_time --
     def test_set_forward_entry_time_first_call(self):
         s = self._make_enabled_stats()
         s.wait_queue_entry_time = 1.0
@@ -584,7 +560,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.set_forward_entry_time(5.0)
         self.assertEqual(s.last_forward_entry_time, 5.0)
 
-    # -- set_last_chunked_prefill_finish_time --
     def test_set_last_chunked_prefill_finish_time_first(self):
         s = self._make_stats()
         s.last_forward_entry_time = 1.0
@@ -598,7 +573,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.set_last_chunked_prefill_finish_time(4.0)
         self.assertEqual(s.last_chunked_prefill_finish_time, 4.0)
 
-    # -- set_prefill_finished_time --
     def test_set_prefill_finished_time_first_call(self):
         s = self._make_enabled_stats()
         s.last_forward_entry_time = 1.0
@@ -635,7 +609,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         # NULL mode + last_decode_scheduled_time > 0 → trace_slice_start for decode
         s.trace_ctx.trace_slice_start.assert_called_once()
 
-    # -- set_last_decode_finish_time --
     def test_set_last_decode_finish_time_first(self):
         s = self._make_enabled_stats()
         s.last_prefill_finished_time = 1.0
@@ -663,7 +636,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.set_last_decode_finish_time(3.0)
         self.assertEqual(s.decode_ct, 1)
 
-    # -- set_last_scheduled_time --
     def test_set_last_scheduled_time_decode(self):
         s = self._make_stats()
         s.set_last_scheduled_time(ForwardMode.DECODE, 5.0)
@@ -684,7 +656,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         # NULL mode + first decode + last_prefill_finished_time > 0 → trace decode waiting
         self.assertEqual(s.last_decode_scheduled_time, 5.0)
 
-    # -- getters --
     def test_get_queueing_time(self):
         s = self._make_stats()
         s.forward_entry_time = 5.0
@@ -709,7 +680,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s = self._make_stats()
         self.assertEqual(s.format_duration(0.001), "1.00ms")
 
-    # -- convert_to_duration --
     def test_convert_to_duration_null(self):
         s = self._make_stats(
             wait_queue_entry_time=1.0,
@@ -779,7 +749,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         s.disagg_mode = "invalid"
         self.assertEqual(s.convert_to_duration(), "Unknown Time Stats")
 
-    # -- convert_to_output_meta_info --
     def test_convert_to_output_meta_info(self):
         s = self._make_stats(
             forward_entry_time=2.0,
@@ -795,7 +764,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         self.assertIn("prefill_waiting_latency", meta)
         self.assertIn("prefill_launch_latency", meta)
 
-    # -- compute_and_observe_kv_transfer_metrics --
     def test_compute_kv_transfer_metrics(self):
         s = self._make_enabled_stats()
         s.prefill_transfer_queue_entry_time = 1.0
@@ -830,9 +798,6 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         self.assertIsNone(result)
 
 
-# ---------------------------------------------------------------------------
-# Module-level batch helpers
-# ---------------------------------------------------------------------------
 class TestBatchFunctions(unittest.TestCase):
     def test_set_time_batch_empty(self):
         set_time_batch(None, "set_completion_time")
@@ -849,12 +814,9 @@ class TestBatchFunctions(unittest.TestCase):
         # Tracing is disabled in our stub → returns early
 
     def test_set_schedule_time_batch_tracing_enabled(self):
-        import sglang.srt.observability.req_time_stats as rts
-        import sglang.srt.observability.trace as trace_mod
-
-        orig = trace_mod.get_global_tracing_enabled
-        trace_mod.get_global_tracing_enabled = lambda: True
-        rts.get_global_tracing_enabled = lambda: True
+        orig = trace_module.get_global_tracing_enabled
+        trace_module.get_global_tracing_enabled = lambda: True
+        rts_module.get_global_tracing_enabled = lambda: True
         try:
             req = MagicMock()
             batch = MagicMock()
@@ -866,8 +828,8 @@ class TestBatchFunctions(unittest.TestCase):
             set_schedule_time_batch(batch)
             req.time_stats.set_last_scheduled_time.assert_called_once()
         finally:
-            trace_mod.get_global_tracing_enabled = orig
-            rts.get_global_tracing_enabled = orig
+            trace_module.get_global_tracing_enabled = orig
+            rts_module.get_global_tracing_enabled = orig
 
 
 if __name__ == "__main__":

@@ -81,9 +81,6 @@ class _ConcreteExporter(RequestMetricsExporter):
         pass
 
 
-# ---------------------------------------------------------------------------
-# Base class: _format_output_data
-# ---------------------------------------------------------------------------
 class TestFormatOutputData(unittest.TestCase):
     def test_basic_formatting(self):
         server_args = _make_server_args("/tmp/unused")
@@ -147,9 +144,6 @@ class TestFormatOutputData(unittest.TestCase):
         self.assertNotIn("secret", result)
 
 
-# ---------------------------------------------------------------------------
-# FileRequestMetricsExporter
-# ---------------------------------------------------------------------------
 class TestFileRequestMetricsExporter(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
@@ -272,9 +266,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         # Should not raise
 
 
-# ---------------------------------------------------------------------------
-# RequestMetricsExporterManager
-# ---------------------------------------------------------------------------
 class TestRequestMetricsExporterManager(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
@@ -304,9 +295,6 @@ class TestRequestMetricsExporterManager(unittest.TestCase):
         self.assertEqual(len(files), 1)
 
 
-# ---------------------------------------------------------------------------
-# Factory function
-# ---------------------------------------------------------------------------
 class TestCreateExporters(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()

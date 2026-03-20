@@ -29,7 +29,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         mod.STARTUP_LATENCY_SECONDS = self.orig_gauge
         mod._max_durations.clear()
 
-    # -- enable / reset / get --
 
     @patch("prometheus_client.Gauge")
     def test_enable_startup_timer(self, MockGauge):
@@ -45,7 +44,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         reset_startup_timers()
         self.assertIsNone(get_max_duration("ctx"))
 
-    # -- set_startup_metric --
 
     def test_set_startup_metric_disabled(self):
         """When metrics disabled, returns early without tracking max."""
@@ -75,7 +73,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
             set_startup_metric("ctx", 1.0, should_log=False)
             mock_log.assert_not_called()
 
-    # -- startup_timer context manager --
 
     def test_startup_timer_basic(self):
         with startup_timer("block"):
@@ -104,7 +101,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         mock_gauge.labels.assert_not_called()
         self.assertIsNotNone(get_max_duration("block"))
 
-    # -- time_startup_latency decorator --
 
     def test_decorator_direct(self):
         """Direct decorator @time_startup_latency preserves return value."""

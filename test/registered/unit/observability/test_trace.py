@@ -27,8 +27,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
+import threading
 import unittest
 from unittest.mock import patch
+
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
 
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
@@ -42,6 +46,8 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_tracing_enabled,
+    get_otlp_span_exporter,
+    process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
 )
@@ -50,9 +56,6 @@ from sglang.srt.observability.trace import (
 _get_host_id = getattr(mod, "__get_host_id")
 
 
-# ---------------------------------------------------------------------------
-# Module-level utilities
-# ---------------------------------------------------------------------------
 class TestTraceFunctions(unittest.TestCase):
     def test_extract_trace_headers(self):
         headers = {"traceparent": "abc", "tracestate": "xyz", "other": "skip"}
@@ -77,9 +80,6 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertGreater(ts, 0)
 
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
 class TestDataclasses(unittest.TestCase):
     def test_trace_thread_info(self):
         info = TraceThreadInfo("host", 123, "label", 0, 1)
@@ -99,9 +99,6 @@ class TestDataclasses(unittest.TestCase):
         self.assertEqual(len(ctx.cur_slice_stack), 0)
 
 
-# ---------------------------------------------------------------------------
-# TraceNullContext
-# ---------------------------------------------------------------------------
 class TestTraceNullContext(unittest.TestCase):
     def test_null_object_pattern(self):
         ctx = TraceNullContext()
@@ -114,18 +111,12 @@ class TestTraceNullContext(unittest.TestCase):
         self.assertIs(ctx.foo.bar.baz(1, 2, 3), ctx)
 
 
-# ---------------------------------------------------------------------------
-# SpanAttributes
-# ---------------------------------------------------------------------------
 class TestSpanAttributes(unittest.TestCase):
     def test_constants_exist(self):
         self.assertEqual(SpanAttributes.GEN_AI_LATENCY_E2E, "gen_ai.latency.e2e")
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
 
 
-# ---------------------------------------------------------------------------
-# TraceCustomIdGenerator
-# ---------------------------------------------------------------------------
 class TestTraceCustomIdGenerator(unittest.TestCase):
     def test_generates_nonzero_ids(self):
         gen = TraceCustomIdGenerator()
@@ -135,9 +126,7 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
         self.assertIsInstance(span_id, int)
 
 
-# ---------------------------------------------------------------------------
 # __get_host_id
-# ---------------------------------------------------------------------------
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
         with patch("os.path.exists", return_value=True), patch(
@@ -170,12 +159,8 @@ class TestGetHostId(unittest.TestCase):
             self.assertEqual(_get_host_id(), "unknown")
 
 
-# ---------------------------------------------------------------------------
-# get_otlp_span_exporter
-# ---------------------------------------------------------------------------
 class TestGetOtlpSpanExporter(unittest.TestCase):
     def test_grpc_default(self):
-        from sglang.srt.observability.trace import get_otlp_span_exporter
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", None)
@@ -183,7 +168,6 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
         self.assertIsNotNone(exporter)
 
     def test_http_protobuf(self):
-        from sglang.srt.observability.trace import get_otlp_span_exporter
 
         with patch.dict(
             os.environ, {"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}
@@ -192,19 +176,14 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
         self.assertIsNotNone(exporter)
 
     def test_invalid_protocol(self):
-        from sglang.srt.observability.trace import get_otlp_span_exporter
 
         with patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "invalid"}):
             with self.assertRaises(ValueError):
                 get_otlp_span_exporter("localhost:4317")
 
 
-# ---------------------------------------------------------------------------
-# process_tracing_init — error path
-# ---------------------------------------------------------------------------
 class TestProcessTracingInit(unittest.TestCase):
     def test_raises_without_otel(self):
-        from sglang.srt.observability.trace import process_tracing_init
 
         orig = mod.opentelemetry_imported
         mod.opentelemetry_imported = False
@@ -215,9 +194,6 @@ class TestProcessTracingInit(unittest.TestCase):
             mod.opentelemetry_imported = orig
 
 
-# ---------------------------------------------------------------------------
-# TraceReqContext — tracing DISABLED
-# ---------------------------------------------------------------------------
 class TestTraceReqContextDisabled(unittest.TestCase):
     def setUp(self):
         self.orig = mod.opentelemetry_initialized
@@ -260,13 +236,8 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         # Should not register anything
 
 
-# ---------------------------------------------------------------------------
-# TraceReqContext — tracing ENABLED (using real OTel SDK)
-# ---------------------------------------------------------------------------
 class TestTraceReqContextEnabled(unittest.TestCase):
     def setUp(self):
-        from opentelemetry import trace as otel_trace
-        from opentelemetry.sdk.trace import TracerProvider
 
         self.orig_initialized = mod.opentelemetry_initialized
         self.orig_tracer = mod.tracer
@@ -288,7 +259,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
     def test_trace_set_thread_info(self):
         trace_set_thread_info("scheduler", tp_rank=0, dp_rank=0)
-        import threading
 
         pid = threading.get_native_id()
         self.assertIn(pid, mod.threads_info)
@@ -533,8 +503,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_finish(ts=2000)
 
     def test_setstate_enabled(self):
-        from opentelemetry import trace as otel_trace
-
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
         state = ctx.__getstate__()
@@ -548,7 +516,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
     def test_thread_context_with_tp_rank(self):
         """Covers tp_rank branch in __create_thread_context."""
-        import threading
 
         pid = threading.get_native_id()
         mod.threads_info[pid] = TraceThreadInfo("host", pid, "sched", tp_rank=0, dp_rank=0)

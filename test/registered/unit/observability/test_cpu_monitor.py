@@ -1,3 +1,4 @@
+import threading
 import time
 import unittest
 from collections import namedtuple
@@ -46,8 +47,6 @@ class TestCpuMonitorMocked(unittest.TestCase):
         self, mock_sleep, MockProcess, MockCounter
     ):
         """Verify delta=(user_diff+system_diff) and last_times update across iterations."""
-        import threading
-
         from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
         CpuTimes = namedtuple("CpuTimes", ["user", "system"])
