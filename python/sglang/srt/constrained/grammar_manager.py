@@ -176,8 +176,9 @@ class GrammarManager:
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            req.grammar = req.grammar.result()
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+            grammar_result = req.grammar.result()
+            self.grammar_backend.set_cache(req.grammar_key, grammar_result)
+            req.grammar = grammar_result.copy()
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)

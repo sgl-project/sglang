@@ -412,13 +412,14 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
     def test_multiple_reqs_sharing_same_future(self):
         """Multiple requests sharing a Future all resolve when it completes.
 
-        Each request calls future.result() independently, so they all receive
-        the same grammar object reference. The cache is set once per request
-        via grammar.copy()."""
+        Each request should get its own copy of the grammar object for
+        state isolation, preventing shared-state issues between requests."""
         mgr = self._make_mgr()
 
+        copied_grammar1 = MagicMock(spec=BaseGrammarObject)
+        copied_grammar2 = MagicMock(spec=BaseGrammarObject)
         grammar_obj = MagicMock(spec=BaseGrammarObject)
-        grammar_obj.copy.return_value = MagicMock(spec=BaseGrammarObject)
+        grammar_obj.copy.side_effect = [copied_grammar1, copied_grammar2]
 
         future = Future()
         future.set_result(grammar_obj)
@@ -435,14 +436,12 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 2)
-        self.assertIn(req1, result)
-        self.assertIn(req2, result)
-        # Both get the same object from future.result(), not separate copies
-        self.assertIs(req1.grammar, grammar_obj)
-        self.assertIs(req2.grammar, grammar_obj)
+
+        # Each request should get its own copy for state isolation
+        self.assertIs(req1.grammar, copied_grammar1)
+        self.assertIs(req2.grammar, copied_grammar2)
+        self.assertIsNot(req1.grammar, req2.grammar)
         self.assertEqual(len(mgr.grammar_queue), 0)
-        # set_cache called once per request
-        self.assertEqual(mgr.grammar_backend.set_cache.call_count, 2)
 
 
 if __name__ == "__main__":
