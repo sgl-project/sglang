@@ -4,10 +4,18 @@ import pytest
 import torch
 
 from sglang.jit_kernel.per_token_quant_fp8 import per_token_quant_fp8
+from sglang.jit_kernel.utils import get_ci_test_range
 
 
-M_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-K_LIST = [512, 1024, 2048, 4096, 7168]
+DEVICE = "cuda"
+M_LIST = get_ci_test_range(
+    [1, 2, 4, 8, 16, 32, 64, 128, 256],
+    [1, 16, 256],
+)
+K_LIST = get_ci_test_range(
+    [512, 1024, 2048, 4096, 7168],
+    [512, 4096],
+)
 DTYPE_LIST = [torch.float16, torch.bfloat16, torch.float32]
 
 configs = list(itertools.product(M_LIST, K_LIST, DTYPE_LIST))
@@ -24,9 +32,9 @@ def _reference_per_token_quant_fp8(input_tensor):
 
 @pytest.mark.parametrize("m, k, dtype", configs)
 def test_per_token_quant_fp8(m, k, dtype):
-    input_tensor = torch.randn(m, k, dtype=dtype, device="cuda")
-    output_q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cuda")
-    output_s = torch.empty(m, dtype=torch.float32, device="cuda")
+    input_tensor = torch.randn(m, k, dtype=dtype, device=DEVICE)
+    output_q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=DEVICE)
+    output_s = torch.empty(m, dtype=torch.float32, device=DEVICE)
 
     per_token_quant_fp8(input_tensor, output_q, output_s)
 
@@ -43,9 +51,9 @@ def test_per_token_quant_fp8(m, k, dtype):
 def test_per_token_quant_fp8_scale_shape(m):
     k = 1024
     dtype = torch.float16
-    input_tensor = torch.randn(m, k, dtype=dtype, device="cuda")
-    output_q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cuda")
-    output_s = torch.empty(m, 1, dtype=torch.float32, device="cuda")
+    input_tensor = torch.randn(m, k, dtype=dtype, device=DEVICE)
+    output_q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=DEVICE)
+    output_s = torch.empty(m, 1, dtype=torch.float32, device=DEVICE)
 
     per_token_quant_fp8(input_tensor, output_q, output_s)
 
