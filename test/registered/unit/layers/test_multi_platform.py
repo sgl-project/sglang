@@ -1,4 +1,6 @@
 import unittest
+from types import ModuleType
+from unittest.mock import patch
 
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,10 +71,20 @@ class TestMultiPlatformTorchCompileOverride(CustomTestCase):
 
     def test_default_fused_moe_heuristic_switches_single_token_path(self):
         layer = DummyFusedMoE()
+        fake_fused_moe_native = ModuleType("sglang.srt.layers.moe.fused_moe_native")
 
-        layer.enter_torch_compile(num_tokens=1)
+        def fake_forward(*args, **kwargs):
+            return "fused-moe-native"
 
-        self.assertEqual(layer.forward(), "native")
+        fake_fused_moe_native.fused_moe_forward_native = fake_forward
+
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.layers.moe.fused_moe_native": fake_fused_moe_native},
+        ):
+            layer.enter_torch_compile(num_tokens=1)
+
+        self.assertIs(layer._forward_method, fake_forward)
         self.assertTrue(layer.is_torch_compile)
 
     def test_override_layers_switch_fused_moe_for_multi_token(self):
