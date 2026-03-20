@@ -733,7 +733,7 @@ class DenoisingStage(PipelineStage):
             and batch.noise_pred is not None
         ):
             batch.noise_pred = server_args.pipeline_config.gather_latents_for_sp(
-                batch.noise_pred
+                batch.noise_pred, batch=batch
             )
             if hasattr(batch, "raw_latent_shape"):
                 orig_s = batch.raw_latent_shape[1]
@@ -813,7 +813,9 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = self.server_args.pipeline_config.gather_latents_for_sp(latents)
+            latents = self.server_args.pipeline_config.gather_latents_for_sp(
+                latents, batch=batch
+            )
             if trajectory_tensor is not None:
                 # trajectory_tensor shapes:
                 # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3

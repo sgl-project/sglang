@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
@@ -14,10 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    sequence_model_parallel_all_gather,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -82,8 +81,13 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return x
         return int(math.ceil(x / m) * m)
 
+    @staticmethod
+    def _split_evenly(total: int, parts: int) -> list[int]:
+        base, remainder = divmod(total, parts)
+        return [base + int(rank < remainder) for rank in range(parts)]
+
     def _build_zimage_sp_plan(self, batch) -> dict:
-        """Build a minimal SP plan on batch for zimage (spatial sharding + cap sharding)."""
+        """Build an SP plan that preserves native H/W geometry for Z-Image."""
         sp_size = get_sp_world_size()
         rank = get_sp_parallel_rank()
 
@@ -99,18 +103,47 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 batch.width // self.vae_config.arch_config.spatial_compression_ratio
             )
 
-        # Rule: shard along the larger spatial dimension (W/H), implemented via optional H/W transpose.
-        # Choose the larger of H and W for sharding, so H_eff = max(H, W).
-        swap_hw = W > H
-        H_eff = W if swap_hw else H
-        W_eff = H if swap_hw else W
+        # ZImage patchifies in native F/H/W order. Preserve that geometry and only
+        # choose which native axis to slice so each rank gets a rectangular shard.
+        H_tok = H // self.PATCH_SIZE
+        W_tok = W // self.PATCH_SIZE
 
-        # ZImage uses PATCH_SIZE=2 for spatial patchify; shard in token space and convert back to latent rows.
-        H_tok = H_eff // self.PATCH_SIZE
-        W_tok = W_eff // self.PATCH_SIZE
-        H_tok_pad = self._ceil_to_multiple(H_tok, sp_size)
-        H_tok_local = H_tok_pad // sp_size
-        h0_tok = rank * H_tok_local
+        candidate_plans = []
+        for shard_axis, axis_tok, other_tok, tie_break in (
+            ("h", H_tok, W_tok, 0),
+            ("w", W_tok, H_tok, 1),
+        ):
+            axis_sizes = self._split_evenly(axis_tok, sp_size)
+            local_seq_lens = [axis_size * other_tok for axis_size in axis_sizes]
+            img_seq_target = self._ceil_to_multiple(
+                max(local_seq_lens), self.SEQ_LEN_MULTIPLE
+            )
+            total_pad_tokens = img_seq_target * sp_size - (H_tok * W_tok)
+            candidate_plans.append(
+                (
+                    total_pad_tokens,
+                    -axis_tok,
+                    tie_break,
+                    shard_axis,
+                    axis_sizes,
+                    img_seq_target,
+                )
+            )
+
+        _, _, _, shard_axis, axis_sizes, img_seq_target = min(candidate_plans)
+        axis_start_tok = sum(axis_sizes[:rank])
+        axis_local_tok = axis_sizes[rank]
+
+        if shard_axis == "h":
+            h0_tok = axis_start_tok
+            w0_tok = 0
+            local_h_tok = axis_local_tok
+            local_w_tok = W_tok
+        else:
+            h0_tok = 0
+            w0_tok = axis_start_tok
+            local_h_tok = H_tok
+            local_w_tok = axis_local_tok
 
         # Cap/text sharding: avoid duplicating cap tokens across ranks.
         cap_len = (
@@ -125,16 +158,17 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         plan = {
             "sp_size": sp_size,
             "rank": rank,
-            "swap_hw": swap_hw,
             "H": H,
             "W": W,
-            "H_eff": H_eff,
-            "W_eff": W_eff,
             "H_tok": H_tok,
             "W_tok": W_tok,
-            "H_tok_pad": H_tok_pad,
-            "H_tok_local": H_tok_local,
+            "shard_axis": shard_axis,
+            "axis_sizes_tok": axis_sizes,
             "h0_tok": h0_tok,
+            "w0_tok": w0_tok,
+            "local_h_tok": local_h_tok,
+            "local_w_tok": local_w_tok,
+            "img_seq_target": img_seq_target,
             "cap_total": cap_total,
             "cap_local": cap_local,
             "cap_start": cap_start,
@@ -175,38 +209,48 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return latents, False
 
         plan = self._get_zimage_sp_plan(batch)
+        if plan["shard_axis"] == "h":
+            h0 = plan["h0_tok"] * self.PATCH_SIZE
+            h1 = (plan["h0_tok"] + plan["local_h_tok"]) * self.PATCH_SIZE
+            return latents[:, :, :, h0:h1, :].contiguous(), True
 
-        # Layout: [B, C, T, H, W]. Always shard on dim=3 by optionally swapping H/W.
-        if plan["swap_hw"]:
-            latents = latents.transpose(3, 4).contiguous()
+        w0 = plan["w0_tok"] * self.PATCH_SIZE
+        w1 = (plan["w0_tok"] + plan["local_w_tok"]) * self.PATCH_SIZE
+        return latents[:, :, :, :, w0:w1].contiguous(), True
 
-        # Pad on effective-H so that H_tok is divisible by sp.
-        H_eff = latents.size(3)
-
-        H_tok = H_eff // self.PATCH_SIZE
-        pad_tok = plan["H_tok_pad"] - H_tok
-        pad_lat = pad_tok * self.PATCH_SIZE
-        if pad_lat > 0:
-            pad = latents[:, :, :, -1:, :].repeat(1, 1, 1, pad_lat, 1)
-            latents = torch.cat([latents, pad], dim=3)
-        h0 = plan["h0_tok"] * self.PATCH_SIZE
-        h1 = (plan["h0_tok"] + plan["H_tok_local"]) * self.PATCH_SIZE
-        latents = latents[:, :, :, h0:h1, :]
-
-        batch._zimage_sp_swap_hw = plan["swap_hw"]
-        return latents, True
-
-    def gather_latents_for_sp(self, latents):
-        # Gather on effective-H dim=3 (matches shard_latents_for_sp); swap-back is handled in post_denoising_loop.
+    def gather_latents_for_sp(self, latents, batch):
+        # Gather rectangular native H/W shards back without reintroducing spatial padding.
         latents = latents.contiguous()
         if get_sp_world_size() <= 1 or latents.dim() != 5:
             return latents
-        return sequence_model_parallel_all_gather(latents, dim=3)
+
+        plan = self._get_zimage_sp_plan(batch)
+        shard_dim = 3 if plan["shard_axis"] == "h" else 4
+        max_axis_tok = max(plan["axis_sizes_tok"])
+        max_axis_lat = max_axis_tok * self.PATCH_SIZE
+
+        pad_shape = list(latents.shape)
+        pad_shape[shard_dim] = max_axis_lat
+        padded = latents.new_zeros(pad_shape)
+        axis_len = latents.shape[shard_dim]
+        if shard_dim == 3:
+            padded[:, :, :, :axis_len, :] = latents
+        else:
+            padded[:, :, :, :, :axis_len] = latents
+
+        gathered = [torch.empty_like(padded) for _ in range(plan["sp_size"])]
+        dist.all_gather(gathered, padded, group=get_sp_group().device_group)
+
+        pieces = []
+        for rank, tensor in enumerate(gathered):
+            axis_lat = plan["axis_sizes_tok"][rank] * self.PATCH_SIZE
+            if shard_dim == 3:
+                pieces.append(tensor[:, :, :, :axis_lat, :])
+            else:
+                pieces.append(tensor[:, :, :, :, :axis_lat])
+        return torch.cat(pieces, dim=shard_dim)
 
     def post_denoising_loop(self, latents, batch):
-        # Restore swapped H/W and crop padded spatial dims before final reshape.
-        if latents.dim() == 5 and getattr(batch, "_zimage_sp_swap_hw", False):
-            latents = latents.transpose(3, 4).contiguous()
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and latents.dim() == 5:
             latents = latents[:, :, :, : raw_latent_shape[3], : raw_latent_shape[4]]
@@ -244,16 +288,17 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             ).flatten(0, 2)
             cap_freqs_cis = rotary_emb(cap_pos_ids)
 
-            # image (local, effective H-shard). Use cap_total for a stable offset across ranks/passes.
+            # Image positions for the local native H/W shard. Use cap_total for a
+            # stable offset across ranks and denoising passes.
             F_tokens = 1
-            H_tokens_local = plan["H_tok_local"]
-            W_tokens = plan["W_tok"]
+            H_tokens_local = plan["local_h_tok"]
+            W_tokens_local = plan["local_w_tok"]
             img_pos_ids = create_coordinate_grid(
-                size=(F_tokens, H_tokens_local, W_tokens),
-                start=(plan["cap_total"] + 1, plan["h0_tok"], 0),
+                size=(F_tokens, H_tokens_local, W_tokens_local),
+                start=(plan["cap_total"] + 1, plan["h0_tok"], plan["w0_tok"]),
                 device=device,
             ).flatten(0, 2)
-            img_pad_len = (-img_pos_ids.shape[0]) % self.SEQ_LEN_MULTIPLE
+            img_pad_len = plan["img_seq_target"] - img_pos_ids.shape[0]
             if img_pad_len:
                 pad_ids = create_coordinate_grid(
                     size=(1, 1, 1), start=(0, 0, 0), device=device
@@ -313,6 +358,11 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 rotary_emb,
                 batch,
             ),
+            "image_seq_len_target": (
+                self._get_zimage_sp_plan(batch)["img_seq_target"]
+                if get_sp_world_size() > 1
+                else None
+            ),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -324,5 +374,10 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+            ),
+            "image_seq_len_target": (
+                self._get_zimage_sp_plan(batch)["img_seq_target"]
+                if get_sp_world_size() > 1
+                else None
             ),
         }
