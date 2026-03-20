@@ -32,7 +32,7 @@ on:
         default: false
   workflow_call:
     inputs:
-      ref:
+      git_ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
         type: string
@@ -50,7 +50,7 @@ concurrency:
   # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
   # - pr_head_sha isolates /rerun-stage from main branch runs
   # - target_stage allows parallel stage dispatches to run independently
-  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -86,7 +86,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Show test partition assignments
         continue-on-error: true
@@ -96,7 +96,7 @@ jobs:
         id: run-mode
         run: |
           # Run all tests for scheduled runs and workflow_call (when ref input is provided)
-          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.git_ref
           if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
             echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
@@ -409,7 +409,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -459,7 +459,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -500,7 +500,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -540,7 +540,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -581,7 +581,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -633,7 +633,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -706,7 +706,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -732,7 +732,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -761,7 +761,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -814,7 +814,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -867,7 +867,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -916,7 +916,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -977,7 +977,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1031,7 +1031,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1087,7 +1087,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1142,7 +1142,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1199,7 +1199,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1253,7 +1253,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1298,7 +1298,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1352,7 +1352,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1421,7 +1421,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1471,7 +1471,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1531,7 +1531,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1597,7 +1597,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1651,7 +1651,7 @@ jobs:
   #     - name: Checkout code
   #       uses: actions/checkout@v4
   #       with:
-  #         ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+  #         ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
   #
   #     - name: Download artifacts
   #       if: needs.check-changes.outputs.sgl_kernel == 'true'
