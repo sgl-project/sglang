@@ -1935,6 +1935,48 @@ class TestEntrypointReplicatedAxis:
         assert isinstance(summary, SummaryRecord)
         assert summary.failed == 1
 
+    def test_dependent_replicated_axes_error(self, tmp_path, capsys):
+        """TP4 + MOE_TP2 both replicated, tp determines moe_tp → ComparisonErrorRecord."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        # TP4 with MOE_TP2: tp_rank determines moe_tp_rank (rank%2)
+        for side_dir in [baseline_dir, target_dir]:
+            for tp_rank in range(4):
+                _create_rank_dump(
+                    side_dir,
+                    rank=tp_rank,
+                    name="gate_out",
+                    tensor=tensor,
+                    dims="b h # tp:replicated moe_tp:replicated",
+                    parallel_info={
+                        "tp_rank": tp_rank,
+                        "tp_size": 4,
+                        "moe_tp_rank": tp_rank % 2,
+                        "moe_tp_size": 2,
+                    },
+                )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert "not orthogonal" in errors[0].traceback_str
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.errored == 1
+        assert exit_code == 1
+
     def test_sharded_tp_with_dependent_etp_passes(self, tmp_path, capsys):
         """TP2 sharded + ETP2 dependent (etp=tp) + EP2 replicated → no undeclared error."""
         torch.manual_seed(42)
