@@ -493,7 +493,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -531,7 +531,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -569,7 +569,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
       CI: true
@@ -692,7 +692,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -715,7 +715,7 @@ jobs:
     if: |
       github.event_name == 'schedule' &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
@@ -743,7 +743,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
       CI: true
@@ -945,7 +945,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -996,7 +996,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1101,7 +1101,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1155,7 +1155,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1210,7 +1210,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
       - name: Checkout code

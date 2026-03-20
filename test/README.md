@@ -75,7 +75,7 @@ When adding 1-GPU tests, choose the appropriate suite based on hardware compatib
 | `stage-a-test-small-1-gpu` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | Stage A per-commit smoke on 5090 (CUDA) |
 | `stage-a-test-small-1-gpu-amd` | AMD CI runners | ROCm | Stage A per-commit smoke (AMD) |
 | `stage-b-test-small-1-gpu` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | 5090-compatible tests (preferred) |
-| `stage-b-test-large-1-gpu` | `1-gpu-runner` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
+| `stage-b-test-large-1-gpu` | `1-gpu-h100` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
 
 **Use `stage-b-test-small-1-gpu` (5090) whenever possible** - this is the preferred suite for most 1-GPU tests.
 
