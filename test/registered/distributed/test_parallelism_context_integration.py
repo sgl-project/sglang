@@ -39,7 +39,7 @@ from sglang.utils import terminate_process
 def get_transfer_engine_info(url: str, rank: int) -> Dict:
     """Get transfer engine info (parameter names and sizes) for a rank."""
     response = requests.get(
-        f"{url}/get_remote_instance_transfer_engine_info",
+        f"{url}/remote_instance_transfer_engine_info",
         params={"rank": rank},
     )
     response.raise_for_status()
@@ -66,14 +66,7 @@ def verify_model_params_match_for_rank(
     server_info: Dict,
     test_gpu_id: int,
 ):
-    """Verify model parameters match for a specific rank by recreating a model shard.
-
-    Args:
-        url: Server URL
-        rank: The rank to verify
-        server_info: Server info dict
-        test_gpu_id: GPU ID to use for instantiating the test model
-    """
+    """Verify model parameters match for a specific rank by recreating a model shard."""
     transfer_info = get_transfer_engine_info(url, rank)
     server_weights_info = transfer_info["remote_instance_transfer_engine_info"][1]
 
@@ -138,7 +131,7 @@ def verify_model_params_match_for_rank(
         server_args_module._global_server_args = original_global_server_args
 
 
-TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
+TEST_CONFIGS: List[Tuple[str, str, int, List[str], int]] = [
     # Basic TP=2 test (CI only)
     (
         "tp2_small",
@@ -146,7 +139,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         2,
         [],
         2,
-        False,
     ),
     # EP=2: MoE experts split across 2 groups, moe_tp=1 per group
     (
@@ -155,7 +147,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         2,
         ["--ep-size", "2"],
         2,
-        True,
     ),
     (
         "mla_dp2_tp4",
@@ -163,7 +154,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         4,
         ["--enable-dp-attention", "--dp", "2"],
         4,
-        True,
     ),
     (
         "mla_dp2_ep2_tp4",
@@ -171,7 +161,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         4,
         ["--enable-dp-attention", "--dp", "2", "--ep-size", "2"],
         4,
-        True,
     ),
     (
         "mla_dp2_ep4_tp4",
@@ -179,7 +168,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         4,
         ["--enable-dp-attention", "--dp", "2", "--ep-size", "4"],
         4,
-        True,
     ),
     (
         "mla_dp4_ep2_tp4",
@@ -187,7 +175,6 @@ TEST_CONFIGS: List[Tuple[str, str, int, List[str], int, bool]] = [
         4,
         ["--enable-dp-attention", "--dp", "4", "--ep-size", "2"],
         4,
-        True,
     ),
 ]
 
@@ -210,11 +197,10 @@ def _get_test_params():
         tp_size,
         extra_args,
         min_gpus,
-        trust_remote_code,
     ) in configs:
         params.append(
             pytest.param(
-                (model_name, tp_size, extra_args, min_gpus, trust_remote_code),
+                (model_name, tp_size, extra_args, min_gpus),
                 id=test_id,
             )
         )
@@ -240,7 +226,7 @@ class TestParallelismContextIntegration:
         4. Uses ParallelismContext to instantiate a model for each rank
         5. Compares the parameter names and sizes
         """
-        model_name, tp_size, extra_args, min_gpus, trust_remote_code = config
+        model_name, tp_size, extra_args, min_gpus = config
         url = DEFAULT_URL_FOR_TEST
 
         # Need min_gpus for server + 1 extra GPU for test model instantiation
@@ -249,8 +235,6 @@ class TestParallelismContextIntegration:
             pytest.skip(
                 f"Need at least {required_gpus} GPUs (server={min_gpus} + test=1), have {torch.cuda.device_count()}"
             )
-
-        # The test model will be instantiated on GPU after the server's GPUs
         test_gpu_id = min_gpus  # e.g., if server uses 0-1, test uses 2
 
         # Build server args
@@ -258,9 +242,8 @@ class TestParallelismContextIntegration:
             "--tp-size",
             str(tp_size),
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+            "--trust-remote-code",
         ]
-        if trust_remote_code:
-            other_args.append("--trust-remote-code")
         other_args.extend(extra_args)
 
         process = None
