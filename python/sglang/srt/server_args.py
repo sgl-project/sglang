@@ -5654,7 +5654,7 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
+    def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -5662,7 +5662,15 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        return NetworkAddress(host, self.port).to_url(scheme)
+        return NetworkAddress(host, port if port is not None else self.port).to_url(scheme)
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
+
+    @property
+    def disaggregation_bootstrap_url(self):
+        return self.url(port=self.disaggregation_bootstrap_port)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
