@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
+from io import StringIO
 from typing import Optional
+
+from rich.console import Console
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -76,6 +80,38 @@ def make_diff(
         target_at_max=1.0005,
         diff_threshold=diff_threshold,
         passed=passed,
+    )
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\033\[([0-9;]*)m")
+
+
+def assert_rich_tags_balanced(markup: str) -> None:
+    """Render Rich markup to ANSI and verify no styles are active at the end.
+
+    Tracks ANSI style state through the output. A ``\\033[0m`` (reset)
+    clears all active styles; any other ``\\033[Nm`` sets a style.
+    At the end of the output, no style should remain active.
+    """
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=True, width=10000, highlight=False)
+    console.print(markup, end="")
+    ansi_output: str = buf.getvalue()
+
+    if "\033[" not in ansi_output:
+        return
+
+    styled = False
+    for match in _ANSI_ESCAPE_RE.finditer(ansi_output):
+        params: str = match.group(1)
+        if params == "0" or params == "":
+            styled = False
+        else:
+            styled = True
+
+    assert not styled, (
+        f"ANSI styles still active at end of output — likely unclosed Rich tag.\n"
+        f"Last 200 chars of ANSI output: {ansi_output[-200:]!r}"
     )
 
 

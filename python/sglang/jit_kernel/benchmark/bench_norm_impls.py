@@ -15,12 +15,13 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, is_in_ci
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.jit_kernel.utils import KERNEL_PATH
+from sglang.utils import is_in_ci
 
 os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 

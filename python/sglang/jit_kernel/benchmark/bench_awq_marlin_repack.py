@@ -7,8 +7,9 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_repack as jit_awq_marlin_repack,
 )
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
+from sglang.utils import is_in_ci
 
 AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "awq_marlin_repack") and hasattr(
     torch.ops.sgl_kernel.awq_marlin_repack, "default"
