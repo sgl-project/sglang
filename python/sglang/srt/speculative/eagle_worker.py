@@ -152,6 +152,7 @@ class EAGLEWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -288,9 +289,12 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
-                batch
-            )
+            (
+                logits_output,
+                next_token_ids,
+                seq_lens_cpu,
+                can_run_cuda_graph,
+            ) = self.forward_target_extend(batch)
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -305,7 +309,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
             with self.draft_tp_context(
@@ -356,7 +360,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_target_extend(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
         """Run the target extend.
 
         Args:
@@ -365,6 +369,8 @@ class EAGLEWorker(TpModelWorker):
         Returns:
             logits_output: The output of logits. It will contain the full hidden states.
             next_token_ids: Next token ids generated.
+            seq_lens_cpu: CPU copy of sequence lengths for the draft prefill path.
+            can_run_cuda_graph: Whether the target prefill ran with cuda graph.
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
@@ -379,6 +385,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output,
             next_token_ids,
             model_worker_batch.seq_lens_cpu,
+            batch_result.can_run_cuda_graph,
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
@@ -795,6 +802,11 @@ class EAGLEWorker(TpModelWorker):
         spec_info: EagleVerifyInput,
         seq_lens_pre_verify: torch.Tensor,
     ):
+        # Under DP attention, some ranks can be IDLE during target verify and never
+        # initialize mamba forward metadata for this step.
+        if batch.forward_mode.is_idle():
+            return
+
         accepted_length = (
             torch.tensor(
                 res.accept_length_per_req_cpu,

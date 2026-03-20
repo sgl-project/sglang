@@ -1,10 +1,12 @@
 import argparse
 import csv
 import os
+from typing import List, Tuple
 
 import torch
 import triton
 from flashinfer import mm_fp4
+from flashinfer.testing import bench_gpu_time_with_cupti
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
 from sglang.srt.utils import get_device_capability, is_sm100_supported
@@ -18,25 +20,68 @@ IS_CI = (
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
+# Weight shapes are in the format: ([K, N], TP_SPLIT_DIM)
+# TP split dim 0 means split K by tp size; dim 1 means split N by tp size.
+DEEPSEEK_R1_MODEL = "deepseek-ai/DeepSeek-R1-0528-FP4"
 
-def get_weight_shapes(args):
-    models_tps = args.tp_sizes
+WEIGHT_SHAPES = {
+    "meta-llama/Llama-3.1-8B-Instruct": [
+        ([4096, 6144], 1),
+        ([4096, 4096], 0),
+        ([4096, 28672], 1),
+        ([14336, 4096], 0),
+    ],
+    "meta-llama/Llama-3.3-70B-Instruct": [
+        ([8192, 10240], 1),
+        ([8192, 8192], 0),
+        ([8192, 57344], 1),
+        ([28672, 8192], 0),
+    ],
+}
 
-    if models_tps == [4]:
-        return [[1024, 3584], [7168, 256], [7168, 2304], [9216, 3584]]
+DEEPSEEK_R1_WEIGHT_SHAPES = {
+    4: [[1024, 3584], [7168, 256], [7168, 2304], [9216, 3584]],
+    8: [[512, 3584], [7168, 128], [7168, 1152], [4608, 3584]],
+}
 
-    if models_tps == [8]:
-        return [[512, 3584], [7168, 128], [7168, 1152], [4608, 3584]]
-    return [
-        [1024, 3584],
-        [7168, 256],
-        [7168, 2304],
-        [9216, 3584],
-        [512, 3584],
-        [7168, 128],
-        [7168, 1152],
-        [4608, 3584],
-    ]
+
+def _bench_cudagraph_with_cupti(fn, quantiles):
+    times_ms = bench_gpu_time_with_cupti(fn=fn, use_cuda_graph=True)
+    if not times_ms:
+        return 0.0, 0.0, 0.0
+    quantiles_tensor = torch.tensor(quantiles, dtype=torch.float32)
+    times_tensor = torch.tensor(times_ms, dtype=torch.float32)
+    qs = torch.quantile(times_tensor, quantiles_tensor).tolist()
+    return qs[0], qs[1], qs[2]
+
+
+def get_weight_shapes(args) -> List[Tuple[int, int, str]]:
+    shapes: List[Tuple[int, int, str]] = []
+    for model in args.models:
+        if model == DEEPSEEK_R1_MODEL:
+            for tp_size in args.tp_sizes:
+                if tp_size in DEEPSEEK_R1_WEIGHT_SHAPES:
+                    selected = DEEPSEEK_R1_WEIGHT_SHAPES[tp_size]
+                else:
+                    selected = (
+                        DEEPSEEK_R1_WEIGHT_SHAPES[4] + DEEPSEEK_R1_WEIGHT_SHAPES[8]
+                    )
+                for n, packed_k in selected:
+                    shapes.append((n, packed_k, model))
+            continue
+
+        if model not in WEIGHT_SHAPES:
+            raise ValueError(f"Unsupported model: {model}")
+        for tp_size in args.tp_sizes:
+            for k_n, tp_split_dim in WEIGHT_SHAPES[model]:
+                k, n = k_n
+                if tp_split_dim == 0:
+                    k = k // tp_size
+                else:
+                    n = n // tp_size
+                packed_k = k // 2
+                shapes.append((n, packed_k, model))
+    return shapes
 
 
 # CI environment uses simplified parameters
@@ -70,12 +115,13 @@ else:
         # x_vals = [64],
         x_log=False,
         line_arg="provider",
-        line_vals=["sglang_cutlass", "cutlass", "cudnn", "trtllm", "auto"],
+        line_vals=["sglang_cutlass", "cutlass", "cudnn", "trtllm", "cute-dsl", "auto"],
         line_names=[
             "sglang cutlass fp4",
             "flashinfer cutlass fp4",
             "cudnn fp4",
             "trtllm fp4",
+            "cute-dsl fp4",
             "auto fp4 (cudnn/cutlass)",
         ],
         styles=[
@@ -83,6 +129,7 @@ else:
             ("orange", "solid"),
             ("blue", "solid"),
             ("green", "solid"),
+            ("brown", "solid"),
             ("purple", "solid"),
         ],
         ylabel="latency (ms)",
@@ -111,14 +158,14 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sglang_cutlass":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
             lambda: cutlass_scaled_fp4_mm(
                 a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
             ),
             quantiles=quantiles,
         )
     if provider == "cutlass":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -132,7 +179,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             quantiles=quantiles,
         )
     if provider == "cudnn":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -148,7 +195,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     if provider == "trtllm":
         a_scale_interleaved = a_scale_interleaved.to(torch.uint8)
         b_scale_interleaved = b_scale_interleaved.to(torch.uint8)
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -161,8 +208,22 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             ),
             quantiles=quantiles,
         )
+    if provider == "cute-dsl":
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
+            lambda: mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_scale_interleaved,
+                b_scale_interleaved.T,
+                alpha,
+                dtype,
+                res_fi,
+                backend="cute-dsl",
+            ),
+            quantiles=quantiles,
+        )
     if provider == "auto":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = _bench_cudagraph_with_cupti(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -216,6 +277,13 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--models",
+        nargs="+",
+        type=str,
+        default=[DEEPSEEK_R1_MODEL],
+        help="List of models to benchmark. Supported: Llama 8B/70B and deepseek-ai/DeepSeek-R1-0528-FP4.",
+    )
+    parser.add_argument(
         "--tp-sizes",
         nargs="+",
         type=int,
@@ -226,7 +294,7 @@ if __name__ == "__main__":
         "--dtype",
         type=torch.dtype,
         default=torch.bfloat16,
-        help="Data type",
+        help="Output data type",
     )
     parser.add_argument(
         "--correctness",
@@ -267,8 +335,8 @@ if __name__ == "__main__":
         if IS_CI:
             NKs = NKs[:2]  # Only test first 2 shapes in CI
 
-        for N, K in NKs:
-            print(f"DeepSeek-R1-0528-FP4 N={N} K={K}: ")
+        for N, K, model_name in NKs:
+            print(f"{model_name} N={N} packed_k={K}: ")
             benchmark.run(
                 print_data=True,
                 N=N,

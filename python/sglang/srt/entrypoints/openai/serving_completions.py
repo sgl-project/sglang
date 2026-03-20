@@ -97,6 +97,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
@@ -112,7 +117,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=request.routed_dp_rank,
+            routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,

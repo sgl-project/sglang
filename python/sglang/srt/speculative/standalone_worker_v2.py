@@ -99,6 +99,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         # Alias for better readability

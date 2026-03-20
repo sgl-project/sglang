@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -125,6 +126,9 @@ class TextEncoderLoader(ComponentLoader):
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
+
+        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+            hf_weights_files.sort()
 
         return hf_folder, hf_weights_files, use_safetensors
 
