@@ -80,11 +80,6 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        # For 5-D input with non-overlapping patches (kernel==stride, which is
-        # always the case here), replace Conv3d with reshape + F.linear.
-        # This eliminates the aten::fill (output-buffer zeroing) and aten::copy
-        # (im2col rearrangement) that the generic Conv3d path emits, reducing
-        # CUDA kernel launches to a single GEMM.
         if x.dim() == 5:
             B, C, T, H, W = x.shape
             ps = self.patch_size
@@ -93,18 +88,14 @@ class PatchEmbed(nn.Module):
             H_ = H // ph
             W_ = W // pw
 
-            # Rearrange input patches into token rows — one copy, no fill.
             x = x.reshape(B, C, T_, pt, H_, ph, W_, pw)
             x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
             x = x.reshape(B, T_ * H_ * W_, C * pt * ph * pw)
 
-            # Single GEMM (weight view is zero-copy).
             w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
             x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
 
             if not self.flatten:
-                # Restore [B, embed_dim, T', H', W'] to match Conv3d output
-                # contract expected by downstream code.
                 x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
 
             x = self.norm(x)
