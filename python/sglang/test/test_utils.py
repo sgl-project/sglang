@@ -865,6 +865,7 @@ def popen_launch_server(
         Started subprocess.Popen object
     """
     other_args = other_args or []
+    offline_force_disabled = env.get("HF_HUB_OFFLINE") == "0"
 
     # Auto-detect device if needed
     if device == "auto":
@@ -885,7 +886,7 @@ def popen_launch_server(
     try:
         from sglang.utils import is_in_ci
 
-        if is_in_ci():
+        if is_in_ci() and not offline_force_disabled:
             per_run_marker_path = _try_enable_offline_mode_if_cache_complete(
                 model, env, other_args
             )
