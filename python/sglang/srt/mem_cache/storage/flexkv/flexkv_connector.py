@@ -262,8 +262,8 @@ class FlexKVConnector(BaseKVConnector):
         self.tp_size = server_args.tp_size
         self.rank = tp_rank
 
-        k_pool = getattr(kvcache, "k_buffer", None)
-        v_pool = getattr(kvcache, "v_buffer", None)
+        self.k_pool = getattr(kvcache, "k_buffer", None)
+        self.v_pool = getattr(kvcache, "v_buffer", None)
 
         if self.rank == 0:
             self.kv_manager = KVManager(
@@ -274,7 +274,7 @@ class FlexKVConnector(BaseKVConnector):
             self.kv_manager.start()
 
         self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
-        self._register_to_server(k_pool, v_pool)
+        self._register_to_server(self.k_pool, self.v_pool)
 
         self.num_layers = model_config.num_hidden_layers if model_config else 0
         self.enable_layerwise_transfer = bool(
@@ -363,10 +363,10 @@ class FlexKVConnector(BaseKVConnector):
         slot_mappings: List[torch.Tensor] = []
 
         for op in load_ops:
-            fk_tid = self._pending_loads.pop(op.rid, -1)
-            if fk_tid < 0:
+            fkv_tid = self._pending_loads.pop(op.rid, -1)
+            if fkv_tid < 0:
                 continue
-            flexkv_task_ids.append(fk_tid)
+            flexkv_task_ids.append(fkv_tid)
             indices = op.device_indices
             slot_mappings.append(indices.cpu() if indices.is_cuda else indices)
 
@@ -432,7 +432,7 @@ class FlexKVConnector(BaseKVConnector):
 
         try:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            fk_task_id, unmatched_mask = self.kv_manager.put_match(
+            fkv_task_id, unmatched_mask = self.kv_manager.put_match(
                 token_ids=token_ids_np, token_mask=None
             )
 
@@ -440,9 +440,9 @@ class FlexKVConnector(BaseKVConnector):
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
                 self.kv_manager.launch(
-                    task_ids=[fk_task_id], slot_mappings=[slot_mapping]
+                    task_ids=[fkv_task_id], slot_mappings=[slot_mapping]
                 )
-                self._ongoing_stores[task_id] = fk_task_id
+                self._ongoing_stores[task_id] = fkv_task_id
             else:
                 self._completed_stores.append(task_id)
         except Exception as e:
