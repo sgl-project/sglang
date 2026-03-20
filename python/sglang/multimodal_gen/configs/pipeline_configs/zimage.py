@@ -103,8 +103,8 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 batch.width // self.vae_config.arch_config.spatial_compression_ratio
             )
 
-        # ZImage patchifies in native F/H/W order. Preserve that geometry and only
-        # choose which native axis to slice so each rank gets a rectangular shard.
+        # ZImage patchifies [C, F, H, W] latents in native F/H/W order, so shard
+        # native H or W directly.
         H_tok = H // self.PATCH_SIZE
         W_tok = W // self.PATCH_SIZE
 
@@ -219,7 +219,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         return latents[:, :, :, :, w0:w1].contiguous(), True
 
     def gather_latents_for_sp(self, latents, batch):
-        # Gather rectangular native H/W shards back without reintroducing spatial padding.
+        # Gather native H/W shards by padding to a common collective shape, then crop.
         latents = latents.contiguous()
         if get_sp_world_size() <= 1 or latents.dim() != 5:
             return latents
@@ -288,8 +288,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             ).flatten(0, 2)
             cap_freqs_cis = rotary_emb(cap_pos_ids)
 
-            # Image positions for the local native H/W shard. Use cap_total for a
-            # stable offset across ranks and denoising passes.
+            # Build image positions for the local native shard.
             F_tokens = 1
             H_tokens_local = plan["local_h_tok"]
             W_tokens_local = plan["local_w_tok"]
