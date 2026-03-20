@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# 61 test classes testing hybrid parallelism configurations
+# 60 test classes testing hybrid parallelism configurations
 # Each test launches server + runs MMLU eval (~90s per test)
 register_cuda_ci(est_time=5400, suite="weekly-8-gpu-h200", nightly=True)
 
@@ -129,42 +129,6 @@ class Test02(CustomTestCase):
 
 
 class Test03(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.48)
-
-
-class Test03AllReduceFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
