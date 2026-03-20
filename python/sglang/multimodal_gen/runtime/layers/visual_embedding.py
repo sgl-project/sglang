@@ -59,12 +59,13 @@ class PatchEmbed(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        # Convert patch_size to 2-tuple
         if isinstance(patch_size, list | tuple):
             if len(patch_size) == 1:
-                patch_size = (patch_size[0], patch_size[0])
+                patch_size = (1, patch_size[0], patch_size[0])
+            elif len(patch_size) == 2:
+                patch_size = (1, patch_size[0], patch_size[1])
         else:
-            patch_size = (patch_size, patch_size)
+            patch_size = (1, patch_size, patch_size)
 
         self.patch_size = patch_size
         self.flatten = flatten
@@ -82,8 +83,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         if x.dim() == 5:
             B, C, T, H, W = x.shape
-            ps = self.patch_size
-            pt, ph, pw = (1, ps[0], ps[1]) if len(ps) == 2 else ps
+            pt, ph, pw = self.patch_size
             T_ = T // pt
             H_ = H // ph
             W_ = W // pw
