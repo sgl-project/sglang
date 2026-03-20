@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,7 +21,7 @@ def _make_cache(match_type="BFS", **kwargs):
     )
     defaults.update(kwargs)
     defaults["match_type"] = match_type
-    return NgramCache(**defaults)
+    return NgramCorpus(**defaults)
 
 
 SEED_SEQUENCES = [
