@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
