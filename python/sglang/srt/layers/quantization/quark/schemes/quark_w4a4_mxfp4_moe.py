@@ -129,11 +129,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             ),
             requires_grad=False,
         )
+
+        W2_SCALE_DIVIDEND = w2_down_dim * 2
+        W2_SCALE_DIVISOR = intermediate_size_per_partition
+        scaling_up = lambda dividend, divisor: (dividend * W2_SCALE_DIVIDEND) // (
+            divisor * W2_SCALE_DIVISOR
+        )
+
         w2_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // OCP_MX_BLOCK_SIZE,
+                scaling_up(intermediate_size_per_partition, OCP_MX_BLOCK_SIZE),
                 dtype=params_dtype,
             ),
             requires_grad=False,
