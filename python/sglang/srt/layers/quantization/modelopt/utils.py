@@ -100,3 +100,69 @@ def slice_nvfp4_output(
     if out.shape[-1] != output_size:
         return out[..., :output_size].contiguous()
     return out
+
+
+# --- ModelOpt W4A16 AWQ (reference dequant / linear, TRT-LLM layout) ---
+
+
+def modelopt_w4a16_dequant_ref(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    Dequantize in TRT-LLM layout: 0th dim of weight (in) is quantized group-wise.
+
+    weight: (in, out_packed) uint8
+    weight_scale: (num_groups, out) float32 with num_groups = in/group_size
+    """
+    in_features, out_packed = weight.shape
+    out_features = out_packed * 2
+    device = weight.device
+    dtype_f = weight_scale.dtype
+    low = (weight & 0xF).to(dtype_f)
+    low_signed = torch.where(low >= 8, low - 16.0, low)
+    high = (weight >> 4).to(dtype_f)
+    high_signed = torch.where(high >= 8, high - 16.0, high)
+    unpacked = torch.stack([low_signed, high_signed], dim=-1).reshape(
+        in_features, out_features
+    )
+    scale_ref = weight_scale.to(device).repeat_interleave(group_size, dim=0)[
+        :in_features, :
+    ]
+    w_fp = (unpacked * scale_ref).to(out_dtype)
+    return w_fp
+
+
+def modelopt_w4a16_linear_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    pre_quant_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Reference: pre_quant_scale on input, then x @ w_fp + bias (TRT-LLM layout)."""
+    if pre_quant_scale is not None:
+        x = x * pre_quant_scale.to(x.dtype)
+    w_fp = modelopt_w4a16_dequant_ref(
+        weight, weight_scale, group_size, out_dtype=out_dtype or x.dtype
+    )
+    return torch.nn.functional.linear(x, w_fp.t(), bias)
+
+
+def pre_quant_scale_sharded_loader(
+    param: torch.Tensor, loaded_weight: torch.Tensor
+) -> None:
+    """Shard dim 0 when param is a TP partition; else copy full tensor."""
+    from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+    if param.size() == loaded_weight.size():
+        param.data.copy_(loaded_weight)
+        return
+    tp_rank = get_attention_tp_rank()
+    shard_size = param.data.shape[0]
+    start_idx = tp_rank * shard_size
+    param.data.copy_(loaded_weight.narrow(0, start_idx, shard_size))

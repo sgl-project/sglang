@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.modelopt import (
     ModelOptFp4Config,
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
+    ModelOptW4A16AWQConfig,
 )
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
@@ -58,6 +59,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
+    "modelopt_awq": ModelOptFp4Config,
+    "modelopt_w4a16_awq": ModelOptW4A16AWQConfig,
     "modelopt_mixed": ModelOptMixedPrecisionConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,

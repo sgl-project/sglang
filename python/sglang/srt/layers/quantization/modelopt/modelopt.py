@@ -62,6 +62,8 @@ class ModelOptQuantConfig(QuantizationConfig):
             if self.is_layer_excluded(prefix):
                 # Falls back to default unquantized MoE
                 return None
+            if Moe is None:
+                return None
             return Moe(self)
         return None
 

@@ -22,6 +22,10 @@ from sglang.srt.layers.quantization.modelopt.schemes.modelopt_fp8 import (
 from sglang.srt.layers.quantization.modelopt.schemes.modelopt_mixed_precision import (
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.quantization.modelopt.schemes.modelopt_w4a16 import (
+    ModelOptW4A16AWQConfig,
+    ModelOptW4A16AWQLinearMethod,
+)
 
 __all__ = [
     "ACTIVATION_SCHEMES",
@@ -36,6 +40,8 @@ __all__ = [
     "ModelOptFp8MoEMethod",
     "ModelOptMixedPrecisionConfig",
     "ModelOptNvFp4FusedMoEMethod",
+    "ModelOptW4A16AWQConfig",
+    "ModelOptW4A16AWQLinearMethod",
     "enable_flashinfer_fp4_gemm",
     "fp4_gemm",
     "fp4_quantize",
