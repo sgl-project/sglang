@@ -3,12 +3,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -71,7 +70,7 @@ def _nvfp4_cuda_flags() -> list[str]:
     ]
 
 
-def _get_nvfp4_cuda_arch_list() -> str:
+def _nvfp4_arch_env():
     if not torch.cuda.is_available():
         raise RuntimeError("NVFP4 JIT kernels require CUDA.")
     major, minor = torch.cuda.get_device_capability()
@@ -84,21 +83,7 @@ def _get_nvfp4_cuda_arch_list() -> str:
     # JIT compilation targets only the current device, unlike AOT fat-binaries;
     # adding extra architectures here would clash with the single SGL_CUDA_ARCH
     # value injected by load_jit().
-    return f"{major}.{minor}a"
-
-
-@contextmanager
-def _nvfp4_arch_env():
-    key = "TVM_FFI_CUDA_ARCH_LIST"
-    old_val = os.environ.get(key)
-    os.environ[key] = _get_nvfp4_cuda_arch_list()
-    try:
-        yield
-    finally:
-        if old_val is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = old_val
+    return override_jit_cuda_arch(major, minor, suffix="a")
 
 
 @cache_once

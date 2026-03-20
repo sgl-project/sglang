@@ -3,6 +3,8 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
 import torch
@@ -72,10 +74,6 @@ def _resolve_kernel_path() -> pathlib.Path:
 KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-DEFAULT_HIP_CFLAGS = [
-    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
-]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
@@ -178,55 +176,90 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
-    env_key = "TVM_FFI_CUDA_ARCH_LIST"
-    env_existed = env_key in os.environ
-    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
-    if is_hip_runtime():
-        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
-        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
-    else:
-        extra_cuda_cflags = [
-            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
-        ] + extra_cuda_cflags
-    if not env_existed:
-        os.environ[env_key] = _get_cuda_arch_list()
-    try:
+    with _jit_compile_context():
         return load_inline(
             "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
+            extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,
         )
+
+
+@dataclass
+class ArchInfo:
+    major: int
+    minor: int
+    suffix: str
+
+    @property
+    def target_name(self) -> str:
+        return f"{self.major}.{self.minor}{self.suffix}"
+
+    @property
+    def jit_flag(self) -> str:
+        return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
+
+
+@cache_once
+def _init_jit_cuda_arch_once():
+    global _CUDA_ARCH
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    _CUDA_ARCH = ArchInfo(major, minor, "")
+
+
+@contextmanager
+def _jit_compile_context():
+    if is_hip_runtime():
+        yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
+        return
+    env_key = "TVM_FFI_CUDA_ARCH_LIST"
+    old_value = os.environ.get(env_key, None)
+    os.environ[env_key] = get_jit_cuda_arch().target_name
+    try:
+        yield
     finally:
-        # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
-        if not env_existed:
-            del os.environ[env_key]
+        if old_value is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old_value
 
 
-@cache_once
+def _get_default_target_flags() -> List[str]:
+    if is_hip_runtime():
+        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+    else:
+        return [
+            get_jit_cuda_arch().jit_flag,
+            "-std=c++20",
+            "-O3",
+            "--expt-relaxed-constexpr",
+        ]
+
+
+@contextmanager
+def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
+    """A context manager to temporarily override CUDA architecture."""
+    global _CUDA_ARCH
+    old_value = get_jit_cuda_arch()
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    try:
+        yield
+    finally:
+        _CUDA_ARCH = old_value
+
+
+def get_jit_cuda_arch() -> ArchInfo:
+    """Get the current CUDA architecture info."""
+    _init_jit_cuda_arch_once()
+    return _CUDA_ARCH
+
+
 def is_arch_support_pdl() -> bool:
-    import torch
-
-    device = torch.cuda.current_device()
-    return torch.cuda.get_device_capability(device)[0] >= 9
-
-
-@cache_once
-def _get_cuda_arch_value() -> int:
-    """Get CUDA arch value for -DSGL_CUDA_ARCH (e.g. 900 for SM 9.0)."""
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return major * 100 + minor * 10
-
-
-@cache_once
-def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}"
+    if is_hip_runtime():
+        return False
+    return get_jit_cuda_arch().major >= 9
