@@ -38,6 +38,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.power import get_power_recorder
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1183,6 +1184,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    record_power: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1309,6 +1311,11 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Start power recording (after warmup)
+    power_recorder = get_power_recorder() if record_power else None
+    if power_recorder is not None:
+        power_recorder.start()
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -1379,6 +1386,12 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
+
+    # Stop power recording
+    power_stats = None
+    if power_recorder is not None:
+        power_recorder.stop()
+        power_stats = power_recorder.get_stats()
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1535,6 +1548,111 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if power_stats is not None:
+        print("{s:{c}^{n}}".format(s="GPU Power (all devices)", n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "P25 Total Power (total W):", power_stats["p25_power_w"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean Total Power (total W):", power_stats["mean_power_w"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median Total Power (total W):", power_stats["median_power_w"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median Power (per-GPU W):",
+                power_stats["median_power_per_accelerator_w"],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "P75 Total Power (total W):", power_stats["p75_power_w"]
+            )
+        )
+        print("{:<40} {:<10}".format("Power samples:", power_stats["num_samples"]))
+
+        print("{s:{c}^{n}}".format(s="CPU Power (all sockets)", n=50, c="-"))
+
+        def _fmt(val) -> str:
+            return f"{val:<10.2f}" if val is not None else "None"
+
+        print(
+            "{:<40} {}".format(
+                "CPU P25 Total Power (W):", _fmt(power_stats["cpu_p25_power_w"])
+            )
+        )
+        print(
+            "{:<40} {}".format(
+                "CPU Mean Total Power (W):", _fmt(power_stats["cpu_mean_power_w"])
+            )
+        )
+        print(
+            "{:<40} {}".format(
+                "CPU Median Total Power (W):", _fmt(power_stats["cpu_median_power_w"])
+            )
+        )
+        print(
+            "{:<40} {}".format(
+                "CPU Median Power (per-socket W):",
+                _fmt(power_stats["cpu_median_power_per_socket_w"]),
+            )
+        )
+        print(
+            "{:<40} {}".format(
+                "CPU P75 Total Power (W):", _fmt(power_stats["cpu_p75_power_w"])
+            )
+        )
+        print(
+            "{:<40} {}".format(
+                "CPU Power samples:",
+                (
+                    power_stats["cpu_num_samples"]
+                    if power_stats["cpu_num_samples"] is not None
+                    else "None"
+                ),
+            )
+        )
+
+        median_power = power_stats["median_power_w"]
+
+        description = "GPU"
+        if power_stats["cpu_median_power_w"] is not None:
+            median_power += power_stats["cpu_median_power_w"]
+            description = "CPU + GPU"
+
+        input_toks_per_watt = metrics.total_input / median_power
+        output_toks_per_watt = metrics.total_output / median_power
+        total_toks_per_watt = (
+            metrics.total_input + metrics.total_output
+        ) / median_power
+
+        power_stats["input_toks_per_watt"] = input_toks_per_watt
+        power_stats["input_toks_per_watt"] = output_toks_per_watt
+        power_stats["input_toks_per_watt"] = total_toks_per_watt
+
+        print("{s:{c}^{n}}".format(s="Power summary", n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Input tokens/({description} median W):", input_toks_per_watt
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Output tokens/({description} median W):", output_toks_per_watt
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Total tokens/({description} median W):", total_toks_per_watt
+            )
+        )
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -1593,6 +1711,8 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+        if power_stats is not None:
+            result.update(power_stats)
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1883,6 +2003,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            record_power=args.record_power,
         )
     )
 
@@ -2240,6 +2361,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--record-power",
+        action="store_true",
+        help="Record GPU power usage during benchmark (excluding warmup). Available only on AMD Instinct GPUs at the moment."
+        "Samples every 5s and reports P25/mean/median/P75 stats.",
     )
     parser.add_argument(
         "--tokenize-prompt",
