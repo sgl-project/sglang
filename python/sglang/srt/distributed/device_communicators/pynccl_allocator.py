@@ -1,6 +1,8 @@
+import ctypes
 import os
 import tempfile
 from contextlib import nullcontext
+from typing import Dict, Set
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
@@ -11,9 +13,19 @@ from sglang.srt.utils.common import torch_release
 
 after_2_8_0 = torch_release >= (2, 8)
 
+# C++ source for the NCCL allocator plugin
+# Key design:
+# 1. nccl_alloc_plug: Allocates memory via ncclMemAlloc and TRACKS the segment
+#    (ptr, size). Does NOT register with any comm at allocation time.
+# 2. nccl_free_plug: Frees memory via ncclMemFree and UNTRACKS the segment.
+#    Each segment is tracked only during its lifetime (from alloc to free).
+# 3. Segment tracking uses a thread-safe map keyed by ptr.
+# 4. Python layer handles registration at context exit time using pynccl API.
 nccl_allocator_source = """
 
 #include <cuda_runtime.h>
+#include <mutex>
+#include <unordered_map>
 
 extern "C" {
 
@@ -27,10 +39,6 @@ typedef enum { ncclSuccess                 =  0,
                ncclRemoteError             =  6,
                ncclInProgress              =  7,
                ncclNumResults              =  8 } ncclResult_t;
-typedef struct ncclComm* ncclComm_t;
-typedef struct ncclWindow_vidmem* ncclWindow_t;
-ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
-#define NCCL_WIN_COLL_SYMMETRIC 0x01
 
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
@@ -45,33 +53,78 @@ const char*  ncclGetErrorString(ncclResult_t result);
   }                                                                       \
 } while(0)
 
+// Thread-safe segment tracking using unordered_map (keyed by ptr)
+// Segments are tracked during their lifetime (from alloc to free).
+static std::unordered_map<void*, size_t> g_segments;
+static std::mutex g_segment_mutex;
+
+// Add or update a segment in the tracking map
+static void track_segment(void* ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    g_segments[ptr] = size;
+}
+
+// Remove a segment from the tracking map
+static void untrack_segment(void* ptr) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    g_segments.erase(ptr);
+}
+
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
-  void* ptr;
-  NCCLCHECK(ncclMemAlloc(&ptr, size));
+    void* ptr;
+    NCCLCHECK(ncclMemAlloc(&ptr, size));
 
-  const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
-  char *endptr;
-  void* int_val = (void *)strtoull(str_val, &endptr, 0);
+    // Track the segment but do NOT register with any comm
+    // Registration will be done at context exit in Python
+    track_segment(ptr, size);
 
-  ncclComm_t comm = (ncclComm_t)(int_val);
-  ncclWindow_t win;
-  NCCLCHECK(ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC));
-
-  return ptr;
+    return ptr;
 }
 
 void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
-  ncclResult_t err = ncclMemFree(ptr);
+    // Untrack the segment before freeing
+    untrack_segment(ptr);
+    ncclResult_t err = ncclMemFree(ptr);
+}
+
+// C API for Python to query tracked segments
+// out_ptrs: output array for pointers (must have max_segments elements)
+// out_sizes: output array for sizes (must have max_segments elements)
+// max_segments: maximum number of segments to return
+// Returns: actual number of segments returned
+extern "C" int nccl_allocator_get_segments(void** out_ptrs, size_t* out_sizes, int max_segments) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    int count = 0;
+    for (const auto& seg : g_segments) {
+        if (count >= max_segments) break;
+        out_ptrs[count] = seg.first;
+        out_sizes[count] = seg.second;
+        count++;
+    }
+    return count;
+}
+
+extern "C" int nccl_allocator_get_segment_count() {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    return (int)g_segments.size();
 }
 
 }
 """
 
 _allocator = None
-_mem_pool = None
+_shared_mem_pool = None
 _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
+
+# Reference to the loaded library
+_nccl_allocator_lib = None
+
+# Global registry for tracking registrations
+# Key: ptr (int), Value: set of comm_ptr (int) that have registered this ptr
+# This allows the same memory to be registered with multiple communicators
+_ptr_to_registered_comms: Dict[int, Set[int]] = {}
 
 
 def is_symmetric_memory_enabled():
@@ -99,9 +152,15 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
-def get_nccl_mem_pool():
-    global _allocator, _mem_pool, _cur_device
-    if _mem_pool is None:
+def get_nccl_mem_pool() -> torch.cuda.MemPool:
+    """
+    Get the shared MemPool for all groups.
+
+    All groups share the same pool to avoid memory fragmentation.
+    Comm registration is handled at context exit time.
+    """
+    global _allocator, _shared_mem_pool, _cur_device, _nccl_allocator_lib
+    if _allocator is None:
         import torch.utils.cpp_extension
 
         out_dir = os.path.join(tempfile.gettempdir(), "symm_allocator")
@@ -116,7 +175,7 @@ def get_nccl_mem_pool():
         torch.distributed.barrier()
 
         nccl_allocator_libname = "nccl_allocator"
-        torch.utils.cpp_extension.load_inline(
+        lib_path = torch.utils.cpp_extension.load_inline(
             name=nccl_allocator_libname,
             cpp_sources=nccl_allocator_source,
             with_cuda=True,
@@ -125,14 +184,58 @@ def get_nccl_mem_pool():
             is_python_module=False,
             build_directory=out_dir,
         )
+        _nccl_allocator_lib = ctypes.CDLL(lib_path)
         _allocator = CUDAPluggableAllocator(
             f"{out_dir}/{nccl_allocator_libname}.so",
             "nccl_alloc_plug",
             "nccl_free_plug",
         ).allocator()
-        _mem_pool = torch.cuda.MemPool(_allocator)
+        _shared_mem_pool = torch.cuda.MemPool(_allocator)
         _cur_device = torch.cuda.current_device()
-    return _mem_pool
+
+    return _shared_mem_pool
+
+
+def _get_tracked_segments() -> list:
+    """
+    Get all tracked segments from C++ as a list of (ptr, size) tuples.
+
+    Returns:
+        List of (ptr_int, size) tuples representing all tracked segments.
+    """
+    # Get segment count first
+    count_func = _nccl_allocator_lib.nccl_allocator_get_segment_count
+    count_func.restype = ctypes.c_int
+    count_func.argtypes = []
+
+    max_segments = count_func()
+    if max_segments == 0:
+        return []
+
+    # Allocate buffers for results
+    ptrs = (ctypes.c_uint64 * max_segments)()
+    sizes = (ctypes.c_size_t * max_segments)()
+
+    # Get segments
+    get_segments_func = _nccl_allocator_lib.nccl_allocator_get_segments
+    get_segments_func.restype = ctypes.c_int
+    get_segments_func.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_int,
+    ]
+
+    actual_count = get_segments_func(ptrs, sizes, max_segments)
+
+    # Convert to Python list of tuples
+    segments = []
+    for i in range(actual_count):
+        ptr_int = ptrs[i]
+        size = sizes[i]
+        if ptr_int != 0:
+            segments.append((ptr_int, size))
+
+    return segments
 
 
 class SymmetricMemoryContext:
@@ -143,6 +246,15 @@ class SymmetricMemoryContext:
     by `ncclMemAlloc` and registered by `ncclCommWindowRegister`. Due to this, we introduce
     this context manager. All tensors created under this context will be correctly
     allocated and registered with a custom allocator.
+
+    Key design:
+    - All groups share a single MemPool to avoid memory fragmentation.
+    - At allocation time, ptrs are tracked but NOT registered with any comm.
+    - At context exit time, we iterate over segments and register unregistered ptrs
+      with the current comm using pynccl.register_comm_window_raw.
+      This handles both:
+      1. Newly allocated memory (never registered)
+      2. Memory reused from pool (may need registration for different comm)
     """
 
     def __init__(
@@ -150,14 +262,19 @@ class SymmetricMemoryContext:
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
+        self.group_name = group_coordinator.unique_name
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
         self.exited = False
 
+        # Get comm ptr for tracking registrations
+        # Use the comm pointer value as unique identifier
+        self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
+
     def __enter__(self):
         assert (
             self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
+        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_name}'"
 
         if self.is_graph_capture:
             assert (
@@ -177,11 +294,6 @@ class SymmetricMemoryContext:
             self.exited = False
         self._mem_pool_ctx.__enter__()
 
-        # Set the env var to pass this argument to the C functions.
-        os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
-            self.group_coordinator.pynccl_comm.comm.value
-        )
-
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
 
@@ -189,6 +301,9 @@ class SymmetricMemoryContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
+        # Register all unregistered segments
+        # with the current comm
+        self._register_segments_for_comm()
 
         if self.is_graph_capture:
             if after_2_8_0:
@@ -202,6 +317,40 @@ class SymmetricMemoryContext:
         _active_symmetric_memory_context = None
 
         self.exited = True
+
+    def _register_segments_for_comm(self):
+        """
+        Register all tracked segments with the current comm if not already registered.
+
+        This handles two scenarios:
+        1. Newly allocated memory: needs registration
+        2. Memory reused from pool: may need registration for different comm
+        """
+        global _ptr_to_registered_comms
+
+        comm_ptr = self._comm_ptr
+        pynccl_comm = self.group_coordinator.pynccl_comm
+
+        # Get all tracked segments from C++
+        segments = _get_tracked_segments()
+        if not segments:
+            return
+
+        # Register segments that are not yet registered with this comm
+        for ptr_int, size in segments:
+            # Check if this ptr is already registered with this comm
+            if ptr_int not in _ptr_to_registered_comms:
+                _ptr_to_registered_comms[ptr_int] = set()
+
+            if comm_ptr in _ptr_to_registered_comms[ptr_int]:
+                # Already registered with this comm, skip
+                continue
+
+            # Register this ptr with the current comm using pynccl API
+            pynccl_comm.register_comm_window_raw(ptr_int, size)
+
+            # Track the registration
+            _ptr_to_registered_comms[ptr_int].add(comm_ptr)
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
