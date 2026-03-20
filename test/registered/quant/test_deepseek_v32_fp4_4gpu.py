@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -46,6 +47,10 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
+            env={
+                **os.environ,
+                "HF_HUB_OFFLINE": "0",
+            },
         )
 
     @classmethod
@@ -113,6 +118,10 @@ class TestDeepseekV32FP4TP(CustomTestCase):
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
+            env={
+                **os.environ,
+                "HF_HUB_OFFLINE": "0",
+            },
         )
 
     @classmethod
