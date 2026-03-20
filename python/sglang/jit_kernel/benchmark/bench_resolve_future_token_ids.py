@@ -10,6 +10,7 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.resolve_future_token_ids import resolve_future_token_ids_cuda
+from sglang.srt.utils import get_compiler_backend
 
 SIZE_LIST = get_benchmark_range(
     full_range=[2**n for n in range(4, 16)],  # 16 … 32K elements
@@ -27,14 +28,19 @@ def _torch_resolve(input_ids, future_map):
     )
 
 
+_compiled_resolve = torch.compile(
+    _torch_resolve, dynamic=True, backend=get_compiler_backend()
+)
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["size"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["jit", "torch"],
-        line_names=["SGL JIT Kernel", "PyTorch"],
-        styles=[("blue", "-"), ("red", "--")],
+        line_vals=["jit", "torch_compile", "torch"],
+        line_names=["SGL JIT Kernel", "torch.compile", "PyTorch"],
+        styles=[("blue", "-"), ("green", "-."), ("red", "--")],
         ylabel="us",
         plot_name="resolve-future-token-ids-performance",
         args={},
@@ -51,6 +57,8 @@ def benchmark(size: int, provider: str):
 
     if provider == "jit":
         fn = lambda: resolve_future_token_ids_cuda(input_ids.clone(), future_map)
+    elif provider == "torch_compile":
+        fn = lambda: _compiled_resolve(input_ids.clone(), future_map)
     else:
         fn = lambda: _torch_resolve(input_ids.clone(), future_map)
 

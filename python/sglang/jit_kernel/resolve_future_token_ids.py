@@ -9,8 +9,6 @@ from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_DTYPES = (torch.int32, torch.int64)
-
 
 @cache_once
 def _jit_resolve_future_token_ids_module(dtype: torch.dtype) -> Module:
@@ -39,11 +37,5 @@ def resolve_future_token_ids_cuda(
 
     Supported dtypes: torch.int32, torch.int64.
     """
-    if not input_ids.is_cuda:
-        raise RuntimeError("input_ids must be a CUDA tensor")
-    if input_ids.dtype not in _SUPPORTED_DTYPES:
-        raise RuntimeError(
-            f"Unsupported dtype {input_ids.dtype}. Supported: {_SUPPORTED_DTYPES}"
-        )
     module = _jit_resolve_future_token_ids_module(input_ids.dtype)
     module.resolve_future_token_ids(input_ids, future_token_ids_map)
