@@ -45,11 +45,19 @@ class MultiPlatformOp(nn.Module):
         # so we decide to only use torch.compile when bs=1
         if "FusedMoE" in self.__class__.__name__:
             if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
+                from sglang.srt.layers.moe.moe_runner.torch_native import (
                     fused_moe_forward_native,
                 )
 
-                self._forward_method = fused_moe_forward_native
+                def fused_moe_forward_wrapper(layer, dispatch_output):
+                    return fused_moe_forward_native(
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        self.moe_runner_config,
+                        dispatch_output,
+                    )
+
+                self._forward_method = fused_moe_forward_wrapper
         elif "TopK" in self.__class__.__name__:
             if num_tokens == 1:
                 self._forward_method = self.forward_native

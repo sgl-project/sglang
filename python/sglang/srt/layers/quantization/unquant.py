@@ -165,6 +165,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_torch_native = get_moe_runner_backend().is_torch_native()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
@@ -327,7 +328,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+
+        if self.use_torch_native:
+            backend = MoeRunnerBackend.TORCH_NATIVE
+        elif self.use_flashinfer_trtllm_moe:
             backend = MoeRunnerBackend.FLASHINFER_TRTLLM
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
@@ -490,15 +494,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return StandardCombineInput(hidden_states=output)
         else:
-            from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
-
-            output = moe_forward_native(
-                layer,
-                x,
-                topk_output,
-                moe_runner_config,
+            from sglang.srt.layers.moe.moe_runner.torch_native import (
+                TorchNativeMoeQuantInfo,
             )
-            return StandardCombineInput(hidden_states=output)
+
+            quant_info = TorchNativeMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+
+            return self.runner.run(dispatch_output, quant_info)
 
     def forward_xpu(
         self,
