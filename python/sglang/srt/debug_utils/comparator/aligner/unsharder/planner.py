@@ -138,6 +138,11 @@ def _validate_explicit_replicated(
             f"Axes {{{conflict_names}}} declared as both sharded and replicated"
         )
 
+    _validate_replicated_axes_orthogonal(
+        explicit_replicated_axes=explicit_replicated_axes,
+        parallel_infos=parallel_infos,
+    )
+
     candidate_axes: set[ParallelAxis] = (
         all_axes - sharded_axes - explicit_replicated_axes
     )
@@ -175,6 +180,33 @@ def _validate_explicit_replicated(
         raise ValueError(
             f"Axes {{{undeclared_names}}} are active (axis_size > 1) but not declared "
             f"in dims. Annotate as sharded in dim spec or as '# axis:replicated'."
+        )
+
+
+def _validate_replicated_axes_orthogonal(
+    *,
+    explicit_replicated_axes: frozenset[ParallelAxis],
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+) -> None:
+    """Every pair of explicitly replicated axes must be fully orthogonal (no dependency)."""
+    axes: list[ParallelAxis] = sorted(explicit_replicated_axes, key=lambda a: a.value)
+    if len(axes) < 2:
+        return
+
+    violations: list[str] = []
+    for i, axis_a in enumerate(axes):
+        for axis_b in axes[i + 1 :]:
+            for parent, child in [(axis_a, axis_b), (axis_b, axis_a)]:
+                if _is_dependent_axis(parallel_infos, parent=parent, child=child):
+                    violations.append(
+                        f"'{parent.value}' determines '{child.value}' — "
+                        f"remove '{child.value}:replicated'"
+                    )
+
+    if violations:
+        details = "; ".join(violations)
+        raise ValueError(
+            f"Explicitly-replicated axes overlap (not orthogonal): {details}"
         )
 
 

@@ -5,6 +5,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     _is_dependent_axis,
     _is_jointly_determined,
     _validate_explicit_replicated,
+    _validate_replicated_axes_orthogonal,
     compute_unsharder_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
@@ -825,6 +826,41 @@ class TestAxisContainment:
             },
         ]
         with pytest.raises(ValueError, match="cp.*not declared"):
+            compute_unsharder_plan(
+                dim_specs, parallel_infos, explicit_replicated_axes=replicated
+            )
+
+    def test_backward_compat_explicit_children(self) -> None:
+        """Both tp:replicated and attn_tp:replicated → ValueError (not orthogonal)."""
+        dim_specs = parse_dims(
+            "t h # tp:replicated attn_tp:replicated moe_tp:replicated"
+        ).dims
+        replicated = frozenset(
+            {ParallelAxis.TP, ParallelAxis.ATTN_TP, ParallelAxis.MOE_TP}
+        )
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="not orthogonal"):
             compute_unsharder_plan(
                 dim_specs, parallel_infos, explicit_replicated_axes=replicated
             )
@@ -1875,3 +1911,154 @@ class TestIsJointlyDetermined:
             parent_axes=frozenset({ParallelAxis.TP}),
             child=ParallelAxis.EDP,
         )
+
+
+class TestReplicatedAxesOrthogonality:
+    """Tests for _validate_replicated_axes_orthogonal: every pair of explicitly
+    replicated axes must be fully orthogonal (no dependency relationship)."""
+
+    def test_tp_determines_moe_tp_raises(self) -> None:
+        """TP4 + MOE_TP2 where tp_rank determines moe_tp_rank → ValueError."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="not orthogonal"):
+            _validate_replicated_axes_orthogonal(
+                explicit_replicated_axes=frozenset(
+                    {ParallelAxis.TP, ParallelAxis.MOE_TP}
+                ),
+                parallel_infos=parallel_infos,
+            )
+
+    def test_tp_determines_sp_identical_group_raises(self) -> None:
+        """TP2 + SP2 where sp_rank == tp_rank → ValueError."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="not orthogonal"):
+            _validate_replicated_axes_orthogonal(
+                explicit_replicated_axes=frozenset({ParallelAxis.TP, ParallelAxis.SP}),
+                parallel_infos=parallel_infos,
+            )
+
+    def test_three_axes_two_overlapping_pairs_raises(self) -> None:
+        """TP4 + ATTN_TP2 + MOE_TP2, TP determines both → error mentions two pairs."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4),
+                ParallelAxis.ATTN_TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.MOE_TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="not orthogonal") as exc_info:
+            _validate_replicated_axes_orthogonal(
+                explicit_replicated_axes=frozenset(
+                    {ParallelAxis.TP, ParallelAxis.ATTN_TP, ParallelAxis.MOE_TP}
+                ),
+                parallel_infos=parallel_infos,
+            )
+        msg = str(exc_info.value)
+        assert "attn_tp" in msg
+        assert "moe_tp" in msg
+
+    def test_three_axes_one_overlap_one_orthogonal_raises(self) -> None:
+        """TP4 + MOE_TP2 (dependent) + CP2 (independent) → only tp/moe_tp pair errors."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for tp_rank in range(4):
+                parallel_infos.append(
+                    {
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=4),
+                        ParallelAxis.MOE_TP: AxisInfo(
+                            axis_rank=tp_rank % 2, axis_size=2
+                        ),
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                    }
+                )
+        with pytest.raises(ValueError, match="not orthogonal") as exc_info:
+            _validate_replicated_axes_orthogonal(
+                explicit_replicated_axes=frozenset(
+                    {ParallelAxis.TP, ParallelAxis.MOE_TP, ParallelAxis.CP}
+                ),
+                parallel_infos=parallel_infos,
+            )
+        msg = str(exc_info.value)
+        assert "moe_tp" in msg
+        assert "cp" not in msg
+
+    def test_single_replicated_axis_no_check(self) -> None:
+        """Only one replicated axis → no orthogonality check needed, passes."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        _validate_replicated_axes_orthogonal(
+            explicit_replicated_axes=frozenset({ParallelAxis.TP}),
+            parallel_infos=parallel_infos,
+        )
+
+    def test_two_independent_axes_ok(self) -> None:
+        """TP2 + CP2 fully orthogonal → no error."""
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        _validate_replicated_axes_orthogonal(
+            explicit_replicated_axes=frozenset({ParallelAxis.TP, ParallelAxis.CP}),
+            parallel_infos=parallel_infos,
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
