@@ -370,6 +370,18 @@ def register_fake_ops():
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
+    @torch.library.register_fake("sgl_kernel::int4_scaled_mm_cpu")
+    def _(
+        x,
+        w,
+        w_zeros,
+        w_scales,
+        bias,
+    ):
+        M = x.shape[0]
+        N = w_scales.shape[0] * w_scales.shape[-1]
+        return x.new_empty(M, N, dtype=x.dtype)
+
     @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_cpu")
     def _(
         mat1,

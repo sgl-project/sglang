@@ -183,7 +183,11 @@ Notes:
 
 1. For running W8A8 quantized models, please add the flag `--quantization w8a8_int8`.
 
-2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
+2. For offline AutoRound INT4 checkpoints, do not add `--quantization`; SGLang auto-detects quantization from model config.
+   AutoRound `auto_round:auto_awq` uses CPU INT4 kernels, and `auto_round:auto_gptq` uses CPU fallback dequantization.
+   AutoRound MoE on CPU is not supported yet.
+
+3. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
     On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
     Usually we can get the SNC information (How many available) from the Operating System with e.g. `lscpu` command.

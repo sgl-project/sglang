@@ -13,10 +13,190 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 
 ScalarType, scalar_types = get_scalar_types()
 
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_npu
+from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
+from sglang.srt.utils import is_cpu, is_npu
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
+
+
+def _has_int4_cpu_kernels() -> bool:
+    sgl_kernel_ops = getattr(torch.ops, "sgl_kernel", None)
+    return (
+        sgl_kernel_ops is not None
+        and hasattr(sgl_kernel_ops, "int4_scaled_mm_cpu")
+        and hasattr(sgl_kernel_ops, "convert_weight_packed_scale_zp")
+    )
+
+
+class AutoRoundAWQCPULinearMethod(LinearMethodBase):
+    """CPU fallback for AutoRound AWQ using sgl-kernel int4 GEMM."""
+
+    def __init__(self, quant_config):
+        from sglang.srt.layers.quantization.awq import AWQLinearMethod
+
+        self.quant_config = quant_config
+        self._delegate = AWQLinearMethod(quant_config)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self._delegate.create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not _has_int4_cpu_kernels():
+            raise RuntimeError(
+                "AutoRound AWQ CPU requires int4 CPU kernels. "
+                "Please build sgl-kernel CPU backend first."
+            )
+
+        qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            layer.qweight.data,
+            layer.qzeros.data,
+            layer.scales.data,
+        )
+        layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(qzeros, requires_grad=False)
+        layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        output = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x_2d,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            bias,
+        )
+        return output.reshape(x.shape[:-1] + (output.shape[-1],))
+
+
+class AutoRoundGPTQCPULinearMethod(LinearMethodBase):
+    """CPU fallback for AutoRound GPTQ by dequantizing weights on-the-fly."""
+
+    def __init__(self, quant_config):
+        from sglang.srt.layers.quantization.gptq import GPTQLinearMethod
+
+        self.quant_config = quant_config
+        self._delegate = GPTQLinearMethod(quant_config)
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+
+    @staticmethod
+    def _unpack_int32(
+        packed: torch.Tensor, num_bits: int, packed_dim: int
+    ) -> torch.Tensor:
+        pack_factor = 32 // num_bits
+        mask = (1 << num_bits) - 1
+        shifts = (
+            torch.arange(pack_factor, device=packed.device, dtype=torch.int32)
+            * num_bits
+        )
+        packed_i32 = packed.to(torch.int32)
+
+        if packed_dim == 0:
+            # [K // pack_factor, N] -> [K, N]
+            return (
+                (packed_i32.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask
+            ).reshape(-1, packed.shape[1])
+        if packed_dim == 1:
+            # [G, N // pack_factor] -> [G, N]
+            return (
+                (packed_i32.unsqueeze(-1) >> shifts.view(1, 1, -1)) & mask
+            ).reshape(packed.shape[0], -1)
+        raise ValueError(f"Unsupported packed_dim={packed_dim}")
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self._delegate.create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Keep tensors in loaded order for CPU fallback dequantization.
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        num_bits = self.quant_config.weight_bits
+
+        qweight = self._unpack_int32(layer.qweight, num_bits=num_bits, packed_dim=0).to(
+            layer.scales.dtype
+        )
+        qzeros = self._unpack_int32(layer.qzeros, num_bits=num_bits, packed_dim=1).to(
+            layer.scales.dtype
+        )
+        if not self.use_v2_format:
+            qzeros = qzeros + 1
+
+        use_default_gidx = layer.g_idx.numel() == 0 or (
+            self.quant_config.group_size == -1 and torch.any(layer.g_idx < 0)
+        )
+        if use_default_gidx:
+            if self.quant_config.group_size == -1:
+                g_idx = torch.zeros(
+                    (qweight.shape[0],), dtype=torch.long, device=layer.scales.device
+                )
+            else:
+                g_idx = torch.arange(
+                    qweight.shape[0], dtype=torch.long, device=layer.scales.device
+                ) // self.quant_config.group_size
+        else:
+            g_idx = layer.g_idx.to(dtype=torch.long)
+
+        if g_idx.numel() != qweight.shape[0]:
+            raise ValueError(
+                "AutoRound GPTQ CPU fallback expects g_idx rows to match qweight rows, "
+                f"but got g_idx={g_idx.numel()} and qweight_rows={qweight.shape[0]}."
+            )
+
+        scale_zeros = qzeros * layer.scales
+        dequant_weight = qweight * layer.scales[g_idx] - scale_zeros[g_idx]
+        output = torch.matmul(x_2d, dequant_weight)
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(x.shape[:-1] + (dequant_weight.shape[-1],))
 
 
 class AutoRoundConfig(QuantizationConfig):
@@ -241,6 +421,22 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        if _is_cpu:
+            from sglang.srt.layers.quantization.awq import AWQConfig
+
+            if isinstance(layer, FusedMoE):
+                raise NotImplementedError(
+                    "AutoRound AWQ MoE on CPU is not supported yet."
+                )
+            quant_args = AWQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                zero_point=not sym,
+            )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return AutoRoundAWQCPULinearMethod(quant_args)
+            return None
+
         if backend == "auto" or "marlin" in backend:
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
@@ -331,6 +527,22 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        if _is_cpu:
+            quant_args = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                lm_head_quantized=False,
+                desc_act=False,
+                dynamic={},
+            )
+            if isinstance(layer, FusedMoE):
+                raise NotImplementedError(
+                    "AutoRound GPTQ MoE on CPU is not supported yet."
+                )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return AutoRoundGPTQCPULinearMethod(quant_args)
+            return None
+
         if _is_npu:
             quant_args = GPTQConfig(
                 weight_bits=weight_bits,
@@ -392,20 +604,17 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+                return GPTQMarlinMoEMethod(quant_args_marlin)
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            return GPTQMarlinMoEMethod(quant_args_marlin)
-
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
                 return GPTQMarlinLinearMethod(quant_args_marlin)
@@ -415,8 +624,8 @@ class AutoRoundConfig(QuantizationConfig):
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        # TODO enable CPU quant method later
         if "gptq" in self.packing_format or "gptq" in self.backend:
             return self.apply_gptq_quant_layer(layer, prefix)
         if "awq" in self.packing_format or "awq" in self.backend:
             return self.apply_awq_quant_layer(layer, prefix)
+        return None

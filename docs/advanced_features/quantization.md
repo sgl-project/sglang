@@ -32,7 +32,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `gptq` | Yes | Yes | Uses Triton or vLLM kernels on AMD |
 | `compressed-tensors` | Yes | Yes | Aiter paths for FP8/MoE on AMD |
 | `quark` | Yes | Yes | AMD Quark quantization; Aiter GEMM paths on AMD |
-| `auto-round` | Yes | Yes | Platform-agnostic (Intel auto-round) |
+| `auto-round` | Yes | Yes | Supports offline INT4 on CPU engine (`SGLANG_USE_CPU_ENGINE=1`): AWQ path uses CPU INT4 kernels, GPTQ path uses CPU fallback dequantization. MoE on CPU is not supported yet. |
 | `quark_int4fp8_moe` | No | Yes | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
 | `awq_marlin` | Yes | No | Marlin kernels are CUDA-only |
 | `gptq_marlin` | Yes | No | Marlin kernels are CUDA-only |
@@ -149,6 +149,19 @@ auto-round \
     --format "auto_round" \
     --output_dir ./tmp_autoround
 ```
+
+- Run AutoRound INT4 model on SGLang CPU engine (offline inference)
+
+```bash
+export SGLANG_USE_CPU_ENGINE=1
+python -m sglang.launch_server \
+    --model-path /path/to/your/autoround-int4-model \
+    --device cpu \
+    --disable-overlap-schedule \
+    --host 0.0.0.0
+```
+
+`--quantization` is not required for offline AutoRound checkpoints, because SGLang reads the quantization method from model config.
 
 - known issues
 
