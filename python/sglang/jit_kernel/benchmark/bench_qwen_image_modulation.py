@@ -3,13 +3,14 @@ from typing import Tuple
 import torch
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_gate_select01_kernel,
 )
+from sglang.utils import is_in_ci
 
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [3072]
