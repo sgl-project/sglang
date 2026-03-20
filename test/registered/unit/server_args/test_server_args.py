@@ -51,6 +51,28 @@ class TestPrepareServerArgs(CustomTestCase):
             ["TopK", "UnquantizedFusedMoEMethod"],
         )
 
+    def test_prepare_server_args_with_local_torch_compile_scope(self):
+        with patch.object(ServerArgs, "__post_init__", lambda self: None):
+            server_args = prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--enable-torch-compile",
+                    "--torch-compile-scope",
+                    "local",
+                    "--torch-compile-override-layers",
+                    "RMSNorm",
+                    "UnquantizedFusedMoEMethod",
+                ]
+            )
+
+        self.assertTrue(server_args.enable_torch_compile)
+        self.assertEqual(server_args.torch_compile_scope, "local")
+        self.assertEqual(
+            server_args.torch_compile_override_layers,
+            ["RMSNorm", "UnquantizedFusedMoEMethod"],
+        )
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

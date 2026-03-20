@@ -104,6 +104,23 @@ if TYPE_CHECKING:
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
+# TODO (kaiximatteoc): parameterize this
+def _get_inductor_groupedmm_compile_options():
+    compile_options = {
+        "max_autotune_gemm_backends": "TRITON",
+        "max_autotune_gemm": True,
+        "trace.enabled": True,
+    }
+    if hasattr(torch._inductor.config, "combo_kernels"):
+        compile_options["combo_kernels"] = True
+    if hasattr(torch._inductor.config, "triton"):
+        triton_cfg = torch._inductor.config.triton
+        if hasattr(triton_cfg, "enable_pdl"):
+            compile_options["triton.enable_pdl"] = True
+    return compile_options
+
+
+INDUCTOR_COMPILE_OPTIONS = _get_inductor_groupedmm_compile_options()
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
@@ -404,7 +421,10 @@ def _to_torch(
     model: torch.nn.Module,
     reverse: bool,
     num_tokens: int,
+    compile_scope: str = "full",
     override_layers: Optional[Collection[str]] = None,
+    compile_options: Optional[dict] = None,
+    compile_dynamic: bool = False,
 ):
     for sub in model._modules.values():
         if isinstance(sub, MultiPlatformOp):
@@ -412,14 +432,21 @@ def _to_torch(
                 sub.leave_torch_compile()
             else:
                 sub.enter_torch_compile(
-                    num_tokens=num_tokens, override_layers=override_layers
+                    num_tokens=num_tokens,
+                    compile_scope=compile_scope,
+                    override_layers=override_layers,
+                    compile_options=compile_options,
+                    compile_dynamic=compile_dynamic,
                 )
         if isinstance(sub, torch.nn.Module):
             _to_torch(
                 sub,
                 reverse,
                 num_tokens,
+                compile_scope=compile_scope,
                 override_layers=override_layers,
+                compile_options=compile_options,
+                compile_dynamic=compile_dynamic,
             )
 
 
@@ -429,6 +456,7 @@ def patch_model(
     enable_compile: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
+    compile_scope: str = "full",
     override_layers: Optional[List[str]] = None,
 ):
     """Patch the model to make it compatible with with torch.compile"""
@@ -436,6 +464,7 @@ def patch_model(
     override_layer_set = (
         frozenset(override_layers) if override_layers is not None else None
     )
+    compile_dynamic = _is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE")
 
     try:
         if enable_compile:
@@ -443,20 +472,29 @@ def patch_model(
                 model,
                 reverse=False,
                 num_tokens=num_tokens,
+                compile_scope=compile_scope,
                 override_layers=override_layer_set,
+                compile_options=INDUCTOR_COMPILE_OPTIONS,
+                compile_dynamic=compile_dynamic,
             )
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
-            )
+            if compile_dynamic:
+                logger.warning("SGLANG_TORCH_DYNAMIC_SHAPE is set to True")
+            if compile_scope == "local":
+                yield torch.no_grad()(model.forward)
+            else:
+                yield torch.compile(
+                    torch.no_grad()(model.forward),
+                    options=INDUCTOR_COMPILE_OPTIONS,
+                    # mode=os.environ.get(
+                    #     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                    # ),
+                    dynamic=compile_dynamic,
+                )
         else:
             yield model.forward
     finally:
@@ -465,7 +503,10 @@ def patch_model(
                 model,
                 reverse=True,
                 num_tokens=num_tokens,
+                compile_scope=compile_scope,
                 override_layers=override_layer_set,
+                compile_options=INDUCTOR_COMPILE_OPTIONS,
+                compile_dynamic=compile_dynamic,
             )
             tp_group.ca_comm = backup_ca_comm
 
@@ -814,6 +855,7 @@ class CudaGraphRunner:
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
+                    compile_scope=self.model_runner.server_args.torch_compile_scope,
                     override_layers=self.model_runner.server_args.torch_compile_override_layers,
                 ) as forward:
                     (

@@ -1,5 +1,6 @@
 from typing import Callable, Collection, Optional, Tuple
 
+import torch
 from torch import nn
 
 from sglang.srt.utils import (
@@ -30,14 +31,41 @@ class MultiPlatformOp(nn.Module):
         self._original_forward_method = None
         self.is_torch_compile = False
 
+    def _get_local_torch_compile_forward_method(
+        self,
+        method_name: str,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ) -> Callable:
+        return torch.compile(
+            getattr(self, method_name),
+            options=compile_options,
+            dynamic=compile_dynamic,
+        )
+
     def _get_torch_compile_forward_method(
         self,
         num_tokens: int,
+        compile_scope: str = "full",
         override_layers: Optional[Collection[str]] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
     ) -> Tuple[bool, Optional[Callable]]:
         class_name = self.__class__.__name__
 
+        if compile_scope == "local":
+            if override_layers is None or class_name not in override_layers:
+                return False, None
+            return True, self._get_local_torch_compile_forward_method(
+                "forward_native",
+                compile_options=compile_options,
+                compile_dynamic=compile_dynamic,
+            )
+
         if override_layers is not None:
+            # Exact class-name allowlist from `--torch-compile-override-layers`,
+            # e.g. `UnquantizedFusedMoEMethod RMSNorm`. Allowlisted ops switch
+            # to their torch-native implementation for torch.compile.
             if class_name not in override_layers:
                 return False, None
             return True, self.forward_native
@@ -62,7 +90,10 @@ class MultiPlatformOp(nn.Module):
     def enter_torch_compile(
         self,
         num_tokens: int,
+        compile_scope: str = "full",
         override_layers: Optional[Collection[str]] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
     ):
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
@@ -73,7 +104,11 @@ class MultiPlatformOp(nn.Module):
             return
 
         should_switch, forward_method = self._get_torch_compile_forward_method(
-            num_tokens=num_tokens, override_layers=override_layers
+            num_tokens=num_tokens,
+            compile_scope=compile_scope,
+            override_layers=override_layers,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
         )
         if not should_switch:
             return

@@ -631,6 +631,7 @@ class ServerArgs:
     enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
+    torch_compile_scope: str = "full"
     torch_compile_override_layers: Optional[List[str]] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
@@ -3375,6 +3376,21 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        if self.torch_compile_override_layers and not self.enable_torch_compile:
+            logger.warning(
+                "--torch-compile-override-layers has no effect without "
+                "--enable-torch-compile"
+            )
+        if (
+            self.enable_torch_compile
+            and self.torch_compile_scope == "local"
+            and not self.torch_compile_override_layers
+        ):
+            logger.warning(
+                "--torch-compile-scope local has no effect without "
+                "--torch-compile-override-layers"
+            )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -5278,11 +5294,22 @@ class ServerArgs:
             help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
+            "--torch-compile-scope",
+            type=str,
+            default=ServerArgs.torch_compile_scope,
+            choices=["full", "local"],
+            help="Set torch compile scope. `full` compiles the outer model "
+            "forward, while `local` compiles only allowlisted MultiPlatformOp "
+            "layers and keeps the outer model forward eager.",
+        )
+        parser.add_argument(
             "--torch-compile-override-layers",
             type=str,
             nargs="+",
+            metavar="CLASS_NAME",
             help="Override decode torch.compile layer switching with an exact-class-name "
-            "allowlist (for example `TopK` or `UnquantizedFusedMoEMethod`).",
+            "allowlist. Requires --enable-torch-compile. Example: "
+            "`--torch-compile-override-layers UnquantizedFusedMoEMethod RMSNorm`.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",
