@@ -17,14 +17,22 @@ IS_QUICK_AR_AVAILABLE = _is_hip
 # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
 IS_MSCCLPP_AR_AVAILABLE = _is_cuda
 
-try:
-    import sgl_kernel.allreduce as _custom_ar
-except ImportError as e:
-    if _is_cuda or _is_hip:
-        logger.warning("Failed to import from custom_ar with %r", e)
-    IS_CUSTOM_AR_AVAILABLE = False
-    IS_QUICK_AR_AVAILABLE = False
-    IS_MSCCLPP_AR_AVAILABLE = False
+_custom_ar = None
+if _is_cuda or _is_musa:
+    try:
+        import sglang.jit_kernel.custom_all_reduce as _custom_ar
+    except Exception as e:
+        logger.warning("Failed to import JIT custom_all_reduce with %r", e)
+
+if _custom_ar is None:
+    try:
+        import sgl_kernel.allreduce as _custom_ar
+    except ImportError as e:
+        if _is_cuda or _is_hip:
+            logger.warning("Failed to import from custom_ar with %r", e)
+        IS_CUSTOM_AR_AVAILABLE = False
+        IS_QUICK_AR_AVAILABLE = False
+        IS_MSCCLPP_AR_AVAILABLE = False
 
 # region IS_CUSTOM_AR_AVAILABLE
 
@@ -35,7 +43,7 @@ elif _is_cuda or _is_musa:
     # CUDA custom allreduce
 
     def init_custom_ar(
-        ipc_tensors: List[torch.Tensor],
+        ipc_tensors: List[int],
         rank_data: torch.Tensor,
         rank: int,
         full_nvlink: bool,
