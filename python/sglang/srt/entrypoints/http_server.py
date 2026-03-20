@@ -1011,9 +1011,9 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.get("/get_remote_instance_transfer_engine_info")
+@app.get("/remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_remote_instance_transfer_engine_info(rank: int = None):
+async def remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
         return ORJSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
