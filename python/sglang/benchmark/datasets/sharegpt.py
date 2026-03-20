@@ -27,6 +27,7 @@ class ShareGPTDataset(BaseDataset):
     num_requests: int
     fixed_output_len: Optional[int]
     context_len: Optional[int]
+    shuffle: bool
     prompt_suffix: str
     apply_chat_template: bool
 
@@ -38,6 +39,7 @@ class ShareGPTDataset(BaseDataset):
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
+            shuffle=not getattr(args, "no_shuffle", False),
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
@@ -51,6 +53,7 @@ class ShareGPTDataset(BaseDataset):
             tokenizer=tokenizer,
             fixed_output_len=self.fixed_output_len,
             context_len=self.context_len,
+            shuffle=self.shuffle,
             prompt_suffix=self.prompt_suffix,
             apply_chat_template=self.apply_chat_template,
         )
@@ -62,6 +65,7 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
     context_len: Optional[int] = None,
+    shuffle: bool = True,
     prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
 ) -> List[DatasetRow]:
@@ -94,8 +98,8 @@ def sample_sharegpt_requests(
         for data in dataset
     ]
 
-    # Shuffle the dataset.
-    random.shuffle(dataset)
+    if shuffle:
+        random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[DatasetRow] = []
