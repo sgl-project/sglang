@@ -88,6 +88,38 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Result of an inc_lock_ref operation."""
+
+    delta: Optional[int] = None
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Parameters for dec_lock_ref operation."""
+
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of an dec_lock_ref operation."""
+
+    delta: Optional[int] = None
+
+
+@dataclasses.dataclass
+class InitLoadBackParams:
+    """Unified parameters for init_load_back across different cache types"""
+
+    last_host_node: Any
+    host_hit_length: int
+    mem_quota: Optional[int] = None
+    req: Optional[Req] = None
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -158,11 +190,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         pass
 
     def evictable_size(self):
@@ -191,8 +225,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
+        params: InitLoadBackParams,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
@@ -204,6 +237,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def flush_write_through_acks(self) -> None:
+        """Release lock_ref on radix-tree nodes whose write-through has completed.
+
+        Lightweight operation that only processes finished write acks.
+        No-op for caches without hierarchical write-through support.
+        """
+        pass
 
     def check_hicache_events(self) -> Any:
         """

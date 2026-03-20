@@ -15,8 +15,12 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
+    InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -817,9 +821,9 @@ class HiRadixCache(RadixCache):
         """
         return RadixKey(token_ids=list(token_ids))
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -831,11 +835,13 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -851,7 +857,7 @@ class HiRadixCache(RadixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -1011,7 +1017,8 @@ class HiRadixCache(RadixCache):
             ancester_node = node
 
         # protect the ancestor nodes from eviction
-        delta = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancester_node)
+        delta = result.delta
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
@@ -1060,11 +1067,10 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
-        mem_quota: Optional[int] = None,
+        params: InitLoadBackParams,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -1087,6 +1093,9 @@ class HiRadixCache(RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         return self.cache_controller.start_loading()
+
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()

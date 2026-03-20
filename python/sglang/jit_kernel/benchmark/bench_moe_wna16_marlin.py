@@ -3,17 +3,15 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm as jit_fn
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.test.test_marlin_utils import marlin_quantize
+from sglang.utils import is_in_ci
 
-try:
-    from sgl_kernel import moe_wna16_marlin_gemm as _aot_import  # noqa: F401
-
-    AOT_AVAILABLE = True
-except (ImportError, AttributeError):
-    AOT_AVAILABLE = False
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
+    torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
+)
 
 IS_CI = is_in_ci()
 

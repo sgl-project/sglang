@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -37,6 +38,7 @@ from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -560,11 +562,9 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
+        result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-            req.swa_uuid_for_lock = swa_uuid_for_lock
-        else:
-            self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -624,14 +624,15 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         try:
+            result = self.tree_cache.inc_lock_ref(last_node)
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-            else:
-                self.tree_cache.inc_lock_ref(last_node)
+                swa_uuid_for_lock = result.swa_uuid_for_lock
             yield None
         finally:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+                self.tree_cache.dec_lock_ref(
+                    last_node, DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+                )
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
@@ -769,7 +770,10 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    InitLoadBackParams(
+                        last_host_node=req.last_host_node,
+                        host_hit_length=req.host_hit_length,
+                    )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
