@@ -84,3 +84,11 @@ class DimsSpec(_FrozenBase):
     dims: list[DimSpec]
     dp_group_alias: Optional[str] = None
     replicated_axes: frozenset[ParallelAxis] = frozenset()
+
+    @property
+    def dp_axis(self) -> ParallelAxis:
+        return (
+            ParallelAxis(self.dp_group_alias)
+            if self.dp_group_alias
+            else ParallelAxis.DP
+        )
