@@ -755,7 +755,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run benchmark tests
         timeout-minutes: 45
