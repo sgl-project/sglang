@@ -5796,10 +5796,6 @@ class ServerArgs:
     def engine_info_bootstrap_url(self):
         return self.url(port=self.engine_info_bootstrap_port)
 
-    @property
-    def disaggregation_bootstrap_url(self):
-        return self.url(port=self.disaggregation_bootstrap_port)
-
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
 
