@@ -407,7 +407,7 @@ def fuse_scale_shift_gate_select01_kernel(
     return output, gate_out
 
 
-if current_platform.is_npu():
+if current_platform.is_npu() or current_platform.is_xpu():
     from .npu_fallback import fuse_scale_shift_native
 
     fuse_scale_shift_kernel = fuse_scale_shift_native
