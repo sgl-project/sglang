@@ -10,8 +10,7 @@
 
 namespace ngram {
 
-template <typename Cache>
-Ngram<Cache>::Ngram(size_t capacity, const Param& param) : param_(param) {
+Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.branch_length > 1)) {
     throw std::runtime_error(
         "param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
@@ -71,14 +70,13 @@ Ngram<Cache>::Ngram(size_t capacity, const Param& param) : param_(param) {
     }
   }
 
-  cache_ = std::make_unique<Cache>(capacity, param_);
+  cache_ = std::make_unique<TrieCache>(capacity, param_);
 
   quit_flag_ = false;
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
 }
 
-template <typename Cache>
-Ngram<Cache>::~Ngram() {
+Ngram::~Ngram() {
   quit_flag_ = true;
   insert_queue_.close();
   if (insert_worker_.joinable()) {
@@ -86,22 +84,19 @@ Ngram<Cache>::~Ngram() {
   }
 }
 
-template <typename Cache>
-void Ngram<Cache>::synchronize() const {
+void Ngram::synchronize() const {
   while (!insert_queue_.empty()) {
     std::this_thread::sleep_for(std::chrono::microseconds(10));
   }
 }
 
-template <typename Cache>
-void Ngram<Cache>::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   for (auto&& token : tokens) {
     insert_queue_.enqueue(std::move(token));
   }
 }
 
-template <typename Cache>
-void Ngram<Cache>::insertWorker() {
+void Ngram::insertWorker() {
   while (!quit_flag_) {
     std::vector<int32_t> data;
     if (!insert_queue_.dequeue(data)) {
@@ -112,16 +107,15 @@ void Ngram<Cache>::insertWorker() {
   }
 }
 
-template <typename Cache>
-Result Ngram<Cache>::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
+Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (Cache::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  using BuildFn = Result (TrieCache::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
   BuildFn build_fn;
   if (param_.match_type == "BFS") {
-    build_fn = &Cache::buildRecency;
+    build_fn = &TrieCache::buildRecency;
   } else if (param_.match_type == "PROB") {
-    build_fn = &Cache::buildFrequency;
+    build_fn = &TrieCache::buildFrequency;
   } else {
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
@@ -135,7 +129,5 @@ Result Ngram<Cache>::batchMatch(const std::vector<std::vector<int32_t>>& tokens)
   }
   return merged;
 }
-
-template class Ngram<TrieCache>;
 
 }  // namespace ngram

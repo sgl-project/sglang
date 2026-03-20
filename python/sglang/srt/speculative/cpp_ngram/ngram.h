@@ -10,12 +10,12 @@
 #include "param.h"
 #include "queue.h"
 #include "result.h"
+#include "trie_cache.h"
 
 namespace ngram {
 
-template <typename Cache>
 class Ngram {
-  std::unique_ptr<Cache> cache_;
+  std::unique_ptr<TrieCache> cache_;
   Param param_;
 
   mutable std::mutex mutex_;
