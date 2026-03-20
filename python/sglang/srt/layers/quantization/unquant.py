@@ -169,6 +169,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
+        self.native_activation_fn = None
 
     def create_weights(
         self,
@@ -322,6 +323,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 )
 
         return
+
+    def create_native_activation_fn(self, moe_runner_config: MoeRunnerConfig) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import _swiglu_gpt_oss_sigmoid_alpha
+
+        # Define native activation function based on moe_runner_config
+        if moe_runner_config.activation == "silu" and moe_runner_config.gemm1_alpha and moe_runner_config.gemm1_clamp_limit:
+            self.native_activation_fn = _swiglu_gpt_oss_sigmoid_alpha
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -635,5 +643,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
+    
+    @staticmethod
+    def create_native_activation_fn_args(x, alpha, limit) -> tuple:
+        if alpha is None and limit is not None:
+            return x, limit
+        elif alpha is None and limit is None:
+            return x
+        else:
+            return x, alpha, limit
 
-    forward_native = forward_cpu
+
+    def forward_native(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.fused_moe_native import (
+            fused_moe_forward_native_grouped_mm,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        moe_runner_config = self.moe_runner_config
+
+        output = fused_moe_forward_native_grouped_mm(
+            layer=layer,
+            hidden_states=x,
+            topk_output=topk_output,
+            moe_runner_config=moe_runner_config,
+            activation_fn=self.native_activation_fn,
+            activation_fn_args=UnquantizedFusedMoEMethod.create_native_activation_fn_args,
+        )
+        return StandardCombineInput(hidden_states=output)
