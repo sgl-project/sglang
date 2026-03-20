@@ -7,7 +7,10 @@ from typing import Optional
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
-    est_time=0, suite="default", nightly=True, disabled="helper module, no tests"
+    est_time=0,
+    suite="stage-a-cpu-only",
+    nightly=True,
+    disabled="helper module, no tests",
 )
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
