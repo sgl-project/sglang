@@ -11,7 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask
@@ -50,7 +50,7 @@ class NGRAMWorker:
 
         self._init_preallocated_tensors()
 
-        self.ngram_cache = NgramCache(
+        self.ngram_cache = NgramCorpus(
             min_match_window_size=server_args.speculative_ngram_min_match_window_size,
             max_match_window_size=server_args.speculative_ngram_max_match_window_size,
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,

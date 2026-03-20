@@ -22,7 +22,7 @@ ngram_cache_cpp = load(
 )
 
 
-class NgramCache:
+class NgramCorpus:
     def __init__(
         self,
         branch_length=18,
@@ -131,7 +131,7 @@ if __name__ == "__main__":
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
     ]
-    cache = NgramCache(branch_length=12, draft_token_num=8)
+    cache = NgramCorpus(branch_length=12, draft_token_num=8)
     cache.batch_put(token_ids)
 
     cache.synchronize()
