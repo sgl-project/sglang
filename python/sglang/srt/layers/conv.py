@@ -14,9 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
 
 _is_cpu = is_cpu()
@@ -258,8 +257,8 @@ class Conv3dLayer(MultiPlatformOp):
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
             self.register_parameter("bias", None)
-        
-        if _is_cpu and _is_cpu_amx_available and self.bias is not None and not self.enable_linear:
+
+        if _is_cpu and _is_cpu_amx_available and self.bias is not None:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self._reset_parameters()
 
@@ -302,7 +301,7 @@ class Conv3dLayer(MultiPlatformOp):
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if use_intel_amx_backend(self):
             return conv3d_embed(
-                input,
+                x,
                 self.weight,
                 self.bias,
                 is_vnni=True,
