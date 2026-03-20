@@ -129,9 +129,11 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
-        host_hit_length :   Length of the KV cache hit on the host, if applicable.
+        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
+                            number of evicted KV tokens on CPU. For hybrid Mamba models this
+                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
+                            host hit still triggers load-back without adding a separate field.
                             0 if HiCache is not enabled.
-        mamba_host_hit_length: Length of the mamba host hit
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -141,7 +143,6 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
-    mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
 

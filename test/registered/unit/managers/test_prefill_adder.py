@@ -81,7 +81,6 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.finished.return_value = False
-        req.should_init_load_back_host = False
         return req
 
     def create_adder(self, running_batch, **kwargs):

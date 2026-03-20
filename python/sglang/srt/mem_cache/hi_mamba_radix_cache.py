@@ -1055,20 +1055,20 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             mamba_branching_seqlen = None
 
-        host_hit_length = 0
+        kv_host_hit_length = 0
         last_device_node = best_last_node
         while last_device_node is not self.root_node and last_device_node.evicted:
-            host_hit_length += len(last_device_node.host_value)
+            kv_host_hit_length += len(last_device_node.host_value)
             last_device_node = last_device_node.parent
 
         last_host_node = best_last_node
         while last_host_node is not self.root_node and not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
-        # Calculate mamba host hit length
-        mamba_host_hit_length = 0
-        if last_host_node.mamba_evicted and last_host_node.mamba_backuped:
-            mamba_host_hit_length = len(last_host_node.mamba_host_value)
+        mamba_host_hit = (
+            1 if (last_host_node.mamba_evicted and last_host_node.mamba_backuped) else 0
+        )
+        host_hit_length = max(kv_host_hit_length, mamba_host_hit)
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
@@ -1099,7 +1099,6 @@ class HiMambaRadixCache(MambaRadixCache):
             last_device_node=last_device_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
-            mamba_host_hit_length=mamba_host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
@@ -1862,7 +1861,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         if loaded_from_storage > 0 and operation.pool_transfers:
-            logger.info(
+            logger.debug(
                 "HiCache mamba prefetch completed for request %s: prefetched_tokens=%s mamba_states=%s",
                 req_id,
                 loaded_from_storage,
