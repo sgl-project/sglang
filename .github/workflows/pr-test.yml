@@ -5,19 +5,11 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours
+    - cron: '0 */12 * * *'  # Run every 12 hours
   pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
-      version:
-        description: "FlashInfer version"
-        required: true
-        type: choice
-        default: "release"
-        options:
-          - "release"
-          - "nightly"
       target_stage:
         description: "Specific stage to run (optional, for quick testing)"
         required: false
@@ -1168,7 +1160,6 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1227,7 +1218,6 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""

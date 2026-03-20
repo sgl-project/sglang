@@ -47,6 +47,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -120,7 +121,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps
 # each line of output with some prefix.
-BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 
 
 @lru_cache(maxsize=1)
@@ -292,7 +293,7 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
@@ -344,7 +345,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -633,7 +634,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -1021,6 +1022,11 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def suppress_other_loggers():
     suppress_noisy_warnings()
@@ -1179,6 +1185,12 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    # Suppress noisy httpx/httpcore loggers in every process that calls
+    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+    # don't inherit the parent's logger state, so this must run here too.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -2306,6 +2318,44 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
 
 
 def pyspy_dump_schedulers():

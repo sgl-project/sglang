@@ -159,7 +159,15 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -198,7 +206,15 @@ jobs:
 
   sgl-kernel-unit-test-2-gpu-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -232,7 +248,16 @@ jobs:
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -263,7 +288,15 @@ jobs:
 
   jit-kernel-unit-test-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.jit_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -294,7 +327,16 @@ jobs:
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -325,7 +367,16 @@ jobs:
 
   stage-b-test-small-1-gpu-amd-nondeterministic:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -354,7 +405,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-nondeterministic --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-small-1-gpu-amd-mi35x:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
@@ -394,7 +445,16 @@ jobs:
 
   stage-b-test-large-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -425,7 +485,16 @@ jobs:
 
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -456,13 +525,21 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-1gpu-sglang]
-        part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
+        part: [0, 1, 2, 3]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -544,7 +621,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 70
+        timeout-minutes: 90
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -563,12 +640,11 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
-            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2 \
+              --total-partitions 4 \
               -k "not flux_2"
 
           # Post-test diagnostics
@@ -577,7 +653,15 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -683,7 +767,6 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
-            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
@@ -697,7 +780,16 @@ jobs:
 
   stage-c-test-large-8-gpu-amd:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
-    if: false
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     env:
       RUNNER_LABELS: linux-mi325-8gpu-sglang
     strategy:
@@ -735,7 +827,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd-mi35x:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
     if: |
       always() &&
       (
@@ -750,7 +842,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -772,11 +864,11 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
