@@ -56,7 +56,8 @@ for wheel in "${wheel_files[@]}"; do
     [[ -f "$wheel" ]] || continue
 
     intermediate_wheel="${wheel/linux/manylinux2014}"
-    [[ "$intermediate_wheel" == *"+rocm"* ]] && continue
+    # Filename may already include +rocm* from a prior mv-only rename while METADATA
+    # is still wrong (#20953-style). Do not skip here; idempotency is handled after unpack.
 
     if [[ "$wheel" != "$intermediate_wheel" ]]; then
         mv -- "$wheel" "$intermediate_wheel"
