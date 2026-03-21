@@ -10,12 +10,12 @@
 #include "param.h"
 #include "queue.h"
 #include "result.h"
-#include "trie_cache.h"
+#include "trie.h"
 
 namespace ngram {
 
 class Ngram {
-  std::unique_ptr<TrieCache> cache_;
+  std::unique_ptr<Trie> trie_;
   Param param_;
 
   mutable std::mutex mutex_;
@@ -35,8 +35,8 @@ class Ngram {
 
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (cache_) {
-      cache_->reset();
+    if (trie_) {
+      trie_->reset();
     }
   }
 

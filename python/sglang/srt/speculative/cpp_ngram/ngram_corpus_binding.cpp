@@ -3,7 +3,7 @@
 
 #include "ngram.h"
 
-PYBIND11_MODULE(ngram_cache_cpp, m) {
+PYBIND11_MODULE(ngram_corpus_cpp, m) {
   using namespace ngram;
   namespace py = pybind11;
   m.doc() = "";

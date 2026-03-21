@@ -32,9 +32,9 @@ struct TrieNode {
   std::multiset<TrieNode*, CompareByFreq> sorted_children;
 };
 
-class TrieCache {
+class Trie {
  public:
-  TrieCache(size_t capacity, const Param& param);
+  Trie(size_t capacity, const Param& param);
 
   void insert(const int32_t* tokens, size_t len);
 

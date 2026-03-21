@@ -2,14 +2,14 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCorpus
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
 
 
-def _make_cache(match_type="BFS", **kwargs):
+def _make_corpus(match_type="BFS", **kwargs):
     defaults = dict(
         branch_length=12,
         min_match_window_size=1,
@@ -110,15 +110,15 @@ EXPECTED_PROB_MASKS = [
 ]
 
 
-class TestNgramCacheBFS(CustomTestCase):
+class TestNgramCorpusBFS(CustomTestCase):
     """Golden-output tests for BFS matching mode."""
 
     @classmethod
     def setUpClass(cls):
-        cls.cache = _make_cache("BFS")
-        cls.cache.batch_put(SEED_SEQUENCES)
-        cls.cache.synchronize()
-        ids, masks = cls.cache.batch_get(QUERY_SEQUENCES)
+        cls.corpus = _make_corpus("BFS")
+        cls.corpus.batch_put(SEED_SEQUENCES)
+        cls.corpus.synchronize()
+        ids, masks = cls.corpus.batch_get(QUERY_SEQUENCES)
         draft = 8
         cls.ids = ids.reshape(-1, draft)
         cls.masks = masks.reshape(-1, draft, draft)
@@ -136,15 +136,15 @@ class TestNgramCacheBFS(CustomTestCase):
         self.assertEqual(self.masks.shape, (n_queries, draft, draft))
 
 
-class TestNgramCacheProb(CustomTestCase):
+class TestNgramCorpusProb(CustomTestCase):
     """Golden-output tests for Prob matching mode."""
 
     @classmethod
     def setUpClass(cls):
-        cls.cache = _make_cache("PROB")
-        cls.cache.batch_put(SEED_SEQUENCES)
-        cls.cache.synchronize()
-        ids, masks = cls.cache.batch_get(QUERY_SEQUENCES)
+        cls.corpus = _make_corpus("PROB")
+        cls.corpus.batch_put(SEED_SEQUENCES)
+        cls.corpus.synchronize()
+        ids, masks = cls.corpus.batch_get(QUERY_SEQUENCES)
         cls.ids = ids.reshape(-1, 8)
         cls.masks = masks.reshape(-1, 8, 8)
 
@@ -160,23 +160,23 @@ class TestNgramCacheProb(CustomTestCase):
         self.assertEqual(self.masks.shape, (n_queries, 8, 8))
 
 
-class TestNgramCacheReset(CustomTestCase):
+class TestNgramCorpusReset(CustomTestCase):
     """Verify reset clears all cached state."""
 
     def test_reset_produces_empty_results(self):
-        cache = _make_cache("BFS")
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
 
-        ids_before, _ = cache.batch_get([[1, 2, 3]])
+        ids_before, _ = corpus.batch_get([[1, 2, 3]])
         self.assertTrue(
             any(t != 0 for t in ids_before.tolist()[1:]),
             "Expected non-trivial draft tokens before reset",
         )
 
-        cache.reset()
+        corpus.reset()
 
-        ids_after, _ = cache.batch_get([[1, 2, 3]])
+        ids_after, _ = corpus.batch_get([[1, 2, 3]])
         self.assertEqual(
             ids_after.tolist(),
             [3, 0, 0, 0, 0, 0, 0, 0],
@@ -184,15 +184,15 @@ class TestNgramCacheReset(CustomTestCase):
         )
 
 
-class TestNgramCacheNoMatch(CustomTestCase):
-    """Verify behavior when query has no match in the cache."""
+class TestNgramCorpusNoMatch(CustomTestCase):
+    """Verify behavior when query has no match in the corpus."""
 
     def test_unmatched_query(self):
-        cache = _make_cache("BFS")
-        cache.batch_put([[10, 20, 30, 40, 50]])
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put([[10, 20, 30, 40, 50]])
+        corpus.synchronize()
 
-        ids, masks = cache.batch_get([[999, 888, 777]])
+        ids, masks = corpus.batch_get([[999, 888, 777]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 777, "First token should be last context token")
         self.assertTrue(
@@ -200,68 +200,68 @@ class TestNgramCacheNoMatch(CustomTestCase):
             "No draft tokens expected when nothing matches",
         )
 
-    def test_empty_cache(self):
-        cache = _make_cache("BFS")
-        ids, masks = cache.batch_get([[1, 2, 3]])
+    def test_empty_corpus(self):
+        corpus = _make_corpus("BFS")
+        ids, masks = corpus.batch_get([[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 3)
         self.assertTrue(all(t == 0 for t in ids_list[1:]))
 
 
-class TestNgramCacheMultipleInserts(CustomTestCase):
+class TestNgramCorpusMultipleInserts(CustomTestCase):
     """Verify that multiple inserts accumulate correctly."""
 
     def test_incremental_inserts(self):
-        cache = _make_cache("BFS")
-        cache.batch_put([[1, 2, 3, 4, 5]])
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put([[1, 2, 3, 4, 5]])
+        corpus.synchronize()
 
-        cache.batch_put([[1, 2, 3, 44, 55]])
-        cache.synchronize()
+        corpus.batch_put([[1, 2, 3, 44, 55]])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[1, 2, 3]])
+        ids, _ = corpus.batch_get([[1, 2, 3]])
         ids_list = ids.tolist()
 
         self.assertIn(4, ids_list, "Token 4 from first insert should still match")
         self.assertIn(44, ids_list, "Token 44 from second insert should also match")
 
 
-class TestNgramCacheSqueeze(CustomTestCase):
+class TestNgramCorpusSqueeze(CustomTestCase):
     """Verify cache eviction under memory pressure."""
 
     def test_small_capacity_does_not_crash(self):
-        cache = _make_cache("BFS", capacity=200)
+        corpus = _make_corpus("BFS", capacity=200)
         long_seq = list(range(1, 101))
-        cache.batch_put([long_seq])
-        cache.synchronize()
+        corpus.batch_put([long_seq])
+        corpus.synchronize()
 
-        ids, masks = cache.batch_get([[50, 51, 52]])
+        ids, masks = corpus.batch_get([[50, 51, 52]])
         self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
 
     def test_eviction_preserves_recent(self):
-        cache = _make_cache(
+        corpus = _make_corpus(
             "BFS", capacity=500, branch_length=6, max_match_window_size=5
         )
 
         old_seq = list(range(1000, 1050))
-        cache.batch_put([old_seq])
-        cache.synchronize()
+        corpus.batch_put([old_seq])
+        corpus.synchronize()
 
         recent_seq = list(range(2000, 2050))
-        cache.batch_put([recent_seq])
-        cache.synchronize()
+        corpus.batch_put([recent_seq])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[2000, 2001, 2002]])
+        ids, _ = corpus.batch_get([[2000, 2001, 2002]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 2002, "Last context token should be first")
         self.assertIn(2003, ids_list, "Recent sequence should still be matchable")
 
 
-class TestNgramCacheLeafPaths(CustomTestCase):
+class TestNgramCorpusLeafPaths(CustomTestCase):
     """Verify the leaf_paths_from_mask utility."""
 
     def test_simple_tree(self):
-        cache = _make_cache("BFS")
+        corpus = _make_corpus("BFS")
         tokens = [3, 4, 44, 5, 55]
         mask = [
             [1, 0, 0, 0, 0],
@@ -270,7 +270,7 @@ class TestNgramCacheLeafPaths(CustomTestCase):
             [1, 1, 0, 1, 0],
             [1, 0, 1, 0, 1],
         ]
-        paths = cache.leaf_paths_from_mask(tokens, mask)
+        paths = corpus.leaf_paths_from_mask(tokens, mask)
 
         for path in paths:
             self.assertIn(3, path, "Root token should be in every path")
@@ -278,33 +278,33 @@ class TestNgramCacheLeafPaths(CustomTestCase):
         self.assertEqual(len(paths), 2, "Two leaf paths expected for a binary tree")
 
     def test_single_chain(self):
-        cache = _make_cache("BFS")
+        corpus = _make_corpus("BFS")
         tokens = [10, 20, 30]
         mask = [
             [1, 0, 0],
             [1, 1, 0],
             [1, 1, 1],
         ]
-        paths = cache.leaf_paths_from_mask(tokens, mask)
+        paths = corpus.leaf_paths_from_mask(tokens, mask)
         self.assertEqual(len(paths), 1)
         self.assertEqual(paths[0], [10, 20, 30])
 
 
-class TestNgramCacheBatchConsistency(CustomTestCase):
+class TestNgramCorpusBatchConsistency(CustomTestCase):
     """Verify batch queries produce same results as individual queries."""
 
     def test_batch_vs_individual(self):
-        cache = _make_cache("BFS")
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
 
-        batch_ids, batch_masks = cache.batch_get(QUERY_SEQUENCES)
+        batch_ids, batch_masks = corpus.batch_get(QUERY_SEQUENCES)
         draft = 8
         batch_ids = batch_ids.reshape(-1, draft)
         batch_masks = batch_masks.reshape(-1, draft, draft)
 
         for i, query in enumerate(QUERY_SEQUENCES):
-            single_ids, single_masks = cache.batch_get([query])
+            single_ids, single_masks = corpus.batch_get([query])
             single_ids = single_ids.reshape(-1, draft)
             single_masks = single_masks.reshape(-1, draft, draft)
 
@@ -330,19 +330,19 @@ class TestMaskValidity(CustomTestCase):
         self.assertEqual(masks_2d[0], [1] + [0] * (n - 1))
 
     def test_bfs_mask_invariants(self):
-        cache = _make_cache("BFS")
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
-        _, masks = cache.batch_get(QUERY_SEQUENCES)
+        corpus = _make_corpus("BFS")
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
+        _, masks = corpus.batch_get(QUERY_SEQUENCES)
         masks = masks.reshape(-1, 8, 8)
         for i in range(masks.shape[0]):
             self._check_mask(masks[i].tolist())
 
     def test_prob_mask_invariants(self):
-        cache = _make_cache("PROB")
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
-        _, masks = cache.batch_get(QUERY_SEQUENCES)
+        corpus = _make_corpus("PROB")
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
+        _, masks = corpus.batch_get(QUERY_SEQUENCES)
         masks = masks.reshape(-1, 8, 8)
         for i in range(masks.shape[0]):
             self._check_mask(masks[i].tolist())
@@ -352,7 +352,7 @@ class TestFrequencyBoosting(CustomTestCase):
     """Verify that repeated insertions change Prob-mode selection."""
 
     def test_repeated_insert_promotes_token(self):
-        cache = _make_cache(
+        corpus = _make_corpus(
             "PROB",
             draft_token_num=2,
             max_bfs_breadth=1,
@@ -360,14 +360,14 @@ class TestFrequencyBoosting(CustomTestCase):
             max_match_window_size=3,
             branch_length=5,
         )
-        cache.batch_put([[1, 2, 3, 10, 11]])
-        cache.synchronize()
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
 
         for _ in range(10):
-            cache.batch_put([[1, 2, 3, 20, 21]])
-        cache.synchronize()
+            corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[1, 2, 3]])
+        ids, _ = corpus.batch_get([[1, 2, 3]])
         ids_list = ids.tolist()
 
         self.assertEqual(
@@ -381,7 +381,7 @@ class TestRecencyOrdering(CustomTestCase):
     """Verify that BFS mode respects LRU recency."""
 
     def test_most_recent_insert_selected(self):
-        cache = _make_cache(
+        corpus = _make_corpus(
             "BFS",
             draft_token_num=2,
             max_bfs_breadth=1,
@@ -389,12 +389,12 @@ class TestRecencyOrdering(CustomTestCase):
             max_match_window_size=3,
             branch_length=5,
         )
-        cache.batch_put([[1, 2, 3, 10, 11]])
-        cache.synchronize()
-        cache.batch_put([[1, 2, 3, 20, 21]])
-        cache.synchronize()
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+        corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[1, 2, 3]])
+        ids, _ = corpus.batch_get([[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(
             ids_list[1],
@@ -407,12 +407,12 @@ class TestOverlappingSuffixes(CustomTestCase):
     """Verify correct matching when sequences share suffixes."""
 
     def test_shared_suffix_both_match(self):
-        cache = _make_cache("BFS")
-        cache.batch_put([[100, 200, 7, 8, 9, 50, 51]])
-        cache.batch_put([[300, 400, 7, 8, 9, 60, 61]])
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put([[100, 200, 7, 8, 9, 50, 51]])
+        corpus.batch_put([[300, 400, 7, 8, 9, 60, 61]])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[7, 8, 9]])
+        ids, _ = corpus.batch_get([[7, 8, 9]])
         ids_list = ids.tolist()
         self.assertIn(50, ids_list, "Continuation from first sequence missing")
         self.assertIn(60, ids_list, "Continuation from second sequence missing")
@@ -422,11 +422,11 @@ class TestSingleTokenContext(CustomTestCase):
     """Verify behavior with minimum-length context."""
 
     def test_single_token_query(self):
-        cache = _make_cache("BFS", min_match_window_size=1)
-        cache.batch_put([[5, 10, 20, 30]])
-        cache.synchronize()
+        corpus = _make_corpus("BFS", min_match_window_size=1)
+        corpus.batch_put([[5, 10, 20, 30]])
+        corpus.synchronize()
 
-        ids, masks = cache.batch_get([[5]])
+        ids, masks = corpus.batch_get([[5]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 5, "First token should be last context token")
         self.assertIn(10, ids_list, "Should match continuation after single token 5")
@@ -436,13 +436,13 @@ class TestLongContext(CustomTestCase):
     """Verify behavior when query context exceeds branch_length."""
 
     def test_context_longer_than_branch_length(self):
-        cache = _make_cache("BFS", branch_length=6, max_match_window_size=5)
+        corpus = _make_corpus("BFS", branch_length=6, max_match_window_size=5)
         seq = list(range(1, 20))
-        cache.batch_put([seq])
-        cache.synchronize()
+        corpus.batch_put([seq])
+        corpus.synchronize()
 
         long_query = list(range(1, 16))
-        ids, masks = cache.batch_get([long_query])
+        ids, masks = corpus.batch_get([long_query])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 15, "First token should be last context token")
         self.assertIn(16, ids_list, "Should match via suffix despite long context")
@@ -452,12 +452,12 @@ class TestDraftBudgetSaturation(CustomTestCase):
     """Verify the draft tree uses exactly draft_token_num slots."""
 
     def test_full_budget_used(self):
-        cache = _make_cache("BFS", draft_token_num=8)
+        corpus = _make_corpus("BFS", draft_token_num=8)
         seq = list(range(1, 30))
-        cache.batch_put([seq])
-        cache.synchronize()
+        corpus.batch_put([seq])
+        corpus.synchronize()
 
-        ids, _ = cache.batch_get([[1, 2, 3]])
+        ids, _ = corpus.batch_get([[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(len(ids_list), 8)
         non_zero = [t for t in ids_list[1:] if t != 0]
@@ -472,11 +472,11 @@ class TestTruncate(CustomTestCase):
     """Verify the Result.truncate method via the Python binding."""
 
     def test_truncate_reduces_output(self):
-        cache = _make_cache("BFS", draft_token_num=8)
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
+        corpus = _make_corpus("BFS", draft_token_num=8)
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
 
-        result = cache.cache.batchMatch([[1, 2, 3]])
+        result = corpus.trie.batchMatch([[1, 2, 3]])
         original_len = len(result.token)
         self.assertEqual(original_len, 8)
 
@@ -485,16 +485,16 @@ class TestTruncate(CustomTestCase):
         self.assertEqual(len(result.mask), 4 * 4)
 
     def test_truncate_preserves_mask_structure(self):
-        cache = _make_cache("BFS", draft_token_num=8)
-        cache.batch_put(SEED_SEQUENCES)
-        cache.synchronize()
+        corpus = _make_corpus("BFS", draft_token_num=8)
+        corpus.batch_put(SEED_SEQUENCES)
+        corpus.synchronize()
 
-        result = cache.cache.batchMatch([[1, 2, 3]])
+        result = corpus.trie.batchMatch([[1, 2, 3]])
         full_ids = list(result.token)
         full_mask = list(result.mask)
         n = len(full_ids)
 
-        result_copy = cache.cache.batchMatch([[1, 2, 3]])
+        result_copy = corpus.trie.batchMatch([[1, 2, 3]])
         trunc_n = 4
         result_copy.truncate(trunc_n)
         trunc_mask = list(result_copy.mask)
@@ -512,23 +512,23 @@ class TestResetAndReinsert(CustomTestCase):
     """Verify that reset followed by new inserts works correctly."""
 
     def test_reset_then_reinsert(self):
-        cache = _make_cache("BFS")
-        cache.batch_put([[1, 2, 3, 4, 5]])
-        cache.synchronize()
+        corpus = _make_corpus("BFS")
+        corpus.batch_put([[1, 2, 3, 4, 5]])
+        corpus.synchronize()
 
-        cache.reset()
+        corpus.reset()
 
-        cache.batch_put([[10, 20, 30, 40, 50]])
-        cache.synchronize()
+        corpus.batch_put([[10, 20, 30, 40, 50]])
+        corpus.synchronize()
 
-        ids_old, _ = cache.batch_get([[1, 2, 3]])
+        ids_old, _ = corpus.batch_get([[1, 2, 3]])
         ids_old_list = ids_old.tolist()
         self.assertTrue(
             all(t == 0 for t in ids_old_list[1:]),
             f"Old data should not match after reset+reinsert, got {ids_old_list}",
         )
 
-        ids_new, _ = cache.batch_get([[10, 20, 30]])
+        ids_new, _ = corpus.batch_get([[10, 20, 30]])
         ids_new_list = ids_new.tolist()
         self.assertEqual(ids_new_list[0], 30)
         self.assertIn(40, ids_new_list, "New data should match after reset+reinsert")
@@ -538,15 +538,15 @@ class TestSqueezeEvictsOld(CustomTestCase):
     """Verify that squeeze actually evicts old data, not just preserves recent."""
 
     def test_old_data_evicted(self):
-        cache = _make_cache(
+        corpus = _make_corpus(
             "BFS", capacity=150, branch_length=6, max_match_window_size=5
         )
 
         old_seq = list(range(5000, 5030))
-        cache.batch_put([old_seq])
-        cache.synchronize()
+        corpus.batch_put([old_seq])
+        corpus.synchronize()
 
-        ids_before, _ = cache.batch_get([[5000, 5001, 5002]])
+        ids_before, _ = corpus.batch_get([[5000, 5001, 5002]])
         self.assertIn(
             5003,
             ids_before.tolist(),
@@ -555,10 +555,10 @@ class TestSqueezeEvictsOld(CustomTestCase):
 
         for i in range(5):
             new_seq = list(range(6000 + i * 30, 6000 + i * 30 + 30))
-            cache.batch_put([new_seq])
-            cache.synchronize()
+            corpus.batch_put([new_seq])
+            corpus.synchronize()
 
-        ids_after, _ = cache.batch_get([[5000, 5001, 5002]])
+        ids_after, _ = corpus.batch_get([[5000, 5001, 5002]])
         ids_after_list = ids_after.tolist()
         self.assertNotIn(
             5003,

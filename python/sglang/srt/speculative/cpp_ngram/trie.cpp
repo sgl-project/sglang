@@ -1,4 +1,4 @@
-#include "trie_cache.h"
+#include "trie.h"
 
 #include <algorithm>
 #include <cstring>
@@ -9,7 +9,7 @@
 
 namespace ngram {
 
-TrieCache::TrieCache(size_t capacity, const Param& param) : param_(param) {
+Trie::Trie(size_t capacity, const Param& param) : param_(param) {
   nodes_.resize(capacity);
   for (auto& node : nodes_) {
     node_pool_.emplace_back(&node);
@@ -18,7 +18,7 @@ TrieCache::TrieCache(size_t capacity, const Param& param) : param_(param) {
   root_ = getNode();
 }
 
-void TrieCache::insert(const int32_t* tokens, size_t len) {
+void Trie::insert(const int32_t* tokens, size_t len) {
   for (size_t i = 0; i + param_.min_match_window_size < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.branch_length);
@@ -64,7 +64,7 @@ void TrieCache::insert(const int32_t* tokens, size_t len) {
   }
 }
 
-void TrieCache::squeeze(size_t count) {
+void Trie::squeeze(size_t count) {
   if (!(node_pool_.size() >= free_node_count_ + count)) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
@@ -89,7 +89,7 @@ void TrieCache::squeeze(size_t count) {
   }
 }
 
-void TrieCache::reset() {
+void Trie::reset() {
   global_lru_.clear();
   path_.clear();
   node_pool_.clear();
@@ -101,7 +101,7 @@ void TrieCache::reset() {
 }
 
 std::vector<std::pair<TrieNode*, int32_t>>
-TrieCache::match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const {
+Trie::match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const {
   std::vector<std::pair<TrieNode*, int32_t>> result;
   result.reserve(max_window - min_window);
   for (int32_t match_window_size = std::min(len, max_window); match_window_size >= static_cast<int32_t>(min_window);
@@ -125,7 +125,7 @@ TrieCache::match(const int32_t* context, size_t len, size_t min_window, size_t m
   return result;
 }
 
-Result TrieCache::buildRecency(
+Result Trie::buildRecency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
 
@@ -166,7 +166,7 @@ Result TrieCache::buildRecency(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result TrieCache::buildFrequency(
+Result Trie::buildFrequency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
 

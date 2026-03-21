@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 
-#include "trie_cache.h"
+#include "trie.h"
 
 namespace ngram {
 
@@ -70,7 +70,7 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     }
   }
 
-  cache_ = std::make_unique<TrieCache>(capacity, param_);
+  trie_ = std::make_unique<Trie>(capacity, param_);
 
   quit_flag_ = false;
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
@@ -103,19 +103,19 @@ void Ngram::insertWorker() {
       continue;
     }
     std::unique_lock<std::mutex> lock(mutex_);
-    cache_->insert(data.data(), data.size());
+    trie_->insert(data.data(), data.size());
   }
 }
 
 Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (TrieCache::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
   BuildFn build_fn;
   if (param_.match_type == "BFS") {
-    build_fn = &TrieCache::buildRecency;
+    build_fn = &Trie::buildRecency;
   } else if (param_.match_type == "PROB") {
-    build_fn = &TrieCache::buildFrequency;
+    build_fn = &Trie::buildFrequency;
   } else {
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
@@ -123,7 +123,7 @@ Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const 
   Result merged;
   for (const auto& suffix : tokens) {
     auto draft_token_num = param_.get_draft_token_num(tokens.size());
-    auto res = (cache_.get()->*build_fn)(suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_);
+    auto res = (trie_.get()->*build_fn)(suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_);
     merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }
