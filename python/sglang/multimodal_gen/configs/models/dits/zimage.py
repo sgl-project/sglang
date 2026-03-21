@@ -51,6 +51,13 @@ class ZImageArchConfig(DiTArchConfig):
         default_factory=lambda: {
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
+            r"^layers\.(\d+)\.ffn_norm2\.(.*)$": r"layers.\1.fused_add_gate_norm.norm.\2",
+            r"^noise_refiner\.(\d+)\.ffn_norm2\.(.*)$": r"noise_refiner.\1.fused_add_gate_norm.norm.\2",
+            r"^layers\.(\d+)\.attention_norm2\.(.*)$": r"layers.\1.fused_norm_residual_gate_add_norm_scale.norm1.\2",
+            r"^noise_refiner\.(\d+)\.attention_norm2\.(.*)$": r"noise_refiner.\1.fused_norm_residual_gate_add_norm_scale.norm1.\2",
+            r"^layers\.(\d+)\.ffn_norm1\.(.*)$": r"layers.\1.fused_norm_residual_gate_add_norm_scale.norm2.\2",
+            r"^noise_refiner\.(\d+)\.ffn_norm1\.(.*)$": r"noise_refiner.\1.fused_norm_residual_gate_add_norm_scale.norm2.\2",
+            # lora
             r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
                 r"\1.feed_forward.w13.\2",
                 0,

@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 # Copied and adapted from sglang
@@ -525,6 +528,231 @@ class LayerNormScaleShift(_NormScaleShift):
 
 
 class RMSNormScaleShift(_NormScaleShift):
+    norm_type = "rms"
+
+
+class _NormResidualGateAddNormScale(CustomOp):
+    """
+    Fused kernel that combines:
+    1. normed = layernorm(x) or rmsnorm(x)
+    2. out = x + gate * normed1(residual)
+    2. norm_out, out = normed2(out) * (scale + 1), out
+    """
+
+    norm_type: str
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.eps = eps
+        self.dtype = dtype
+        if self.norm_type == "rms":
+            self.norm1 = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+            self.norm2 = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        elif self.norm_type == "layer":
+            self.norm1 = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
+            )
+            self.norm2 = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
+            )
+        else:
+            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
+
+    def forward_cuda(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+            import warnings
+
+            warnings.warn(
+                "NormResidualGateAddNormScale cuda not available, using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(residual, x, gate, scale)
+
+        from sglang.jit_kernel.diffusion.cutedsl.norm_residual_gate_add_norm_scale import (
+            fused_norm_residual_gate_add_norm_scale,
+        )
+
+        if isinstance(gate, int) and gate != 1:
+            raise ValueError(
+                f"Only gate value of 1 is supported for int type, but got {gate}"
+            )
+
+        return fused_norm_residual_gate_add_norm_scale(
+            x.contiguous(),
+            residual.contiguous(),
+            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+            _ensure_contiguous(getattr(self.norm1, "weight", None)),
+            _ensure_contiguous(getattr(self.norm1, "bias", None)),
+            _ensure_contiguous(getattr(self.norm2, "weight", None)),
+            _ensure_contiguous(getattr(self.norm2, "bias", None)),
+            scale.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
+
+    def forward_hip(self, *args, **kwargs):
+        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x.shape: [batch_size, seq_len, inner_dim]
+        normalized_residual = self.norm1(residual)
+        # x = x + gate_msa * self.fused_norm_residual_gate_add_norm_scale.norm1(attn_out)
+        # norm_x = self.fused_norm_residual_gate_add_norm_scale.norm2(x) * (scale_mlp + 1.0)
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = normalized_residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = x + gate * (
+                    normalized_residual.unflatten(
+                        dim=1, sizes=(num_frames, frame_seqlen)
+                    )
+                ).flatten(1, 2)
+
+            else:
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = x + gate * normalized_residual
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        norm_output = self.norm2(residual_output) * (scale + 1.0)
+        return norm_output, residual_output
+
+
+class LayerNormResidualGateAddNormScale(_NormResidualGateAddNormScale):
+    norm_type = "layer"
+
+
+class RMSNormResidualGateAddNormScale(_NormResidualGateAddNormScale):
+    norm_type = "rms"
+
+
+class _AddGateNorm(CustomOp):
+    """
+    Fused kernel that combines:
+    1. normed = layernorm(x) or rmsnorm(x)
+    2. out = x + gate * norm(residual)
+    """
+
+    norm_type: str
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.eps = eps
+        self.dtype = dtype
+
+        if self.norm_type == "rms":
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        elif self.norm_type == "layer":
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
+            )
+        else:
+            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
+
+    def forward_cuda(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+            import warnings
+
+            warnings.warn(
+                "AddGateNorm cuda not available, using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(residual, x, gate)
+
+        from sglang.jit_kernel.diffusion.cutedsl.add_gate_norm import (
+            fused_add_gate_norm,
+        )
+
+        return fused_add_gate_norm(
+            x.contiguous(),
+            residual.contiguous(),
+            gate.contiguous(),
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            self.norm_type,
+            self.eps,
+        )
+
+    def forward_hip(self, *args, **kwargs):
+        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+    ) -> torch.Tensor:
+        # x.shape: [batch_size, seq_len, inner_dim]
+        normalized_residual = self.norm(residual)
+
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = x + normalized_residual
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = x + (
+                    normalized_residual.unflatten(
+                        dim=1, sizes=(num_frames, frame_seqlen)
+                    )
+                    * gate
+                ).flatten(1, 2)
+
+            else:
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = x + gate * normalized_residual
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        return residual_output
+
+
+class AddGateLayerNorm(_AddGateNorm):
+    norm_type = "layer"
+
+
+class AddGateRMSNorm(_AddGateNorm):
     norm_type = "rms"
 
 

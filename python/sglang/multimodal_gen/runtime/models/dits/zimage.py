@@ -8,7 +8,12 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    AddGateRMSNorm,
+    RMSNorm,
+    RMSNormResidualGateAddNormScale,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -329,10 +334,18 @@ class ZImageTransformerBlock(nn.Module):
             self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
 
-        self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+        if modulation:
+            # fused norm
+            self.fused_norm_residual_gate_add_norm_scale = (
+                RMSNormResidualGateAddNormScale(dim, eps=norm_eps)
+            )  # ffn_norm1, attention_norm2
+            self.fused_add_gate_norm = AddGateRMSNorm(dim, eps=norm_eps)  # ffn_norm2
+
+        else:
+            self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
+            self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+            self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -352,21 +365,27 @@ class ZImageTransformerBlock(nn.Module):
                 1
             ).chunk(4, dim=2)
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            scale_msa = 1.0 + scale_msa
 
             # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 freqs_cis=freqs_cis,
             )
-            x = x + gate_msa * self.attention_norm2(attn_out)
+
+            # between attention and ffn
+            # x = x + gate_msa * self.attention_norm2(attn_out)
+            # norm_x = self.ffn_norm1(x) * (scale_mlp + 1.0)
+            norm_x, x = self.fused_norm_residual_gate_add_norm_scale(
+                attn_out, x, gate_msa, scale_mlp
+            )
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_out = self.feed_forward(norm_x)
+
+            # after ffn
+            # x = x + gate_mlp * self.ffn_norm2(ffn_out)
+            x = self.fused_add_gate_norm(ffn_out, x, gate_mlp)
         else:
             # Attention block
             attn_out = self.attention(
