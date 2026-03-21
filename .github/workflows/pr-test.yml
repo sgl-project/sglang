@@ -61,6 +61,7 @@ env:
 permissions:
   actions: write
   contents: read
+  issues: read
   pull-requests: read
 
 jobs:
@@ -87,6 +88,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Show test partition assignments
         continue-on-error: true
@@ -329,6 +334,11 @@ jobs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
@@ -354,6 +364,11 @@ jobs:
       stage_b_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
@@ -411,6 +426,10 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -461,6 +480,10 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -500,6 +523,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Cleanup
         run: |
           ls -alh sgl-kernel/dist || true
@@ -538,6 +565,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Cleanup
         run: |
           ls -alh sgl-kernel/dist || true
@@ -571,12 +602,14 @@ jobs:
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
-    env:
-      CI: true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -627,6 +660,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -699,6 +736,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -724,6 +765,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -745,12 +790,14 @@ jobs:
       needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
-    env:
-      CI: true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -806,6 +853,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -855,6 +906,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -900,6 +955,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -958,6 +1017,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1007,6 +1070,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1060,6 +1127,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
@@ -1112,6 +1183,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1167,6 +1242,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1218,6 +1297,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1260,6 +1343,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1310,6 +1397,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1377,6 +1468,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1422,6 +1517,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1478,6 +1577,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1541,6 +1644,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
@@ -1586,6 +1693,10 @@ jobs:
   #   strategy:
   #     fail-fast: false
   #   steps:
+  #     - uses: ./.github/actions/check-maintenance
+  #       with:
+  #         github-token: ${{ github.token }}
+  #
   #     - name: Checkout code
   #       uses: actions/checkout@v4
   #       with:
