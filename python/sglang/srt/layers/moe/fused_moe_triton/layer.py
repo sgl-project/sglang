@@ -440,8 +440,14 @@ class FusedMoE(torch.nn.Module):
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 3. GPU with Aiter padding
         # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
+        aiter_padded = (
+            _use_aiter
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
         if use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
@@ -514,8 +520,14 @@ class FusedMoE(torch.nn.Module):
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 3. GPU with Aiter padding
         # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
+        aiter_padded = (
+            _use_aiter
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
         if use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
