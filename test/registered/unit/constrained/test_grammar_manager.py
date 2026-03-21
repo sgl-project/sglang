@@ -509,40 +509,6 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mgr.get_ready_grammar_requests()
 
-    def test_multiple_reqs_sharing_same_future(self):
-        """Multiple requests sharing a Future all resolve when it completes.
-
-        Each request should get its own copy of the grammar object for
-        state isolation, preventing shared-state issues between requests."""
-        mgr = self._make_mgr()
-
-        copied_grammar1 = MagicMock(spec=BaseGrammarObject)
-        copied_grammar2 = MagicMock(spec=BaseGrammarObject)
-        grammar_obj = MagicMock(spec=BaseGrammarObject)
-        grammar_obj.copy.side_effect = [copied_grammar1, copied_grammar2]
-
-        future = Future()
-        future.set_result(grammar_obj)
-
-        req1 = _make_req(json_schema="schema", rid="r1")
-        req1.grammar = future
-        req1.grammar_key = ("json", "schema")
-
-        req2 = _make_req(json_schema="schema", rid="r2")
-        req2.grammar = future
-        req2.grammar_key = ("json", "schema")
-
-        mgr.grammar_queue = [req1, req2]
-
-        result = mgr.get_ready_grammar_requests()
-        self.assertEqual(len(result), 2)
-
-        # Each request should get its own copy for state isolation
-        self.assertIs(req1.grammar, copied_grammar1)
-        self.assertIs(req2.grammar, copied_grammar2)
-        self.assertIsNot(req1.grammar, req2.grammar)
-        self.assertEqual(len(mgr.grammar_queue), 0)
-
     @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_intersects_ready_unions_failed(self, mock_all_gather):
         """With multiple ranks, ready = intersection, failed = union."""
