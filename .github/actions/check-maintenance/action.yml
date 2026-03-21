@@ -1,5 +1,5 @@
 name: Check Maintenance Mode
-description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label.
+description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only).
 
 inputs:
   github-token:
@@ -17,6 +17,12 @@ runs:
         MAINTENANCE_ISSUE=21065
         REPO="${{ github.repository }}"
         PR_NUMBER="${{ github.event.pull_request.number }}"
+
+        # PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
+        if [[ "${SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
+          echo "✅ PR Test on main branch; bypassing maintenance gate."
+          exit 0
+        fi
 
         # Check if maintenance issue is open (fail-open: if API errors, allow CI to proceed)
         ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
@@ -39,6 +45,8 @@ runs:
           "## ⚠️ CI Maintenance Mode is Active" \
           "The CI infrastructure is currently under maintenance." \
           "All PR CI runs are paused until maintenance is complete." \
+          "You might also experience unexpected failures during this period." \
+          "The team is working on the issue and will update the status as soon as possible." \
           "" \
           "What should you do?" \
           "- Check back later (~12 hours)" \
