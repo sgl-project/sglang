@@ -390,11 +390,10 @@ class TestQwen35PPAccuracy(unittest.TestCase):
             kill_process_tree(process.pid)
 
     def test_pp_consistency(self):
-        # Baseline uses tp=2 because the full model (~66GB) doesn't fit on
-        # a single H100 (80GB). tp=2/pp=2 is not used because Qwen3.5's
-        # linear attention crashes with combined TP+PP during CUDA graph
-        # capture. The different TP sizes add ~4% accuracy variance, so we
-        # use a 5% threshold (vs 2% for same-TP comparisons).
+        # tp=2/pp=1 vs tp=1/pp=2: can't use tp=1 baseline (OOM on H100)
+        # or tp=2/pp=2 (Triton crash in linear_attn + TP+PP cuda graph).
+        # 5% threshold because ~4% comes from tp=2 vs tp=1 float diff,
+        # not PP regression (Qwen3-30B same-TP PP gap is only ~0.4%).
         baseline = self.run_gsm8k_test(tp_size=2, pp_size=1)
         pp_metrics = self.run_gsm8k_test(tp_size=1, pp_size=2)
 
