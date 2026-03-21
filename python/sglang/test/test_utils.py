@@ -1688,6 +1688,7 @@ def run_and_check_memory_leak(
     chunked_prefill_size,
     assert_has_abort,
     api_key: Optional[str] = None,
+    enable_metrics: bool = False,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1701,6 +1702,8 @@ def run_and_check_memory_leak(
         other_args += ["--enable-mixed-chunk"]
     if disable_overlap:
         other_args += ["--disable-overlap-schedule"]
+    if enable_metrics:
+        other_args += ["--enable-metrics"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)

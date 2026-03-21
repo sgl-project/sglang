@@ -1499,33 +1499,54 @@ def add_prometheus_track_response_middleware(app):
         )
     )
 
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
+    from starlette.requests import Request
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
+    class _PrometheusASGIMiddleware:
+        """ASGI-native middleware to preserve client disconnect events."""
 
-        try:
-            response = await call_next(request)
+        def __init__(self, app):
+            self.app = app
 
-            http_response_counter.labels(
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
 
-            return response
-        finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            request = Request(scope, receive=receive)
+            # With recording all requests, we have the risk of high cardinality
+            # if requests have arbitrary unhandled paths. But given that SGLang
+            # engines with metrics enabled are usually behind routers this
+            # looks safe.
+            path, is_handled_path = _get_fastapi_request_path(request)
+            method = request.method
+            routing_key = request.headers.get("x-smg-routing-key")
+
+            http_request_counter.labels(endpoint=path, method=method).inc()
+            http_requests_active.labels(endpoint=path, method=method).inc()
             if routing_key:
-                routing_keys_active.dec(routing_key)
+                routing_keys_active.inc(routing_key)
+
+            status_code = "500"
+
+            async def send_wrapper(message):
+                nonlocal status_code
+                if message["type"] == "http.response.start":
+                    status_code = str(message["status"])
+                await send(message)
+
+            try:
+                await self.app(scope, receive, send_wrapper)
+            finally:
+                http_response_counter.labels(
+                    endpoint=path,
+                    method=method,
+                    status_code=status_code,
+                ).inc()
+                http_requests_active.labels(endpoint=path, method=method).dec()
+                if routing_key:
+                    routing_keys_active.dec(routing_key)
+
+    app.add_middleware(_PrometheusASGIMiddleware)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
