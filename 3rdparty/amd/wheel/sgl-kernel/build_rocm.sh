@@ -23,6 +23,7 @@ docker run --rm \
   -v $(pwd):/sgl-kernel \
   -e AMDGPU_TARGET="${AMDGPU_TARGET}" \
   -e PYTORCH_ROCM_ARCH="${AMDGPU_TARGET}" \
+  -e PYTHON_ROOT_PATH="${PYTHON_ROOT_PATH}" \
   ${IMAGE} \
   bash -c "
   # Install torch, triton, and friends, depending on the ROCm version
