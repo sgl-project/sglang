@@ -2697,8 +2697,10 @@ def has_hf_quant_config(model_path: str) -> bool:
 
     # Check if the model_path is a HuggingFace model ID and exists locally
     local_model_dir = get_local_hf_model_dir(model_path)
-    if local_model_dir:
-        return os.path.exists(os.path.join(local_model_dir, "hf_quant_config.json"))
+    if local_model_dir and os.path.exists(
+        os.path.join(local_model_dir, "hf_quant_config.json")
+    ):
+        return True
 
     # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
