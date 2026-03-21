@@ -93,9 +93,19 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+_has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+
+    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+        if _has_foreach_copy:
+            torch._foreach_copy_(dsts, srcs)
+        else:
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
         key = (dst.dtype, src.dtype)
@@ -104,7 +114,7 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         groups[key][0].append(dst)
         groups[key][1].append(src)
     for group_dsts, group_srcs in groups.values():
-        torch._foreach_copy_(group_dsts, group_srcs)
+        foreach_copy(group_dsts, group_srcs)
 
 
 @dataclass

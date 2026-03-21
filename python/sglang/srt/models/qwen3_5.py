@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
-from einops import rearrange
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -81,7 +80,7 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -194,7 +193,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.ones(self.num_v_heads // self.attn_tp_size),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size),
+            torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
         )
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
@@ -287,7 +286,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -398,7 +397,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter,
+                should_allreduce_fusion,
+            )
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
@@ -445,14 +449,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        if hasattr(config, "rope_parameters"):
-            self.rope_scaling = getattr(config, "rope_parameters", None)
-        else:
-            self.rope_scaling = getattr(config, "rope_scaling", None)
-
-        self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
-        self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
+        self.rope_theta, rope_scaling = get_rope_config(config)
+        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+
+        # If rope_scaling doesn't specify a scaling type, treat as no scaling
+        if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
+            rope_scaling = None
 
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
@@ -462,7 +465,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
+            rope_scaling=rope_scaling,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
             is_neox_style=True,
@@ -647,7 +650,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter,
+                should_allreduce_fusion,
+            )
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter

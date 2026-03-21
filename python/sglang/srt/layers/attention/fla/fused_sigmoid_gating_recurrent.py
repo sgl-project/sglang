@@ -99,8 +99,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[None, :] * K
+                + o_k[:, None]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -137,8 +137,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[None, :] * K
+                    + o_k[:, None]
                 )
                 b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
@@ -207,8 +207,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[None, :] * K
+                    + o_k[:, None]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
@@ -234,8 +234,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     h0_source
                     + idx * HV * K * V
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[None, :] * K
+                    + o_k[:, None]
                 )
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 

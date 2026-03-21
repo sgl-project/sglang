@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
+    SGLANG_USE_ROCM_VAE: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -276,6 +277,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    # ROCm: use AITer GroupNorm in VAE for improved performance
+    "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

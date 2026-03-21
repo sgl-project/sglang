@@ -7,16 +7,13 @@ from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar
 
 import torch
 
+from sglang.utils import is_in_ci
+
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
 F = TypeVar("F", bound=Callable[..., Any])
 _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
-
-
-def is_in_ci() -> bool:
-    ci_env_vars = ("SGLANG_IS_IN_CI", "CI", "GITHUB_ACTIONS")
-    return any(os.getenv(env_var, "false").lower() == "true" for env_var in ci_env_vars)
 
 
 def should_run_full_tests() -> bool:
@@ -94,6 +91,7 @@ CPP_DTYPE_MAP = {
     torch.float8_e4m3fn: "fp8_e4m3_t",
     torch.bfloat16: "bf16_t",
     torch.int8: "int8_t",
+    torch.int32: "int32_t",
     torch.int64: "int64_t",
 }
 
@@ -187,6 +185,10 @@ def load_jit(
     if is_hip_runtime():
         selected_cuda_cflags = DEFAULT_HIP_CFLAGS
         extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
+    else:
+        extra_cuda_cflags = [
+            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
+        ] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:
@@ -212,6 +214,14 @@ def is_arch_support_pdl() -> bool:
 
     device = torch.cuda.current_device()
     return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+@cache_once
+def _get_cuda_arch_value() -> int:
+    """Get CUDA arch value for -DSGL_CUDA_ARCH (e.g. 900 for SM 9.0)."""
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 100 + minor * 10
 
 
 @cache_once

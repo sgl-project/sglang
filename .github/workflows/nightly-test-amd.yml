@@ -2,7 +2,7 @@ name: Nightly Test (AMD)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '30 17 * * *'
   push:
     branches:
       - main
@@ -612,7 +612,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Accuracy Test (8-GPU Qwen 3.5)
         timeout-minutes: 120
@@ -643,8 +643,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
-          # GLM-5 requires latest transformers for glm_moe_dsa architecture
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test (8-GPU GLM-5 NSA)
         timeout-minutes: 120
@@ -1202,7 +1201,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Accuracy Test MI35x (8-GPU Qwen 3.5)
         timeout-minutes: 120
@@ -1235,8 +1234,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          # GLM-5 requires latest transformers for glm_moe_dsa architecture
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test MI35x (8-GPU GLM-5 NSA)
         timeout-minutes: 180
