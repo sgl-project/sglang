@@ -292,7 +292,7 @@
                 "48": 497.49,
                 "49": 495.69
             },
-            "expected_e2e_ms": 25832.82,
+            "expected_e2e_ms": 329129.82,
             "expected_avg_denoise_ms": 489.43,
             "expected_median_denoise_ms": 497.53
         },
@@ -1281,7 +1281,7 @@
                 "TimestepPreparationStage": 58.66,
                 "LatentPreparationStage": 28.55,
                 "DmdDenoisingStage": 499.34,
-                "DecodingStage": 1924.01,
+                "DecodingStage": 3712.76,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
