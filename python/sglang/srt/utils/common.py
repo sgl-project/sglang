@@ -2691,8 +2691,16 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
+    # Check if the model_path is a local path
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    # Check if the model_path is a HuggingFace model ID and exists locally
+    local_model_dir = get_local_hf_model_dir(model_path)
+    if local_model_dir:
+        return os.path.exists(os.path.join(local_model_dir, "hf_quant_config.json"))
+
+    # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
         from huggingface_hub import HfApi
 
@@ -2898,6 +2906,23 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_local_hf_model_dir(model_id: str) -> Optional[str]:
+    """
+    Get the local directory of a HuggingFace model.
+    Args:
+        model_id: The huggingface model ID.
+    Returns:
+        The local directory of the model, or None if the model is not found locally.
+    """
+    from huggingface_hub import scan_cache_dir
+
+    cache_info = scan_cache_dir()
+    for repo in cache_info.repos:
+        if repo.repo_id == model_id:
+            return repo.repo_path
+    return None
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
