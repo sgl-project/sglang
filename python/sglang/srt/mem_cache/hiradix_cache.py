@@ -58,13 +58,6 @@ class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
-        if server_args.hicache_io_backend == "direct":
-            # FIXME: move this logic into server_args parsing
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, switching to page first direct layout"
-                )
 
         if not server_args.disable_hicache_numa_detect:
             bind_to_closest_numa_node_cuda()
