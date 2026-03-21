@@ -17,7 +17,7 @@ def _ensure_module(name):
     return sys.modules[name]
 
 
-# -- sglang.srt.disaggregation.utils --
+# Mirrors sglang.srt.disaggregation.utils.DisaggregationMode (stubbed to avoid torch dep).
 class _DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -34,7 +34,7 @@ _du.DisaggregationMode = _DisaggregationMode
 _du.kv_to_page_num = _kv_to_page_num
 
 
-# -- sglang.srt.model_executor.forward_batch_info --
+# Mirrors sglang.srt.model_executor.forward_batch_info.ForwardMode (stubbed to avoid torch dep).
 class _ForwardMode(IntEnum):
     EXTEND = auto()
     DECODE = auto()
