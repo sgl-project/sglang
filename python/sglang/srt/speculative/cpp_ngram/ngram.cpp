@@ -1,10 +1,8 @@
 #include "ngram.h"
 
-#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <thread>
 
 #include "trie.h"
 
@@ -85,12 +83,15 @@ Ngram::~Ngram() {
 }
 
 void Ngram::synchronize() const {
-  while (!insert_queue_.empty()) {
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
-  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
 }
 
 void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_count_ += tokens.size();
+  }
   for (auto&& token : tokens) {
     insert_queue_.enqueue(std::move(token));
   }
@@ -104,6 +105,9 @@ void Ngram::insertWorker() {
     }
     std::unique_lock<std::mutex> lock(mutex_);
     trie_->insert(data.data(), data.size());
+    --pending_count_;
+    lock.unlock();
+    sync_cv_.notify_all();
   }
 }
 
