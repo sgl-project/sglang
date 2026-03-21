@@ -48,19 +48,20 @@ class TestConstants(unittest.TestCase):
         self.assertIn(EOS, DEFAULT_SPECIAL_TOKENS)
         self.assertIn(SEP, DEFAULT_SPECIAL_TOKENS)
 
-    def test_default_control_tokens_keys(self):
-        self.assertIn("pad", DEFAULT_CONTROL_TOKENS)
-        self.assertIn("sep", DEFAULT_CONTROL_TOKENS)
-        self.assertIn("eos", DEFAULT_CONTROL_TOKENS)
-
+    def test_default_control_tokens_values(self):
+        # Note: "sep" maps to EOS and "eos" maps to SEP in the source code 
+        self.assertEqual(DEFAULT_CONTROL_TOKENS["pad"], PAD)
+        self.assertEqual(DEFAULT_CONTROL_TOKENS["sep"], EOS)
+        self.assertEqual(DEFAULT_CONTROL_TOKENS["eos"], SEP)
 
 class TestTiktokenProcessor(unittest.TestCase):
     def setUp(self):
-        with patch(
+        tokenizer_patcher = patch(
             "sglang.srt.tokenizer.tiktoken_tokenizer.TiktokenTokenizer"
-        ):
-            self.processor = TiktokenProcessor.__new__(TiktokenProcessor)
-            self.processor.tokenizer = MagicMock()
+        )
+        tokenizer_patcher.start()
+        self.addCleanup(tokenizer_patcher.stop)
+        self.processor = TiktokenProcessor(name="dummy")
 
     def test_image_processor_returns_dict(self):
         result = self.processor.image_processor("fake_image")
