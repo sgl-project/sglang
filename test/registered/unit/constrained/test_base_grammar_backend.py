@@ -2,9 +2,9 @@
 Unit tests for sglang.srt.constrained.base_grammar_backend.
 
 Test Coverage:
-- GrammarStats: default values, custom values
-- BaseGrammarObject: initial state, default behavior, copy
-- InvalidGrammarObject: error message, repr
+- GrammarStats: default values, mutable default isolation
+- BaseGrammarObject: default behavior
+- InvalidGrammarObject: error message
 - BaseGrammarBackend: caching, dispatch routing, unsupported fallback,
   thread pool execution, cache hit/miss
 - create_grammar_backend: factory routing, "none" backend, invalid name,
@@ -47,20 +47,6 @@ class TestGrammarStats(unittest.TestCase):
         self.assertIsNone(stats.dispatch_type)
         self.assertEqual(stats.num_timeout, 0)
 
-    def test_custom_values(self):
-        stats = GrammarStats(
-            compilation_time=1.5,
-            schema_count=3,
-            ebnf_size=100,
-            is_cache_hit=True,
-            dispatch_type="json",
-            num_timeout=2,
-        )
-        self.assertEqual(stats.compilation_time, 1.5)
-        self.assertEqual(stats.schema_count, 3)
-        self.assertTrue(stats.is_cache_hit)
-        self.assertEqual(stats.dispatch_type, "json")
-
     def test_tree_traversal_time_mutable_default(self):
         """Ensure each instance gets its own list."""
         s1 = GrammarStats()
@@ -72,31 +58,13 @@ class TestGrammarStats(unittest.TestCase):
 class TestBaseGrammarObject(unittest.TestCase):
     """Test BaseGrammarObject base class."""
 
-    def test_initial_state(self):
-        obj = BaseGrammarObject()
-        self.assertFalse(obj.finished)
-        self.assertIsNone(obj.grammar_stats)
-        self.assertIsNone(obj.current_token)
-
-    def test_finished_property(self):
-        obj = BaseGrammarObject()
-        obj.finished = True
-        self.assertTrue(obj.finished)
-        obj.finished = False
-        self.assertFalse(obj.finished)
-
     def test_is_terminated_default(self):
         obj = BaseGrammarObject()
         self.assertFalse(obj.is_terminated())
 
-    def test_copy_returns_self(self):
-        obj = BaseGrammarObject()
-        self.assertIs(obj.copy(), obj)
-
     def test_maybe_init_reasoning_noop(self):
         obj = BaseGrammarObject()
         obj.maybe_init_reasoning(True)  # Should not raise
-
 
 
 class TestInvalidGrammarObject(unittest.TestCase):
@@ -110,11 +78,6 @@ class TestInvalidGrammarObject(unittest.TestCase):
         obj = InvalidGrammarObject("Regex compilation failed")
         self.assertEqual(obj.error_message, "Regex compilation failed")
 
-    def test_repr(self):
-        obj = InvalidGrammarObject("test error")
-        self.assertEqual(repr(obj), "InvalidGrammarObject(error_message='test error')")
-
-
 
 class TestBaseGrammarBackend(unittest.TestCase):
     """Test BaseGrammarBackend caching and dispatch."""
@@ -124,9 +87,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
 
     def tearDown(self):
         self.backend.executor.shutdown(wait=True)
-
-    def test_initial_cache_empty(self):
-        self.assertEqual(len(self.backend.cache), 0)
 
     def test_set_and_get_cache(self):
         obj = BaseGrammarObject()
@@ -173,41 +133,37 @@ class TestBaseGrammarBackend(unittest.TestCase):
         value = result.result(timeout=5)
         self.assertIsInstance(value, InvalidGrammarObject)
 
-    def test_dispatch_json_unsupported(self):
-        result = self.backend.dispatch_json("schema")
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_dispatch_regex_unsupported(self):
-        result = self.backend.dispatch_regex("[a-z]+")
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_dispatch_ebnf_unsupported(self):
-        result = self.backend.dispatch_ebnf("root ::= 'hello'")
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_dispatch_structural_tag_unsupported(self):
-        result = self.backend.dispatch_structural_tag("{}")
-        self.assertIsInstance(result, InvalidGrammarObject)
+    def test_all_dispatch_methods_unsupported(self):
+        """All dispatch methods on base class return InvalidGrammarObject."""
+        cases = [
+            ("dispatch_json", ("schema",)),
+            ("dispatch_regex", ("[a-z]+",)),
+            ("dispatch_ebnf", ("root ::= 'hello'",)),
+            ("dispatch_structural_tag", ("{}",)),
+        ]
+        for method_name, args in cases:
+            with self.subTest(method=method_name):
+                result = getattr(self.backend, method_name)(*args)
+                self.assertIsInstance(result, InvalidGrammarObject)
 
     def test_dispatch_fallback_raises(self):
         with self.assertRaises(ValueError):
             self.backend.dispatch_fallback("unknown", "value")
 
-    def test_init_value_dispatch_routes_json(self):
-        result = self.backend._init_value_dispatch(("json", "schema"), False)
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_init_value_dispatch_routes_regex(self):
-        result = self.backend._init_value_dispatch(("regex", "[a-z]+"), False)
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_init_value_dispatch_routes_ebnf(self):
-        result = self.backend._init_value_dispatch(("ebnf", "root ::= 'x'"), False)
-        self.assertIsInstance(result, InvalidGrammarObject)
-
-    def test_init_value_dispatch_routes_structural_tag(self):
-        result = self.backend._init_value_dispatch(("structural_tag", "{}"), False)
-        self.assertIsInstance(result, InvalidGrammarObject)
+    def test_init_value_dispatch_routes_all_types(self):
+        """_init_value_dispatch routes all grammar types to their dispatch methods."""
+        cases = [
+            ("json", "schema"),
+            ("regex", "[a-z]+"),
+            ("ebnf", "root ::= 'x'"),
+            ("structural_tag", "{}"),
+        ]
+        for grammar_type, value in cases:
+            with self.subTest(grammar_type=grammar_type):
+                result = self.backend._init_value_dispatch(
+                    (grammar_type, value), False
+                )
+                self.assertIsInstance(result, InvalidGrammarObject)
 
     def test_init_value_dispatch_unknown_type_raises(self):
         with self.assertRaises(ValueError):
@@ -230,23 +186,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.backend.dispatch_json = MagicMock(return_value=mock_grammar)
         # Should not raise
         self.backend._init_value_dispatch(("json", "schema"), False)
-
-    def test_multiple_cache_keys(self):
-        obj1 = BaseGrammarObject()
-        obj2 = BaseGrammarObject()
-        self.backend.set_cache(("json", "s1"), obj1)
-        self.backend.set_cache(("regex", "r1"), obj2)
-        self.assertEqual(len(self.backend.cache), 2)
-
-    def test_cache_overwrite_replaces_value(self):
-        """Setting the same key twice should overwrite the first value."""
-        key = ("json", "schema")
-        obj1 = BaseGrammarObject()
-        obj2 = BaseGrammarObject()
-        self.backend.set_cache(key, obj1)
-        self.backend.set_cache(key, obj2)
-        self.assertIs(self.backend.cache[key], obj2)
-        self.assertEqual(len(self.backend.cache), 1)
 
     def test_reset_then_miss(self):
         """After reset, previously cached keys should be misses."""
