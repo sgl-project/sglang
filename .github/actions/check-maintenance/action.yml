@@ -1,0 +1,52 @@
+name: Check Maintenance Mode
+description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label.
+
+inputs:
+  github-token:
+    description: GitHub token for API access
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check maintenance mode
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        MAINTENANCE_ISSUE=21065
+        REPO="${{ github.repository }}"
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+
+        # Check if maintenance issue is open (fail-open: if API errors, allow CI to proceed)
+        ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+
+        if [[ "$ISSUE_STATE" != "OPEN" ]]; then
+          echo "✅ Maintenance mode is OFF. Proceeding with CI."
+          exit 0
+        fi
+
+        # For PRs, check if bypass-maintenance label is present
+        if [[ -n "$PR_NUMBER" ]]; then
+          HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
+          if [[ "$HAS_BYPASS" -gt 0 ]]; then
+            echo "✅ PR #$PR_NUMBER has 'bypass-maintenance' label. Bypassing maintenance mode."
+            exit 0
+          fi
+        fi
+
+        MSG=$(printf "%s\n" \
+          "## ⚠️ CI Maintenance Mode is Active" \
+          "The CI infrastructure is currently under maintenance." \
+          "All PR CI runs are paused until maintenance is complete." \
+          "" \
+          "What should you do?" \
+          "- Check back later (~12 hours)" \
+          "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+
+        echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+        while IFS= read -r line; do
+          echo "::error::$line"
+        done <<< "$MSG"
+
+        exit 1
