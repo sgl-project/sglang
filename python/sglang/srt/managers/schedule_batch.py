@@ -873,6 +873,23 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+
+        # Streaming sessions reuse committed KV from the session slot, so
+        # custom logprob_start_len is not supported — override to -1.
+        if (
+            self.session is not None
+            and self.session.streaming
+            and self.return_logprob
+            and self.logprob_start_len >= 0
+        ):
+            logger.warning(
+                "logprob_start_len=%d is not supported for streaming sessions "
+                "and will be ignored (rid=%s). Only new-token logprobs are returned.",
+                self.logprob_start_len,
+                self.rid,
+            )
+            self.logprob_start_len = -1
+
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
