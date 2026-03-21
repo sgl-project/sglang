@@ -340,7 +340,6 @@ def handle_rerun_stage(
                 }
             else:
                 inputs = {
-                    "version": "release",
                     "target_stage": stage_name,
                     "pr_head_sha": pr_head_sha,
                 }
@@ -352,7 +351,7 @@ def handle_rerun_stage(
             if is_amd_stage:
                 inputs = {"target_stage": stage_name}
             else:
-                inputs = {"version": "release", "target_stage": stage_name}
+                inputs = {"target_stage": stage_name}
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
