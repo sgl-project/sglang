@@ -198,6 +198,7 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
+    enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
 
@@ -726,6 +727,7 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
                 modality="3d",
+                enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
         ),
