@@ -75,6 +75,8 @@ for wheel in "${wheel_files[@]}"; do
     fi
 
     TMPDIR=$(mktemp -d)
+    trap 'rm -rf -- "$TMPDIR"' ERR
+
     "${PYTHON}" -m wheel unpack "$wheel" --dest "$TMPDIR"
     UNPACKED=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -1)
     DIST_INFO=$(find "$UNPACKED" -maxdepth 1 -type d -name "*.dist-info" | head -1)
@@ -84,6 +86,12 @@ for wheel in "${wheel_files[@]}"; do
     patch_wheel_platform_tags "$WHEEL_META"
 
     ORIG_VERSION=$(grep '^Version:' "$METADATA_FILE" | head -1 | sed 's/^Version:[[:space:]]*//')
+    if [[ "$ORIG_VERSION" == *"$CUDA_SUFFIX"* ]]; then
+        echo "Skipping $wheel: version in METADATA is already suffixed."
+        rm -rf "$TMPDIR"
+        trap - ERR
+        continue
+    fi
     NEW_VERSION="${ORIG_VERSION}${CUDA_SUFFIX}"
     sed -i "s/^Version:.*/Version: ${NEW_VERSION}/" "$METADATA_FILE"
 
@@ -94,5 +102,6 @@ for wheel in "${wheel_files[@]}"; do
     rm -f "$wheel"
     "${PYTHON}" -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
     rm -rf "$TMPDIR"
+    trap - ERR
 done
 echo "Wheel renaming completed."
