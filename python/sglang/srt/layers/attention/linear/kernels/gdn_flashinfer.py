@@ -98,14 +98,36 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major != 9
+        self.supports_extend = sm_major == 9
+        self.supports_target_verify = sm_major == 9
+        # Slot 0 is reserved for padded requests in SGLang's MambaPool.
+        self.pad_state_slot = 0
 
-        if sm_major == 9:
+        if self.supports_extend:
             if self._prefill_fn is None:
                 raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
-            if self._mtp_fn is None:
-                raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
+        if self.supports_target_verify and self._mtp_fn is None:
+            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
         logger.info("Using FlashInfer GDN kernels")
+
+    def _sanitize_cache_indices(
+        self, cache_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Remap padded graph-replay slots to the reserved dummy state slot.
+
+        FlashInfer's pooled GDN decode kernel does not safely handle negative
+        padding indices, while SGLang uses `-1` for padded requests during CUDA
+        graph replay. Valid requests are always allocated from slots 1..N, so
+        mapping padded slots to 0 keeps writes isolated to the dummy state slot.
+        """
+        pad_mask = cache_indices < 0
+        safe_cache_indices = torch.where(
+            pad_mask,
+            torch.full_like(cache_indices, self.pad_state_slot),
+            cache_indices,
+        )
+        return safe_cache_indices, pad_mask
 
     # ---- decode ----
 
@@ -129,6 +151,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         head_k_dim = q.shape[3]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
+        safe_cache_indices, pad_mask = self._sanitize_cache_indices(cache_indices)
 
         query_fi = q.view(batch_size, 1, num_heads, head_k_dim)
         key_fi = k.view(batch_size, 1, num_heads, head_k_dim)
@@ -148,12 +171,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 b=b_fi,
                 use_qk_l2norm=True,
                 initial_state=ssm_states,
-                initial_state_indices=cache_indices,
+                initial_state_indices=safe_cache_indices,
             )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
+            state_batch = ssm_states[safe_cache_indices]
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -167,7 +190,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            ssm_states[safe_cache_indices] = new_state
+
+        output_fi = output_fi.masked_fill(
+            pad_mask.view(batch_size, 1, 1, 1),
+            0,
+        )
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -282,6 +310,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         seq_len = q.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
+        safe_cache_indices, pad_mask = self._sanitize_cache_indices(cache_indices)
 
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -305,7 +334,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             k=key_mtp,
             v=value_mtp,
             initial_state=ssm_states,
-            initial_state_indices=cache_indices,
+            initial_state_indices=safe_cache_indices,
             A_log=A_log.detach(),
             a=a_mtp,
             dt_bias=dt_bias.detach(),
@@ -315,6 +344,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=True,
             use_qk_l2norm=True,
+        )
+        output_fi = output_fi.masked_fill(
+            pad_mask.view(batch_size, 1, 1, 1),
+            0,
         )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)

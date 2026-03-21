@@ -59,6 +59,8 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        flashinfer_kernel = None
+        flashinfer_verify_kernel = None
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
@@ -94,6 +96,11 @@ class GDNKernelDispatcher:
                 raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
             if decode_backend.is_flashinfer():
+                if not flashinfer_kernel.supports_extend:
+                    raise ValueError(
+                        "FlashInfer GDN prefill is not supported on SM100+. "
+                        "Use --linear-attn-prefill-backend triton instead."
+                    )
                 self.extend_kernel = flashinfer_kernel
             else:
                 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
@@ -101,13 +108,27 @@ class GDNKernelDispatcher:
                 )
 
                 flashinfer_kernel = FlashInferGDNKernel()
+                if not flashinfer_kernel.supports_extend:
+                    raise ValueError(
+                        "FlashInfer GDN prefill is not supported on SM100+. "
+                        "Use --linear-attn-prefill-backend triton instead."
+                    )
                 self.extend_kernel = flashinfer_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
-        if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
-            self.verify_kernel = flashinfer_kernel
+        if (
+            flashinfer_kernel is not None
+            and flashinfer_kernel.supports_target_verify
+            and (decode_backend.is_flashinfer() or prefill_backend.is_flashinfer())
+        ):
+            flashinfer_verify_kernel = flashinfer_kernel
+
+        # Verify kernel: use FlashInfer only when the selected device/backend
+        # supports MTP verify. On SM100 decode-only FlashInfer should still use
+        # Triton verify.
+        if flashinfer_verify_kernel is not None:
+            self.verify_kernel = flashinfer_verify_kernel
         else:
             self.verify_kernel = triton_kernel
 
