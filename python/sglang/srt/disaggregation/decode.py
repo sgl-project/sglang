@@ -670,13 +670,19 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
             self._pre_alloc(decode_req.req)
 
-            kv_indices = (
-                self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
-                ]
-                .cpu()
-                .numpy()
-            )
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx
+            ][: len(decode_req.req.origin_input_ids)]
+            if self.scheduler.enable_hisparse:
+                kv_indices = (
+                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        kv_indices_full
+                    )
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                kv_indices = kv_indices_full.cpu().numpy()
             page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
@@ -967,6 +973,10 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(
+                        decode_req.req
+                    )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
@@ -982,6 +992,10 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
+                        if self.scheduler.enable_hisparse:
+                            self.scheduler.hisparse_coordinator.request_finished(
+                                decode_req.req
+                            )
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
@@ -1099,6 +1113,10 @@ class SchedulerDisaggregationDecodeMixin:
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
+                    if self.enable_hisparse:
+                        self.running_batch.hisparse_coordinator = (
+                            self.hisparse_coordinator
+                        )
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
@@ -1170,6 +1188,9 @@ class SchedulerDisaggregationDecodeMixin:
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
+        if self.enable_hisparse:
+            self.waiting_queue.extend(self.hisparse_coordinator.collect_ready_reqs())
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -1191,4 +1212,8 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(transferred_reqs)
+            if self.enable_hisparse:
+                for req in transferred_reqs:
+                    self.hisparse_coordinator.admit_request_into_staging(req)
+            else:
+                self.waiting_queue.extend(transferred_reqs)

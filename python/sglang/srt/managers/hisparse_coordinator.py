@@ -56,7 +56,7 @@ class HiSparseCoordinator:
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
 
-        max_num_reqs = req_to_token_pool.size
+        max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         # to have an extra page for new tokens
