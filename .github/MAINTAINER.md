@@ -65,3 +65,6 @@ The format is @github-username (Slack username).
 @iforgetmyname (Even Zhou)
 
 This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
+
+## Suspending Permissions
+If the merge oncall bypasses checks to merge a PR that breaks the `main` branch, or if they repeatedly break the CI due to various reasons, their privileges will be suspended for at least three days, depending on the severity of the incident.

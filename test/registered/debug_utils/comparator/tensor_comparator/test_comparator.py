@@ -9,11 +9,158 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     _compute_tensor_stats,
     compare_tensor_pair,
     compute_diff,
+    compute_tensor_info,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="stage-a-cpu-only", nightly=True)
+
+
+class TestComputeTensorInfo:
+    def test_basic_tensor_returns_correct_shape_and_dtype(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3]
+        assert info.dtype == "torch.float32"
+        assert info.stats.mean == pytest.approx(tensor.float().mean().item(), abs=1e-4)
+
+    def test_include_sample_false_returns_none_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=False)
+        assert info.sample is None
+
+    def test_include_sample_true_returns_string_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert isinstance(info.sample, str)
+
+    def test_empty_tensor_stats_are_zero(self) -> None:
+        tensor = torch.tensor([])
+        info = compute_tensor_info(tensor)
+        assert info.stats.mean == 0.0
+        assert info.stats.std == 0.0
+        assert info.shape == [0]
+
+    def test_integer_tensor_converted_to_float_for_stats(self) -> None:
+        """Integer tensors should be cast to float internally for stats computation."""
+        tensor = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        info = compute_tensor_info(tensor)
+        assert info.dtype == "torch.int32"
+        assert info.stats.mean == pytest.approx(2.5, abs=1e-4)
+        assert info.stats.min == pytest.approx(1.0, abs=1e-4)
+        assert info.stats.max == pytest.approx(4.0, abs=1e-4)
+
+    def test_bfloat16_tensor_shape_and_stats(self) -> None:
+        """bfloat16 tensors produce correct shape and dtype string."""
+        tensor = torch.ones(3, 4, dtype=torch.bfloat16)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [3, 4]
+        assert info.dtype == "torch.bfloat16"
+        assert info.stats.mean == pytest.approx(1.0, abs=1e-2)
+
+    def test_multidimensional_shape(self) -> None:
+        """Shape is preserved for high-rank tensors."""
+        tensor = torch.randn(2, 3, 4, 5)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3, 4, 5]
+
+    def test_scalar_tensor(self) -> None:
+        """Scalar (0-dim) tensor produces empty shape list."""
+        tensor = torch.tensor(3.14)
+        info = compute_tensor_info(tensor)
+        assert info.shape == []
+        assert info.stats.mean == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.min == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.max == pytest.approx(3.14, abs=1e-4)
+
+    def test_include_sample_true_contains_tensor_representation(self) -> None:
+        """Sample string should contain some recognizable tensor content."""
+        tensor = torch.tensor([1.0, 2.0])
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert "1." in info.sample or "2." in info.sample
+
+    def test_percentiles_present_for_small_tensor(self) -> None:
+        """Small tensors (< threshold) should have percentile data."""
+        tensor = torch.randn(100)
+        info = compute_tensor_info(tensor)
+        assert len(info.stats.percentiles) > 0
+        assert 50 in info.stats.percentiles
+
+
+class TestComputeTensorInfo:
+    def test_basic_tensor_returns_correct_shape_and_dtype(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3]
+        assert info.dtype == "torch.float32"
+        assert info.stats.mean == pytest.approx(tensor.float().mean().item(), abs=1e-4)
+
+    def test_include_sample_false_returns_none_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=False)
+        assert info.sample is None
+
+    def test_include_sample_true_returns_string_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert isinstance(info.sample, str)
+
+    def test_empty_tensor_stats_are_zero(self) -> None:
+        tensor = torch.tensor([])
+        info = compute_tensor_info(tensor)
+        assert info.stats.mean == 0.0
+        assert info.stats.std == 0.0
+        assert info.shape == [0]
+
+    def test_integer_tensor_converted_to_float_for_stats(self) -> None:
+        """Integer tensors should be cast to float internally for stats computation."""
+        tensor = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        info = compute_tensor_info(tensor)
+        assert info.dtype == "torch.int32"
+        assert info.stats.mean == pytest.approx(2.5, abs=1e-4)
+        assert info.stats.min == pytest.approx(1.0, abs=1e-4)
+        assert info.stats.max == pytest.approx(4.0, abs=1e-4)
+
+    def test_bfloat16_tensor_shape_and_stats(self) -> None:
+        """bfloat16 tensors produce correct shape and dtype string."""
+        tensor = torch.ones(3, 4, dtype=torch.bfloat16)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [3, 4]
+        assert info.dtype == "torch.bfloat16"
+        assert info.stats.mean == pytest.approx(1.0, abs=1e-2)
+
+    def test_multidimensional_shape(self) -> None:
+        """Shape is preserved for high-rank tensors."""
+        tensor = torch.randn(2, 3, 4, 5)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3, 4, 5]
+
+    def test_scalar_tensor(self) -> None:
+        """Scalar (0-dim) tensor produces empty shape list."""
+        tensor = torch.tensor(3.14)
+        info = compute_tensor_info(tensor)
+        assert info.shape == []
+        assert info.stats.mean == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.min == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.max == pytest.approx(3.14, abs=1e-4)
+
+    def test_include_sample_true_contains_tensor_representation(self) -> None:
+        """Sample string should contain some recognizable tensor content."""
+        tensor = torch.tensor([1.0, 2.0])
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert "1." in info.sample or "2." in info.sample
+
+    def test_percentiles_present_for_small_tensor(self) -> None:
+        """Small tensors (< threshold) should have percentile data."""
+        tensor = torch.randn(100)
+        info = compute_tensor_info(tensor)
+        assert len(info.stats.percentiles) > 0
+        assert 50 in info.stats.percentiles
 
 
 class TestComputeTensorStats:

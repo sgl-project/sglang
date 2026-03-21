@@ -204,7 +204,9 @@ class AiterAttnBackend(AttentionBackend):
             self.token_to_kv_pool = model_runner.token_to_kv_pool
             self.use_triton_unified_attention = True
         else:
-            self.use_triton_unified_attention = False
+            self.use_triton_unified_attention = get_bool_env_var(
+                "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -682,6 +684,8 @@ class AiterAttnBackend(AttentionBackend):
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
+                    elif self.page_size > 1:
+                        kv_indices = self._transform_table_1_to_real(kv_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1280,6 +1284,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1657,6 +1666,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1983,7 +1997,15 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_triton_unified_attention:
+                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+                # both unified attention and sliding window kv pool are active.
+                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+                # use standard set_kv_buffer, as they lack SWA-specific attributes
+                # like full_to_swa_index_mapping.
+                if (
+                    self.use_triton_unified_attention
+                    and self.use_sliding_window_kv_pool
+                ):
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2385,7 +2407,12 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            if self.use_triton_unified_attention:
+            # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+            # both unified attention and sliding window kv pool are active.
+            # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+            # use standard set_kv_buffer, as they lack SWA-specific attributes
+            # like full_to_swa_index_mapping.
+            if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
