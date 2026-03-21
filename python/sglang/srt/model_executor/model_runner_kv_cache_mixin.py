@@ -464,7 +464,6 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    enable_hisparse=self.enable_hisparse,
                 )
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (

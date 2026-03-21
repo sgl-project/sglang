@@ -1799,7 +1799,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
-        index_buf_size = index_buf_size if index_buf_size is not None else size
+        if index_buf_size is None:
+            index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
