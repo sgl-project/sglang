@@ -31,9 +31,6 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
@@ -46,11 +43,20 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_tracing_enabled,
-    get_otlp_span_exporter,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
 )
+
+try:
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from sglang.srt.observability.trace import get_otlp_span_exporter
+
+    _has_otel = True
+except ImportError:
+    _has_otel = False
 
 # Access the private module-level function (avoid name mangling inside classes).
 _get_host_id = getattr(mod, "__get_host_id")
@@ -159,6 +165,7 @@ class TestGetHostId(unittest.TestCase):
             self.assertEqual(_get_host_id(), "unknown")
 
 
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
 class TestGetOtlpSpanExporter(unittest.TestCase):
     def test_grpc_default(self):
 
@@ -236,6 +243,7 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         # Should not register anything
 
 
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
 class TestTraceReqContextEnabled(unittest.TestCase):
     def setUp(self):
 
@@ -307,7 +315,10 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_start(ts=1000)
 
         s = TraceSliceContext(
-            "decode", 2000, end_time_ns=3000, level=1,
+            "decode",
+            2000,
+            end_time_ns=3000,
+            level=1,
             attrs={"key": "val"},
             events=[TraceEvent("evt", 2500, {"e": 1})],
         )
@@ -368,8 +379,11 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_start(ts=1000)
         ctx.trace_slice_start("dispatch", level=2, ts=1500)
         ctx.trace_slice_end(
-            "dispatch", level=2, ts=2000,
-            attrs={"key": "val"}, thread_finish_flag=True,
+            "dispatch",
+            level=2,
+            ts=2000,
+            attrs={"key": "val"},
+            thread_finish_flag=True,
         )
         # thread_finish_flag triggers abort → thread_context is None
         self.assertIsNone(ctx.thread_context)
@@ -518,7 +532,9 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         """Covers tp_rank branch in __create_thread_context."""
 
         pid = threading.get_native_id()
-        mod.threads_info[pid] = TraceThreadInfo("host", pid, "sched", tp_rank=0, dp_rank=0)
+        mod.threads_info[pid] = TraceThreadInfo(
+            "host", pid, "sched", tp_rank=0, dp_rank=0
+        )
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
         self.assertIsNotNone(ctx.thread_context)

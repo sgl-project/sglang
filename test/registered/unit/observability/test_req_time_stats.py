@@ -9,7 +9,6 @@ import sys
 import types
 from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
-from typing import Any, Dict, List, Optional
 
 
 def _ensure_module(name):
@@ -53,8 +52,11 @@ class _ForwardMode(IntEnum):
 
     def is_prefill(self):
         return self in (
-            _ForwardMode.EXTEND, _ForwardMode.MIXED, _ForwardMode.DRAFT_EXTEND,
-            _ForwardMode.TARGET_VERIFY, _ForwardMode.SPLIT_PREFILL,
+            _ForwardMode.EXTEND,
+            _ForwardMode.MIXED,
+            _ForwardMode.DRAFT_EXTEND,
+            _ForwardMode.TARGET_VERIFY,
+            _ForwardMode.SPLIT_PREFILL,
         )
 
     def is_prebuilt(self):
@@ -107,10 +109,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
-import pickle
 import unittest
 from unittest.mock import MagicMock
 
+import sglang.srt.observability.req_time_stats as rts_module
+import sglang.srt.observability.trace as trace_module
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     DPControllerReqTimeStats,
@@ -127,8 +130,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-import sglang.srt.observability.req_time_stats as rts_module
-import sglang.srt.observability.trace as trace_module
 from sglang.srt.observability.trace import SpanAttributes
 
 DisaggregationMode = _DisaggregationMode

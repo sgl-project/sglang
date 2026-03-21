@@ -4,7 +4,7 @@
 import sys
 import types
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 
 def _ensure_module(name):
@@ -59,7 +59,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.observability.request_metrics_exporter import (
-    ALWAYS_EXCLUDE_FIELDS,
     FileRequestMetricsExporter,
     RequestMetricsExporter,
     RequestMetricsExporterManager,
@@ -84,9 +83,13 @@ class _ConcreteExporter(RequestMetricsExporter):
 class TestFormatOutputData(unittest.TestCase):
     def test_basic_formatting(self):
         server_args = _make_server_args("/tmp/unused")
-        exporter = _ConcreteExporter(server_args, obj_skip_names=None, out_skip_names=None)
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
 
-        obj = _GenerateReqInput(rid="req-1", text="hello", sampling_params={"temp": 0.5})
+        obj = _GenerateReqInput(
+            rid="req-1", text="hello", sampling_params={"temp": 0.5}
+        )
         out_dict = {"meta_info": {"latency": 1.5, "tokens": 10}}
 
         result = exporter._format_output_data(obj, out_dict)
@@ -99,7 +102,9 @@ class TestFormatOutputData(unittest.TestCase):
 
     def test_excludes_always_exclude_fields(self):
         server_args = _make_server_args("/tmp/unused")
-        exporter = _ConcreteExporter(server_args, obj_skip_names=None, out_skip_names=None)
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
 
         obj = _GenerateReqInput(rid="req-1", image_data="should_be_excluded")
         result = exporter._format_output_data(obj, {})
@@ -122,7 +127,9 @@ class TestFormatOutputData(unittest.TestCase):
 
     def test_excludes_none_values(self):
         server_args = _make_server_args("/tmp/unused")
-        exporter = _ConcreteExporter(server_args, obj_skip_names=None, out_skip_names=None)
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
 
         obj = _GenerateReqInput(rid="req-1", text=None)
         result = exporter._format_output_data(obj, {})
@@ -152,9 +159,7 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _make_exporter(self):
-        return FileRequestMetricsExporter(
-            _make_server_args(self.tmp_dir), None, None
-        )
+        return FileRequestMetricsExporter(_make_server_args(self.tmp_dir), None, None)
 
     def test_init_creates_directory(self):
         sub_dir = os.path.join(self.tmp_dir, "nested", "dir")
