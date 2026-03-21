@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -20,12 +22,10 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=9,
     suite="stage-b-test-small-1-gpu",
-    disabled="Test uses pytest-style function without TestCase class - see #17145",
 )
 register_amd_ci(
     est_time=15,
     suite="stage-b-test-small-1-gpu-amd",
-    disabled="Test uses pytest-style function without TestCase class - see #17145",
 )
 
 TEST_HIDDEN_SIZE = 32
@@ -75,32 +75,37 @@ def init_weights(module):
         torch.nn.init.ones_(module.weight)
 
 
-def test_model_forward_dump(tmp_path):
-    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-    init_distributed_environment(
-        backend="nccl",
-        world_size=1,
-        rank=0,
-        local_rank=0,
-        distributed_init_method="tcp://127.0.0.1:2646",
-    )
-    initialize_model_parallel()
-    model = MockCausalLM()
-    model.apply(init_weights)
-    model = model.cuda().bfloat16()
-    dumper = register_forward_hook_for_model(
-        model, tmp_path / "sglang_dump", [0], 0, 0, 0
-    )
+class TestTensorDumpForwardHook(unittest.TestCase):
+    def test_model_forward_dump(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+            init_distributed_environment(
+                backend="nccl",
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method="tcp://127.0.0.1:2646",
+            )
+            initialize_model_parallel()
+            model = MockCausalLM()
+            model.apply(init_weights)
+            model = model.cuda().bfloat16()
+            dumper = register_forward_hook_for_model(
+                model, tmp_path / "sglang_dump", [0], 0, 0, 0
+            )
 
-    dir_path = dumper.get_dump_dir()
-    inp = torch.randn(4, TEST_HIDDEN_SIZE, dtype=torch.bfloat16) * 0.01
-    result = model(inp.cuda())
-    data = torch.load(f"{dir_path}/Pass00000.pt")
-    assert "model.layernorm" in data
-    assert "model.mlp.down_proj" in data
-    assert torch.allclose(
-        data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
-    )
+            dir_path = dumper.get_dump_dir()
+            inp = torch.randn(4, TEST_HIDDEN_SIZE, dtype=torch.bfloat16) * 0.01
+            result = model(inp.cuda())
+            data = torch.load(f"{dir_path}/Pass00000.pt")
+            self.assertIn("model.layernorm", data)
+            self.assertIn("model.mlp.down_proj", data)
+            self.assertTrue(
+                torch.allclose(
+                    data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
+                )
+            )
 
 
 if __name__ == "__main__":
