@@ -213,7 +213,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "flashinfer_cudnn",
-    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -2021,6 +2020,17 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
 
+        if (
+            model_arch in ["Qwen3VLForConditionalGeneration"]
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_UNIFIED_ATTN")
+            and self.page_size is None
+        ):
+            self.page_size = 16
+            logger.info(
+                "Setting page_size=16 for aiter unified attention on Qwen3VLForConditionalGeneration."
+            )
+
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
             logger.warning(
@@ -2775,56 +2785,103 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
+        """Normalize hicache-related knobs into a valid runtime configuration.
+
+        Resolution order:
+        1) Layout <-> I/O compatibility for direct conflicts.
+        2) Storage <-> layout compatibility (may rewrite layout).
+        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
+        4) Re-run step (1) if step (3) changed I/O backend.
+        """
+        # Skip all normalization when neither hicache nor decode-offload path is active.
+        if not (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ):
+            return
+
+        # Step 1: Initial layout-io compatibility normalization.
+        self._resolve_layout_io_compatibility()
+
+        # Step 2: Storage-layout normalization without changing io backend.
+        self._resolve_storage_layout_compatibility()
+
+        # Step 3: IO-decode backend compatibility (may change io backend).
+        io_changed = self._resolve_io_decode_attention_compatibility()
+
+        # Step 4: Re-normalize layout after io backend changes.
+        if io_changed:
+            self._resolve_layout_io_compatibility()
+
+    def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
-                "Kernel io backend does not support page first direct layout"
+                "Kernel io backend does not support page first direct layout, switching to direct io backend"
             )
 
         if (
-            self.enable_hierarchical_cache
-            or self.disaggregation_decode_enable_offload_kvcache
-        ) and self.hicache_io_backend == "kernel":
-            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
-            # Only override when the *effective* decode backend would be FA3.
-            # Otherwise, respect the user's chosen attention backend (e.g., aiter on ROCm).
-            effective_decode_backend = (
-                self.decode_attention_backend
-                if self.decode_attention_backend is not None
-                else self.attention_backend
+            self.hicache_mem_layout == "page_first"
+            and self.hicache_io_backend == "direct"
+        ):
+            self.hicache_mem_layout = "page_first_direct"
+            logger.warning(
+                "Page first layout is not supported with direct IO backend, switching to page first direct layout"
             )
-            if effective_decode_backend == "fa3":
-                if self.decode_attention_backend is None:
-                    # If decode backend wasn't explicitly set, pick a safe default that works with HiCache kernel IO.
-                    if not self.use_mla_backend():
-                        self.decode_attention_backend = (
-                            "flashinfer" if is_flashinfer_available() else "triton"
-                        )
-                    else:
-                        self.decode_attention_backend = (
-                            "flashinfer" if is_sm100_supported() else "triton"
-                        )
-                else:
-                    # If user explicitly requested FA3 decode, fall back to direct IO.
-                    self.hicache_io_backend = "direct"
-                    logger.warning(
-                        "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                        "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-                    )
 
-        if self.hicache_storage_backend == "mooncake":
-            if self.hicache_mem_layout == "layer_first":
-                if self.hicache_io_backend == "direct":
-                    self.hicache_mem_layout = "page_first_direct"
-                elif self.hicache_io_backend == "kernel":
-                    self.hicache_mem_layout = "page_first"
-                logger.warning(
-                    f"Mooncake storage backend does not support layer_first layout, "
-                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
-                )
+    def _resolve_storage_layout_compatibility(self):
+        if (
+            self.hicache_storage_backend != "mooncake"
+            or self.hicache_mem_layout != "layer_first"
+        ):
+            return
+
+        if self.hicache_io_backend == "direct":
+            new_layout = "page_first_direct"
+        elif self.hicache_io_backend == "kernel":
+            new_layout = "page_first"
+        else:
+            # Keep current behavior for unknown backends (e.g., kernel_ascend).
+            new_layout = self.hicache_mem_layout
+
+        self.hicache_mem_layout = new_layout
+        logger.warning(
+            f"Mooncake storage backend does not support layer_first layout, "
+            f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
+        )
+
+    def _resolve_io_decode_attention_compatibility(self) -> bool:
+        if self.hicache_io_backend != "kernel":
+            return False
+
+        # Only patch settings when the effective decode backend is FA3.
+        effective_decode_backend = (
+            self.decode_attention_backend or self.attention_backend
+        )
+        if effective_decode_backend != "fa3":
+            return False
+
+        if self.decode_attention_backend is not None:
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+            )
+            return True
+
+        # If decode backend is implicit, pick a safe backend without changing io backend.
+        if not self.use_mla_backend():
+            self.decode_attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
+        else:
+            self.decode_attention_backend = (
+                "flashinfer" if is_sm100_supported() else "triton"
+            )
+        return False
 
     def _handle_speculative_decoding(self):
         if (
@@ -4547,8 +4604,7 @@ class ServerArgs:
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
             "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "
             "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )

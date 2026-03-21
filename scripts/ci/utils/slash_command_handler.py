@@ -340,7 +340,6 @@ def handle_rerun_stage(
                 }
             else:
                 inputs = {
-                    "version": "release",
                     "target_stage": stage_name,
                     "pr_head_sha": pr_head_sha,
                 }
@@ -352,7 +351,7 @@ def handle_rerun_stage(
             if is_amd_stage:
                 inputs = {"target_stage": stage_name}
             else:
-                inputs = {"version": "release", "target_stage": stage_name}
+                inputs = {"target_stage": stage_name}
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
@@ -416,8 +415,8 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-a-test-small-1-gpu": "1-gpu-5090",
     "stage-a-cpu-only": "ubuntu-latest",
     "stage-b-test-small-1-gpu": "1-gpu-5090",
-    "stage-b-test-large-1-gpu": "1-gpu-runner",
-    "stage-b-test-large-2-gpu": "2-gpu-runner",
+    "stage-b-test-large-1-gpu": "1-gpu-h100",
+    "stage-b-test-large-2-gpu": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",

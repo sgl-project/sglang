@@ -13,9 +13,9 @@ on:
         required: true
         type: choice
         options:
-          - 1-gpu-runner
+          - 1-gpu-h100
           - 1-gpu-5090
-          - 2-gpu-runner
+          - 2-gpu-h100
           - 4-gpu-h100
           - 4-gpu-a10
           - 4-gpu-b200
