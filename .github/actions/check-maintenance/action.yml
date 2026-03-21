@@ -35,16 +35,18 @@ runs:
           fi
         fi
 
-        {
-          echo "::error::⚠️ CI Maintenance Mode is Active"
-          echo "::error::"
-          echo "::error::The CI infrastructure is currently under maintenance."
-          echo "::error::All PR CI runs are paused until maintenance is complete."
-          echo "::error::"
-          echo "::error::What should you do?"
-          echo "::error::- Check back later (~12 hours)"
-          echo "::error::- Follow CI Maintenance Mode (issue #$MAINTENANCE_ISSUE): https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates"
-          echo "::error::"
-        } | tee -a "$GITHUB_STEP_SUMMARY"
+        MSG=$(printf "%s\n" \
+          "⚠️ CI Maintenance Mode is Active" \
+          "The CI infrastructure is currently under maintenance." \
+          "All PR CI runs are paused until maintenance is complete." \
+          "" \
+          "What should you do?" \
+          "- Check back later (~12 hours)" \
+          "- Follow CI Maintenance Mode (issue #$MAINTENANCE_ISSUE): https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+
+        echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+        while IFS= read -r line; do
+          echo "::error::$line"
+        done <<< "$MSG"
 
         exit 1
