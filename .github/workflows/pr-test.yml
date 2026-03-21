@@ -915,10 +915,16 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
         run: |
-          pip install -e "python/[dev]"
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
       - name: Run test
         timeout-minutes: 10
