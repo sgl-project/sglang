@@ -390,8 +390,10 @@ class TestQwen35PPAccuracy(unittest.TestCase):
             kill_process_tree(process.pid)
 
     def test_pp_consistency(self):
+        # Use tp=2 for both: model (~66GB) doesn't fit on a single H100,
+        # and matching TP avoids accuracy differences from reduction order.
         baseline = self.run_gsm8k_test(tp_size=2, pp_size=1)
-        pp_metrics = self.run_gsm8k_test(tp_size=1, pp_size=2)
+        pp_metrics = self.run_gsm8k_test(tp_size=2, pp_size=2)
 
         print(f"[Qwen35 PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
