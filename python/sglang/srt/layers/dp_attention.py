@@ -467,10 +467,7 @@ def _dp_gather_via_all_reduce(
         not local_tokens.dtype.is_floating_point
         and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
     ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+        get_tp_group().all_reduce(global_tokens, inplace=True)
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
@@ -581,4 +578,4 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-    return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+    return get_attention_tp_group().all_gather_list(input, output_list)

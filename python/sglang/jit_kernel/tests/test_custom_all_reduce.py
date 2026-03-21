@@ -186,7 +186,7 @@ def worker_test(
         with comm.capture():
             with torch.cuda.graph(graph):
                 for i in range(TEST_LAYERS):
-                    out_jits.append(comm.custom_all_reduce(graph_inp[i]))
+                    out_jits.append(comm.all_reduce(graph_inp[i]))
                 out_jit = torch.stack(out_jits)
         torch.cuda.synchronize()
 
@@ -202,7 +202,7 @@ def worker_test(
             eager_inp = x.clone()
             out_eagers = []
             for i in range(TEST_LAYERS):
-                out_eagers.append(comm.custom_all_reduce(eager_inp[i]))
+                out_eagers.append(comm.all_reduce(eager_inp[i]))
                 torch.cuda.synchronize()
             return torch.stack(out_eagers)
 
@@ -213,7 +213,7 @@ def worker_test(
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.should_custom_ar(inp[0])
+        assert comm.can_all_reduce(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run_fn(inp)
