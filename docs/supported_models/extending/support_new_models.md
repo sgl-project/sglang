@@ -310,7 +310,7 @@ if __name__ == "__main__":
 
 Now, when we call `python run.py`, we will get the outputs of our newly created model!
 
-## Serving an External Model via the Standard CLI
+## Serving External Models via the Standard CLI
 
 The previous sections show how to register a model programmatically via `ModelRegistry` and serve it through the Offline Engine. Similar to vLLM model plugin, there is an alternative that lets you keep using the standard `python -m sglang.launch_server` CLI without modifying any SGLang source code: you can register your model using the `SGLANG_EXTERNAL_MODEL_PACKAGE` environment variable.
 
@@ -329,7 +329,7 @@ EntryClass = LlamaWrapper
 
 Using the same Llama wrapper from the previous section, here is how to package and serve it via the CLI.
 
-#### Step 1: Create your project
+1. Create your project
 
 ```
 sglang_custom_project/
@@ -352,7 +352,7 @@ setup(
 )
 ```
 
-#### Step 2: Write your model code
+2. Write your model code
 
 Inside `llama_wrapper.py`, write your model and include `EntryClass`:
 
@@ -389,7 +389,7 @@ class LlamaWrapper(LlamaForCausalLM):
 EntryClass = LlamaWrapper
 ```
 
-#### Step 3: Install your package
+3. Install your package
 
 Run this inside your `sglang_custom_project` directory to install your code into the active Python environment:
 
@@ -397,7 +397,7 @@ Run this inside your `sglang_custom_project` directory to install your code into
 pip install -e .
 ```
 
-#### Step 4: Update your `config.json`
+4. Update your `config.json`
 
 Update the `config.json` under your HuggingFace model checkpoint directory so the `architectures` field matches your class name:
 
@@ -408,7 +408,7 @@ Update the `config.json` under your HuggingFace model checkpoint directory so th
 }
 ```
 
-#### Step 5: Launch the server
+5. Launch the server
 
 Set the environment variable before running the CLI:
 
