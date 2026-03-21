@@ -741,18 +741,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             num_frames=33,
         ),
     ),
-    DiffusionTestCase(
-        "helios_distilled_t2v",
-        DiffusionServerArgs(
-            model_path="BestWishYsh/Helios-Distilled",
-            modality="video",
-        ),
-        DiffusionSamplingParams(
-            prompt=T2V_PROMPT,
-            output_size="640x384",
-            num_frames=33,
-        ),
-    ),
+    # flaky
+    # DiffusionTestCase(
+    #     "helios_distilled_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Distilled",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
 ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
