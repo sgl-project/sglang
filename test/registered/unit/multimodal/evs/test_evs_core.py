@@ -103,6 +103,36 @@ class TestComputeRetentionMask(unittest.TestCase):
         self.assertEqual(mask.dim(), 1)
 
 
+class TestEvsInputIdHelpers(unittest.TestCase):
+    def test_tokens_per_frame_sums_to_retained(self):
+        out = evs_core.tokens_per_frame(q=0.25, num_frames=3, frame_num_tokens=4)
+        retained = evs_core.compute_retained_tokens_count(
+            tokens_per_frame=4, num_frames=3, q=0.25
+        )
+        self.assertEqual(len(out), 3)
+        self.assertEqual(sum(out), retained)
+        # Contract: remainder goes to the final frame.
+        self.assertGreaterEqual(out[-1], out[0])
+
+    def test_replace_offsets_single_span(self):
+        out = evs_core.replace_offsets_with_tokens_per_frame(
+            pre_chunked_input_ids=[1, 0, 0, 4, 5],
+            num_tokens_per_frame=[1, 2],
+            frame_offsets_inclusive=[(1, 2)],
+            filler_token_id=9,
+        )
+        self.assertEqual(out, [1, 9, 9, 9, 4, 5])
+
+    def test_replace_offsets_multi_span(self):
+        out = evs_core.replace_offsets_with_tokens_per_frame(
+            pre_chunked_input_ids=[1, 0, 0, 4, 5, 0, 0, 9],
+            num_tokens_per_frame=[1, 3],
+            frame_offsets_inclusive=[(1, 2), (5, 6)],
+            filler_token_id=7,
+        )
+        self.assertEqual(out, [1, 7, 4, 5, 7, 7, 7, 9])
+
+
 if __name__ == "__main__":
     unittest.main()
 

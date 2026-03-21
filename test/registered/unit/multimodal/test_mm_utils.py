@@ -275,6 +275,103 @@ class TestGetDpEncoderLbAssignment(unittest.TestCase):
         self.assertEqual(len(loads), 4)
 
 
+class _DummyProcessor:
+    def __init__(self, *, crop_size, size, image_mean=(0.5, 0.5, 0.5)):
+        self.crop_size = crop_size
+        self.size = size
+        self.image_mean = image_mean
+
+    def preprocess(self, image):
+        arr = np.asarray(image, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        arr = arr.transpose(2, 0, 1)
+        return {"pixel_values": [arr]}
+
+    def __call__(self, images):
+        vals = [self.preprocess(img)["pixel_values"][0] for img in images]
+        return {"pixel_values": np.stack(vals, axis=0)}
+
+
+class _DummyCfg:
+    def __init__(self, image_aspect_ratio, image_grid_pinpoints=None):
+        self.image_aspect_ratio = image_aspect_ratio
+        self.image_grid_pinpoints = image_grid_pinpoints
+
+
+class TestProcessAnyresImage(unittest.TestCase):
+    def test_uses_crop_size_when_present(self):
+        img = Image.new("RGB", (100, 50), color=(5, 6, 7))
+        processor = _DummyProcessor(
+            crop_size={"height": 224}, size={"height": 224, "shortest_edge": 224}
+        )
+        out = mm_utils.process_anyres_image(img, processor, "[(224, 224), (448, 448)]")
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.shape[1:], (3, 224, 224))
+        self.assertGreaterEqual(out.shape[0], 2)
+
+    def test_falls_back_to_shortest_edge_when_crop_size_none(self):
+        img = Image.new("RGB", (100, 50), color=(5, 6, 7))
+        processor = _DummyProcessor(
+            crop_size=None, size={"height": 224, "shortest_edge": 224}
+        )
+        out = mm_utils.process_anyres_image(img, processor, "(1x1)(2x2)")
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.shape[1:], (3, 224, 224))
+
+
+class TestProcessImages(unittest.TestCase):
+    def test_pad_path_stacks_when_shapes_match(self):
+        images = [Image.new("RGB", (32, 16), color=(1, 2, 3)), Image.new("RGB", (16, 32), color=(1, 2, 3))]
+        processor = _DummyProcessor(crop_size={"height": 32}, size={"height": 32})
+        cfg = _DummyCfg("pad")
+        out = mm_utils.process_images(images, processor, cfg)
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.shape, (2, 3, 32, 32))
+
+    def test_anyres_path_stacks_when_shapes_match(self):
+        images = [Image.new("RGB", (32, 16), color=(1, 2, 3)), Image.new("RGB", (128, 32), color=(1, 2, 3))]
+        processor = _DummyProcessor(
+            crop_size={"height": 224}, size={"height": 224, "shortest_edge": 224}
+        )
+        cfg = _DummyCfg("anyres", "[(224, 224), (448, 448)]")
+        out = mm_utils.process_images(images, processor, cfg)
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.shape[0], 2)
+
+    def test_anyres_path_keeps_list_for_mismatched_shapes(self):
+        original = mm_utils.process_anyres_image
+
+        def _fake_process_anyres_image(image, _processor, _pinpoints):
+            # Force one image to produce a different first-dimension length.
+            n = 2 if image.size[0] < 100 else 3
+            return np.zeros((n, 3, 8, 8), dtype=np.float32)
+
+        mm_utils.process_anyres_image = _fake_process_anyres_image
+        try:
+            images = [
+                Image.new("RGB", (32, 16), color=(1, 2, 3)),
+                Image.new("RGB", (128, 32), color=(1, 2, 3)),
+            ]
+            processor = _DummyProcessor(
+                crop_size={"height": 224}, size={"height": 224, "shortest_edge": 224}
+            )
+            cfg = _DummyCfg("anyres", "[(224, 224), (448, 448)]")
+            out = mm_utils.process_images(images, processor, cfg)
+            self.assertIsInstance(out, list)
+            self.assertEqual(len(out), 2)
+        finally:
+            mm_utils.process_anyres_image = original
+
+    def test_default_path_uses_processor_call(self):
+        images = [Image.new("RGB", (24, 24), color=(1, 2, 3))]
+        processor = _DummyProcessor(crop_size={"height": 24}, size={"height": 24})
+        cfg = _DummyCfg("")
+        out = mm_utils.process_images(images, processor, cfg)
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.shape, (1, 3, 24, 24))
+
+
 if __name__ == "__main__":
     unittest.main()
 
