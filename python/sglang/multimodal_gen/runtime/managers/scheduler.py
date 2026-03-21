@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -97,6 +98,7 @@ class Scheduler:
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+            UpdateWeightFromTensorCheckerReqInput: self._handle_update_weight_checker,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
@@ -171,6 +173,15 @@ class Scheduler:
         req = reqs[0]
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
         return OutputBatch(output=checksums)
+
+    def _handle_update_weight_checker(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_tensor_checker request."""
+        req = reqs[0]
+        success, message = self.worker.update_weight_from_tensor_checker(req)
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
