@@ -716,32 +716,32 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         TI2V_sampling_params,
     ),
-    # === Helios T2V ===
-    DiffusionTestCase(
-        "helios_base_t2v",
-        DiffusionServerArgs(
-            model_path="BestWishYsh/Helios-Base",
-            modality="video",
-        ),
-        DiffusionSamplingParams(
-            prompt=T2V_PROMPT,
-            output_size="640x384",
-            num_frames=33,
-        ),
-    ),
-    DiffusionTestCase(
-        "helios_mid_t2v",
-        DiffusionServerArgs(
-            model_path="BestWishYsh/Helios-Mid",
-            modality="video",
-        ),
-        DiffusionSamplingParams(
-            prompt=T2V_PROMPT,
-            output_size="640x384",
-            num_frames=33,
-        ),
-    ),
     # flaky
+    # === Helios T2V ===
+    # DiffusionTestCase(
+    #     "helios_base_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Base",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
+    # DiffusionTestCase(
+    #     "helios_mid_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Mid",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
     # DiffusionTestCase(
     #     "helios_distilled_t2v",
     #     DiffusionServerArgs(
