@@ -36,13 +36,13 @@ runs:
         fi
 
         MSG=$(printf "%s\n" \
-          "⚠️ CI Maintenance Mode is Active" \
+          "## ⚠️ CI Maintenance Mode is Active" \
           "The CI infrastructure is currently under maintenance." \
           "All PR CI runs are paused until maintenance is complete." \
           "" \
           "What should you do?" \
           "- Check back later (~12 hours)" \
-          "- Follow CI Maintenance Mode (issue #$MAINTENANCE_ISSUE): https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+          "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
 
         echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
         while IFS= read -r line; do
