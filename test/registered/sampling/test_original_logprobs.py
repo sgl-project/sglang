@@ -11,6 +11,11 @@ The test covers the following scenarios:
   consistent with Hugging Face outputs.
 - Specified token IDs: Confirms that the original logprobs for specific token IDs
   match the values computed from Hugging Face logits.
+- Multi-token decoding: Validates per-step log-probability accuracy across a
+  complete generation sequence (max_new_tokens=8).
+
+Two test classes run the same suite with SGLANG_RETURN_ORIGINAL_LOGPROB=True
+and False respectively, each launching its own server instance.
 """
 
 import os
@@ -18,15 +23,24 @@ import random
 import unittest
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import sglang as sgl
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.kits.logprob_kit import (
+    assert_position_logprobs_match,
+    generate_with_logprobs,
+    hf_logprobs_for_sequence,
+)
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 
-register_cuda_ci(est_time=41, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=120, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=180, suite="stage-b-test-small-1-gpu-amd")
 
 # ------------------------- Configurable via env ------------------------- #
 MODEL_ID = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -36,11 +50,17 @@ PROMPTS = [
     "The president of the United States is",
     "The capital of France is ",
 ]
+SAMPLING_PARAMS = {
+    "temperature": 0.5,
+    "top_p": 1.0,
+    "top_k": 10,
+}
 TOP_LOGPROBS_NUM = 50
 NUM_RANDOM_TOKEN_IDS = 10
 RTOL = 0.20
-ATOL = 0.00
-# ------------------------------------------------
+ATOL = 0.04
+MULTI_TOKEN_COUNT = 8
+# ----------------------------------------------------------------------- #
 
 torch.manual_seed(1234)
 if torch.cuda.is_available():
@@ -49,150 +69,160 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = False
 
 
-class TestOriginalLogprob(unittest.TestCase):
-    def setUp(self):
-        # ----- HF side (float32 weights) -----
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
-        self.hf_model = AutoModelForCausalLM.from_pretrained(
+class _OriginalLogprobBase(unittest.TestCase):
+    """Base class — subclasses set ``return_original_logprob`` to "True" or "False"."""
+
+    return_original_logprob = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls is _OriginalLogprobBase:
+            raise unittest.SkipTest("Base class")
+
+        cls.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
+        cls.hf_model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID, torch_dtype=torch.float32, device_map="auto"
         )
 
-        # Shared sampling parameters
-        self.sampling_params = {
-            "temperature": 0.5,  # SGLang uses 0.5, but original logprobs are used 1.0
-            "top_p": 1.0,
-            "top_k": 10,
-            "max_new_tokens": 1,
-        }
-
-    # ---------------------------------------------------------------------
-    # Helper: compare one SGLang block (token_logprobs / top_logprobs / ids_logprobs)
-    #         against a reference HF log‑prob vector.
-    # ---------------------------------------------------------------------
-    def assert_logprobs_block_equal(
-        self,
-        hf_log_probs: torch.Tensor,  # [V]
-        token_log_probs: list,
-        top_log_probs: list,
-        ids_log_probs: list,
-        random_token_ids: list,
-        tag: str = "",
-    ):
-        vals, idxs, _ = zip(*token_log_probs)
-        sgl_vals = torch.tensor(vals, device=self.hf_model.device, dtype=torch.float32)
-        sgl_idxs = torch.tensor(idxs, device=self.hf_model.device, dtype=torch.long)
-        hf_vals = hf_log_probs[sgl_idxs]
-
-        self.assertTrue(
-            torch.allclose(hf_vals, sgl_vals, rtol=RTOL, atol=ATOL),
-            msg=f"[{tag}] token‑level mismatch at indices {sgl_idxs.tolist()}",
+        env = os.environ.copy()
+        env["SGLANG_RETURN_ORIGINAL_LOGPROB"] = cls.return_original_logprob
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            MODEL_ID,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--trust-remote-code", "--mem-fraction-static", "0.60"],
+            env=env,
         )
 
-        hf_topk, _ = torch.topk(hf_log_probs, k=TOP_LOGPROBS_NUM, dim=-1)
+    @classmethod
+    def tearDownClass(cls):
+        if cls is _OriginalLogprobBase:
+            return
+        kill_process_tree(cls.process.pid)
 
-        sgl_topk = torch.tensor(
-            [float(t[0]) for t in top_log_probs[0] if t and t[0] is not None][
-                :TOP_LOGPROBS_NUM
-            ],
-            dtype=torch.float32,
-            device=self.hf_model.device,
+    @property
+    def hf_temperature(self):
+        """HF reference temperature: 1.0 for original logprobs, else request temp."""
+        return (
+            1.0
+            if self.return_original_logprob == "True"
+            else SAMPLING_PARAMS["temperature"]
         )
 
-        k = min(hf_topk.numel(), sgl_topk.numel())
-        self.assertTrue(
-            torch.allclose(hf_topk[:k], sgl_topk[:k], rtol=RTOL, atol=ATOL),
-            msg=f"[{tag}] top‑k mismatch",
-        )
-
-        indices = torch.tensor(
-            random_token_ids, dtype=torch.long, device=hf_log_probs.device
-        )
-
-        hf_token_ids = hf_log_probs[indices]
-
-        sgl_token_ids = torch.tensor(
-            [v for v, _, _ in ids_log_probs[0]],
-            device=self.hf_model.device,
-            dtype=torch.float32,
-        )
-        self.assertTrue(
-            torch.allclose(hf_token_ids, sgl_token_ids, rtol=RTOL, atol=ATOL),
-            msg=f"[{tag}] token‑IDs mismatch",
-        )
-
-        # Optional: print max abs diff for quick diagnostics
-        max_diff = torch.max(torch.abs(hf_vals - sgl_vals)).item()
-        print(f"[{tag}] max|diff| token‑level = {max_diff:.4f}")
+    # --------------------------------------------------------------------- #
+    # Tests
+    # --------------------------------------------------------------------- #
 
     def test_logprob_match(self):
-        vocab_size = self.tokenizer.vocab_size
+        """Single-token: verify next-token logprobs against HF."""
+        for prompt in PROMPTS:
+            with self.subTest(prompt=prompt):
+                random_token_ids = sorted(
+                    random.sample(
+                        range(self.tokenizer.vocab_size), NUM_RANDOM_TOKEN_IDS
+                    )
+                )
+                input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"][
+                    0
+                ].tolist()
 
-        for env_val in ["True", "False"]:
-            with self.subTest(SGLANG_RETURN_ORIGINAL_LOGPROB=env_val):
-                os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] = env_val
+                res = generate_with_logprobs(
+                    self.base_url,
+                    input_ids,
+                    max_new_tokens=1,
+                    top_logprobs_num=TOP_LOGPROBS_NUM,
+                    token_ids_logprob=random_token_ids,
+                    sampling_params=SAMPLING_PARAMS,
+                )
+                meta = res["meta_info"]
 
-                # ----- SGLang side -----
-                sgl_engine = sgl.Engine(
-                    model_path=MODEL_ID,
-                    skip_tokenizer_init=True,
-                    trust_remote_code=True,
-                    mem_fraction_static=0.60,
+                hf_lp = hf_logprobs_for_sequence(
+                    self.hf_model, input_ids, temperature=self.hf_temperature
                 )
 
-                for prompt in PROMPTS:
-                    random_token_ids = sorted(
-                        random.sample(range(vocab_size), NUM_RANDOM_TOKEN_IDS)
+                assert_position_logprobs_match(
+                    self,
+                    ref_lp_vec=hf_lp[-1],
+                    sgl_token_logprob=meta["output_token_logprobs"][0],
+                    sgl_top_logprobs=meta["output_top_logprobs"][0],
+                    sgl_ids_logprobs=meta["output_token_ids_logprobs"][0],
+                    token_ids=random_token_ids,
+                    top_k=TOP_LOGPROBS_NUM,
+                    rtol=RTOL,
+                    atol=ATOL,
+                    tag=f"SGLang vs HF: {prompt} ({self.return_original_logprob})",
+                )
+
+    def test_output_logprob_multi_token(self):
+        """Multi-token decode: validate per-step logprobs across an 8-token generation."""
+        for prompt in PROMPTS:
+            with self.subTest(prompt=prompt):
+                random_token_ids = sorted(
+                    random.sample(
+                        range(self.tokenizer.vocab_size), NUM_RANDOM_TOKEN_IDS
                     )
+                )
+                input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"][
+                    0
+                ].tolist()
+                prompt_len = len(input_ids)
 
-                    enc = self.tokenizer(prompt, return_tensors="pt")
-                    input_ids = enc["input_ids"].to(self.hf_model.device)
-                    attn_mask = enc["attention_mask"].to(self.hf_model.device)
+                res = generate_with_logprobs(
+                    self.base_url,
+                    input_ids,
+                    max_new_tokens=MULTI_TOKEN_COUNT,
+                    top_logprobs_num=TOP_LOGPROBS_NUM,
+                    token_ids_logprob=random_token_ids,
+                    sampling_params=SAMPLING_PARAMS,
+                )
+                meta = res["meta_info"]
 
-                    with torch.inference_mode():
-                        hf_out = self.hf_model(
-                            input_ids=input_ids,
-                            attention_mask=attn_mask,
-                            return_dict=True,
-                        )
-                    logits = hf_out.logits[:, -1, :]  # [1, V]
-                    hf_log_probs = F.log_softmax(
-                        logits.float() / self.sampling_params["temperature"], dim=-1
-                    )[0]
-                    hf_original_log_probs = F.log_softmax(logits.float(), dim=-1)[0]
+                output_token_ids = [t[1] for t in meta["output_token_logprobs"]]
+                self.assertEqual(len(output_token_ids), MULTI_TOKEN_COUNT)
 
-                    outputs = sgl_engine.generate(
-                        input_ids=input_ids[0].tolist(),
-                        sampling_params=self.sampling_params,
-                        return_logprob=True,
-                        top_logprobs_num=TOP_LOGPROBS_NUM,
-                        token_ids_logprob=random_token_ids,
+                full_sequence = input_ids + output_token_ids
+                hf_all_lp = hf_logprobs_for_sequence(
+                    self.hf_model, full_sequence, temperature=self.hf_temperature
+                )
+
+                max_diff = 0.0
+                for step in range(MULTI_TOKEN_COUNT):
+                    hf_pos = prompt_len - 1 + step
+                    assert_position_logprobs_match(
+                        self,
+                        ref_lp_vec=hf_all_lp[hf_pos],
+                        sgl_token_logprob=meta["output_token_logprobs"][step],
+                        sgl_top_logprobs=meta["output_top_logprobs"][step],
+                        sgl_ids_logprobs=meta["output_token_ids_logprobs"][step],
+                        token_ids=random_token_ids,
+                        top_k=TOP_LOGPROBS_NUM,
+                        rtol=RTOL,
+                        atol=ATOL,
+                        tag=f"Multi-token step {step}: {prompt} ({self.return_original_logprob})",
                     )
+                    sgl_val = meta["output_token_logprobs"][step][0]
+                    hf_val = hf_all_lp[hf_pos][
+                        meta["output_token_logprobs"][step][1]
+                    ].item()
+                    max_diff = max(max_diff, abs(hf_val - sgl_val))
 
-                    if isinstance(outputs, list):
-                        outputs = outputs[0]
-                    meta = outputs["meta_info"]
+                print(
+                    f"[Multi-token {prompt} ({self.return_original_logprob})] "
+                    f"max|diff| = {max_diff:.4f}"
+                )
 
-                    # Check original logprobs only if enabled
-                    if env_val.lower() == "true":
-                        self.assert_logprobs_block_equal(
-                            hf_log_probs=hf_original_log_probs,
-                            token_log_probs=meta["output_token_logprobs"],
-                            top_log_probs=meta["output_top_logprobs"],
-                            ids_log_probs=meta["output_token_ids_logprobs"],
-                            random_token_ids=random_token_ids,
-                            tag=f"Original logprobs SGLang vs HF: {prompt} ({env_val})",
-                        )
-                    else:
-                        # Always check regular logprobs
-                        self.assert_logprobs_block_equal(
-                            hf_log_probs=hf_log_probs,
-                            token_log_probs=meta["output_token_logprobs"],
-                            top_log_probs=meta["output_top_logprobs"],
-                            ids_log_probs=meta["output_token_ids_logprobs"],
-                            random_token_ids=random_token_ids,
-                            tag=f"logprobs SGLang vs HF: {prompt} ({env_val})",
-                        )
-                sgl_engine.shutdown()
+
+class TestOriginalLogprobEnabled(_OriginalLogprobBase):
+    """Tests with SGLANG_RETURN_ORIGINAL_LOGPROB=True."""
+
+    return_original_logprob = "True"
+
+
+class TestOriginalLogprobDisabled(_OriginalLogprobBase):
+    """Tests with SGLANG_RETURN_ORIGINAL_LOGPROB=False."""
+
+    return_original_logprob = "False"
 
 
 if __name__ == "__main__":

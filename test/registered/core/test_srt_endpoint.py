@@ -18,13 +18,13 @@ import requests
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.logprob_kit import run_logprob_check
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
-    run_logprob_check,
 )
 
 register_cuda_ci(est_time=127, suite="stage-b-test-small-1-gpu")
