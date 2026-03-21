@@ -26,8 +26,6 @@ runs:
           exit 0
         fi
 
-        echo "::warning::CI Maintenance Mode is ACTIVE (issue #$MAINTENANCE_ISSUE is open)"
-
         # For PRs, check if bypass-maintenance label is present
         if [[ -n "$PR_NUMBER" ]]; then
           HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
@@ -43,7 +41,7 @@ runs:
           echo "::error::The CI infrastructure is currently under maintenance."
           echo "::error::All PR CI runs are paused until maintenance is complete."
           echo "::error::"
-          echo "::error::What should I do?"
+          echo "::error::What should you do?"
           echo "::error::- Check back later (~12 hours)"
           echo "::error::- Follow CI Maintenance Mode (issue #$MAINTENANCE_ISSUE): https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates"
           echo "::error::"
