@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.mm_utils import MMSendWrapper
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
@@ -325,9 +326,10 @@ class MultiTokenizerRouter:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
+        send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
+        self.send_to_scheduler = MMSendWrapper(send_to_scheduler)
         self.receive_from_worker = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
         )
