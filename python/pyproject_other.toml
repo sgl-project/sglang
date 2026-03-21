@@ -19,6 +19,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
   "IPython",
   "aiohttp",
+  "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "av",
@@ -61,6 +62,7 @@ runtime_common = [
   "transformers==5.3.0",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xgrammar==0.1.27",
   "smg-grpc-servicer>=0.5.0",
 ]
@@ -107,6 +109,13 @@ diffusion_hip = [
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
+
+# https://docs.sglang.io/platforms/metax_gpu.md
+# Metax MACA (CUDA API–compatible): use vendor PyTorch; no PyPI torch/sglang-kernel/flashinfer wheels.
+srt_metax = [
+  "sglang[runtime_common]",
+  "nvidia-ml-py",
+]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
@@ -159,11 +168,13 @@ test = [
 
 all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_metax = ["sglang[srt_metax]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_metax = ["sglang[all_metax]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
 
