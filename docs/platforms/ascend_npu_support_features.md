@@ -151,6 +151,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--served-model-name`   | `None`    | Type: str                      |      A2, A3      |
 | `--weight-version`      | `default` | Type: str                      |      A2, A3      |
 | `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
+| `--hf-chat-template-name` | `None`  | Type: str                      |      A2, A3      |
 | `--completion-template` | `None`    | Type: str                      |      A2, A3      |
 | `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
 | `--reasoning-parser`    | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3`                  |      A2, A3      |
