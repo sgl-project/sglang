@@ -786,7 +786,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=True,
+            is_aiter_moe=_use_aiter,
             is_concat=True,
             is_packed=False,
         )
