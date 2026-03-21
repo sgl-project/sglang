@@ -102,6 +102,7 @@ docker pull "${IMAGE}"
 docker run --rm \
   -v $(pwd):/sgl-kernel \
   -e AMDGPU_TARGET="${AMDGPU_TARGET}" \
+  -e PYTHON_ROOT_PATH="${PYTHON_ROOT_PATH}" \
   ${IMAGE} \
   bash -c "
   # Install CMake (version >= 3.26) - Robust Installation
