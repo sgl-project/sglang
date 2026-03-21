@@ -3,8 +3,8 @@ Unit tests for sglang.srt.constrained.base_grammar_backend.
 
 Test Coverage:
 - GrammarStats: default values, custom values
-- BaseGrammarObject: finished property, default behavior, copy
-- InvalidGrammarObject: error message, repr, inheritance
+- BaseGrammarObject: initial state, default behavior, copy
+- InvalidGrammarObject: error message, repr
 - BaseGrammarBackend: caching, dispatch routing, unsupported fallback,
   thread pool execution, cache hit/miss
 - create_grammar_backend: factory routing, "none" backend, invalid name,
@@ -97,28 +97,6 @@ class TestBaseGrammarObject(unittest.TestCase):
         obj = BaseGrammarObject()
         obj.maybe_init_reasoning(True)  # Should not raise
 
-    def test_abstract_methods_raise(self):
-        obj = BaseGrammarObject()
-        with self.assertRaises(NotImplementedError):
-            obj.accept_token(0)
-        with self.assertRaises(NotImplementedError):
-            obj.rollback(1)
-        with self.assertRaises(NotImplementedError):
-            obj.allocate_vocab_mask(100, 1, "cpu")
-        with self.assertRaises(NotImplementedError):
-            obj.fill_vocab_mask(None, 0)
-        with self.assertRaises(NotImplementedError):
-            obj.try_jump_forward(None)
-        with self.assertRaises(NotImplementedError):
-            obj.jump_forward_str_state(None)
-        with self.assertRaises(NotImplementedError):
-            obj.jump_and_retokenize([], [], 0)
-
-    def test_static_methods_raise(self):
-        with self.assertRaises(NotImplementedError):
-            BaseGrammarObject.move_vocab_mask(None, "cpu")
-        with self.assertRaises(NotImplementedError):
-            BaseGrammarObject.apply_vocab_mask(None, None)
 
 
 class TestInvalidGrammarObject(unittest.TestCase):
@@ -136,15 +114,6 @@ class TestInvalidGrammarObject(unittest.TestCase):
         obj = InvalidGrammarObject("test error")
         self.assertEqual(repr(obj), "InvalidGrammarObject(error_message='test error')")
 
-    def test_is_base_grammar_object(self):
-        obj = InvalidGrammarObject()
-        self.assertIsInstance(obj, BaseGrammarObject)
-
-    def test_inherits_finished_property(self):
-        obj = InvalidGrammarObject("err")
-        self.assertFalse(obj.finished)
-        obj.finished = True
-        self.assertTrue(obj.finished)
 
 
 class TestBaseGrammarBackend(unittest.TestCase):

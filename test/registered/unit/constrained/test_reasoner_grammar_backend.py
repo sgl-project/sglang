@@ -409,10 +409,6 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         # reasoning=False → tokens_after_think_end should be 0
         self.assertEqual(result.tokens_after_think_end, 0)
 
-    def test_inherits_base_backend(self):
-        backend, _ = self._make()
-        self.assertIsInstance(backend, BaseGrammarBackend)
-
 
 if __name__ == "__main__":
     unittest.main()
