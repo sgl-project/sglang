@@ -657,11 +657,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
-                    # detokenizer (it holds back text at word boundaries). Return None
-                    # for logprobs since no new tokens were generated for this text.
-                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                    # Only populate logprobs when there are actual new tokens
+                    # to report. The detokenizer may flush buffered text in
+                    # chunks where no new tokens were generated, so skip those.
+                    if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
                             content, n_prev_token
                         )
