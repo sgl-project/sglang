@@ -20,6 +20,15 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 from sglang.srt.compilation.fusion.pattern import OpPatternBase, OpPatternRegistery
 
 
+def _is_cutedsl_dual_gemm_available():
+    try:
+        from sglang.jit_kernel.cutedsl_dual_gemm import cutedsl_dual_gemm  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 class _DualGemmPattern(OpPatternBase):
     @staticmethod
     @abstractmethod
@@ -32,37 +41,27 @@ class _DualGemmPattern(OpPatternBase):
 class TritonFusedOpsDualGemmPattern(_DualGemmPattern):
     @staticmethod
     def pattern(x, w, out):
-        return torch.ops.sglang.dual_gemm.default(x, w)
+        return torch.ops.sglang.triton_dual_gemm.default(x, w)
 
 
-# op: sgl-kernel/dual_mm
-class CutlassDualGemmPattern(_DualGemmPattern):
+# op: cutedsl_dual_gemm (registered via @register_custom_op decorator)
+class CuteDSLDualGemmPattern(_DualGemmPattern):
     @staticmethod
     def pattern(x, w, out):
-        w_gate, w_up = torch.split(w, w.shape[1] // 2, dim=1)
-        dual_mm = auto_functionalized_v2(
-            torch.sgl_kernel.dual_mm.out,
-            a=x,
-            b0=w_gate,
-            b1=w_up,
-            post_grad_name="",
-            epilogue_name="silu",
-            out_shape=(x.shape[0], w.shape[1] // 2),
-            out_stride=out.stride(),
-            out_dtype=out.dtype,
-            a_scale=None,
-            b_scale=None,
-            o_scale=None,
+        result = auto_functionalized_v2(
+            torch.ops.sglang.cutedsl_dual_gemm.default,
+            x=x,
+            w=w,
             _out_base_index=0,
             _all_bases=[out],
         )
-        return dual_mm[1]
+        return result[1]
 
 
 class _DualGemmPatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
-        if False:
-            self.register_op_pattern(CutlassDualGemmPattern)
+        if _is_cutedsl_dual_gemm_available():
+            self.register_op_pattern(CuteDSLDualGemmPattern)
         else:
             self.register_op_pattern(TritonFusedOpsDualGemmPattern)
 
@@ -82,37 +81,32 @@ class _DualGemmFp8Pattern(OpPatternBase):
 class TritonFusedOpsDualGemmFp8Pattern(_DualGemmFp8Pattern):
     @staticmethod
     def pattern(x, w, x_scale, w_scale, o_scale, output_q):
-        return torch.ops.sglang.dual_gemm.default(x, w, x_scale, w_scale, o_scale)
+        return torch.ops.sglang.triton_dual_gemm.default(
+            x, w, x_scale, w_scale, o_scale
+        )
 
 
-# op: sgl-kernel/dual_mm
-class CutlassDualGemmFp8Pattern(_DualGemmFp8Pattern):
+# op: cutedsl_dual_gemm (registered via @register_custom_op decorator)
+class CuteDSLDualGemmFp8Pattern(_DualGemmFp8Pattern):
     @staticmethod
     def pattern(x, w, x_scale, w_scale, o_scale, output_q):
-        w_gate, w_up = torch.split(w, w.shape[1] // 2, dim=1)
-        dual_mm = auto_functionalized_v2(
-            torch.ops.sgl_kernel.dual_mm.out,
-            a=x,
-            b0=w_gate,
-            b1=w_up,
-            post_grad_name="",
-            epilogue_name="silu",
-            out_shape=(x.shape[0], w.shape[1] // 2),
-            out_stride=output_q.stride(),
-            out_dtype=output_q.dtype,
-            a_scale=x_scale,
-            b_scale=w_scale,
-            o_scale=1 / o_scale,
+        result = auto_functionalized_v2(
+            torch.ops.sglang.cutedsl_dual_gemm.default,
+            x=x,
+            w=w,
+            x_scale=x_scale,
+            w_scale=w_scale,
+            o_scale=o_scale,
             _out_base_index=0,
             _all_bases=[output_q],
         )
-        return dual_mm[1]
+        return result[1]
 
 
 class _DualGemmFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
-        if False:
-            self.register_op_pattern(CutlassDualGemmFp8Pattern)
+        if _is_cutedsl_dual_gemm_available():
+            self.register_op_pattern(CuteDSLDualGemmFp8Pattern)
         else:
             self.register_op_pattern(TritonFusedOpsDualGemmFp8Pattern)
 

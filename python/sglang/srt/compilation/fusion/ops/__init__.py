@@ -16,6 +16,6 @@ from .flashinfer_ops import register_flashinfer_fused_ops
 from .triton_ops import register_triton_fused_ops
 
 
-def register_fused_ops():
+def register_fused_ops() -> None:
     register_triton_fused_ops()
     register_flashinfer_fused_ops()

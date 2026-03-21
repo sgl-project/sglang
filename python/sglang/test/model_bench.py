@@ -17,12 +17,13 @@ import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Callable, Optional, Self
 
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
@@ -38,15 +39,11 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_runner import torch_compile
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import _get_quantization_config
-from sglang.srt.model_loader.utils import (
-    get_model_architecture,
-    post_load_weights,
-    set_default_torch_dtype,
-)
-from sglang.srt.model_loader.weight_utils import initialize_dummy_weights
+from sglang.srt.model_loader.utils import get_model_architecture
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import configure_logger
+from sglang.srt.utils import add_prefix, configure_logger
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +85,7 @@ class ModelBench(ABC):
         self._server_args = server_args
         self._bench_args = bench_args
         self._initializer = initializer
+        self._prefix = "model.layers.0"
 
     def __enter__(self):
         set_global_server_args_for_scheduler(self._server_args)
@@ -124,9 +122,16 @@ class ModelBench(ABC):
         )
 
         # Pre processing required for model loader
+        self._device_config = DeviceConfig(device=self._bench_args.init_device)
         self._model_config = ModelConfig.from_server_args(self._server_args)
-        self._load_config = LoadConfig(LoadFormat.DUMMY)
         self._model_class, _ = get_model_architecture(self._model_config)
+        self._load_config = LoadConfig(
+            load_format=(
+                LoadFormat.AUTO
+                if self._bench_args.use_real_weights
+                else LoadFormat.DUMMY
+            )
+        )
         self._quant_config = _get_quantization_config(
             self._model_config, self._load_config
         )
@@ -183,25 +188,64 @@ class ModelBench(ABC):
         return result
 
     def _init_model(self):
-        if self._bench_args.use_real_weights:
-            logger.warning(
-                "using real weights is currently not supported by model bench, defaulting to dummy weights."
+        """Initialize the model using the custom initializer via monkey-patching.
+
+        Monkey-patches ``loader._initialize_model`` so that ``get_model()``
+        delegates model construction to ``self._initializer`` instead of
+        the default ``model_class(**kwargs)`` path.  This lets callers
+        supply a partial model (e.g. just the MLP) while still going
+        through the full weight-loading and device-placement pipeline.
+        The original ``_initialize_model`` is always restored in the
+        ``finally`` block.
+        """
+        import sglang.srt.model_loader.loader as loader_module
+
+        original_initialize_model = loader_module._initialize_model
+        orig_named_parameters = None
+
+        def _custom_initialize_model(model_config, load_config, quant_config=None):
+            nonlocal orig_named_parameters
+            model = self._initializer(self, model_config.hf_config, quant_config)
+            if self._load_config.load_format == LoadFormat.AUTO:
+                weight_prefix = getattr(model, "_weight_prefix", "")
+
+                if getattr(self._model_class, "load_weights", None) is not None:
+                    model.load_weights = MethodType(
+                        self._model_class.load_weights, model
+                    )
+
+                # Override named_parameters to prepend the weight prefix
+                # so that params_dict keys match checkpoint weight names.
+                # This is needed for stacked_params_mapping (e.g.
+                # ".gate_proj" → ".gate_up_proj") which relies on the
+                # leading dot from the full module path.
+                # The override is restored after get_model() returns to
+                # avoid confusing TorchDynamo's __func__ introspection.
+                orig_named_parameters = model.named_parameters
+
+                def _prefixed_named_parameters(prefix="", recurse=True):
+                    effective = f"{weight_prefix}.{prefix}" if prefix else weight_prefix
+                    return orig_named_parameters(prefix=effective, recurse=recurse)
+
+                model.named_parameters = _prefixed_named_parameters
+
+                model.config = self._hf_config
+                model.quant_config = self._quant_config
+                model.model = SimpleNamespace()
+
+            return model
+
+        loader_module._initialize_model = _custom_initialize_model
+        try:
+            self._model = get_model(
+                model_config=self._model_config,
+                load_config=self._load_config,
+                device_config=self._device_config,
             )
-
-        with set_default_torch_dtype(self._model_config.dtype):
-            # model initialization
-            self._model = self._initializer(
-                self, self._model_config.hf_config, self._quant_config
-            )
-
-            # Post processing step of dummy model loader
-            for _, module in self._model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            initialize_dummy_weights(self._model)
-            post_load_weights(self._model, self._model_config)
+        finally:
+            loader_module._initialize_model = original_initialize_model
+            if self._load_config.load_format == LoadFormat.AUTO:
+                self._model.named_parameters = orig_named_parameters
 
     def _init_attention_backend(self):
         if self._server_args.attention_backend == "dummy":
@@ -439,13 +483,16 @@ class LlamaBench(ModelBench):
     def init_mlp(self):
         from sglang.srt.models.llama import LlamaMLP
 
-        return LlamaMLP(
+        prefix = add_prefix("mlp", self._prefix)
+        model = LlamaMLP(
             self._hf_config.hidden_size,
             self._hf_config.intermediate_size,  # type: ignore
             self._hf_config.hidden_act,  # type: ignore
             self._quant_config,
-            "llama_mlp",
+            prefix=prefix,
         )
+        model._weight_prefix = prefix
+        return model
 
     def get_rand_input_forward_batch(self):
         forward_batch = SimpleNamespace(

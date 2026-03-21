@@ -42,7 +42,8 @@ def dual_gemm_kernel(
     w_up_ptr,
     o_ptr,
     x_scale_ptr,
-    w_scale_ptr,
+    w_scale_gate_ptr,
+    w_scale_up_ptr,
     o_scale_ptr,
     USE_SCALE: tl.constexpr,
     xrow_stride: tl.constexpr,
@@ -122,9 +123,10 @@ def dual_gemm_kernel(
         w_up_block_ptr = tl.advance(w_up_block_ptr, offsets=(BLOCK_SIZE_N, 0))
 
     if USE_SCALE:
-        scale = tl.load(w_scale_ptr) * tl.load(x_scale_ptr)
+        gate_scale = tl.load(w_scale_gate_ptr) * tl.load(x_scale_ptr)
+        up_scale = tl.load(w_scale_up_ptr) * tl.load(x_scale_ptr)
         o_scale_inv = 1.0 / tl.load(o_scale_ptr)
-        acc_up = (acc_up * scale) * silu(acc_gate * scale)
+        acc_up = (acc_up * up_scale) * silu(acc_gate * gate_scale)
         acc_up = tl.clamp(acc_up * o_scale_inv, min_val, max_val)
     else:
         acc_up *= silu(acc_gate)
@@ -149,6 +151,24 @@ def dual_gemm(
     out = torch.empty((M, K), device=x.device, dtype=x.dtype)
     w_gate, w_up = torch.split(w, w.shape[1] // 2, dim=1)
 
+    # Extract separate gate/up weight scales:
+    #   numel()==1 : single per-tensor scale for both
+    #   numel()==2 : fused per-tensor (w_scale[0] for gate, w_scale[1] for up)
+    #   numel()>2  : per-channel (2*K,) — gate at index 0, up at index K
+    if w_scale is not None:
+        if w_scale.numel() == 1:
+            w_scale_gate = w_scale
+            w_scale_up = w_scale
+        elif w_scale.numel() == 2:
+            w_scale_gate = w_scale[0].reshape(1)
+            w_scale_up = w_scale[1].reshape(1)
+        else:
+            w_scale_gate = w_scale[0].reshape(1)
+            w_scale_up = w_scale[K].reshape(1)
+    else:
+        w_scale_gate = None
+        w_scale_up = None
+
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),
@@ -156,7 +176,7 @@ def dual_gemm(
 
     # fmt: off
     dual_gemm_kernel[grid](
-        x,w_gate,w_up,out,x_scale,w_scale,o_scale,
+        x,w_gate,w_up,out,x_scale,w_scale_gate,w_scale_up,o_scale,
         x_scale is not None and w_scale is not None and o_scale is not None,
         x.stride(0),x.stride(1),
         w_up.stride(0),w_up.stride(1),

@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import copy
 import os
 from typing import Optional
 
@@ -21,6 +20,9 @@ import torch
 from torch._inductor.utils import run_and_get_code
 from transformers import LlamaConfig
 
+from sglang.srt.compilation.fusion.pattern.dual_gemm_pattern import (
+    _is_cutedsl_dual_gemm_available,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
@@ -69,6 +71,7 @@ def test_fused_activation_pass(model, model_initializer):
     bench_args = ModelBenchArgs(
         num_tokens=1,
         forward_mode=ForwardMode.DECODE,
+        use_real_weights=True,
     )
 
     with LlamaBench(server_args, bench_args, model_initializer) as bench:
@@ -76,8 +79,7 @@ def test_fused_activation_pass(model, model_initializer):
         hidden_states = bench.get_rand_input_hidden_states()
 
         # reference should be done before torch compile
-        ref_model = copy.deepcopy(bench.model)
-        ref_res = ref_model(hidden_states)
+        ref_res = bench.model(hidden_states)
 
         # torch compile run
         bench.torch_compile()
@@ -86,7 +88,11 @@ def test_fused_activation_pass(model, model_initializer):
 
         torch.testing.assert_close(ref_res, res)
 
-        assert "sglang.dual_gemm" in code
+        if _is_cutedsl_dual_gemm_available():
+            assert "sglang.cutedsl_dual_gemm" in code
+        else:
+            assert "sglang.triton_dual_gemm" in code
+
         assert "sgl_kernel.silu_and_mul" not in code
 
 

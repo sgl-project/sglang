@@ -33,7 +33,7 @@ def dual_gemm_fwd(
 
 def register_triton_fused_ops():
     direct_register_custom_op(
-        op_name="dual_gemm",
+        op_name="triton_dual_gemm",
         op_func=dual_gemm,
         mutates_args=[],
         fake_impl=dual_gemm_fake,

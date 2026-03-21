@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import copy
 import os
 from typing import Optional
 
@@ -79,8 +78,7 @@ def test_rmsnorm_quant_pass(model, model_initializer):
         forward_batch = bench.get_rand_input_forward_batch()
 
         # reference should be done before torch compile
-        ref_model = copy.deepcopy(bench.model)
-        ref_res = ref_model(positions, hidden_states, forward_batch, None)
+        ref_res = bench.model(positions, hidden_states, forward_batch, None)
 
         # torch compile run
         bench.torch_compile()

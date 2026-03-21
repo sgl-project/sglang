@@ -73,7 +73,7 @@ def enable_hf_transfer():
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
         try:
             # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
+            import hf_transfer  # type: ignore  # noqa
 
             huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
         except ImportError:
@@ -1167,10 +1167,19 @@ def initialize_dummy_weights(
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             if torch.finfo(param.data.dtype).bits < 16:
-                # uniform_ doesn't support < 16-bit datatypes (FP8)
+                # uniform_ doesn't support < 16-bit datatypes (FP8).
+                # Use a wider range so values survive the cast back to
+                # low-precision types (e.g. FP8 e4m3fn smallest subnormal
+                # is ~0.002, so the default [-1e-3, 1e-3] would all round
+                # to zero).
                 dtype = param.data.dtype
+                finfo = torch.finfo(dtype)
+                lo = max(low, -finfo.max)
+                hi = min(high, finfo.max)
+                if hi - lo < 2 * finfo.tiny:
+                    lo, hi = -finfo.tiny * 2, finfo.tiny * 2
                 tmp_param = param.data.to(torch.float16)
-                tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
+                tmp_param = tmp_param.uniform_(lo, hi, generator=generator).to(dtype)
                 param.data.copy_(tmp_param)
             else:
                 param.uniform_(low, high, generator=generator)
