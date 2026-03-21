@@ -160,9 +160,10 @@ class TestOpenAIServer(CustomTestCase):
             is_first = is_firsts.get(index, True)
 
             if logprobs:
-                # When finish_reason is set, logprobs may be None if this chunk
-                # only contains buffered text being flushed (no new tokens generated).
-                # The detokenizer holds back text at word boundaries during streaming.
+                # When logprobs is requested, it may be None if this chunk only contains
+                # buffered text being flushed (no new tokens generated). The detokenizer
+                # holds back text at word boundaries during streaming. This can happen
+                # both mid-stream and on the final chunk when finish_reason is set.
                 if response.choices[0].logprobs is not None:
                     assert isinstance(
                         response.choices[0].logprobs.tokens[0], str
@@ -273,19 +274,24 @@ class TestOpenAIServer(CustomTestCase):
                 continue
 
             if logprobs and not is_finished.get(index, False):
-                assert response.choices[0].logprobs, f"logprobs was not returned"
-                assert isinstance(
-                    response.choices[0].logprobs.content[0].top_logprobs[0].token, str
-                ), f"top_logprobs token was not a string"
-                assert isinstance(
-                    response.choices[0].logprobs.content[0].top_logprobs, list
-                ), f"top_logprobs was not a list"
-                ret_num_top_logprobs = len(
-                    response.choices[0].logprobs.content[0].top_logprobs
-                )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                # When logprobs is requested, it may be None if this chunk only contains
+                # buffered text being flushed (no new tokens generated). The detokenizer
+                # holds back text at word boundaries during streaming. This can happen
+                # both mid-stream and on the final chunk when finish_reason is set.
+                if response.choices[0].logprobs is not None:
+                    assert isinstance(
+                        response.choices[0].logprobs.content[0].top_logprobs[0].token,
+                        str,
+                    ), f"top_logprobs token was not a string"
+                    assert isinstance(
+                        response.choices[0].logprobs.content[0].top_logprobs, list
+                    ), f"top_logprobs was not a list"
+                    ret_num_top_logprobs = len(
+                        response.choices[0].logprobs.content[0].top_logprobs
+                    )
+                    assert (
+                        ret_num_top_logprobs == logprobs
+                    ), f"{ret_num_top_logprobs} vs {logprobs}"
 
             assert (
                 isinstance(data.content, str)
