@@ -1964,27 +1964,27 @@
         },
         "fsdp-inference": {
             "stages_ms": {
-                "InputValidationStage": 0.04,
-                "TextEncodingStage": 411.12,
-                "TimestepPreparationStage": 1.44,
-                "LatentPreparationStage": 0.1,
-                "DenoisingStage": 1569.61,
-                "DecodingStage": 41.43
+                "InputValidationStage": 0.07,
+                "TextEncodingStage": 605.9,
+                "LatentPreparationStage": 0.2,
+                "TimestepPreparationStage": 61.38,
+                "DenoisingStage": 2180.15,
+                "DecodingStage": 8.15
             },
             "denoise_step_ms": {
-                "0": 165.33,
-                "1": 158.34,
-                "2": 167.65,
-                "3": 179.11,
-                "4": 183.98,
-                "5": 175.08,
-                "6": 178.34,
-                "7": 178.53,
-                "8": 178.08
+                "0": 97.92,
+                "1": 228.71,
+                "2": 267.25,
+                "3": 266.93,
+                "4": 265.8,
+                "5": 263.33,
+                "6": 262.05,
+                "7": 261.54,
+                "8": 261.6
             },
-            "expected_e2e_ms": 2300.0,
-            "expected_avg_denoise_ms": 173.83,
-            "expected_median_denoise_ms": 178.08
+            "expected_e2e_ms": 3541.48,
+            "expected_avg_denoise_ms": 241.68,
+            "expected_median_denoise_ms": 262.05
         },
         "hunyuan3d_shape_gen": {
             "stages_ms": {
