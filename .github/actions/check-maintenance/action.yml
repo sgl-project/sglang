@@ -39,6 +39,8 @@ runs:
           "## ⚠️ CI Maintenance Mode is Active" \
           "The CI infrastructure is currently under maintenance." \
           "All PR CI runs are paused until maintenance is complete." \
+          "You might also experience unexpected failures during this period." \
+          "The team is working on the issue and will update the status as soon as possible." \
           "" \
           "What should you do?" \
           "- Check back later (~12 hours)" \
