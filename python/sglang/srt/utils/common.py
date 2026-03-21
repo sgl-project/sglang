@@ -2697,6 +2697,7 @@ def has_hf_quant_config(model_path: str) -> bool:
 
     from huggingface_hub import try_to_load_from_cache
 
+    # Check if the model_path is a HuggingFace model ID and exists locally
     result = try_to_load_from_cache(model_path, "hf_quant_config.json")
     if isinstance(result, str):
         return True
