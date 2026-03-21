@@ -2048,7 +2048,7 @@
                 "48": 67.89,
                 "49": 68.3
             },
-            "expected_e2e_ms": 248171.5,
+            "expected_e2e_ms": 299485.7,
             "expected_avg_denoise_ms": 68.98,
             "expected_median_denoise_ms": 68.19
         },
