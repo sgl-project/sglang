@@ -364,6 +364,8 @@ class TestQwen35PPAccuracy(unittest.TestCase):
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--tp-size",
+                2,
                 "--pp-size",
                 pp_size,
                 "--chunked-prefill-size",
