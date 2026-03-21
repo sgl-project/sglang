@@ -358,14 +358,14 @@ class TestQwen35PPAccuracy(unittest.TestCase):
             "Qwen/Qwen3.5-35B-A3B"  # replace with your Qwen Model if needed
         )
 
-    def run_gsm8k_test(self, pp_size):
+    def run_gsm8k_test(self, tp_size, pp_size):
         process = popen_launch_server(
             self.model_name,
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                2,
+                tp_size,
                 "--pp-size",
                 pp_size,
                 "--chunked-prefill-size",
@@ -390,8 +390,8 @@ class TestQwen35PPAccuracy(unittest.TestCase):
             kill_process_tree(process.pid)
 
     def test_pp_consistency(self):
-        baseline = self.run_gsm8k_test(pp_size=1)
-        pp_metrics = self.run_gsm8k_test(pp_size=2)
+        baseline = self.run_gsm8k_test(tp_size=2, pp_size=1)
+        pp_metrics = self.run_gsm8k_test(tp_size=1, pp_size=2)
 
         print(f"[Qwen35 PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
