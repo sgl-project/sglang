@@ -41,7 +41,9 @@ _TARGET = (
     / "multimodal"
     / "customized_mm_processor_utils.py"
 )
-spec = importlib.util.spec_from_file_location("customized_mm_processor_utils_test", str(_TARGET))
+spec = importlib.util.spec_from_file_location(
+    "customized_mm_processor_utils_test", str(_TARGET)
+)
 cmmpu = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(cmmpu)
@@ -105,4 +107,3 @@ class TestRegisterCustomizedProcessor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -48,7 +48,11 @@ class TestFindClosestAspectRatio(unittest.TestCase):
     def test_exact_match_is_selected(self):
         ratios = [(1, 1), (4, 3), (16, 9)]
         best = internvl_utils.find_closest_aspect_ratio(
-            aspect_ratio=4 / 3, target_ratios=ratios, width=400, height=300, image_size=32
+            aspect_ratio=4 / 3,
+            target_ratios=ratios,
+            width=400,
+            height=300,
+            image_size=32,
         )
         self.assertEqual(best, (4, 3))
 
@@ -141,4 +145,3 @@ class TestImageToPixelValues(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

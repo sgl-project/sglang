@@ -5,9 +5,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 import importlib.util
-import re
-import os
 import pathlib
+import re
 import sys
 import types
 import unittest
@@ -18,6 +17,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+
 
 # Load `base_processor.py` from source with lightweight stubs for heavy runtime deps.
 class Modality(enum.Enum):
@@ -82,14 +82,20 @@ def _install_stub_modules():
     _set_module("sglang.srt.server_args", server_args_mod)
 
     utils_mod = types.ModuleType("sglang.srt.utils")
-    utils_mod.envs = types.SimpleNamespace(SGLANG_USE_CUDA_IPC_TRANSPORT=types.SimpleNamespace(get=lambda: False))
+    utils_mod.envs = types.SimpleNamespace(
+        SGLANG_USE_CUDA_IPC_TRANSPORT=types.SimpleNamespace(get=lambda: False)
+    )
     utils_mod.is_cpu = lambda: True
     utils_mod.is_npu = lambda: False
     utils_mod.is_xpu = lambda: False
     utils_mod.load_audio = lambda data, sr=None: data
     utils_mod.load_image = lambda data: (data, (0, 0))
     utils_mod.load_video = lambda data, frame_count_limit=None: data
-    utils_mod.logger = types.SimpleNamespace(debug=lambda *a, **k: None, warning=lambda *a, **k: None, exception=lambda *a, **k: None)
+    utils_mod.logger = types.SimpleNamespace(
+        debug=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        exception=lambda *a, **k: None,
+    )
     _set_module("sglang.srt.utils", utils_mod)
 
     cuda_ipc_mod = types.ModuleType("sglang.srt.utils.cuda_ipc_transport_utils")
@@ -127,7 +133,9 @@ _TARGET = (
     / "processors"
     / "base_processor.py"
 )
-spec = importlib.util.spec_from_file_location("base_processor_test_module", str(_TARGET))
+spec = importlib.util.spec_from_file_location(
+    "base_processor_test_module", str(_TARGET)
+)
 base_processor_mod = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(base_processor_mod)
@@ -199,7 +207,9 @@ class TestMultimodalSpecialTokens(unittest.TestCase):
         self.assertTrue(tokens.image_token_regex.match("<image>"))
 
     def test_get_token_id_by_modality(self):
-        tokens = MultimodalSpecialTokens(image_token_id=11, video_token_id=22, audio_token_id=33)
+        tokens = MultimodalSpecialTokens(
+            image_token_id=11, video_token_id=22, audio_token_id=33
+        )
         self.assertEqual(tokens.get_token_id_by_modality(Modality.IMAGE), 11)
         self.assertEqual(tokens.get_token_id_by_modality(Modality.MULTI_IMAGES), 11)
         self.assertEqual(tokens.get_token_id_by_modality(Modality.VIDEO), 22)
@@ -279,7 +289,9 @@ class TestMmOffsets(unittest.TestCase):
 
 
 class _MinimalProcessor(BaseMultimodalProcessor):
-    async def process_mm_data_async(self, image_data, audio_data, input_text, request_obj, **kwargs):
+    async def process_mm_data_async(
+        self, image_data, audio_data, input_text, request_obj, **kwargs
+    ):
         raise NotImplementedError()
 
 
@@ -341,4 +353,3 @@ class TestProcessLoadedMmData(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

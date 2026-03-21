@@ -14,8 +14,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
-_EVS_CORE = _REPO_ROOT / "python" / "sglang" / "srt" / "multimodal" / "evs" / "evs_core.py"
-spec = importlib.util.spec_from_file_location("sglang_evs_core_for_test", os.fspath(_EVS_CORE))
+_EVS_CORE = (
+    _REPO_ROOT / "python" / "sglang" / "srt" / "multimodal" / "evs" / "evs_core.py"
+)
+spec = importlib.util.spec_from_file_location(
+    "sglang_evs_core_for_test", os.fspath(_EVS_CORE)
+)
 evs_core = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(evs_core)
@@ -135,4 +139,3 @@ class TestEvsInputIdHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

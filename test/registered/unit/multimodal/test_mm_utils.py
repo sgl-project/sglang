@@ -31,7 +31,6 @@ if os.name == "nt" and "resource" not in sys.modules:
     sys.modules["resource"] = resource_stub
 
 from sglang.srt.multimodal import mm_utils
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
@@ -70,38 +69,50 @@ class TestSelectBestResolution(unittest.TestCase):
     def test_selects_best_fit_by_effective_resolution(self):
         original = (1000, 500)
         possible = [(256, 256), (1024, 1024), (512, 512)]
-        self.assertEqual(mm_utils.select_best_resolution(original, possible), (1024, 1024))
+        self.assertEqual(
+            mm_utils.select_best_resolution(original, possible), (1024, 1024)
+        )
 
     def test_single_resolution_returns_it(self):
         original = (640, 480)
-        self.assertEqual(mm_utils.select_best_resolution(original, [(224, 224)]), (224, 224))
+        self.assertEqual(
+            mm_utils.select_best_resolution(original, [(224, 224)]), (224, 224)
+        )
 
     def test_tie_breaker_min_wasted_resolution(self):
         # Construct a case where effective resolution ties, but wasted differs.
         original = (400, 400)  # area=160k
         # Both can fully cover original (effective=160k), but wasted differs.
         possible = [(450, 450), (500, 500)]
-        self.assertEqual(mm_utils.select_best_resolution(original, possible), (450, 450))
+        self.assertEqual(
+            mm_utils.select_best_resolution(original, possible), (450, 450)
+        )
 
 
 class TestGetAnyresImageGridShape(unittest.TestCase):
     def test_grid_pinpoints_as_list(self):
         image_size = (800, 600)
         grid_pinpoints = [(224, 224), (448, 448)]
-        w, h = mm_utils.get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size=224)
+        w, h = mm_utils.get_anyres_image_grid_shape(
+            image_size, grid_pinpoints, patch_size=224
+        )
         self.assertEqual((w, h), (448 // 224, 448 // 224))
 
     def test_grid_pinpoints_as_range_string(self):
         # String of the form "(ax b)(...)" with 'x' triggers range expansion.
         image_size = (640, 480)
         grid_pinpoints = "(1x1)(2x2)"
-        w, h = mm_utils.get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size=224)
+        w, h = mm_utils.get_anyres_image_grid_shape(
+            image_size, grid_pinpoints, patch_size=224
+        )
         # Expanded possible resolutions are multiples of patch_size. Best will be 448x448.
         self.assertEqual((w, h), (2, 2))
 
     def test_invalid_patch_size_raises(self):
         with self.assertRaises(AssertionError):
-            mm_utils.get_anyres_image_grid_shape((640, 480), "(1x1)(2x2)", patch_size=128)
+            mm_utils.get_anyres_image_grid_shape(
+                (640, 480), "(1x1)(2x2)", patch_size=128
+            )
 
     def test_literal_eval_string_list_supported(self):
         shape = mm_utils.get_anyres_image_grid_shape(
@@ -141,8 +152,12 @@ class TestResizeAndPadImage(unittest.TestCase):
     def test_landscape_and_portrait_both_supported(self):
         landscape = Image.new("RGB", (200, 100), color=(10, 20, 30))
         portrait = Image.new("RGB", (100, 200), color=(10, 20, 30))
-        self.assertEqual(mm_utils.resize_and_pad_image(landscape, (224, 224)).size, (224, 224))
-        self.assertEqual(mm_utils.resize_and_pad_image(portrait, (224, 224)).size, (224, 224))
+        self.assertEqual(
+            mm_utils.resize_and_pad_image(landscape, (224, 224)).size, (224, 224)
+        )
+        self.assertEqual(
+            mm_utils.resize_and_pad_image(portrait, (224, 224)).size, (224, 224)
+        )
 
     def test_noop_when_already_target_size(self):
         img = Image.new("RGB", (224, 224), color=(10, 20, 30))
@@ -220,7 +235,9 @@ class TestUnpadImageShape(unittest.TestCase):
 class TestLoadImageFromBase64(unittest.TestCase):
     def test_loads_valid_png(self):
         img = Image.new("RGB", (2, 3), color=(123, 45, 67))
-        buf = torch.zeros(1)  # dummy to avoid importing io in hot path; use PIL save below
+        buf = torch.zeros(
+            1
+        )  # dummy to avoid importing io in hot path; use PIL save below
         del buf
 
         import io
@@ -244,7 +261,9 @@ class TestLoadImageFromBase64(unittest.TestCase):
 class TestGetDpEncoderLbAssignment(unittest.TestCase):
     def test_balances_by_total_size_greedy(self):
         sizes = [1000, 100, 200, 50]
-        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(sizes, num_gpus=2)
+        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(
+            sizes, num_gpus=2
+        )
         self.assertEqual(sorted(shuffle), [0, 1, 2, 3])
         self.assertEqual(sum(counts), len(sizes))
         self.assertEqual(len(counts), 2)
@@ -261,14 +280,18 @@ class TestGetDpEncoderLbAssignment(unittest.TestCase):
 
     def test_single_gpu_assigns_all(self):
         sizes = [5, 6, 7]
-        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(sizes, num_gpus=1)
+        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(
+            sizes, num_gpus=1
+        )
         self.assertEqual(shuffle, [2, 1, 0])
         self.assertEqual(counts, [3])
         self.assertEqual(loads, [18])
 
     def test_more_gpus_than_samples(self):
         sizes = [9, 1]
-        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(sizes, num_gpus=4)
+        shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(
+            sizes, num_gpus=4
+        )
         self.assertEqual(sorted(shuffle), [0, 1])
         self.assertEqual(sum(counts), 2)
         self.assertEqual(len(counts), 4)
@@ -322,7 +345,10 @@ class TestProcessAnyresImage(unittest.TestCase):
 
 class TestProcessImages(unittest.TestCase):
     def test_pad_path_stacks_when_shapes_match(self):
-        images = [Image.new("RGB", (32, 16), color=(1, 2, 3)), Image.new("RGB", (16, 32), color=(1, 2, 3))]
+        images = [
+            Image.new("RGB", (32, 16), color=(1, 2, 3)),
+            Image.new("RGB", (16, 32), color=(1, 2, 3)),
+        ]
         processor = _DummyProcessor(crop_size={"height": 32}, size={"height": 32})
         cfg = _DummyCfg("pad")
         out = mm_utils.process_images(images, processor, cfg)
@@ -330,7 +356,10 @@ class TestProcessImages(unittest.TestCase):
         self.assertEqual(out.shape, (2, 3, 32, 32))
 
     def test_anyres_path_stacks_when_shapes_match(self):
-        images = [Image.new("RGB", (32, 16), color=(1, 2, 3)), Image.new("RGB", (128, 32), color=(1, 2, 3))]
+        images = [
+            Image.new("RGB", (32, 16), color=(1, 2, 3)),
+            Image.new("RGB", (128, 32), color=(1, 2, 3)),
+        ]
         processor = _DummyProcessor(
             crop_size={"height": 224}, size={"height": 224, "shortest_edge": 224}
         )
@@ -374,4 +403,3 @@ class TestProcessImages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
