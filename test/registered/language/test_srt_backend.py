@@ -19,8 +19,8 @@ from sglang.test.test_programs import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=80, suite="stage-a-test-1")
-register_amd_ci(est_time=120, suite="stage-a-test-1-amd")
+register_cuda_ci(est_time=80, suite="stage-a-test-small-1-gpu")
+register_amd_ci(est_time=120, suite="stage-a-test-small-1-gpu-amd")
 
 
 class TestSRTBackend(CustomTestCase):
@@ -29,7 +29,9 @@ class TestSRTBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.backend = sgl.Runtime(
-            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+            cuda_graph_max_bs=4,
+            mem_fraction_static=0.7,
         )
         sgl.set_default_backend(cls.backend)
 

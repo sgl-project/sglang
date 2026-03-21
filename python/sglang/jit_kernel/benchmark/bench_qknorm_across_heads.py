@@ -6,9 +6,10 @@ import triton
 import triton.testing
 from sgl_kernel import rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
 from sglang.srt.utils import get_current_device_stream_fast
+from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
 
