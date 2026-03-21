@@ -12,10 +12,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import (
-    get_moe_runner_backend,
-    get_moe_weight_sizes,
-)
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -123,22 +120,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
-        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
-            intermediate_size_per_partition,
-            is_aiter_moe=True,
-            is_concat=True,
-            is_packed=False,
-        )
-
-        extra_weight_attrs.update(
-            {"weight_padded": weight_padded},
-        )
-
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                w13_up_dim,
+                2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
             ),
@@ -151,7 +137,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                w2_down_dim,
+                intermediate_size_per_partition,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -175,7 +161,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    w13_up_dim,
+                    2 * intermediate_size_per_partition,
                     1,
                     dtype=torch.float32,
                 ),
