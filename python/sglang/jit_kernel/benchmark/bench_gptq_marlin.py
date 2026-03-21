@@ -3,17 +3,15 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm as jit_gptq_marlin_gemm
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 from sglang.test.test_marlin_utils import marlin_quantize
+from sglang.utils import is_in_ci
 
-try:
-    from sgl_kernel import gptq_marlin_gemm as aot_gptq_marlin_gemm
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+AOT_AVAILABLE = hasattr(torch.ops.sgl_kernel, "gptq_marlin_gemm") and hasattr(
+    torch.ops.sgl_kernel.gptq_marlin_gemm, "default"
+)
 
 IS_CI = is_in_ci()
 
@@ -51,13 +49,35 @@ def _run_gemm(fn, a):
     )
 
 
+def _run_gemm_aot(a):
+    return torch.ops.sgl_kernel.gptq_marlin_gemm.default(
+        a,
+        None,
+        _marlin_q_w,
+        _marlin_s,
+        None,
+        None,
+        _g_idx,
+        _sort_indices,
+        _workspace,
+        QUANT_TYPE.id,
+        a.shape[0],
+        SIZE_N,
+        SIZE_K,
+        True,
+        False,
+        False,
+        False,
+    )
+
+
 def check_correctness():
     if not AOT_AVAILABLE:
         print("sgl_kernel AOT not available, skipping correctness check")
         return
     a = torch.randn((16, SIZE_K), dtype=torch.float16, device="cuda")
     out_jit = _run_gemm(jit_gptq_marlin_gemm, a)
-    out_aot = _run_gemm(aot_gptq_marlin_gemm, a)
+    out_aot = _run_gemm_aot(a)
     torch.testing.assert_close(out_jit, out_aot, rtol=1e-3, atol=1e-3)
     print("Correctness check passed (JIT vs AOT)")
 
@@ -97,7 +117,7 @@ def benchmark(size_m, provider):
     if provider == "jit":
         fn = lambda: _run_gemm(jit_gptq_marlin_gemm, a)
     elif provider == "aot":
-        fn = lambda: _run_gemm(aot_gptq_marlin_gemm, a)
+        fn = lambda: _run_gemm_aot(a)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -49,7 +49,7 @@ elif _is_cpu and _is_cpu_amx_available:
 elif _is_hip:
     pass
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = get_moe_padding_size(_use_aiter)
 
 
 def support_tensor_descriptor():
