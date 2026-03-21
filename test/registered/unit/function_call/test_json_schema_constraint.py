@@ -18,7 +18,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "default")
+register_cpu_ci(1.0, "stage-a-cpu-only")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):

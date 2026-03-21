@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/amd-ci-job-monitor.yml'
-      - 'scripts/ci/query_job_status.py'
+      - 'scripts/ci/utils/query_job_status.py'
   workflow_dispatch:
     inputs:
       hours:
@@ -42,7 +42,7 @@ jobs:
       - name: Generate Custom Job Report
         timeout-minutes: 30
         run: |
-          python scripts/ci/query_job_status.py \
+          python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ inputs.job_filter }}" \
             --workflow "pr-test-amd.yml" \
@@ -107,7 +107,7 @@ jobs:
       - name: Generate Report
         timeout-minutes: 15
         run: |
-          python scripts/ci/query_job_status.py \
+          python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
             --workflow "pr-test-amd.yml" \
@@ -141,7 +141,7 @@ jobs:
       - name: Generate Nightly Report
         timeout-minutes: 15
         run: |
-          python scripts/ci/query_job_status.py \
+          python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
             --workflow "nightly-test-amd.yml" \
