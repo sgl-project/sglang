@@ -16,7 +16,7 @@ description: Step-by-step guide for adding a new JIT CUDA kernel to SGLang Diffu
 > - [references/a100-optimization-guide.md](references/a100-optimization-guide.md) — A100 (sm_80) deep dive
 > - [references/t4-optimization-guide.md](references/t4-optimization-guide.md) — T4 (sm_75, FP16 only) deep dive
 > - [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark vs PyTorch
-> - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark with/without kernels
+> - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner; compare perf dumps with `compare_perf.py`
 
 ## When to Use CUDA vs Triton
 
@@ -224,21 +224,25 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
 @cache_once
-def _jit_rmsnorm_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
     return load_jit(
         "diffusion_rmsnorm",
         *args,
-        cuda_files=["diffusion/rmsnorm.cuh"],    # relative to csrc/
-        cuda_wrappers=[("rmsnorm", f"rmsnorm<{args}>")],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        cuda_files=["diffusion/rmsnorm.cuh"],  # relative to csrc/
+        cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
     )
 
 
@@ -253,32 +257,33 @@ def diffusion_rmsnorm(
 
     y = x / rms(x) * weight   (weight=None → no affine scaling)
 
-    Supported dtypes: float16, bfloat16, float32.
-    hidden_size must be divisible by 8 (fp16/bf16) or 4 (fp32).
+    Supported fast path: float16 / bfloat16.
+    For unsupported combinations (for example some float32 configs),
+    fall back to torch.nn.functional.rms_norm.
     """
     assert src.is_cuda, "src must be a CUDA tensor"
     assert src.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    hidden_size = src.shape[-1]
 
     if out is None:
         out = torch.empty_like(src)
 
-    # Pass a zero-sized tensor when weight is absent (launcher checks data_ptr == nullptr)
-    w = weight if weight is not None else torch.empty(0, dtype=src.dtype, device=src.device)
+    w = weight if weight is not None else torch.ones(hidden_size, dtype=src.dtype, device=src.device)
 
-    module = _jit_rmsnorm_module(src.dtype)
-    module.rmsnorm(out, src, w, eps)
+    module = _jit_rmsnorm_module(hidden_size, src.dtype)
+    module.rmsnorm(src.reshape(-1, hidden_size), w, out.reshape(-1, hidden_size), eps)
     return out
 ```
 
 **Key rules for the wrapper:**
 - Use `cache_once` — never `functools.lru_cache` (breaks `torch.compile`)
-- First arg(s) to `load_jit` form the unique build cache key
+- Include every compile-time specialization parameter in the cache key (`hidden_size`, PDL support, dtype here)
 - `cuda_files` are relative to `python/sglang/jit_kernel/csrc/`
 - `cuda_wrappers`: `(python_name, cpp_template_instantiation)`
 
 ---
 
-## Step 3: Integrate into Denoising Stage
+## Step 3: Integrate into Runtime (Optional, After Standalone Validation)
 
 The kernel replaces a slow operator inside the DiT forward pass. Find the correct module in:
 
@@ -287,7 +292,7 @@ python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
 python/sglang/multimodal_gen/runtime/models/dits/<model>.py
 ```
 
-**Pattern — monkey-patch the DiT block's RMSNorm:**
+There is no built-in `SGLANG_DIFFUSION_CUSTOM_CUDA_KERNELS` hook in the runtime. After the standalone test/benchmark passes, wire the new kernel into the actual execution path explicitly. A minimal pattern is to monkey-patch the target RMSNorm modules before `torch.compile` or any CPU offload setup:
 
 ```python
 from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
@@ -387,7 +392,7 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 6: Tests
 
-Create `python/sglang/jit_kernel/tests/test_diffusion_rmsnorm.py`:
+For this tutorial kernel, the repo now includes a verified regression test at `python/sglang/jit_kernel/tests/test_diffusion_rmsnorm.py`. Model new kernel tests after it:
 
 ```python
 import pytest
@@ -422,46 +427,7 @@ if __name__ == "__main__":
 
 ## Step 7: Benchmark
 
-Create `python/sglang/jit_kernel/benchmark/bench_diffusion_rmsnorm.py`:
-
-```python
-import torch
-import triton.testing
-
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE, run_benchmark
-from sglang.jit_kernel.diffusion.rmsnorm import diffusion_rmsnorm
-
-SHAPES = [(4096, 2048), (4096, 3072), (4096, 4096)]
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["hidden"],
-        x_vals=[s[1] for s in SHAPES],
-        line_arg="provider",
-        line_vals=["jit_cuda", "torch"],
-        line_names=["SGLang JIT CUDA", "PyTorch rms_norm"],
-        styles=[("blue", "-"), ("red", "--")],
-        ylabel="us",
-        plot_name="diffusion-rmsnorm",
-        args={},
-    )
-)
-def benchmark(hidden: int, provider: str):
-    src = torch.randn(4096, hidden, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
-    w   = torch.ones(hidden, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
-
-    if provider == "jit_cuda":
-        fn = lambda: diffusion_rmsnorm(src, weight=w, eps=1e-6)
-    else:
-        fn = lambda: torch.nn.functional.rms_norm(src, (hidden,), w, eps=1e-6)
-
-    return run_benchmark(fn)
-
-
-if __name__ == "__main__":
-    benchmark.run(print_data=True)
-```
+For the RMSNorm example in this skill, use the checked-in micro-benchmark script `scripts/bench_diffusion_rmsnorm.py`. For new kernels, follow the same structure or model a `triton.testing` benchmark after `python/sglang/jit_kernel/benchmark/bench_rmsnorm.py`.
 
 ---
 
@@ -505,8 +471,9 @@ python/sglang/jit_kernel/diffusion/
 python/sglang/jit_kernel/tests/
 └── test_diffusion_rmsnorm.py                    # NEW: correctness tests
 
-python/sglang/jit_kernel/benchmark/
-└── bench_diffusion_rmsnorm.py                   # NEW: benchmark
+python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/
+├── bench_diffusion_rmsnorm.py                   # Validated micro-benchmark used by this skill
+└── bench_diffusion_denoise.py                   # Preset runner for end-to-end perf dumps
 ```
 
 ---
@@ -523,7 +490,7 @@ python/sglang/jit_kernel/benchmark/
 | [references/a100-optimization-guide.md](references/a100-optimization-guide.md) | A100 (sm_80): cp.async, TF32, 2:4 sparsity, H100→A100 migration checklist |
 | [references/t4-optimization-guide.md](references/t4-optimization-guide.md) | T4 (sm_75): FP16 only, low bandwidth, tile size limits, memory constraints |
 | [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) | Micro-benchmark: JIT CUDA RMSNorm vs PyTorch, correctness check, bandwidth analysis |
-| [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) | End-to-end: `sglang generate` baseline vs custom kernels, comparison table |
+| [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) | End-to-end preset runner. Save perf dumps per label, then compare with `compare_perf.py` |
 
 ### SGLang Internals
 
