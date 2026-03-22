@@ -15,6 +15,8 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import safe_open
 
+from sglang.srt.utils import MultiprocessingSerializer
+
 BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 TRANSFORMER_MODULE = "transformer"
 NUM_TENSORS_TO_UPDATE = 4
@@ -97,6 +99,12 @@ def _build_shifted_named_tensors(
 
 def _serialize_named_tensors(named_tensors: list[tuple[str, torch.Tensor]]) -> str:
     return base64.b64encode(pickle.dumps(named_tensors)).decode("utf-8")
+
+
+def _serialize_named_tensors_multiprocessing(
+    named_tensors: list[tuple[str, torch.Tensor]],
+) -> str:
+    return MultiprocessingSerializer.serialize(named_tensors, output_str=True)
 
 
 class _ServerRunner:
@@ -228,11 +236,13 @@ class UpdateWeightFromTensorCheckerE2ETest(unittest.TestCase):
     def _update_weights_from_tensor(
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
+        *,
+        serializer=_serialize_named_tensors,
     ) -> tuple[dict, int]:
         response = requests.post(
             f"{self.server.base_url}/update_weights_from_tensor",
             json={
-                "serialized_named_tensors": [_serialize_named_tensors(named_tensors)],
+                "serialized_named_tensors": [serializer(named_tensors)],
                 "target_modules": [TRANSFORMER_MODULE],
             },
             timeout=300,
@@ -270,6 +280,36 @@ class UpdateWeightFromTensorCheckerE2ETest(unittest.TestCase):
         self.assertEqual(check_status, 200, check_result)
         self.assertTrue(check_result.get("success"), check_result)
         self.assertIn("Verified transformer update", check_result.get("message", ""))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_update_weights_from_tensor_checker_with_multiprocessing_serializer(self):
+        cuda_named_tensors = [
+            (name, tensor.to(device="cuda", non_blocking=True))
+            for name, tensor in self.expected_updated_tensors
+        ]
+        try:
+            update_result, update_status = self._update_weights_from_tensor(
+                cuda_named_tensors,
+                serializer=_serialize_named_tensors_multiprocessing,
+            )
+            self.assertEqual(update_status, 200, update_result)
+            self.assertTrue(update_result.get("success"), update_result)
+
+            expected_transformer_sha256 = _build_named_tensor_sha256(
+                self.expected_updated_tensors
+            )
+            check_result, check_status = self._check_updated_weights_from_tensor(
+                expected_transformer_sha256
+            )
+            self.assertEqual(check_status, 200, check_result)
+            self.assertTrue(check_result.get("success"), check_result)
+            self.assertIn(
+                "Verified transformer update",
+                check_result.get("message", ""),
+            )
+        finally:
+            del cuda_named_tensors
+            torch.cuda.empty_cache()
 
     def test_update_weights_from_tensor_checker_detects_corrupted_payload(self):
         reset_result, reset_status = self._update_weights_from_disk(BASE_MODEL)
@@ -345,8 +385,10 @@ class UpdateWeightFromTensorChecker2GPUTest(unittest.TestCase):
     def _update_weights_from_tensor(
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
+        *,
+        serializer=_serialize_named_tensors,
     ) -> tuple[dict, int]:
-        serialized_payload = _serialize_named_tensors(named_tensors)
+        serialized_payload = serializer(named_tensors)
         response = requests.post(
             f"{self.server.base_url}/update_weights_from_tensor",
             json={
