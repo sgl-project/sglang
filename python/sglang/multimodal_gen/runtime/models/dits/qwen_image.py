@@ -703,11 +703,6 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
-        mod_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "svdquant")
-            else None
-        )
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
@@ -1102,7 +1097,6 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
-
         sp_world_size = get_sp_world_size()
 
         modulate_index_list = []
