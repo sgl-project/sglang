@@ -11,7 +11,13 @@ RMSNORM_HIDDEN_SIZES = [64, 128, 256, 512, 1024, 3072, 3584, 4096, 8192]
 # JIT fused_add_rmsnorm: fp16/bf16 only; hidden_size % 8 == 0, <=8192
 FUSED_ADD_RMSNORM_HIDDEN_SIZES = [1024, 3072, 3584, 4096, 8192]
 
-BS_LIST = [1, 19, 99, 989]
+BS_LIST = [
+    1,
+    19,
+    99,
+    989,
+    8192,
+]  # 8192 ensures num_tokens > max_occupancy * kNumSM on any GPU
 
 
 def _jit_rmsnorm(input, weight, output, eps):

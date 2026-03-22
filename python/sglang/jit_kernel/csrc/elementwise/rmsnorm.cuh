@@ -35,19 +35,14 @@ __global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
 
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
-  void* output_ptr = nullptr;
-  Storage output_vec;
   for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
     const auto input_ptr = pointer::offset<Float>(input, i * input_stride);
+    const auto output_ptr = pointer::offset<Float>(output, i * output_stride);
     const auto input_vec = gmem.load(input_ptr);
     const auto weight_vec = gmem.load(weight_ptr);
-    if (output_ptr != nullptr) {
-      gmem.store(output_ptr, output_vec);
-    }
-    output_ptr = pointer::offset<Float>(output, i * output_stride);
-    output_vec = norm::apply_norm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
+    const auto output_vec = norm::apply_norm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
+    gmem.store(output_ptr, output_vec);
   }
-  gmem.store(output_ptr, output_vec);
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
@@ -62,19 +57,14 @@ __global__ void rmsnorm_warp(const RMSNormParams __grid_constant__ params) {
 
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
-  void* output_ptr = nullptr;
-  Storage output_vec;
   for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
     const auto input_ptr = pointer::offset<Float>(input, i * input_stride);
+    const auto output_ptr = pointer::offset<Float>(output, i * output_stride);
     const auto input_vec = gmem.load(input_ptr);
     const auto weight_vec = gmem.load(weight_ptr);
-    if (output_ptr != nullptr) {
-      gmem.store(output_ptr, output_vec);
-    }
-    output_ptr = pointer::offset<Float>(output, i * output_stride);
-    output_vec = norm::apply_norm_warp<kDim>(input_vec, weight_vec, eps);
+    const auto output_vec = norm::apply_norm_warp<kDim>(input_vec, weight_vec, eps);
+    gmem.store(output_ptr, output_vec);
   }
-  gmem.store(output_ptr, output_vec);
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
