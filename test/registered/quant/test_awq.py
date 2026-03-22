@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=163, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=700, suite="stage-b-test-large-1-gpu")
 register_amd_ci(est_time=200, suite="stage-b-test-large-1-gpu-amd")
 
 
