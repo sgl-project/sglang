@@ -1271,7 +1271,7 @@ class MambaRadixCache(BasePrefixCache):
         req = params.req
 
         node_update = last_node
-        if self.eviction_policy == "marconi":
+        if self.eviction_policy in ("marconi", "seglen"):
             if last_node != self.root_node:
                 last_node.last_access_time = get_last_access_time()
                 last_node._flop_efficiency = None  # invalidate cached score
