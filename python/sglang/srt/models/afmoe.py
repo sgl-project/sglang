@@ -57,7 +57,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_cuda
 
 _is_npu = is_npu()
 _is_cuda = _is_cuda()
@@ -70,6 +70,7 @@ elif _is_npu:
     )
 else:
     from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:
     sliding_window = getattr(config, "sliding_window", None)

@@ -27,7 +27,11 @@ def fused_topk_npu(
     correction_bias = topk_config.correction_bias
     custom_routing_function = topk_config.custom_routing_function
 
-    if not use_grouped_topk and correction_bias is None and custom_routing_function is None:
+    if (
+        not use_grouped_topk
+        and correction_bias is None
+        and custom_routing_function is None
+    ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -41,7 +45,11 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
-    elif use_grouped_topk and correction_bias is not None:
+    elif (
+        use_grouped_topk
+        and correction_bias is not None
+        and custom_routing_function is None
+    ):
         # Force set routed_scaling_factor = 1 to optimize renormalize
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
