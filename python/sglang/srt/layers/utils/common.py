@@ -61,7 +61,11 @@ class _PPPlaceholder:
         return self
 
     def __call__(self, *args, **kwargs):
-        return args[0] if args else None
+        if args:
+            return args[0]
+        if kwargs:
+            return next(iter(kwargs.values()))
+        return None
 
     def __bool__(self):
         return False
