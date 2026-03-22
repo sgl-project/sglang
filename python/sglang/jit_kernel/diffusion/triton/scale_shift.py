@@ -2,6 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -444,6 +445,7 @@ def fuse_scale_shift_gate_select01_kernel_blc_opt(
     tl.store(gate_out_ptr + go_off, gate, mask=mask)
 
 
+@maybe_wrap_jit_kernel_debug
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -563,6 +565,7 @@ def fuse_scale_shift_kernel(
     return output
 
 
+@maybe_wrap_jit_kernel_debug
 def fuse_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     scale0: torch.Tensor,
@@ -635,6 +638,7 @@ def fuse_scale_shift_gate_select01_kernel(
     return output, gate_out
 
 
+@maybe_wrap_jit_kernel_debug
 def fuse_layernorm_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -724,6 +728,7 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     return output, gate_out
 
 
+@maybe_wrap_jit_kernel_debug
 def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -834,7 +839,19 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
 if current_platform.is_npu():
     from .npu_fallback import fuse_scale_shift_native
 
-    fuse_scale_shift_kernel = fuse_scale_shift_native
+    @maybe_wrap_jit_kernel_debug
+    def fuse_scale_shift_kernel(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        scale_constant: float = 1.0,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return fuse_scale_shift_native(
+            x, scale, shift, scale_constant, block_l, block_c
+        )
+
 
 if current_platform.is_mps():
     from .mps_fallback import (
@@ -842,5 +859,41 @@ if current_platform.is_mps():
         fuse_scale_shift_kernel_native,
     )
 
-    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
-    fuse_scale_shift_gate_select01_kernel = fuse_scale_shift_gate_select01_kernel_native
+    @maybe_wrap_jit_kernel_debug
+    def fuse_scale_shift_kernel(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        scale_constant: float = 1.0,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return fuse_scale_shift_kernel_native(
+            x, scale, shift, scale_constant, block_l, block_c
+        )
+
+    @maybe_wrap_jit_kernel_debug
+    def fuse_scale_shift_gate_select01_kernel(
+        x: torch.Tensor,
+        scale0: torch.Tensor,
+        shift0: torch.Tensor,
+        gate0: torch.Tensor,
+        scale1: torch.Tensor,
+        shift1: torch.Tensor,
+        gate1: torch.Tensor,
+        index: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return fuse_scale_shift_gate_select01_kernel_native(
+            x,
+            scale0,
+            shift0,
+            gate0,
+            scale1,
+            shift1,
+            gate1,
+            index,
+            block_l,
+            block_c,
+        )
