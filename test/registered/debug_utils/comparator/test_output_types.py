@@ -2,7 +2,11 @@ import sys
 from io import StringIO
 
 import pytest
+from registered.debug_utils.comparator.testing_helpers import (
+    assert_rich_tags_balanced,
+)
 from registered.debug_utils.comparator.testing_helpers import make_diff as _make_diff
+from registered.debug_utils.comparator.testing_helpers import make_stats as _make_stats
 from registered.debug_utils.comparator.testing_helpers import (
     make_tensor_info as _make_tensor_info,
 )
@@ -34,6 +38,8 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
+    BundleFileInfo,
+    BundleSideInfo,
     ComparisonNonTensorRecord,
     ComparisonSkipRecord,
     ComparisonTensorRecord,
@@ -192,6 +198,63 @@ class TestComparisonSkipRecord:
             errors=[ErrorLog(category="e", message="boom")],
         )
         assert record.category == "failed"
+
+    def test_format_body_with_available_side(self) -> None:
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
+            name="layer.weight",
+            reason="baseline_load_failed",
+            available_side="target",
+            available_tensor_info=_make_tensor_info(
+                shape=[4, 8],
+                dtype="torch.float32",
+                stats=_make_stats(mean=0.5, std=1.2, min=-2.0, max=3.0),
+                sample="tensor([0.1, 0.2, ...])",
+            ),
+        )
+        body: str = record._format_body()
+        assert "baseline_load_failed" in body
+        assert "target: shape=[4, 8]" in body
+        assert "mean=0.5000" in body
+        assert "sample: tensor([0.1, 0.2, ...])" in body
+
+    def test_format_rich_body_with_available_side(self) -> None:
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
+            name="attn.qkv",
+            reason="baseline_load_failed",
+            available_side="target",
+            available_tensor_info=_make_tensor_info(
+                shape=[4, 8],
+                dtype="torch.float32",
+                stats=_make_stats(mean=0.5, std=1.2, min=-2.0, max=3.0),
+                sample="tensor([0.1, 0.2, ...])",
+            ),
+            available_bundle_info=BundleSideInfo(
+                num_files=2,
+                files=[
+                    BundleFileInfo(shape=[4, 8], dtype="torch.float32"),
+                    BundleFileInfo(shape=[4, 8], dtype="torch.float32"),
+                ],
+            ),
+        )
+        body: str = record._format_rich_body()
+        assert "skipped (baseline_load_failed)" in body
+        assert "target" in body
+        assert "2 files" in body
+        assert "mean=0.5000" in body
+        assert "tensor(" in body
+        assert_rich_tags_balanced(body)
+
+    def test_format_rich_body_minimal_hides_available_side(self) -> None:
+        record: ComparisonSkipRecord = ComparisonSkipRecord(
+            name="x",
+            reason="target_load_failed",
+            available_side="baseline",
+            available_tensor_info=_make_tensor_info(),
+        )
+        body: str = record._format_rich_body(verbosity="minimal")
+        assert "skipped" in body
+        assert "stats" not in body
+        assert_rich_tags_balanced(body)
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +609,9 @@ class TestFormatAlignerPlan:
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
         assert result == (
-            "Aligner Plan:\n" "  baseline: (no steps)\n" "  target: [step=0: unsharder]"
+            "Aligner Plan:\n"
+            "  baseline: (no steps)\n"
+            "  target: [step=0: unsharder(tp)]"
         )
 
     def test_reorderer(self) -> None:
@@ -566,7 +631,9 @@ class TestFormatAlignerPlan:
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
         assert result == (
-            "Aligner Plan:\n" "  baseline: (no steps)\n" "  target: [step=0: reorderer]"
+            "Aligner Plan:\n"
+            "  baseline: (no steps)\n"
+            "  target: [step=0: reorderer(zigzag_to_natural)]"
         )
 
     def test_multi_step(self) -> None:
@@ -596,7 +663,7 @@ class TestFormatAlignerPlan:
         assert result == (
             "Aligner Plan:\n"
             "  baseline: (no steps)\n"
-            "  target: [step=0: unsharder; step=1: reorderer]"
+            "  target: [step=0: unsharder(tp); step=1: reorderer(zigzag_to_natural)]"
         )
 
     def test_with_token_aligner(self) -> None:
@@ -687,7 +754,7 @@ class TestOutputRecordLogAttachment:
         body = record.to_rich()
 
         assert isinstance(body, str)
-        assert body == "[dim]⊘ x ── skipped (r)[/]\n  [red]✗ oops[/]"
+        assert body == "[dim]⊘ x ── skipped (r)[/]\n  [red]✗ oops[/]\n"
 
     def test_to_rich_group_body(self) -> None:
         record: ConfigRecord = ConfigRecord(

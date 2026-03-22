@@ -5,7 +5,8 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Run every 12 hours
+    - cron: '0 */12 * * *'  # Run every 12 hours (UTC)
+    - cron: '15 8 * * *'
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -57,10 +58,13 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
+  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 permissions:
   actions: write
   contents: read
+  issues: read
   pull-requests: read
 
 jobs:
@@ -87,6 +91,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Show test partition assignments
         continue-on-error: true
@@ -329,11 +337,16 @@ jobs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1", "stage-a-cpu-only"]'
+          jobs: '["stage-a-test-small-1-gpu", "stage-a-cpu-only"]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -354,6 +367,11 @@ jobs:
       stage_b_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
@@ -411,6 +429,10 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -461,6 +483,10 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -493,12 +519,16 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -531,12 +561,16 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -569,14 +603,16 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
-    env:
-      CI: true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -627,6 +663,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -692,12 +732,16 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -715,7 +759,7 @@ jobs:
     if: |
       github.event_name == 'schedule' &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
@@ -723,6 +767,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -743,14 +791,16 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
-    env:
-      CI: true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -783,25 +833,32 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1:
+  # Runs on 5090 (32GB, SM120)
+  stage-a-test-small-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-1') ||
+        (inputs.target_stage == 'stage-a-test-small-1-gpu') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-5090
     timeout-minutes: 240
+    env:
+      IS_BLACKWELL: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -818,13 +875,11 @@ jobs:
 
       - name: Run test
         timeout-minutes: 10
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-small-1-gpu $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -854,24 +909,32 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
         run: |
-          pip install -e "python/[dev]"
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
       - name: Run test
         timeout-minutes: 10
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
@@ -902,6 +965,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -921,13 +988,11 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -948,7 +1013,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -960,6 +1025,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -976,12 +1045,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1001,7 +1068,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1012,6 +1079,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1031,12 +1102,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1067,6 +1136,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
@@ -1082,12 +1155,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
       - name: Run FA4 jit_kernel tests (SM100+)
@@ -1110,7 +1181,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1121,6 +1192,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1138,12 +1213,9 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
@@ -1167,7 +1239,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1178,6 +1250,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1196,12 +1272,9 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
@@ -1225,13 +1298,17 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1276,6 +1353,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1291,12 +1372,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1328,6 +1407,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1357,12 +1440,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1396,6 +1477,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -1411,12 +1496,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1443,6 +1526,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1471,12 +1558,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1501,6 +1586,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1530,12 +1619,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 45
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1566,6 +1653,10 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
@@ -1581,12 +1672,10 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -1613,6 +1702,10 @@ jobs:
   #   strategy:
   #     fail-fast: false
   #   steps:
+  #     - uses: ./.github/actions/check-maintenance
+  #       with:
+  #         github-token: ${{ github.token }}
+  #
   #     - name: Checkout code
   #       uses: actions/checkout@v4
   #       with:
@@ -1633,12 +1726,10 @@ jobs:
   #
   #     - name: Run test
   #       timeout-minutes: 45
+  #       env:
+  #         CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
   #       run: |
   #         cd test
-  #         CONTINUE_ON_ERROR_FLAG=""
-  #         if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-  #           CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-  #         fi
   #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
   #
   #     - uses: ./.github/actions/upload-cuda-coredumps
@@ -1667,7 +1758,7 @@ jobs:
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
 
-        stage-a-test-1,
+        stage-a-test-small-1-gpu,
         stage-a-cpu-only,
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
