@@ -704,6 +704,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF),
             image_seq_len_target or 0,
         )
+        assert image_seq_len_target >= image_ori_len
         image_padding_len = image_seq_len_target - image_ori_len
 
         # padded feature

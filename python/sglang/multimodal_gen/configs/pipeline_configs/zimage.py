@@ -221,11 +221,14 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     def gather_latents_for_sp(self, latents, batch):
         # Gather native H/W shards by padding to a common collective shape, then crop.
         latents = latents.contiguous()
-        if get_sp_world_size() <= 1 or latents.dim() != 5:
+        if get_sp_world_size() <= 1 or latents.dim() not in (5, 6):
             return latents
 
         plan = self._get_zimage_sp_plan(batch)
-        shard_dim = 3 if plan["shard_axis"] == "h" else 4
+        if latents.dim() == 5:
+            shard_dim = 3 if plan["shard_axis"] == "h" else 4
+        else:
+            shard_dim = 4 if plan["shard_axis"] == "h" else 5
         max_axis_tok = max(plan["shard_sizes_tok"])
         max_axis_lat = max_axis_tok * self.PATCH_SIZE
 
@@ -233,10 +236,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         pad_shape[shard_dim] = max_axis_lat
         padded = latents.new_zeros(pad_shape)
         axis_len = latents.shape[shard_dim]
-        if shard_dim == 3:
-            padded[:, :, :, :axis_len, :] = latents
-        else:
-            padded[:, :, :, :, :axis_len] = latents
+        padded_slices = [slice(None)] * latents.dim()
+        padded_slices[shard_dim] = slice(axis_len)
+        padded[tuple(padded_slices)] = latents
 
         gathered = [torch.empty_like(padded) for _ in range(plan["sp_size"])]
         dist.all_gather(gathered, padded, group=get_sp_group().device_group)
@@ -244,10 +246,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         pieces = []
         for rank, tensor in enumerate(gathered):
             axis_lat = plan["shard_sizes_tok"][rank] * self.PATCH_SIZE
-            if shard_dim == 3:
-                pieces.append(tensor[:, :, :, :axis_lat, :])
-            else:
-                pieces.append(tensor[:, :, :, :, :axis_lat])
+            gather_slices = [slice(None)] * latents.dim()
+            gather_slices[shard_dim] = slice(axis_lat)
+            pieces.append(tensor[tuple(gather_slices)])
         return torch.cat(pieces, dim=shard_dim)
 
     def post_denoising_loop(self, latents, batch):
