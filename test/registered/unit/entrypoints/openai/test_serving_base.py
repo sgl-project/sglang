@@ -16,16 +16,10 @@ class _MockTokenizerManager:
         self.model_config = Mock()
         self.server_args = Mock()
         self.server_args.enable_cache_report = False
+        self.server_args.tokenizer_metrics_allowed_custom_labels = None
         self.model_path = "test-model"
         self.tokenizer = Mock()
         self.tokenizer.chat_template = None
-
-
-class _MockTemplateManager:
-    def __init__(self):
-        self.chat_template_name = None
-        self.jinja_template_content_format = None
-        self.completion_template_name = None
 
 
 class _ConcreteServingBase(OpenAIServingBase):
@@ -38,7 +32,7 @@ class _ConcreteServingBase(OpenAIServingBase):
 
 
 def _make_serving():
-    return _ConcreteServingBase(_MockTokenizerManager(), _MockTemplateManager())
+    return _ConcreteServingBase(_MockTokenizerManager())
 
 
 class TestParseModelParameter(unittest.TestCase):
