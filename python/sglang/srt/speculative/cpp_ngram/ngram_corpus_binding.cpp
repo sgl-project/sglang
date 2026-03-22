@@ -3,7 +3,7 @@
 
 #include "ngram.h"
 
-PYBIND11_MODULE(ngram_cache_cpp, m) {
+PYBIND11_MODULE(ngram_corpus_cpp, m) {
   using namespace ngram;
   namespace py = pybind11;
   m.doc() = "";
@@ -35,9 +35,9 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
       .def("resetBatchReturnTokenNum", &Param::resetBatchReturnTokenNum, "")
       .def("detail", &Param::detail, "");
 
-  py::class_<Ngram::Result>(m, "Result")
+  py::class_<Result>(m, "Result")
       .def(py::init<>())
-      .def_readwrite("token", &Ngram::Result::token)
-      .def_readwrite("mask", &Ngram::Result::mask)
-      .def("truncate", &Ngram::Result::truncate);
+      .def_readwrite("token", &Result::token)
+      .def_readwrite("mask", &Result::mask)
+      .def("truncate", &Result::truncate);
 }
