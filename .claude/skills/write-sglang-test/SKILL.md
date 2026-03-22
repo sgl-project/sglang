@@ -291,5 +291,5 @@ Before submitting a test:
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
-- [ ] Has `if __name__ == "__main__": unittest.main(verbosity=3)`
+- [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)
