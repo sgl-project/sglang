@@ -607,6 +607,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.sampler = create_sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
