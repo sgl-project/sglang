@@ -170,7 +170,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "marconi"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "marconi", "seglen"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -3792,7 +3792,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used, 'marconi' enables FLOP-aware eviction for hybrid SSM models.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used, 'marconi' enables FLOP-aware eviction for hybrid SSM models, and 'seglen' ranks by replay length to the nearest reusable Mamba ancestor.",
         )
         parser.add_argument(
             "--marconi-eff-weight",

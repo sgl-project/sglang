@@ -768,6 +768,8 @@ class MambaRadixCache(BasePrefixCache):
         logger.info("evict mamba num: %d", mamba_num)
         if self.eviction_policy == "marconi" and self.model_config is not None:
             return self._evict_mamba_marconi(mamba_num)
+        if self.eviction_policy == "seglen":
+            return self._evict_mamba_seglen(mamba_num)
         return self._evict_mamba_lru(mamba_num)
 
     def evict_full(self, full_num_tokens: int) -> int:
@@ -775,6 +777,8 @@ class MambaRadixCache(BasePrefixCache):
         logger.info("evict_full num tokens: %d", full_num_tokens)
         if self.eviction_policy == "marconi" and self.model_config is not None:
             return self._evict_full_marconi(full_num_tokens)
+        if self.eviction_policy == "seglen":
+            return self._evict_full_seglen(full_num_tokens)
         return self._evict_full_lru(full_num_tokens)
 
     def _evict_mamba_lru(self, mamba_num: int) -> int:
@@ -851,6 +855,23 @@ class MambaRadixCache(BasePrefixCache):
             )
         return node._flop_efficiency
 
+    def _get_mamba_recompute_length(self, node: TreeNode) -> int:
+        """Return replay length from the nearest reusable Mamba ancestor to this node.
+
+        The reusable anchor is the nearest ancestor on the path to root whose
+        ``mamba_value`` is not ``None``, excluding ``node`` itself. The replay
+        length is the total token length from that ancestor's child boundary down
+        to ``node``.
+        """
+        recompute_length = 0
+        cur = node
+        while cur != self.root_node:
+            recompute_length += len(cur.key)
+            cur = cur.parent
+            if cur.mamba_value is not None:
+                break
+        return recompute_length
+
     def _collect_unlocked_candidates(self, leaf_only: bool) -> List[TreeNode]:
         """Collect unlocked eviction candidates from the mamba or full LRU list."""
         candidates = []
@@ -908,6 +929,27 @@ class MambaRadixCache(BasePrefixCache):
         scored.sort(key=lambda x: x[0])
         return [node for _, node in scored]
 
+    def _rank_candidates_seglen(
+        self, candidates: List[TreeNode]
+    ) -> List[TreeNode]:
+        """Rank candidates by replay length from the nearest live Mamba ancestor.
+
+        Lower replay length is less valuable to keep and should be evicted first.
+        Ties fall back to recency so older nodes are evicted first.
+        """
+        scored = []
+        for node in candidates:
+            scored.append(
+                (
+                    self._get_mamba_recompute_length(node),
+                    node.last_access_time,
+                    node,
+                )
+            )
+
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return [node for _, _, node in scored]
+
     def _evict_mamba_marconi(self, mamba_num: int) -> int:
         """Evict mamba states using Marconi FLOP-aware scoring."""
         if self.disable or mamba_num <= 0:
@@ -951,6 +993,49 @@ class MambaRadixCache(BasePrefixCache):
 
         return mamba_num_evicted
 
+    def _evict_mamba_seglen(self, mamba_num: int) -> int:
+        """Evict mamba states using replay length from the nearest live anchor."""
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        mamba_num_evicted = 0
+
+        # Collect and rank once per eviction call.
+        candidates = self._collect_unlocked_candidates(leaf_only=False)
+        if not candidates:
+            return 0
+
+        ranked = self._rank_candidates_seglen(candidates)
+
+        for x in ranked:
+            if mamba_num_evicted >= mamba_num:
+                break
+
+            # Skip if locked or already evicted since ranking.
+            if x.mamba_lock_ref != 0:
+                continue
+            if not self.mamba_lru_list.in_list(x):
+                continue
+
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert (
+                len(x.mamba_value) == 1
+            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+
+            if len(x.children) > 0:
+                # Internal node: free mamba only, tombstone.
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                mamba_num_evicted += len(x.mamba_value)
+                self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                # Leaf node: free both KV + mamba, delete.
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
+                mamba_num_evicted += mamba_evicted_delta
+
+        return mamba_num_evicted
+
     def _evict_full_marconi(self, full_num_tokens: int) -> int:
         """Evict full KV cache using Marconi FLOP-aware scoring."""
         if self.disable or full_num_tokens <= 0:
@@ -973,6 +1058,38 @@ class MambaRadixCache(BasePrefixCache):
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
             full_num_evicted_delta, _, x, _ = self._evict_leaf_node(x, False)
+            full_num_evicted += full_num_evicted_delta
+
+        return full_num_evicted
+
+    def _evict_full_seglen(self, full_num_tokens: int) -> int:
+        """Evict full KV cache using replay length from the nearest live anchor."""
+        if self.disable or full_num_tokens <= 0:
+            return 0
+
+        full_num_evicted = 0
+
+        # Collect and rank once per eviction call.
+        candidates = self._collect_unlocked_candidates(leaf_only=True)
+        if not candidates:
+            return 0
+
+        ranked = self._rank_candidates_seglen(candidates)
+
+        for x in ranked:
+            if full_num_evicted >= full_num_tokens:
+                break
+
+            # Skip if locked or already evicted since ranking.
+            if x.full_lock_ref != 0:
+                continue
+            if not self.full_lru_list.in_list(x):
+                continue
+
+            assert (
+                x != self.root_node
+            ), f"root node should not exist in full lru list, {x.id=}"
+            full_num_evicted_delta, _, _, _ = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
         return full_num_evicted
