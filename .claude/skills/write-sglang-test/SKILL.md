@@ -1,6 +1,6 @@
 ---
 name: write-sglang-test
-description: Guide for writing SGLang CI/UT tests following project conventions. Covers CustomTestCase, CI registration, server fixtures, model selection, and test placement. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
+description: Guide for writing SGLang CI/UT tests following project conventions. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
 ---
 
 # Writing SGLang CI / UT Tests
@@ -10,15 +10,84 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`
 2. **Place tests in `test/registered/<category>/`** — only use `test/manual/` for debugging / non-CI tests
 3. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
-4. **Smallest model for model-agnostic functionality** — use `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (Llama-3.2-1B-Instruct) for basic features that don't depend on model size
-5. **8B for general performance** — use `DEFAULT_MODEL_NAME_FOR_TEST` (Llama-3.1-8B-Instruct, single-node) for performance tests that don't involve spec / DP / parallelism
-6. **Bigger features → discuss case by case** — spec, DP attention, tensor/pipeline parallelism etc. may need multi-GPU suites and specific models
+4. **Prefer mock over real server** — when testing logic that doesn't need inference (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
 ---
 
-## Test File Template
+## Model & Backend Selection
 
-### Functional correctness test (small model)
+| Scenario | Model | CI Registration | Suite |
+|----------|-------|-----------------|-------|
+| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-small-1-gpu` |
+| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-small-1-gpu` |
+| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-large-1-gpu` |
+| **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
+
+**Key principle**: Do NOT add `register_amd_ci` / `register_cpu_ci` unless the test specifically exercises AMD/ROCm or CPU-specific code paths. Common tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
+
+### All model constants
+
+Defined in `python/sglang/test/test_utils.py`:
+
+| Constant | Model | When to use |
+|----------|-------|-------------|
+| `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` | Llama-3.2-1B-Instruct | Common features, model-agnostic tests |
+| `DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE` | Llama-3.2-1B | Base (non-instruct) model tests |
+| `DEFAULT_MODEL_NAME_FOR_TEST` | Llama-3.1-8B-Instruct | General performance (single node) |
+| `DEFAULT_MOE_MODEL_NAME_FOR_TEST` | Mixtral-8x7B-Instruct | MoE-specific tests |
+| `DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST` | — | Embedding tests |
+| `DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST` | — | Vision-language tests |
+
+### All CI suites
+
+| Suite | Runner | Scenario |
+|-------|--------|----------|
+| `stage-b-test-small-1-gpu` | 1× 5090 (32GB) | Small model tests |
+| `stage-b-test-large-1-gpu` | 1× H100 (80GB) | 8B model tests |
+| `stage-b-test-large-2-gpu` | 2× H100 | TP=2 tests |
+| `stage-c-test-4-gpu-h100` | 4× H100 | TP=4 / EP tests |
+| `stage-c-test-8-gpu-h200` | 8× H200 | Large-scale multi-GPU |
+| `nightly-1-gpu` | 1 GPU | Nightly-only |
+| `nightly-8-gpu` | 8 GPU | Nightly-only |
+
+---
+
+## Test File Templates
+
+### Mock test (no server needed)
+
+Use this for testing logic that doesn't require inference — fastest, most deterministic.
+
+```python
+import unittest
+from unittest.mock import MagicMock, patch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
+
+
+class TestMyLogic(CustomTestCase):
+    def test_config_validation(self):
+        """Test that invalid config raises ValueError."""
+        from sglang.srt.server_args import ServerArgs
+
+        with self.assertRaises(ValueError):
+            ServerArgs.from_cli_args(["--invalid-flag"])
+
+    @patch("sglang.srt.utils.common.some_function")
+    def test_middleware_behavior(self, mock_fn):
+        mock_fn.return_value = MagicMock(status_code=200)
+        # test middleware logic without launching a server
+        ...
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=3)
+```
+
+### Integration test (small model, server needed)
 
 ```python
 import unittest
@@ -66,7 +135,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=3)
 ```
 
-### General performance test (8B model, single node, no spec/DP/parallelism)
+### Performance test (8B model)
 
 ```python
 import time
@@ -150,53 +219,18 @@ Available fixtures in `python/sglang/test/server_fixtures/`:
 Every test file in `test/registered/` **must** call a registration function at module level:
 
 ```python
-from sglang.test.ci.ci_register import register_cuda_ci, register_amd_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")  # optional
 ```
 
 Parameters:
 - `est_time`: estimated runtime in seconds (used for CI partitioning)
-- `suite`: which CI suite to run in (see below)
+- `suite`: which CI suite to run in (see suite table above)
 - `nightly=True`: for nightly-only tests (default `False` = per-commit)
 - `disabled="reason"`: temporarily disable with explanation
 
-### Suite selection guide
-
-**Default cases (1 GPU):**
-
-| Scenario | Model | Suite |
-|----------|-------|-------|
-| Model-agnostic basic functionality | 1B (smallest) | `stage-b-test-small-1-gpu` |
-| General performance (no spec/DP/parallelism) | 8B | `stage-b-test-large-1-gpu` |
-
-**Bigger features (case by case):**
-
-| Scenario | Suite |
-|----------|-------|
-| 2 GPU (e.g. TP=2) | `stage-b-test-large-2-gpu` |
-| 4 GPU (H100) | `stage-c-test-4-gpu-h100` |
-| 8 GPU (H200) | `stage-c-test-8-gpu-h200` |
-| Nightly, 1 GPU | `nightly-1-gpu` |
-| Nightly, 8 GPU | `nightly-8-gpu` |
-
-For spec, DP attention, parallelism, disaggregation, etc., discuss with the team to determine the appropriate suite and GPU configuration.
-
----
-
-## Model Constants
-
-All defined in `python/sglang/test/test_utils.py`:
-
-| Constant | Model | When to use |
-|----------|-------|-------------|
-| `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` | Llama-3.2-1B-Instruct | Model-agnostic basic functionality |
-| `DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE` | Llama-3.2-1B | Base (non-instruct) model tests |
-| `DEFAULT_MODEL_NAME_FOR_TEST` | Llama-3.1-8B-Instruct | General performance (single node) |
-| `DEFAULT_MOE_MODEL_NAME_FOR_TEST` | Mixtral-8x7B-Instruct | MoE-specific tests |
-| `DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST` | — | Embedding tests |
-| `DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST` | — | Vision-language tests |
+Only add `register_amd_ci` / `register_cpu_ci` when the test exercises backend-specific code paths.
 
 ---
 
@@ -242,7 +276,8 @@ Before submitting a test:
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
 - [ ] Placed in `test/registered/<category>/`
-- [ ] Model selection: smallest for model-agnostic features, 8B for general perf, case-by-case for other complex features
-- [ ] `setUpClass` launches server, `tearDownClass` kills it
+- [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
+- [ ] Logic that doesn't need inference uses `unittest.mock.patch` instead of a real server
+- [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
 - [ ] Has `if __name__ == "__main__": unittest.main(verbosity=3)`
 - [ ] `est_time` is reasonable (measure locally)

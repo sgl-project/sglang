@@ -6,7 +6,6 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 on:
   schedule:
     - cron: '0 */12 * * *'  # Run every 12 hours (UTC)
-    - cron: '15 8 * * *'
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -683,7 +682,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run sgl-kernel unit tests on B200
         timeout-minutes: 30
@@ -746,7 +745,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
@@ -848,8 +847,6 @@ jobs:
       )
     runs-on: 1-gpu-5090
     timeout-minutes: 240
-    env:
-      IS_BLACKWELL: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
