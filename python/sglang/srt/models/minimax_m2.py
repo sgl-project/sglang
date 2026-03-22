@@ -25,6 +25,7 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -158,6 +159,7 @@ def rmsnorm_apply_kernel_serial(
     tl.store(out2_row + offsets2, out2, mask=mask2)
 
 
+@debug_kernel_api
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
@@ -196,6 +198,7 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return sum_sq
 
 
+@debug_kernel_api
 def rms_apply_serial(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -566,7 +569,8 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        # FIXME: minimax_m2 config use external config that not compatible with transformers v5
+        self.rope_theta = config.rope_theta
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
@@ -941,6 +945,18 @@ class MiniMaxM2Model(nn.Module):
 class MiniMaxM2ForCausalLM(nn.Module):
     """MiniMax M2 model for causal language modeling."""
 
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1063,9 +1079,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            _is_kv_scale = name.endswith(".k_scale") or name.endswith(".v_scale")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+                # Skip kv cache scales - maybe_remap_kv_scale_name expects the
+                # original checkpoint name (e.g. self_attn.k_proj.k_scale) to
+                # remap it to self_attn.attn.k_scale. Renaming k_proj -> qkv_proj
+                # here would break that pattern match.
+                if _is_kv_scale:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
