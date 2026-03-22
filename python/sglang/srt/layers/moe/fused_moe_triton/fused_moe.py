@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -13,7 +14,6 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -75,7 +75,7 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         # Fallback: vllm not available, will use native PyTorch implementations
         _has_vllm_ops = False
 
-padding_size = get_moe_padding_size(_use_aiter)
+padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
 @register_custom_op(mutates_args=["hidden_states"])

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -74,20 +73,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
-            intermediate_size_per_partition,
-            is_aiter_moe=True,
-            is_concat=True,
-            is_packed=True,
-        )
-
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
-            {
-                "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
-                "weight_padded": weight_padded,
-            },
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
         params_dtype = torch.uint8
@@ -96,7 +85,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                w13_up_dim,
+                2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=params_dtype,
             ),
@@ -110,7 +99,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                w2_down_dim,
+                intermediate_size_per_partition // 2,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -123,24 +112,17 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                w13_up_dim,
+                2 * intermediate_size_per_partition,
                 hidden_size // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
-
-        W2_SCALE_DIVIDEND = w2_down_dim * 2
-        W2_SCALE_DIVISOR = intermediate_size_per_partition
-        scaling_up = lambda dividend, divisor: (dividend * W2_SCALE_DIVIDEND) // (
-            divisor * W2_SCALE_DIVISOR
-        )
-
         w2_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
                 hidden_size,
-                scaling_up(intermediate_size_per_partition, OCP_MX_BLOCK_SIZE),
+                intermediate_size_per_partition // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
             requires_grad=False,
