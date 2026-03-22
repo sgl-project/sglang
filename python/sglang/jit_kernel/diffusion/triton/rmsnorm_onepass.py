@@ -1,9 +1,9 @@
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 
