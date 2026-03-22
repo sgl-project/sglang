@@ -24,7 +24,7 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 | **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-large-1-gpu` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
 
-**Key principle**: Do NOT add `register_amd_ci` / `register_cpu_ci` unless the test specifically exercises AMD/ROCm or CPU-specific code paths. Common tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
+**Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
 
 ### All model constants
 
@@ -93,7 +93,7 @@ Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the log
 
 **Quality bar** — test real logic (validation boundaries, state transitions, error paths, branching, etc.). Skip tests that just verify Python itself works (e.g., "does calling an abstract method raise `NotImplementedError`?", "does a dataclass store the field I assigned?"). Consolidate repetitive patterns into parameterized tests. No production code changes in test PRs.
 
-### Integration test (small model, server needed)
+### E2E test (small model, server needed)
 
 ```python
 import unittest
@@ -141,7 +141,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=3)
 ```
 
-### Performance test (8B model)
+### E2E test (8B model, server needed, performance)
 
 ```python
 import time
