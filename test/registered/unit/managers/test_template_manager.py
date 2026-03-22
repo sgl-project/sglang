@@ -1,11 +1,6 @@
 """Unit tests for template_manager.py — no server, no model loading."""
 
-import sys
-from unittest.mock import MagicMock, Mock, patch
-
-for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
-    if _mod not in sys.modules:
-        sys.modules[_mod] = MagicMock()
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 

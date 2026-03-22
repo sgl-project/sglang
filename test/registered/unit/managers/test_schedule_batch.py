@@ -1,12 +1,5 @@
 """Unit tests for schedule_batch.py finish reasons, enums, and pad utilities."""
 
-import sys
-from unittest.mock import MagicMock
-
-for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
-    if _mod not in sys.modules:
-        sys.modules[_mod] = MagicMock()
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
