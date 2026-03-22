@@ -802,7 +802,6 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.staging = False
-        self.batch = None
 
     @property
     def seqlen(self) -> int:

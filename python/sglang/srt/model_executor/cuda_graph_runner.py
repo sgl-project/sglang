@@ -164,7 +164,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
+            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)

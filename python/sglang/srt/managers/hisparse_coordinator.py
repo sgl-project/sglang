@@ -556,13 +556,14 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
-        # The CUDA kernel determines IdxType from req_pool_indices.dtype() and
-        # casts both req_pool_indices and seq_lens to that type.  Ensure they
-        # share the same dtype so the kernel does not reinterpret int64 memory
-        # through an int32 pointer (which reads garbage for odd batch indices).
-        if seq_lens.dtype != req_pool_indices.dtype:
+        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32.
+        if req_pool_indices.dtype != torch.int64:
             raise ValueError(
-                f"seq_lens dtype {seq_lens.dtype} does not match req_pool_indices dtype {req_pool_indices.dtype}"
+                f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
+            )
+        if seq_lens.dtype != torch.int32:
+            raise ValueError(
+                f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
             )
         if top_k_result.dtype != torch.int32:
             raise ValueError(

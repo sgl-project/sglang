@@ -5068,12 +5068,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            "Required fields: algorithm (str), backend (str). "
-            "Optional fields: top_k (int, default 2048, warning: ensure it is appropriate for your model), "
-            "device_buffer_size (int, default 2*top_k), host_to_device_ratio (int, default 2, "
-            "controls logical memory, index buffer, and host pool sizing relative to device memory). "
-            "All other fields are algorithm-specific and passed to the algorithm constructor. "
-            'Example: \'{"algorithm": "quest", "backend": "flashattention", "top_k": 2048, "device_buffer_size": 4096}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
         )
 
         # LMCache
@@ -6033,6 +6028,12 @@ class ServerArgs:
                 "Multi-item scoring requires chunked prefill to be disabled. "
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
+
+        # Check hisparse
+        if self.enable_hisparse:
+            assert (
+                self.disable_radix_cache
+            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
         assert (
             self.schedule_conservativeness >= 0
