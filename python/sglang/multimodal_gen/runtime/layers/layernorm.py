@@ -68,6 +68,11 @@ class RMSNorm(CustomOp):
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
         )
 
+    def _forward_cuda_fp32_rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        # Avoid wrap_triton in torch.compile: it specializes on a fresh
+        # constant_args_idx every call and eventually falls back to eager.
+        return self.forward_native(x)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -81,7 +86,8 @@ class RMSNorm(CustomOp):
             residual = residual.view(-1, shape[-1])
 
         if x.dtype == torch.float:
-            # fp32
+            if residual is None and self.variance_size_override is None:
+                return self._forward_cuda_fp32_rmsnorm(x).view(shape)
             out = self.forward_triton(x, residual)
             if residual is not None:
                 return out[0].view(shape), out[1].view(residual_shape)

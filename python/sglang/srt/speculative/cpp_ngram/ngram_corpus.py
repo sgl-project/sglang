@@ -10,17 +10,19 @@ from torch.utils.cpp_extension import load
 logger = logging.getLogger(__name__)
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
-ngram_cache_cpp = load(
-    name="ngram_cache_cpp",
+ngram_corpus_cpp = load(
+    name="ngram_corpus_cpp",
     sources=[
-        f"{_abs_path}/ngram_cache_binding.cpp",
+        f"{_abs_path}/ngram_corpus_binding.cpp",
         f"{_abs_path}/ngram.cpp",
+        f"{_abs_path}/trie.cpp",
+        f"{_abs_path}/result.cpp",
     ],
     extra_cflags=["-O3", "-std=c++20"],
 )
 
 
-class NgramCache:
+class NgramCorpus:
     def __init__(
         self,
         branch_length=18,
@@ -32,7 +34,7 @@ class NgramCache:
         match_type="BFS",
         capacity=1000000,
     ):
-        param = ngram_cache_cpp.Param()
+        param = ngram_corpus_cpp.Param()
         param.branch_length = branch_length
         param.min_match_window_size = min_match_window_size
         param.max_match_window_size = max_match_window_size
@@ -40,22 +42,22 @@ class NgramCache:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.match_type = match_type
-        self.cache = ngram_cache_cpp.Ngram(capacity, param)
+        self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
 
     def batch_put(self, batch_tokens: List[List[int]]):
-        self.cache.asyncInsert(batch_tokens)
+        self._ngram.asyncInsert(batch_tokens)
 
     def synchronize(self):
-        self.cache.synchronize()
+        self._ngram.synchronize()
 
     def reset(self):
-        self.cache.reset()
+        self._ngram.reset()
 
     def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        result = self.cache.batchMatch(batch_tokens)
+        result = self._ngram.batchMatch(batch_tokens)
         return np.array(result.token), np.array(result.mask)
 
     def leaf_paths_from_mask(
@@ -129,10 +131,10 @@ if __name__ == "__main__":
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
     ]
-    cache = NgramCache(branch_length=12, draft_token_num=8)
-    cache.batch_put(token_ids)
+    corpus = NgramCorpus(branch_length=12, draft_token_num=8)
+    corpus.batch_put(token_ids)
 
-    cache.synchronize()
-    decoding_ids, decoding_masks = cache.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
+    corpus.synchronize()
+    decoding_ids, decoding_masks = corpus.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
 
-    cache.debug_result(decoding_ids, decoding_masks)
+    corpus.debug_result(decoding_ids, decoding_masks)

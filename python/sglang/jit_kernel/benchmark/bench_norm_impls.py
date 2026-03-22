@@ -57,11 +57,11 @@ ACTUAL_DIFFUSION_GROUPS: list[
         "qwen-edit",
         "1 GPU",
         [
-            ("qwen_edit_ln_189x3072", "layernorm", (1, 189, 3072), SGL_LN_PAIR),
-            ("qwen_edit_ln_192x3072", "layernorm", (1, 192, 3072), SGL_LN_PAIR),
+            ("qwen_edit_ln_200x3072", "layernorm", (1, 200, 3072), SGL_LN_PAIR),
+            ("qwen_edit_ln_203x3072", "layernorm", (1, 203, 3072), SGL_LN_PAIR),
             ("qwen_edit_ln_8308x3072", "layernorm", (1, 8308, 3072), TORCH_LN),
-            ("qwen_edit_rms_189x3584", "rmsnorm", (1, 189, 3584), SGL_RMS),
-            ("qwen_edit_rms_192x3584", "rmsnorm", (1, 192, 3584), SGL_RMS),
+            ("qwen_edit_rms_200x3584", "rmsnorm", (1, 200, 3584), SGL_RMS),
+            ("qwen_edit_rms_203x3584", "rmsnorm", (1, 203, 3584), SGL_RMS),
         ],
     ),
     (
@@ -93,9 +93,7 @@ ACTUAL_DIFFUSION_GROUPS: list[
             ("zimage_rms_32x3840", "rmsnorm", (1, 32, 3840), SGL_RMS),
             ("zimage_rms_4096x3840", "rmsnorm", (1, 4096, 3840), SGL_RMS),
             ("zimage_rms_4128x3840", "rmsnorm", (1, 4128, 3840), SGL_RMS),
-            ("zimage_rms_512x2560", "rmsnorm", (1, 512, 2560), SGL_RMS),
-            ("zimage_rms_512x32x128", "rmsnorm", (1, 512, 32, 128), SGL_RMS),
-            ("zimage_rms_512x8x128", "rmsnorm", (1, 512, 8, 128), SGL_RMS),
+            ("zimage_rms_32x2560", "rmsnorm", (32, 2560), SGL_RMS),
         ],
     ),
     (

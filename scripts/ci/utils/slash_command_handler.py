@@ -515,19 +515,23 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     Handles the /rerun-ut <file>::<TestClass.test_method> command.
     Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
     """
-    # SECURITY: Block /rerun-ut entirely for fork PRs. This command checks out and
-    # executes code from the PR branch on self-hosted GPU runners, which would bypass
-    # the run-ci label gate that requires maintainer review for fork PRs.
+    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
+    # This command checks out and executes code from the PR branch on self-hosted GPU
+    # runners, so we must ensure the commenter is a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
     if is_fork:
-        print("Permission denied: /rerun-ut is not allowed on fork PRs.")
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            "❌ `/rerun-ut` is not available for fork PRs (security restriction).\n\n"
-            "Please ask a maintainer to add the `run-ci` label and use the normal CI flow, "
-            "or use `/rerun-failed-ci` to rerun workflows that have already passed the gate."
-        )
-        return False
+        commenter = comment.user.login
+        perm = gh_repo.get_collaborator_permission(commenter)
+        if perm not in ("admin", "write"):
+            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
+                "has write permission on the repo.\n\n"
+                "Please ask a maintainer to run this command, or use the normal CI flow."
+            )
+            return False
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
 
     if not (
         user_perms.get("can_rerun_ut", False)

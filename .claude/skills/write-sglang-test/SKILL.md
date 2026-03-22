@@ -10,7 +10,7 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`
 2. **Place tests in `test/registered/<category>/`** — only use `test/manual/` for debugging / non-CI tests
 3. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
-4. **Prefer mock over real server** — when testing logic that doesn't need inference (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
+4. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
 ---
 
@@ -18,12 +18,13 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 
 | Scenario | Model | CI Registration | Suite |
 |----------|-------|-----------------|-------|
+| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-cpu-only` or `stage-b-test-small-1-gpu` |
 | **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-small-1-gpu` |
 | **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-small-1-gpu` |
 | **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-large-1-gpu` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
 
-**Key principle**: Do NOT add `register_amd_ci` / `register_cpu_ci` unless the test specifically exercises AMD/ROCm or CPU-specific code paths. Common tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
+**Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
 
 ### All model constants
 
@@ -42,6 +43,7 @@ Defined in `python/sglang/test/test_utils.py`:
 
 | Suite | Runner | Scenario |
 |-------|--------|----------|
+| `stage-a-cpu-only` | CPU | CPU unit tests |
 | `stage-b-test-small-1-gpu` | 1× 5090 (32GB) | Small model tests |
 | `stage-b-test-large-1-gpu` | 1× H100 (80GB) | 8B model tests |
 | `stage-b-test-large-2-gpu` | 2× H100 | TP=2 tests |
@@ -54,40 +56,44 @@ Defined in `python/sglang/test/test_utils.py`:
 
 ## Test File Templates
 
-### Mock test (no server needed)
+### Unit Tests (no server / engine launch)
 
-Use this for testing logic that doesn't require inference — fastest, most deterministic.
+See `test/registered/unit/README.md` for quick-start and rules. Unit tests live in `test/registered/unit/`, mirroring `python/sglang/srt/`:
 
 ```python
+"""Unit tests for srt/<module>"""
+
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.<module> import TargetClass
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+# Prefer CPU. Only use register_cuda_ci when the test truly needs a GPU.
 
+class TestTargetClass(CustomTestCase):
+    def test_basic_behavior(self):
+        obj = TargetClass(...)
+        self.assertEqual(obj.method(), expected)
 
-class TestMyLogic(CustomTestCase):
-    def test_config_validation(self):
-        """Test that invalid config raises ValueError."""
-        from sglang.srt.server_args import ServerArgs
-
-        with self.assertRaises(ValueError):
-            ServerArgs.from_cli_args(["--invalid-flag"])
-
-    @patch("sglang.srt.utils.common.some_function")
-    def test_middleware_behavior(self, mock_fn):
-        mock_fn.return_value = MagicMock(status_code=200)
-        # test middleware logic without launching a server
+    @patch("sglang.srt.<module>.some_dependency")
+    def test_with_mock(self, mock_dep):
+        mock_dep.return_value = MagicMock()
+        # test logic with dependency mocked
         ...
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=3)
+    unittest.main()
 ```
 
-### Integration test (small model, server needed)
+Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module fails to import on CPU CI (e.g., imports `torch` or CUDA ops at module level), use `sys.modules` stubs to make the import succeed. See existing tests in `test/registered/unit/` for examples.
+
+**Quality bar** — test real logic (validation boundaries, state transitions, error paths, branching, etc.). Skip tests that just verify Python itself works (e.g., "does calling an abstract method raise `NotImplementedError`?", "does a dataclass store the field I assigned?"). Consolidate repetitive patterns into parameterized tests. No production code changes in test PRs.
+
+### E2E test (small model, server needed)
 
 ```python
 import unittest
@@ -135,7 +141,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=3)
 ```
 
-### Performance test (8B model)
+### E2E test (8B model, server needed, performance)
 
 ```python
 import time
@@ -239,6 +245,8 @@ Only add `register_amd_ci` / `register_cpu_ci` when the test exercises backend-s
 ```
 test/
 ├── registered/          # CI tests (auto-discovered by run_suite.py)
+│   ├── unit/            # No server / engine launch (see test/registered/unit/README.md)
+│   ├── kernels/         # CUDA kernel correctness (no server, GPU required)
 │   ├── sampling/        # test_penalty.py, test_sampling_params.py ...
 │   ├── sessions/        # test_session_control.py ...
 │   ├── openai_server/   # basic/, features/, validation/ ...
@@ -250,7 +258,11 @@ test/
 └── run_suite.py         # CI runner (scans registered/ only)
 ```
 
-**Decision rule**: if the test should run in CI → `registered/`. If it's for local debugging or requires special hardware not in CI → `manual/`.
+**Decision rule** (see also `test/registered/README.md`):
+- Component logic, no server → `registered/unit/`
+- Kernel correctness → `registered/kernels/`
+- Server needed → `registered/<category>/`
+- Local debugging → `manual/`
 
 ---
 
@@ -277,7 +289,7 @@ Before submitting a test:
 - [ ] Has `register_*_ci(...)` call at module level
 - [ ] Placed in `test/registered/<category>/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
-- [ ] Logic that doesn't need inference uses `unittest.mock.patch` instead of a real server
+- [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
-- [ ] Has `if __name__ == "__main__": unittest.main(verbosity=3)`
+- [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)
