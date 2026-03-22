@@ -100,8 +100,16 @@ def _serialize_named_tensors(named_tensors: list[tuple[str, torch.Tensor]]) -> s
 
 
 class _ServerRunner:
-    def __init__(self, model_path: str):
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        num_gpus: int = 1,
+        tp_size: int | None = None,
+    ):
         self.model_path = model_path
+        self.num_gpus = num_gpus
+        self.tp_size = tp_size
         self.port = _get_free_port()
         self.process: subprocess.Popen | None = None
         self.log_file = None
@@ -124,8 +132,10 @@ class _ServerRunner:
             str(self.port),
             "--log-level=debug",
             "--num-gpus",
-            "1",
+            str(self.num_gpus),
         ]
+        if self.tp_size is not None:
+            command.extend(["--tp-size", str(self.tp_size)])
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
 
@@ -290,6 +300,179 @@ class UpdateWeightFromTensorCheckerE2ETest(unittest.TestCase):
             self.expected_updated_tensors[0][0],
             check_result.get("message", ""),
         )
+
+
+def _select_tp_candidate_tensors(
+    model_path: str,
+    max_tensors: int = 24,
+) -> list[tuple[str, torch.Tensor]]:
+    norm_candidates: list[tuple[str, torch.Tensor]] = []
+    other_candidates: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in _iter_transformer_weights_from_disk(model_path):
+        if not tensor.is_floating_point() or tensor.ndim != 1:
+            continue
+        candidate = (name, tensor.to(torch.bfloat16).clone())
+        if "norm" in name:
+            norm_candidates.append(candidate)
+        elif name.endswith(".bias"):
+            other_candidates.append(candidate)
+
+        if len(norm_candidates) + len(other_candidates) >= max_tensors:
+            break
+
+    candidates = norm_candidates + other_candidates
+    if not candidates:
+        raise AssertionError("Expected at least one 1D transformer tensor candidate")
+    return candidates[:max_tensors]
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires at least 2 GPUs")
+class UpdateWeightFromTensorChecker2GPUTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        snapshot_download(repo_id=BASE_MODEL)
+        cls.tp_candidates = _select_tp_candidate_tensors(BASE_MODEL)
+        cls.selected_updated_tensors = None
+
+    def setUp(self):
+        self.server = _ServerRunner(BASE_MODEL, num_gpus=2, tp_size=2)
+        self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self.server = None
+
+    def _update_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> tuple[dict, int]:
+        serialized_payload = _serialize_named_tensors(named_tensors)
+        response = requests.post(
+            f"{self.server.base_url}/update_weights_from_tensor",
+            json={
+                "serialized_named_tensors": [serialized_payload, serialized_payload],
+                "target_modules": [TRANSFORMER_MODULE],
+            },
+            timeout=300,
+        )
+        return response.json(), response.status_code
+
+    def _check_updated_weights_from_tensor(
+        self,
+        expected_transformer_sha256: dict[str, str],
+    ) -> tuple[dict, int]:
+        response = requests.post(
+            f"{self.server.base_url}/update_weights_from_tensor_checker",
+            json={
+                "expected_transformer_sha256": [
+                    expected_transformer_sha256,
+                    expected_transformer_sha256,
+                ]
+            },
+            timeout=300,
+        )
+        return response.json(), response.status_code
+
+    def _build_selected_updated_tensors(self):
+        cls = type(self)
+        if cls.selected_updated_tensors is not None:
+            return cls.selected_updated_tensors
+
+        errors: list[str] = []
+        for name, tensor in cls.tp_candidates:
+            updated_tensors = [(name, tensor.clone().add_(1.0))]
+
+            serialized_payload = _serialize_named_tensors(updated_tensors)
+            update_response = requests.post(
+                f"{self.server.base_url}/update_weights_from_tensor",
+                json={
+                    "serialized_named_tensors": [serialized_payload, serialized_payload],
+                    "target_modules": [TRANSFORMER_MODULE],
+                },
+                timeout=300,
+            )
+            if (
+                update_response.status_code != 200
+                or not update_response.json().get("success")
+            ):
+                errors.append(
+                    f"{name}: update failed with "
+                    f"{update_response.status_code} {update_response.text}"
+                )
+                continue
+
+            expected_transformer_sha256 = _build_named_tensor_sha256(updated_tensors)
+            check_response = requests.post(
+                f"{self.server.base_url}/update_weights_from_tensor_checker",
+                json={
+                    "expected_transformer_sha256": [
+                        expected_transformer_sha256,
+                        expected_transformer_sha256,
+                    ]
+                },
+                timeout=300,
+            )
+            if (
+                check_response.status_code == 200
+                and check_response.json().get("success")
+            ):
+                cls.selected_updated_tensors = updated_tensors
+                return cls.selected_updated_tensors
+
+            errors.append(
+                f"{name}: checker failed with "
+                f"{check_response.status_code} {check_response.text}"
+            )
+
+        displayed_errors = "; ".join(errors[:5])
+        raise AssertionError(
+            "Could not find a TP-compatible transformer tensor candidate for 2 GPU "
+            f"update_weights_from_tensor checker test. First errors: {displayed_errors}"
+        )
+
+    def test_update_weights_from_tensor_checker_success(self):
+        selected_updated_tensors = self._build_selected_updated_tensors()
+        update_result, update_status = self._update_weights_from_tensor(
+            selected_updated_tensors
+        )
+        self.assertEqual(update_status, 200, update_result)
+        self.assertTrue(update_result.get("success"), update_result)
+
+        expected_transformer_sha256 = _build_named_tensor_sha256(
+            selected_updated_tensors
+        )
+        check_result, check_status = self._check_updated_weights_from_tensor(
+            expected_transformer_sha256
+        )
+        self.assertEqual(check_status, 200, check_result)
+        self.assertTrue(check_result.get("success"), check_result)
+        self.assertIn("across 2 TP ranks", check_result.get("message", ""))
+
+    def test_update_weights_from_tensor_checker_detects_corrupted_payload(self):
+        selected_updated_tensors = self._build_selected_updated_tensors()
+        expected_transformer_sha256 = _build_named_tensor_sha256(
+            selected_updated_tensors
+        )
+        corrupted_named_tensors = [
+            (name, tensor.clone().add_(1.0)) for name, tensor in selected_updated_tensors
+        ]
+
+        update_result, update_status = self._update_weights_from_tensor(
+            corrupted_named_tensors
+        )
+        self.assertEqual(update_status, 200, update_result)
+        self.assertTrue(update_result.get("success"), update_result)
+
+        check_result, check_status = self._check_updated_weights_from_tensor(
+            expected_transformer_sha256
+        )
+        self.assertEqual(check_status, 400, check_result)
+        self.assertFalse(check_result.get("success", True), check_result)
+        self.assertIn(
+            "failed update_weight_from_tensor_checker",
+            check_result.get("message", ""),
+        )
+        self.assertIn(selected_updated_tensors[0][0], check_result.get("message", ""))
 
 
 if __name__ == "__main__":
