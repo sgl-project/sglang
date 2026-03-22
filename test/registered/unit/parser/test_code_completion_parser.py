@@ -1,6 +1,7 @@
 """Unit tests for srt/parser/code_completion_parser.py"""
 
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.parser.code_completion_parser import (
@@ -144,11 +145,10 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
 
     def test_nonempty_suffix_uses_fim_template(self):
         """Test that non-empty suffix triggers FIM formatting."""
-        import sglang.srt.parser.code_completion_parser as module
-
-        old_name = module.completion_template_name
-        try:
-            module.completion_template_name = "deepseek_coder"
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
             request = CompletionRequest(prompt="prefix", suffix="suffix")
             result = generate_completion_prompt_from_request(request)
             t = completion_templates["deepseek_coder"]
@@ -156,8 +156,6 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
                 f"{t.fim_begin_token}prefix{t.fim_middle_token}suffix{t.fim_end_token}"
             )
             self.assertEqual(result, expected)
-        finally:
-            module.completion_template_name = old_name
 
 
 class TestSetCompletionTemplate(CustomTestCase):
@@ -165,16 +163,12 @@ class TestSetCompletionTemplate(CustomTestCase):
         """Test that set_completion_template only sets the name once."""
         import sglang.srt.parser.code_completion_parser as module
 
-        old_name = module.completion_template_name
-        try:
-            module.completion_template_name = None
+        with patch.object(module, "completion_template_name", None):
             set_completion_template("star_coder")
             self.assertEqual(module.completion_template_name, "star_coder")
             # Second call should be ignored
             set_completion_template("qwen_coder")
             self.assertEqual(module.completion_template_name, "star_coder")
-        finally:
-            module.completion_template_name = old_name
 
     def test_is_completion_template_defined(self):
         """Test the defined check before and after setting."""

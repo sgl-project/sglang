@@ -841,7 +841,7 @@ class TestBufferLossBugFix(CustomTestCase):
         5. Buffer is cleared and "answer" is returned directly
         6. The "</" from previous step is lost
 
-        This test verifies the fix where line 108 was changed from:
+        This test verifies the fix where the return was changed from:
         return StreamingParseResult(normal_text=new_text)
         to:
         return StreamingParseResult(normal_text=current_text)
@@ -1127,7 +1127,7 @@ class TestContinueFinalMessage(CustomTestCase):
 
     def test_continue_detect_parse_with_end_in_previous(self):
         """Test detect_and_parse when think_end_token is in previous_content only.
-        This hits line 99: the branch where think_end is NOT in current text
+        This covers the branch where think_end is NOT in current text
         but IS in previous_content, so output is treated as normal_text."""
         detector = BaseReasoningFormatDetector(
             "<think>",
@@ -1145,10 +1145,10 @@ class TestContinueFinalMessage(CustomTestCase):
         self.assertEqual(result.normal_text, "new content here")
 
     def test_continue_end_in_previous_new_text_has_start_but_no_end(self):
-        """Test line 99: think_end in previous, new text has think_start but no think_end.
+        """Test: think_end in previous, new text has think_start but no think_end.
         This produces: in_reasoning=True (from think_start in text),
         think_end NOT in processed_text, think_end IN previous_content,
-        so it falls through to the else branch at line 97-99."""
+        so it falls through to the else branch that returns normal_text."""
         detector = BaseReasoningFormatDetector(
             "<think>",
             "</think>",
@@ -1158,9 +1158,9 @@ class TestContinueFinalMessage(CustomTestCase):
         )
         # _in_reasoning = False (think_end in previous overrides)
         self.assertFalse(detector._in_reasoning)
-        # New text has <think> (triggers in_reasoning via line 59) but no </think>
+        # New text has <think> (triggers in_reasoning) but no </think>
         # think_end IS in previous_content → skips the truncated-reasoning branch
-        # think_end NOT in processed_text → falls to else at line 97
+        # think_end NOT in processed_text → falls to else that returns normal_text
         result = detector.detect_and_parse("<think>continuing reasoning")
         self.assertEqual(result.normal_text, "continuing reasoning")
         self.assertEqual(result.reasoning_text, "")
