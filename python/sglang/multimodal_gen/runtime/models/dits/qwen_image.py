@@ -21,6 +21,9 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import (
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -54,6 +57,16 @@ try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
     NunchakuFeedForward = None
+
+
+def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
+    """get the local seq len, from seq_len padding to the next multiple of sp_world_size, then shard to local"""
+    if sp_world_size <= 1:
+        return seq_len
+    padded_len = seq_len
+    if padded_len % sp_world_size != 0:
+        padded_len += sp_world_size - (padded_len % sp_world_size)
+    return padded_len // sp_world_size
 
 
 def _get_qkv_projections(
@@ -648,6 +661,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_query,
             joint_key,
             joint_value,
+            num_replicated_prefix=seq_len_txt,
         )
 
         # Reshape back
@@ -1088,11 +1102,24 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+
+        sp_world_size = get_sp_world_size()
+
         modulate_index_list = []
         for sample in img_shapes:
             first_size = sample[0][0] * sample[0][1] * sample[0][2]
             total_size = sum(s[0] * s[1] * s[2] for s in sample)
-            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            if sp_world_size > 1:
+                first_local_size = _local_seq_len(first_size)
+                tail_local_size = _local_seq_len(total_size - first_size)
+                idx = torch.cat(
+                    [
+                        torch.zeros(first_local_size, device=device, dtype=torch.int),
+                        torch.ones(tail_local_size, device=device, dtype=torch.int),
+                    ]
+                )
+            else:
+                idx = (torch.arange(total_size, device=device) >= first_size).int()
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)

@@ -2,6 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -64,6 +65,7 @@ def _rotary_embedding_kernel(
         tl.store(output_row_ptr + offsets_x2, o2_vals.to(x2_vals.dtype), mask=mask)
 
 
+@maybe_wrap_jit_kernel_debug
 def apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
@@ -110,9 +112,24 @@ def apply_rotary_embedding(
 if current_platform.is_npu():
     from .npu_fallback import apply_rotary_embedding_native
 
-    apply_rotary_embedding = apply_rotary_embedding_native
+    @maybe_wrap_jit_kernel_debug
+    def apply_rotary_embedding(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        interleaved: bool = False,
+    ) -> torch.Tensor:
+        return apply_rotary_embedding_native(x, cos, sin, interleaved)
+
 
 if current_platform.is_mps():
     from .mps_fallback import apply_rotary_embedding_native
 
-    apply_rotary_embedding = apply_rotary_embedding_native
+    @maybe_wrap_jit_kernel_debug
+    def apply_rotary_embedding(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        interleaved: bool = False,
+    ) -> torch.Tensor:
+        return apply_rotary_embedding_native(x, cos, sin, interleaved)

@@ -45,6 +45,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3TextConfig(),)
     )
@@ -61,19 +62,22 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        inputs = tokenizer.apply_chat_template(
-            prompts,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
+        rendered_prompts = [
+            tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt in prompts
+        ]
+        return tokenizer(
+            rendered_prompts,
             padding="max_length",
             max_length=512,  # TODO (yhyang201): set max length according to config
             truncation=True,
             return_tensors="pt",
-            return_dict=True,
         )
-        return inputs
 
     @staticmethod
     def _ceil_to_multiple(x: int, m: int) -> int:
@@ -87,7 +91,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         return [base + int(rank < remainder) for rank in range(parts)]
 
     def _build_zimage_sp_plan(self, batch) -> dict:
-        """Build an SP plan that preserves native H/W geometry for Z-Image."""
+        """Build an SP plan that preserves native spatial layout for Z-Image."""
         sp_size = get_sp_world_size()
         rank = get_sp_parallel_rank()
 
@@ -145,16 +149,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             local_h_tok = H_tok
             local_w_tok = axis_local_tok
 
-        # Cap/text sharding: avoid duplicating cap tokens across ranks.
-        cap_len = (
-            int(batch.prompt_embeds[0].size(0))
-            if getattr(batch, "prompt_embeds", None)
-            else 0
-        )
-        cap_total = self._ceil_to_multiple(cap_len, self.SEQ_LEN_MULTIPLE * sp_size)
-        cap_local = cap_total // sp_size
-        cap_start = rank * cap_local
-
         plan = {
             "sp_size": sp_size,
             "rank": rank,
@@ -169,9 +163,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             "local_h_tok": local_h_tok,
             "local_w_tok": local_w_tok,
             "img_seq_target": img_seq_target,
-            "cap_total": cap_total,
-            "cap_local": cap_local,
-            "cap_start": cap_start,
         }
         batch._zimage_sp_plan = plan
         return plan
@@ -183,25 +174,13 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             plan = self._build_zimage_sp_plan(batch)
         return plan
 
-    def _shard_cap(self, cap: torch.Tensor, plan: dict) -> torch.Tensor:
-        """cap: [L, D] -> [cap_local, D], padded by repeating last token."""
-        if plan["sp_size"] <= 1:
-            return cap
-        # print(f"cap shape: {cap.shape}")  # [L, 2560] for zimage-turbo
-        L = cap.size(0)
-        cap_total = plan["cap_total"]
-        if cap_total > L:
-            cap = torch.cat([cap, cap[-1:].repeat(cap_total - L, 1)], dim=0)
-        start = plan["cap_start"]
-        local = plan["cap_local"]
-        return cap[start : start + local]
-
     def get_pos_prompt_embeds(self, batch):
-        # Keep ZImage model signature: encoder_hidden_states is List[Tensor]
-        if get_sp_world_size() <= 1:
-            return batch.prompt_embeds
-        plan = self._get_zimage_sp_plan(batch)
-        return [self._shard_cap(batch.prompt_embeds[0], plan)]
+        return batch.prompt_embeds
+
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        # Match the official diffusers Z-Image pipeline, which samples latents in fp32
+        # and keeps scheduler state in fp32.
+        return torch.float32
 
     def shard_latents_for_sp(self, batch, latents):
         sp_size = get_sp_world_size()
@@ -221,11 +200,14 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     def gather_latents_for_sp(self, latents, batch):
         # Gather native H/W shards by padding to a common collective shape, then crop.
         latents = latents.contiguous()
-        if get_sp_world_size() <= 1 or latents.dim() not in (5, 6):
+        if get_sp_world_size() <= 1 or latents.dim() not in (4, 5, 6):
             return latents
 
+        assert batch is not None
         plan = self._get_zimage_sp_plan(batch)
-        if latents.dim() == 5:
+        if latents.dim() == 4:
+            shard_dim = 2 if plan["shard_axis"] == "h" else 3
+        elif latents.dim() == 5:
             shard_dim = 3 if plan["shard_axis"] == "h" else 4
         else:
             shard_dim = 4 if plan["shard_axis"] == "h" else 5
@@ -250,6 +232,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             gather_slices[shard_dim] = slice(axis_lat)
             pieces.append(tensor[tuple(gather_slices)])
         return torch.cat(pieces, dim=shard_dim)
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        return self.gather_latents_for_sp(noise_pred, batch=batch)
 
     def post_denoising_loop(self, latents, batch):
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
@@ -278,13 +263,16 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
         sp_size = get_sp_world_size()
         if sp_size > 1:
-            # SP path: build local-only freqs_cis matching local cap/x.
+            # SP path: keep caption replicated on every rank and build local-only
+            # image freqs_cis matching the spatial shard.
             plan = self._get_zimage_sp_plan(batch)
+            cap_ori_len = prompt_embeds.size(0)
+            cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
 
-            # cap (local)
+            # caption (replicated prefix)
             cap_pos_ids = create_coordinate_grid(
-                size=(plan["cap_local"], 1, 1),
-                start=(1 + plan["cap_start"], 0, 0),
+                size=(cap_ori_len + cap_padding_len, 1, 1),
+                start=(1, 0, 0),
                 device=device,
             ).flatten(0, 2)
             cap_freqs_cis = rotary_emb(cap_pos_ids)
@@ -295,7 +283,11 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             W_tokens_local = plan["local_w_tok"]
             img_pos_ids = create_coordinate_grid(
                 size=(F_tokens, H_tokens_local, W_tokens_local),
-                start=(plan["cap_total"] + 1, plan["h0_tok"], plan["w0_tok"]),
+                start=(
+                    cap_ori_len + cap_padding_len + 1,
+                    plan["h0_tok"],
+                    plan["w0_tok"],
+                ),
                 device=device,
             ).flatten(0, 2)
             img_pad_len = plan["img_seq_target"] - img_pos_ids.shape[0]
