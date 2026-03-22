@@ -133,6 +133,12 @@ class GPUWorker:
         else:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
+        # Initialize FP8 GEMM backend before building pipeline so that
+        # dispatch_w8a8_block_fp8_linear() respects --fp8-gemm-backend /
+        # SGLANG_ENABLE_JIT_DEEPGEMM env var. Without this call the dispatch
+        # function falls back to AUTO (DeepGemm) regardless of user settings.
+        self._initialize_fp8_gemm_config()
+
         self.pipeline = build_pipeline(self.server_args)
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
@@ -158,6 +164,44 @@ class GPUWorker:
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
+
+    def _initialize_fp8_gemm_config(self) -> None:
+        """Initialize FP8 GEMM backend selection for diffusion models.
+
+        The srt Scheduler calls initialize_fp8_gemm_config(server_args) which
+        sets the global FP8_GEMM_RUNNER_BACKEND. The diffusion GPUWorker never
+        calls it, so dispatch_w8a8_block_fp8_linear() always falls back to AUTO
+        (DeepGemm) regardless of SGLANG_ENABLE_JIT_DEEPGEMM env var.
+
+        Root cause: deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM is a module-level
+        constant fixed at import time. To honour the env var we must re-evaluate
+        it here (after the worker process starts with the correct env vars) and
+        patch the module attribute before build_pipeline() triggers
+        dispatch_w8a8_block_fp8_linear() via Fp8LinearMethod.__init__.
+        """
+        try:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                _compute_enable_deep_gemm,
+            )
+            from sglang.srt.utils import is_blackwell_supported
+
+            # Re-evaluate the env var now that the worker process is running.
+            # The module constant was frozen at import time; patch it here so
+            # that _dispatch_auto_backend() (fp8_utils.py:436) sees the correct
+            # value when it reads deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM.
+            enabled = _compute_enable_deep_gemm()
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = enabled
+            deep_gemm_wrapper.DEEPGEMM_BLACKWELL = enabled and is_blackwell_supported()
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 = deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+            logger.info(
+                "FP8 GEMM: ENABLE_JIT_DEEPGEMM re-evaluated to %s "
+                "(env SGLANG_ENABLE_JIT_DEEPGEMM=%s)",
+                enabled,
+                __import__("os").environ.get("SGLANG_ENABLE_JIT_DEEPGEMM", "not set"),
+            )
+        except Exception as e:
+            logger.debug("FP8 GEMM config initialization skipped: %s", e)
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         final_snapshot = capture_memory_snapshot()
