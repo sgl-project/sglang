@@ -523,9 +523,7 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
         commenter = comment.user.login
         perm = gh_repo.get_collaborator_permission(commenter)
         if perm not in ("admin", "write"):
-            print(
-                f"Permission denied: /rerun-ut on fork PR by {commenter} (perm={perm})."
-            )
+            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
                 "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
@@ -533,9 +531,7 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
             return False
-        print(
-            f"Fork PR, but commenter {commenter} has '{perm}' permission. Proceeding."
-        )
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
 
     if not (
         user_perms.get("can_rerun_ut", False)
