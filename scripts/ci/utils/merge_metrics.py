@@ -5,7 +5,7 @@ This script reads all per-partition metric JSON files and consolidates them
 into a single JSON file with run-level metadata.
 
 Usage:
-    python3 scripts/ci/merge_metrics.py \
+    python3 scripts/ci/utils/merge_metrics.py \
         --input-dir metrics/ \
         --output consolidated-metrics-12345678.json \
         --run-id 12345678 \
