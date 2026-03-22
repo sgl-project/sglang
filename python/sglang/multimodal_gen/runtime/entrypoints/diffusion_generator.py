@@ -10,6 +10,7 @@ diffusion models.
 
 import dataclasses
 import multiprocessing as mp
+import os
 import time
 from typing import Any, List, Union
 
@@ -181,13 +182,8 @@ class DiffGenerator:
         Returns a single GenerationResult for a single prompt, a list for
         multiple prompts, or None when every request failed.
         """
-        sampling_params_kwargs = sampling_params_kwargs or {}
-
         # 1. prepare requests
-        prompts = self._resolve_prompts(
-            prompt=sampling_params_kwargs.get("prompt"),
-            prompt_path=sampling_params_kwargs.get("prompt_path"),
-        )
+        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
         user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
         if len(prompts) > 1 and user_output_file_name is not None:
@@ -338,18 +334,24 @@ class DiffGenerator:
             return None
         return results[0] if len(results) == 1 else results
 
-    def _resolve_prompts(
-        self,
-        prompt: str | list[str] | None,
-        prompt_path: str | None = None,
-    ) -> list[str]:
+    def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
         """Collect prompts from the argument or from a prompt file."""
-        return resolve_prompts(
-            prompt=prompt,
-            prompt_path=prompt_path,
-            legacy_prompt_path=self.server_args.prompt_file_path,
-            logger=logger,
-        )
+        if self.server_args.prompt_file_path is not None:
+            path = self.server_args.prompt_file_path
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Prompt text file not found: {path}")
+            with open(path, encoding="utf-8") as f:
+                prompts = [line.strip() for line in f if line.strip()]
+            if not prompts:
+                raise ValueError(f"No prompts found in file: {path}")
+            logger.info("Found %d prompts in %s", len(prompts), path)
+            return prompts
+
+        if prompt is None:
+            return [" "]
+        if isinstance(prompt, str):
+            return [prompt]
+        return list(prompt)
 
     def _log_summary(self, results: list[GenerationResult]) -> None:
         if not results:
