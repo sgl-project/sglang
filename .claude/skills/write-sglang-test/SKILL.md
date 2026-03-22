@@ -13,6 +13,8 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 4. **Smallest model for model-agnostic functionality** — use `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (Llama-3.2-1B-Instruct) for basic features that don't depend on model size
 5. **8B for general performance** — use `DEFAULT_MODEL_NAME_FOR_TEST` (Llama-3.1-8B-Instruct, single-node) for performance tests that don't involve spec / DP / parallelism
 6. **Bigger features → discuss case by case** — spec, DP attention, tensor/pipeline parallelism etc. may need multi-GPU suites and specific models
+7. **Common tests only register `register_cuda_ci`** — tests for backend-independent functionality (HTTP middleware, abort, API routing, config parsing, argument validation, etc.) should **only** call `register_cuda_ci`. Do NOT add `register_amd_ci` / `register_cpu_ci` unless the test specifically exercises AMD/ROCm or CPU-specific code paths. These tests just need any GPU to run the server — there is no value in duplicating them across backends.
+8. **Prefer `unittest.mock.patch` over launching a real server** — when testing logic that doesn't require end-to-end inference (middleware behavior, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` to isolate the unit under test. Only launch a real server (`popen_launch_server`) when the test genuinely needs inference results or server lifecycle behavior. Mock-based tests are faster, more deterministic, and don't consume GPU CI time.
 
 ---
 
@@ -150,10 +152,14 @@ Available fixtures in `python/sglang/test/server_fixtures/`:
 Every test file in `test/registered/` **must** call a registration function at module level:
 
 ```python
-from sglang.test.ci.ci_register import register_cuda_ci, register_amd_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")  # optional
+
+# Only add register_amd_ci / register_cpu_ci when the test exercises
+# backend-specific code paths (e.g., AMD kernel, ROCm integration).
+# Common tests (middleware, abort, routing, config) should NOT register
+# non-CUDA backends — it wastes CI time with no extra coverage.
 ```
 
 Parameters:
@@ -246,3 +252,5 @@ Before submitting a test:
 - [ ] `setUpClass` launches server, `tearDownClass` kills it
 - [ ] Has `if __name__ == "__main__": unittest.main(verbosity=3)`
 - [ ] `est_time` is reasonable (measure locally)
+- [ ] Backend-independent tests only register `register_cuda_ci` (no unnecessary AMD/CPU registration)
+- [ ] Logic that doesn't need inference uses `unittest.mock.patch` instead of launching a server
