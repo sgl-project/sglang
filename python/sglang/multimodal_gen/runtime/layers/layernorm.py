@@ -210,7 +210,7 @@ class RMSNorm(CustomOp):
         return out
 
     def extra_repr(self) -> str:
-        return f"hidden_size={self.hidden_size}, eps={self.eps}"
+        return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
 
 
 # Copied and adapted from sglang
