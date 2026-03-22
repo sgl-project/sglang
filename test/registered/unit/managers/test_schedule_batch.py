@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
     FINISHED_MATCHED_REGEX,
+    MM_PAD_SHIFT_VALUE,
     BaseFinishReason,
     Modality,
     _compute_pad_value,
@@ -119,8 +120,7 @@ class TestComputePadValue(unittest.TestCase):
         self.assertNotEqual(_compute_pad_value(1), _compute_pad_value(2))
 
     def test_result_above_mm_pad_shift(self):
-        # MM_PAD_SHIFT_VALUE = 1 << 40
-        self.assertGreaterEqual(_compute_pad_value(0), 1 << 40)
+        self.assertGreaterEqual(_compute_pad_value(0), MM_PAD_SHIFT_VALUE)
 
 
 class TestSanityCheckMmPadShiftValue(unittest.TestCase):
@@ -132,7 +132,7 @@ class TestSanityCheckMmPadShiftValue(unittest.TestCase):
     def test_oversized_vocab_raises(self):
         sanity_check_mm_pad_shift_value.cache_clear()
         with self.assertRaises(ValueError) as ctx:
-            sanity_check_mm_pad_shift_value((1 << 40) + 1)
+            sanity_check_mm_pad_shift_value(MM_PAD_SHIFT_VALUE + 1)
         self.assertIn("MM_PAD_SHIFT_VALUE", str(ctx.exception))
 
 

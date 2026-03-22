@@ -28,8 +28,17 @@ class _MockTemplateManager:
         self.completion_template_name = None
 
 
+class _ConcreteServingBase(OpenAIServingBase):
+    """Minimal concrete subclass so we can test base-class methods."""
+
+    _request_id_prefix = "test"
+
+    def _convert_to_internal_request(self, request):
+        pass
+
+
 def _make_serving():
-    return OpenAIServingBase(_MockTokenizerManager(), _MockTemplateManager())
+    return _ConcreteServingBase(_MockTokenizerManager(), _MockTemplateManager())
 
 
 class TestParseModelParameter(unittest.TestCase):
