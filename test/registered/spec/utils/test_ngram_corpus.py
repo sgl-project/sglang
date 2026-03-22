@@ -476,7 +476,7 @@ class TestTruncate(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = corpus.trie.batchMatch([[1, 2, 3]])
+        result = corpus._ngram.batchMatch([[1, 2, 3]])
         original_len = len(result.token)
         self.assertEqual(original_len, 8)
 
@@ -489,12 +489,12 @@ class TestTruncate(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = corpus.trie.batchMatch([[1, 2, 3]])
+        result = corpus._ngram.batchMatch([[1, 2, 3]])
         full_ids = list(result.token)
         full_mask = list(result.mask)
         n = len(full_ids)
 
-        result_copy = corpus.trie.batchMatch([[1, 2, 3]])
+        result_copy = corpus._ngram.batchMatch([[1, 2, 3]])
         trunc_n = 4
         result_copy.truncate(trunc_n)
         trunc_mask = list(result_copy.mask)

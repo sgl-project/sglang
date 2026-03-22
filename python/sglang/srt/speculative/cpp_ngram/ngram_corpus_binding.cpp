@@ -8,7 +8,7 @@ PYBIND11_MODULE(ngram_corpus_cpp, m) {
   namespace py = pybind11;
   m.doc() = "";
 
-  py::class_<Ngram>(m, "NgramTrie")
+  py::class_<Ngram>(m, "Ngram")
       .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
       .def("asyncInsert", &Ngram::asyncInsert, "")
       .def("batchMatch", &Ngram::batchMatch, "")

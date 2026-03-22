@@ -42,22 +42,22 @@ class NgramCorpus:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.match_type = match_type
-        self.trie = ngram_corpus_cpp.NgramTrie(capacity, param)
+        self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
 
     def batch_put(self, batch_tokens: List[List[int]]):
-        self.trie.asyncInsert(batch_tokens)
+        self._ngram.asyncInsert(batch_tokens)
 
     def synchronize(self):
-        self.trie.synchronize()
+        self._ngram.synchronize()
 
     def reset(self):
-        self.trie.reset()
+        self._ngram.reset()
 
     def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        result = self.trie.batchMatch(batch_tokens)
+        result = self._ngram.batchMatch(batch_tokens)
         return np.array(result.token), np.array(result.mask)
 
     def leaf_paths_from_mask(
