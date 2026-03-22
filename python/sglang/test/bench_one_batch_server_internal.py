@@ -94,6 +94,8 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_start_step: Optional[int] = None
     profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
@@ -141,6 +143,20 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=("CPU", "GPU"),
+            choices=["CPU", "GPU", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU. use torch profiler.",
+        )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=BenchArgs.profile_start_step,
+            help="Start profiling after this many forward steps. Useful for warmup.",
+        )
         parser.add_argument(
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
@@ -394,6 +410,8 @@ def run_one_case(
     result_filename: str,
     tokenizer: PreTrainedTokenizer | AutoProcessor,
     profile: bool = False,
+    profile_activities: Tuple[str] = ("CPU", "GPU"),
+    profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
@@ -523,10 +541,11 @@ def run_one_case(
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
-            activities=["CPU", "GPU"],
+            activities=profile_activities,
             output_dir=profile_output_dir,
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
+            start_step=profile_start_step,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -581,8 +600,8 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
+    input_throughput = batch_size * input_len / latency
+    output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":
@@ -918,6 +937,8 @@ def run_benchmark_internal(
                             parallel_batch=bench_args.parallel_batch,
                             cache_hit_rate=bench_args.cache_hit_rate,
                             profile=bench_args.profile,
+                            profile_activities=bench_args.profile_activities,
+                            profile_start_step=bench_args.profile_start_step,
                             profile_steps=bench_args.profile_steps,
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,

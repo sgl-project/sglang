@@ -535,13 +535,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        if self.current_scheduler_metrics_enabled:
-            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-            self.log_prefill_stats(
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        self.report_prefill_stats(
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -570,7 +569,20 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-                assert poll == KVPoll.Success or poll == KVPoll.Failed
+                # In PP mode, the previous rank may have reached a terminal
+                # state (Success/Failed) while this rank's local poll is still
+                # in a transient state due to clock skew or propagation delay.
+                # Treat non-terminal states as undone instead of crashing.
+                if poll not in (
+                    KVPoll.Success,
+                    KVPoll.Failed,
+                ):
+                    logger.warning(
+                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"from consensus; treating as undone"
+                    )
+                    undone_reqs.append(req)
+                    continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
@@ -598,7 +610,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                assert False, f"Unexpected polling state {poll=}"
+                logger.warning(
+                    f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
+                    f"treating as undone"
+                )
+                undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()

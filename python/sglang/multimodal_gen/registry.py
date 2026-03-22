@@ -63,6 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
@@ -98,6 +99,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
@@ -287,7 +289,7 @@ def _get_config_info(
     for registered_model_hf_id in all_model_hf_paths:
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
-        if registered_model_name == model_short_name:
+        if registered_model_name in model_short_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
@@ -336,11 +338,17 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
-def _get_diffusers_model_info() -> ModelInfo:
+def _get_diffusers_model_info(
+    model_path: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> ModelInfo:
     """
     Get model info for diffusers backend.
 
     Returns a ModelInfo with DiffusersPipeline and generic configs.
+    When model_path is provided and has a registered native config,
+    inherits task_type from it so that validation (e.g. accepts_image_input)
+    works correctly even under the diffusers backend.
     """
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DiffusersGenericPipelineConfig,
@@ -352,10 +360,36 @@ def _get_diffusers_model_info() -> ModelInfo:
         DiffusersPipeline,
     )
 
+    sampling_param_cls = DiffusersGenericSamplingParams
+    pipeline_config_cls = DiffusersGenericPipelineConfig
+
+    # If there is a registered native config for this model, inherit its task_type
+    if model_path is not None:
+        config_info = _get_config_info(model_path, model_id=model_id)
+        if config_info is not None:
+            sampling_param_cls = config_info.sampling_param_cls
+            native_task_type = config_info.pipeline_config_cls.task_type
+            if native_task_type != DiffusersGenericPipelineConfig.task_type:
+                pipeline_config_cls = dataclasses.make_dataclass(
+                    "DiffusersGenericPipelineConfig",
+                    [
+                        (
+                            "task_type",
+                            type(native_task_type),
+                            dataclasses.field(default=native_task_type),
+                        )
+                    ],
+                    bases=(DiffusersGenericPipelineConfig,),
+                )
+                logger.debug(
+                    "Inherited task_type=%s from native config for diffusers backend",
+                    native_task_type.name,
+                )
+
     return ModelInfo(
         pipeline_cls=DiffusersPipeline,
-        sampling_param_cls=DiffusersGenericSamplingParams,
-        pipeline_config_cls=DiffusersGenericPipelineConfig,
+        sampling_param_cls=sampling_param_cls,
+        pipeline_config_cls=pipeline_config_cls,
     )
 
 
@@ -392,7 +426,7 @@ def get_model_info(
         logger.info(
             "Using diffusers backend for model '%s' (explicitly requested)", model_path
         )
-        return _get_diffusers_model_info()
+        return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
 
     # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
@@ -407,7 +441,7 @@ def get_model_info(
             "Falling back to diffusers backend.",
             model_path,
         )
-        return _get_diffusers_model_info(model_path)
+        return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
 
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
@@ -427,7 +461,9 @@ def get_model_info(
             logger.error(f"Could not read model config for '{model_path}': {e}")
             if backend == Backend.AUTO:
                 logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info()
+                return _get_diffusers_model_info(
+                    model_path=model_path, model_id=model_id
+                )
             return None
 
         pipeline_class_name = config.get("_class_name")
@@ -437,7 +473,9 @@ def get_model_info(
             )
             if backend == Backend.AUTO:
                 logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info()
+                return _get_diffusers_model_info(
+                    model_path=model_path, model_id=model_id
+                )
             return None
 
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
@@ -447,7 +485,7 @@ def get_model_info(
                 f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
                 f"Falling back to diffusers backend."
             )
-            return _get_diffusers_model_info()
+            return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
         else:
             logger.error(
                 f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
@@ -464,7 +502,7 @@ def get_model_info(
                 f"Could not resolve native configuration for model '{model_path}'. "
                 f"Falling back to diffusers backend."
             )
-            return _get_diffusers_model_info()
+            return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
         else:
             logger.error(
                 f"Could not resolve configuration for model '{model_path}'. "
@@ -760,6 +798,21 @@ def _register_configs():
         hf_model_paths=[
             "BestWishYsh/Helios-Distilled",
         ],
+    )
+
+    # SANA
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
     )
 
 

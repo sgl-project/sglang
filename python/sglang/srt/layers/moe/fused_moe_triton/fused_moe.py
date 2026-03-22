@@ -45,10 +45,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 
+from sglang.srt.server_args import get_global_server_args
+
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
-
-    from sglang.srt.server_args import get_global_server_args
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -528,7 +528,7 @@ def fused_experts_impl(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         config,
-                        topk_ids,
+                        curr_topk_ids,
                         expert_ids,
                         down_moe_use_tma,
                         activation,
@@ -554,7 +554,7 @@ def fused_experts_impl(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         config,
-                        topk_ids,
+                        curr_topk_ids,
                         expert_ids,
                         down_moe_use_tma,
                         activation,
