@@ -54,26 +54,56 @@ def copy_or_rebind_param(
         setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
+class _PPPlaceholder:
+    """Lightweight null object that supports chained attribute access."""
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return args[0] if args else None
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "PPPlaceholder"
+
+
+_PP_PLACEHOLDER = _PPPlaceholder()
+
+
 class PPMissingLayer(torch.nn.Identity):
     # Adapted from
     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
     """
     A placeholder layer for missing layers in a pipeline parallel model.
 
-    Attribute access on this placeholder returns 'self' so that common
-    patterns like ``isinstance(layer.mlp, SomeMoE)`` safely evaluate to
-    ``False`` instead of raising ``AttributeError``.
+    Structural attributes (weight, mlp, etc.) are pre-set to a lightweight
+    placeholder.
     """
+
+    _PP_ATTRS = (
+        "weight",
+        "bias",
+        "embedding_dim",
+        "mlp",
+        "self_attn",
+        "input_layernorm",
+        "post_attention_layernorm",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.return_tuple = kwargs.get("return_tuple", False)
+        for name in self._PP_ATTRS:
+            object.__setattr__(self, name, _PP_PLACEHOLDER)
 
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
         except (AttributeError, KeyError):
-            return self
+            raise AttributeError(name)
 
     def __setattr__(self, name: str, value):
         if name == "return_tuple" or name.startswith("_"):
