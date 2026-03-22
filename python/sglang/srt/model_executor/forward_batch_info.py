@@ -56,7 +56,13 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
+from sglang.srt.utils import (
+    get_compiler_backend,
+    is_cuda,
+    is_hip,
+    is_npu,
+    support_triton,
+)
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -1175,6 +1181,17 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def clamp_position(seq_lens):
+def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+if is_cuda():
+    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+
+    clamp_position = clamp_position_cuda
+elif is_hip():
+    clamp_position = torch.compile(
+        _clamp_position_native, dynamic=True, backend=get_compiler_backend()
+    )
+else:
+    clamp_position = _clamp_position_native
