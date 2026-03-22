@@ -160,9 +160,7 @@ class TestBaseGrammarBackend(unittest.TestCase):
         ]
         for grammar_type, value in cases:
             with self.subTest(grammar_type=grammar_type):
-                result = self.backend._init_value_dispatch(
-                    (grammar_type, value), False
-                )
+                result = self.backend._init_value_dispatch((grammar_type, value), False)
                 self.assertIsInstance(result, InvalidGrammarObject)
 
     def test_init_value_dispatch_unknown_type_raises(self):
