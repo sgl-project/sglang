@@ -13,9 +13,6 @@ from sglang.srt.layers.moe.token_dispatcher import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 
 def fused_moe_forward_native(
@@ -101,8 +98,7 @@ def moe_forward_native(
 
     new_x[idxs] = outs
     if (
-        not is_npu
-        or moe_runner_config.routed_scaling_factor is None
+        moe_runner_config.routed_scaling_factor is None
         or abs(moe_runner_config.routed_scaling_factor - 1.0) < 1e-5
     ):
         final_out = (
