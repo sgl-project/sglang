@@ -77,7 +77,7 @@ patches:
               hidden_states=hidden_states,
               forward_batch=forward_batch,
           )
-        append: "dumper.dump('attn_output', hidden_states, dims='t h[tp:partial]')"
+        append: "dumper.dump('attn_output', hidden_states, dims='t h[attn_tp:partial] # tp:replicated')"
       - match: |
           hidden_states, residual = self.layer_communicator.prepare_mlp(
               hidden_states, residual, forward_batch
@@ -87,13 +87,13 @@ patches:
           hidden_states = self.mlp(
               hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
           )
-        append: "dumper.dump('mlp_output', hidden_states, dims='t h[tp:partial]')"
+        append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
     edits:
       - match: "output, _ = self.o_proj(attn_output)"
-        prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h[tp]')"
+        prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h[attn_tp] # tp:replicated')"
 
   # --- moe internals ---
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
@@ -101,14 +101,19 @@ patches:
       - match: "router_logits, _ = self.gate(hidden_states)"
         append: "dumper.dump('moe_router_logits', router_logits, dims='t num_experts # tp:replicated')"
       - match: "final_hidden_states = self.experts(hidden_states, topk_output)"
-        append: "dumper.dump('moe_expert_output', final_hidden_states, dims='t h[tp:partial]')"
+        append: "dumper.dump('moe_expert_output', final_hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 """
 
 PATCH_CONFIG_DP_ATTENTION_YAML: str = """\
 patches:
   # --- decoder layer level (aligned with miles test) ---
-  # In dp-attention mode: attn tensors are NOT TP-sharded (attn_tp_size=1),
-  # and mlp_output is already all-reduced inside forward_normal().
+  # dp-attention TP=2 DP=2 uses only 2 GPUs:
+  #   GPU 0: tp=0, attn_tp=0 (attn_tp_size=1), attn_dp=0
+  #   GPU 1: tp=1, attn_tp=0 (attn_tp_size=1), attn_dp=1
+  # All sub-axes (attn_tp, moe_tp, attn_dp) are uniquely determined by tp_rank,
+  # so only tp:replicated is needed — sub-axes are auto-resolved as implicitly replicated.
+  #
+  # Attn tensors are NOT TP-sharded, mlp_output is already all-reduced.
   # layer_input is dumped after prepare_attn which DP-distributes tokens,
   # so it needs dp:=attn_dp to filter to the non-empty DP rank.
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
@@ -146,7 +151,7 @@ patches:
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
     edits:
       - match: "output, _ = self.o_proj(attn_output)"
-        prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h # tp:replicated')"
+        prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h # tp:replicated dp:=attn_dp')"
 
   # --- moe internals ---
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
@@ -154,7 +159,7 @@ patches:
       - match: "router_logits, _ = self.gate(hidden_states)"
         append: "dumper.dump('moe_router_logits', router_logits, dims='t num_experts # tp:replicated')"
       - match: "final_hidden_states = self.experts(hidden_states, topk_output)"
-        append: "dumper.dump('moe_expert_output', final_hidden_states, dims='t h[tp:partial]')"
+        append: "dumper.dump('moe_expert_output', final_hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 """
 
 
@@ -279,6 +284,7 @@ def _run_server_and_generate(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
     ]
     if extra_server_args:

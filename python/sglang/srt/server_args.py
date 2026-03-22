@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    is_xpu,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -83,6 +84,7 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "gguf",
     "bitsandbytes",
+    "mistral",
     "layered",
     "flash_rl",
     "remote",
@@ -700,8 +702,11 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
-    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
+    remote_instance_weight_loader_backend: Literal[
+        "transfer_engine", "nccl", "modelexpress"
+    ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -1063,8 +1068,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, etc.)
-        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, XPU, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1191,10 +1196,28 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         # Set cuda graph batch sizes
-        if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+        if self.device != "cpu":
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+            else:
+                self.cuda_graph_max_bs = max(self.cuda_graph_bs)
         else:
-            self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+            # Reuse cuda_graph_bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
+            # as cpu graph is based on torch.compile
+            if self.cuda_graph_bs is not None:
+                self.torch_compile_max_bs = max(self.cuda_graph_bs)
+            else:
+                # If cuda_graph_bs is not set, we will preferentially use torch_compile_max_bs
+                # to generate cuda_graph_bs
+                self.torch_compile_max_bs = (
+                    self.torch_compile_max_bs or self.cuda_graph_max_bs
+                )
+                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
+
+            assert (
+                self.torch_compile_max_bs > 0
+            ), "cuda_graph_bs should contain positive batch sizes"
+            self.cuda_graph_max_bs = self.torch_compile_max_bs
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
@@ -1313,6 +1336,26 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
+        return capture_bs
+
+    def _generate_cpu_graph_batch_sizes(self):
+        """
+        Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
+        """
+        if self.disable_cuda_graph_padding:
+            capture_bs = list(range(1, self.torch_compile_max_bs + 1))
+        else:
+            capture_bs = sorted(
+                set().union(
+                    range(1, 17),
+                    range(18, 31, 2),
+                    range(32, 81, 4),
+                    range(84, self.torch_compile_max_bs + 1, 8),
+                    {self.torch_compile_max_bs},
+                )
+            )
+        capture_bs = [bs for bs in capture_bs if bs <= self.torch_compile_max_bs]
 
         return capture_bs
 
@@ -1621,6 +1664,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_hip():
+                    self.attention_backend = "aiter"
                 else:
                     self.attention_backend = "triton"
 
@@ -1973,6 +2018,17 @@ class ServerArgs:
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
+            )
+
+        if (
+            model_arch in ["Qwen3VLForConditionalGeneration"]
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_UNIFIED_ATTN")
+            and self.page_size is None
+        ):
+            self.page_size = 16
+            logger.info(
+                "Setting page_size=16 for aiter unified attention on Qwen3VLForConditionalGeneration."
             )
 
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
@@ -2729,56 +2785,103 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
+        """Normalize hicache-related knobs into a valid runtime configuration.
+
+        Resolution order:
+        1) Layout <-> I/O compatibility for direct conflicts.
+        2) Storage <-> layout compatibility (may rewrite layout).
+        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
+        4) Re-run step (1) if step (3) changed I/O backend.
+        """
+        # Skip all normalization when neither hicache nor decode-offload path is active.
+        if not (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ):
+            return
+
+        # Step 1: Initial layout-io compatibility normalization.
+        self._resolve_layout_io_compatibility()
+
+        # Step 2: Storage-layout normalization without changing io backend.
+        self._resolve_storage_layout_compatibility()
+
+        # Step 3: IO-decode backend compatibility (may change io backend).
+        io_changed = self._resolve_io_decode_attention_compatibility()
+
+        # Step 4: Re-normalize layout after io backend changes.
+        if io_changed:
+            self._resolve_layout_io_compatibility()
+
+    def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
-                "Kernel io backend does not support page first direct layout"
+                "Kernel io backend does not support page first direct layout, switching to direct io backend"
             )
 
         if (
-            self.enable_hierarchical_cache
-            or self.disaggregation_decode_enable_offload_kvcache
-        ) and self.hicache_io_backend == "kernel":
-            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
-            # Only override when the *effective* decode backend would be FA3.
-            # Otherwise, respect the user's chosen attention backend (e.g., aiter on ROCm).
-            effective_decode_backend = (
-                self.decode_attention_backend
-                if self.decode_attention_backend is not None
-                else self.attention_backend
+            self.hicache_mem_layout == "page_first"
+            and self.hicache_io_backend == "direct"
+        ):
+            self.hicache_mem_layout = "page_first_direct"
+            logger.warning(
+                "Page first layout is not supported with direct IO backend, switching to page first direct layout"
             )
-            if effective_decode_backend == "fa3":
-                if self.decode_attention_backend is None:
-                    # If decode backend wasn't explicitly set, pick a safe default that works with HiCache kernel IO.
-                    if not self.use_mla_backend():
-                        self.decode_attention_backend = (
-                            "flashinfer" if is_flashinfer_available() else "triton"
-                        )
-                    else:
-                        self.decode_attention_backend = (
-                            "flashinfer" if is_sm100_supported() else "triton"
-                        )
-                else:
-                    # If user explicitly requested FA3 decode, fall back to direct IO.
-                    self.hicache_io_backend = "direct"
-                    logger.warning(
-                        "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                        "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-                    )
 
-        if self.hicache_storage_backend == "mooncake":
-            if self.hicache_mem_layout == "layer_first":
-                if self.hicache_io_backend == "direct":
-                    self.hicache_mem_layout = "page_first_direct"
-                elif self.hicache_io_backend == "kernel":
-                    self.hicache_mem_layout = "page_first"
-                logger.warning(
-                    f"Mooncake storage backend does not support layer_first layout, "
-                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
-                )
+    def _resolve_storage_layout_compatibility(self):
+        if (
+            self.hicache_storage_backend != "mooncake"
+            or self.hicache_mem_layout != "layer_first"
+        ):
+            return
+
+        if self.hicache_io_backend == "direct":
+            new_layout = "page_first_direct"
+        elif self.hicache_io_backend == "kernel":
+            new_layout = "page_first"
+        else:
+            # Keep current behavior for unknown backends (e.g., kernel_ascend).
+            new_layout = self.hicache_mem_layout
+
+        self.hicache_mem_layout = new_layout
+        logger.warning(
+            f"Mooncake storage backend does not support layer_first layout, "
+            f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
+        )
+
+    def _resolve_io_decode_attention_compatibility(self) -> bool:
+        if self.hicache_io_backend != "kernel":
+            return False
+
+        # Only patch settings when the effective decode backend is FA3.
+        effective_decode_backend = (
+            self.decode_attention_backend or self.attention_backend
+        )
+        if effective_decode_backend != "fa3":
+            return False
+
+        if self.decode_attention_backend is not None:
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+            )
+            return True
+
+        # If decode backend is implicit, pick a safe backend without changing io backend.
+        if not self.use_mla_backend():
+            self.decode_attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
+        else:
+            self.decode_attention_backend = (
+                "flashinfer" if is_sm100_supported() else "triton"
+            )
+        return False
 
     def _handle_speculative_decoding(self):
         if (
@@ -2960,6 +3063,12 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        if self.load_format == "auto" and self._is_mistral_native_format():
+            self.load_format = "mistral"
+            logger.info(
+                "Detected Mistral native format checkpoint, setting load_format='mistral'"
+            )
+
         if is_remote_url(self.model_path):
             self.load_format = "remote"
 
@@ -2967,7 +3076,19 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.load_format == "remote_instance":
-            if (
+            if self.remote_instance_weight_loader_backend == "modelexpress":
+                # ModelExpress backend: requires url in --modelexpress-config
+                if self.modelexpress_url is None:
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to missing 'url' in --modelexpress-config."
+                    )
+                    self.load_format = "auto"
+                elif not self.validate_transfer_engine():
+                    logger.warning(
+                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by modelexpress) not being supported."
+                    )
+                    self.load_format = "auto"
+            elif (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
@@ -2997,6 +3118,19 @@ class ServerArgs:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
             )
+
+    def _is_mistral_native_format(self) -> bool:
+        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        if os.path.isdir(self.model_path):
+            return os.path.exists(os.path.join(self.model_path, "params.json"))
+        # For hub models, check remote files
+        try:
+            from huggingface_hub import HfApi
+
+            files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
+            return "params.json" in files
+        except Exception:
+            return False
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
@@ -5567,14 +5701,20 @@ class ServerArgs:
         parser.add_argument(
             "--remote-instance-weight-loader-backend",
             type=str,
-            choices=["transfer_engine", "nccl"],
+            choices=["transfer_engine", "nccl", "modelexpress"],
             default=ServerArgs.remote_instance_weight_loader_backend,
-            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--modelexpress-config",
+            type=str,
+            default=ServerArgs.modelexpress_config,
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
         )
 
         # For PD-Multiplexing
@@ -6109,7 +6249,11 @@ class ServerArgs:
         )
 
     def validate_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
+        try:
+            mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
+        except (ModuleNotFoundError, ValueError):
+            mooncake_available = False
+        if not mooncake_available:
             logger.warning(
                 "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
@@ -6122,14 +6266,44 @@ class ServerArgs:
         else:
             return True
 
+    @property
+    def _parsed_modelexpress_config(self) -> dict:
+        cache = getattr(self, "_mx_config_cache", None)
+        if cache is not None:
+            return cache
+        if self.modelexpress_config is None:
+            result = {}
+        elif isinstance(self.modelexpress_config, str):
+            result = json.loads(self.modelexpress_config)
+        else:
+            result = self.modelexpress_config
+        object.__setattr__(self, "_mx_config_cache", result)
+        return result
+
+    @property
+    def modelexpress_url(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("url")
+
+    @property
+    def modelexpress_model_name(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("model_name")
+
+    @property
+    def modelexpress_source(self) -> bool:
+        return self._parsed_modelexpress_config.get("source", False)
+
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
+        # ModelExpress source mode also needs TransferEngine init.
+        if self.modelexpress_source:
+            return True
         # Use TransferEngine as client backend.
         elif (
             self.load_format == "remote_instance"
-            and self.remote_instance_weight_loader_backend == "transfer_engine"
+            and self.remote_instance_weight_loader_backend
+            in ("transfer_engine", "modelexpress")
         ):
             return True
         else:
@@ -6166,7 +6340,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="sglang serve")
     ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present

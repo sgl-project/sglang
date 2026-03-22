@@ -30,8 +30,15 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
   // Memory node binding
   if (numa_available() != -1) {
-    int mem_node_id = numa_node_of_cpu(omp_cpu_ids.front());
-    bitmask* mask = numa_parse_nodestring(std::to_string(mem_node_id).c_str());
+    TORCH_CHECK(!omp_cpu_ids.empty(), "Cannot bind memory, no CPUs specified.");
+    int mem_node_id_st = numa_node_of_cpu(omp_cpu_ids.front());
+    int mem_node_id_ed = numa_node_of_cpu(omp_cpu_ids.back());
+    if (mem_node_id_st > mem_node_id_ed) {
+      std::swap(mem_node_id_st, mem_node_id_ed);
+    }
+
+    bitmask* mask =
+        numa_parse_nodestring((std::to_string(mem_node_id_st) + "-" + std::to_string(mem_node_id_ed)).c_str());
     bitmask* src_mask = numa_get_membind();
 
     int pid = getpid();
