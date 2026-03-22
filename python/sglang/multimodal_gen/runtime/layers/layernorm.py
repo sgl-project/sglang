@@ -9,8 +9,19 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
@@ -23,18 +34,6 @@ if _is_npu:
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
-
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
-from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
-from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 
 # Copied and adapted from sglang
@@ -74,7 +73,6 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
-        device = x.device
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape

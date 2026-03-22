@@ -375,7 +375,10 @@ def fuse_scale_shift_kernel(
         rows = B * L
         x_2d = x.view(rows, C)
         output_2d = output.view(rows, C)
-        grid = lambda META: (rows, triton.cdiv(C, META["BLOCK_N"]))
+
+        def grid(meta):
+            return (rows, triton.cdiv(C, meta["BLOCK_N"]))
+
         num_frames = scale.shape[1]
         assert (
             L % num_frames == 0

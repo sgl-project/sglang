@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from torch import Tensor
 
 from sglang.srt.utils.custom_op import register_custom_op
@@ -19,7 +20,6 @@ def maybe_contiguous(x):
 
 def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
-    configs = []
     # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
     max_threads_per_block = 1024
     # Default to warp size 32 if not defined by device
@@ -646,7 +646,7 @@ def norm_infer(
         num_warps=num_warps,
     )
     return out
-from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 if current_platform.is_mps():
     from .mps_fallback import norm_infer_native, rms_norm_fn_native
