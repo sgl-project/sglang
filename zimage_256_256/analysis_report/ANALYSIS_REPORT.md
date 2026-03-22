@@ -486,10 +486,10 @@ Z-Image-Turbo HF safetensors 权重键名与排除匹配情况：
 #### 在 GPU 集群上执行以下步骤：
 
 ```bash
-MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
-PROMPT="A beautiful sunset over the ocean with golden clouds"
-WORK=/mnt/geminihzceph/rhyshen/scripts/scripts_collection/sglang-diffusion-benchmark/zimage_fp8
-OUT_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256
+export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
+export PROMPT="A beautiful sunset over the ocean with golden clouds"
+export WORK=/mnt/geminihzceph/rhyshen/scripts/scripts_collection/sglang-diffusion-benchmark/zimage_fp8
+export OUT_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256
 # ============================================================
 # Step 1: FP8 转换（包含 FFN）
 # ============================================================
@@ -728,9 +728,9 @@ done
 以下命令需要在 GPU 集群上执行，用于获取**无 torch profiler 开销**的干净 GPU kernel 时延数据。
 
 ```bash
-MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
-PROMPT="A beautiful sunset over the ocean with golden clouds"
-NSYS_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256/zimage_bench/nsys
+export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
+export PROMPT="A beautiful sunset over the ocean with golden clouds"
+export NSYS_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256/zimage_bench/nsys
 
 # ============================================================
 # nsys 1: BF16 TextEnc + FP8 DiT（含 FFN）
@@ -1077,24 +1077,120 @@ FP8 input × FP8 weight → FP8 accumulation → scale by weight_scale_inv → B
 
 **Denoising 阶段 FP8 比 BF16 慢 29%**（350.2ms vs 271.5ms），而非预期的加速。
 
-#### 23d. 初步根因推测
+#### 23d. nsys Kernel 级根因分析
 
-1. **DeepGemm 在小 M 维度效率低**：256×256 的 seq_len=768，GEMM shape 为 M=768, K/N=3840/10240。DeepGemm 针对大 batch（M > 4096）优化，M=768 时 tile 利用率低。相比 nvjet BF16 GEMM（已针对各种 shape 做了 autotuning），DeepGemm 可能没有优势。
+使用 nsys 获取无 profiler 开销的 GPU kernel 时延，对比三种配置：
+- **BF16**：纯 BF16 nvjet GEMM baseline
+- **FP8+DeepGemm**：FP8 权重 + DeepGemm FP8 GEMM
+- **FP8-DisableDeepGemm**：设置 `SGLANG_DISABLE_DEEPGEMM=1`（见 23f 关于此 flag 的问题）
 
-2. **FP8 量化 + 反量化开销**：每个 GEMM 前需要 `per_token_group_quant`（BF16→FP8 动态量化），这个额外开销在小矩阵上占比更大。
+##### GPU Kernel 分类对比表
 
-3. **内存带宽受限场景**：M=768 时 GEMM 可能是 bandwidth-bound 而非 compute-bound。FP8 的优势（2× compute TFLOPS）在 bandwidth-bound 场景下无法发挥，而量化/反量化的额外内存访问反而增加了带宽压力。
+| 类别 | BF16 (ms) | FP8+DeepGemm (ms) | FP8-DisableDG (ms) |
+|------|----------:|-------------------:|-------------------:|
+| **DeepGemm FP8 GEMM** | 0 | **171.8** (2040次) | **171.7** (2040次) |
+| **DeepGemm transpose** | 0 | **139.8** (49152次) | **139.9** (49152次) |
+| **nvjet BF16 GEMM** | 279.2 (2420次) | 59.1 (668次) | 59.2 (668次) |
+| **FP8 量化 (per_token_quant)** | 0 | **11.8** (2040次) | **11.8** (2040次) |
+| FlashAttention | 21.8 | 24.2 | 24.2 |
+| Conv/cuDNN | 27.1 | 27.1 | 27.1 |
+| RMSNorm | 4.6 | 5.6 | 5.6 |
+| 其他 Elementwise | 39.9 | 33.8 | 33.8 |
 
-**需要 nsys kernel 级分析来确认具体原因。**
+> 注：BF16 profile 中还有 ~317ms FP32 cuBLAS GEMM（TextEncoder 的 FP32 GEMM，在 BF16 模式下仍为 FP32）和部分初始化 overhead，在 FP8 模式中已消除。
 
-#### 23e. 验证清单更新
+##### 逐 GEMM Shape 对比：BF16 nvjet vs FP8 DeepGemm
+
+| GEMM 用途 | Shape (M×K×N) | BF16 nvjet (μs/call) | FP8 DeepGemm (μs/call) | 加速比 |
+|-----------|---------------|---------------------:|------------------------:|-------:|
+| **FFN w13** (gate+up) | 768×3840×10240 | 396 | 227 | **1.75×** |
+| **QKV+output proj** | 768×3840×3840 | 73.8 | 47.8 | **1.54×** |
+| **FFN w2** (down) | 768×10240×3840 | 175 | 120 | **1.46×** |
+| **DiT GEMM 合计** | — | **260.0ms** | **171.8ms** | **1.51×** |
+
+**DeepGemm 的 GEMM 计算本身比 nvjet BF16 快 1.51×**，在 M=768 小矩阵上是合理的加速（理论 2× compute，实际受 bandwidth 限制）。
+
+##### 问题根因：DeepGemm transpose 开销
+
+| 指标 | 值 |
+|------|---:|
+| DeepGemm transpose 总时间 | **139.8ms** |
+| DeepGemm GEMM 计算总时间 | 171.8ms |
+| **Transpose 占 GEMM 的比例** | **81%** |
+| Transpose kernel launch 次数 | **49,152** |
+| GEMM kernel launch 次数 | 2,040 |
+| **每次 GEMM 对应的 transpose 次数** | **~24** |
+
+两种 transpose kernel：
+- `transpose_fp32<512,64,30,31>`：32,768 次调用，78.1ms（avg 2.4μs/call）
+- `transpose_fp32<512,64,80,81>`：16,384 次调用，61.8ms（avg 3.8μs/call）
+
+这些 transpose 用于将 FP32 block scale 从行优先转为列优先（DeepGemm 的 block-scaled FP8 格式要求）。每个 kernel 极小（2-4μs），但 launch overhead 累积后成为瓶颈。
+
+##### FP8 时间收支表
+
+| 组件 | 时间 | 说明 |
+|------|------|------|
+| BF16 nvjet GEMM（被替换） | 260.0ms | 参照 |
+| | | |
+| FP8 DeepGemm GEMM 计算 | 171.8ms | 快了 88.2ms ✅ |
+| FP8 DeepGemm transpose | **+139.8ms** | **回吐所有加速** ❌ |
+| FP8 量化开销 | +11.8ms | 可接受 |
+| **FP8 总计** | **323.4ms** | **比 BF16 慢 63.4ms** |
+
+> **结论**：DeepGemm GEMM 计算节省了 88.2ms，但 transpose 开销 139.8ms 完全抵消了加速，净结果是慢 63.4ms。
+> 如果能消除 transpose 开销，FP8 DiT GEMM 时间将从 260.0ms 降至 183.6ms，实现 **1.42× 加速**。
+
+#### 23e. `SGLANG_DISABLE_DEEPGEMM=1` 为什么不生效
+
+**原因：环境变量名错误。`SGLANG_DISABLE_DEEPGEMM` 不存在。**
+
+正确的环境变量是 `SGLANG_ENABLE_JIT_DEEPGEMM`（默认值 True）。
+
+| 设置 | 效果 |
+|------|------|
+| `SGLANG_DISABLE_DEEPGEMM=1` | ❌ 无效 — 该变量不存在 |
+| `SGLANG_ENABLE_JIT_DEEPGEMM=0` | ✅ 正确禁用 DeepGemm |
+
+代码路径：
+```
+srt/environ.py:365  →  SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+srt/layers/deep_gemm_wrapper/configurer.py:19  →  读取该变量
+srt/layers/quantization/fp8_utils.py:427-445  →  AUTO 模式下检查 ENABLE_JIT_DEEPGEMM
+multimodal_gen/runtime/layers/quantization/fp8.py:37-41  →  从 srt/ 导入 dispatch
+```
+
+multimodal_gen（diffusion）的 FP8 路径直接导入 `srt/layers/quantization/fp8_utils.py` 的 `dispatch_w8a8_block_fp8_linear()`，共享同一 dispatch 逻辑。禁用 DeepGemm 后，dispatch 会 fall back 到 CUTLASS FP8 或 Triton FP8。
+
+**待验证命令**：
+```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0 sglang generate \
+    --model-path $MODEL \
+    --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 \
+    --prompt "$PROMPT" \
+    --height 256 --width 256 --warmup --save-output
+```
+
+#### 23f. 验证清单更新
 
 - [x] 诊断脚本确认 quant_config 正确解析（Fp8Config）
 - [x] FP8 含 FFN 图像质量正常（✅ 正确）
 - [x] "Checkpoint keys not loaded" 不再出现 weight_scale_inv
-- [ ] ~~FP8 E2E < 420ms~~ — **未达标**（547.5ms）
-- [ ] ~~DeepGemm 替换 nvjet~~ — **待 nsys 确认**
+- [ ] ~~FP8 E2E < 420ms~~ — **未达标**（547.5ms），根因为 DeepGemm transpose 开销
+- [x] DeepGemm 确实替换了 nvjet — GEMM 计算快 1.51×，但 transpose 抵消了加速
 - [x] VRAM 节省显著（-35.5%）
+- [ ] 待测试：`SGLANG_ENABLE_JIT_DEEPGEMM=0` 下的 CUTLASS/Triton FP8 性能
+- [ ] 待研究：pre-transpose scale 消除 transpose 开销
+
+#### 23g. 下一步优化路线
+
+| 优先级 | 行动 | 预期收益 |
+|--------|------|---------|
+| **P0** | 用正确 env var `SGLANG_ENABLE_JIT_DEEPGEMM=0` 测试 CUTLASS FP8 | 无 transpose 开销，可能直接加速 |
+| **P1** | Pre-transpose scale：权重加载时一次性转置，推理不再 transpose | 消除 139.8ms，DeepGemm 实现 1.42× 加速 |
+| **P2** | 向 DeepGemm 上游反馈：fuse transpose into GEMM kernel | 长期方案 |
+| **P3** | 在更大分辨率（512×512, 1024×1024）验证 FP8 | M 更大时 GEMM compute-bound，FP8 优势更明显 |
 
 ## Part VII: Cross-Reference — Yikai's Z-Image Profile (1024×1024, H100)
 
@@ -1165,27 +1261,29 @@ At 256×256:
 | Priority | Optimization | Target | Expected Savings | Cumulative E2E | Status |
 |----------|-------------|--------|-----------------|----------------|--------|
 | **✅ Done** | TextEncoder FP32→BF16 | TextEncoding | -264ms (-35.1%) | **486ms** | ✅ 完成 |
-| **✅ Done** | **DiT FP8 block quantization** | Denoising GEMM + VRAM | VRAM -35.5%, 速度 +17% | **548ms** | ✅ 修复完成，VRAM 收益显著，速度未加速 (Section 23) |
-| P2 | Fused adaLN + gate kernel | Elementwise | -5~10ms | ~475-480ms | 待实施 |
-| P3 | CuTe DSL FlashAttention | Attention | -3~5ms | ~470-477ms | 待实施 |
-| P4 | Better RMSNorm (Quack) | Norm | -2~3ms | ~468-475ms | 待实施 |
-| P5 | VAE BF16 | Decoding | -3~5ms | ~465-470ms | 待实施 |
-| **P6 (新)** | **FP8 GEMM 后端调优** | Denoising GEMM | 待分析 nsys | 待定 | nsys 分析中 |
+| **✅ Done** | **DiT FP8 scale 加载修复** | Bug fix | VRAM -35.5% | 548ms | ✅ 4 处代码修复，图像质量恢复 (Section 22-23) |
+| **P0** | **CUTLASS FP8 测试** (`SGLANG_ENABLE_JIT_DEEPGEMM=0`) | Denoising GEMM | 无 transpose 开销 | 待测 | 待验证 (Section 23e) |
+| **P1** | **Pre-transpose scale** — 权重加载时一次性转置 | 消除 DeepGemm transpose | -139.8ms → 1.42× GEMM 加速 | ~410ms | 待实施 |
+| P2 | Fused adaLN + gate kernel | Elementwise | -5~10ms | ~400-405ms | 待实施 |
+| P3 | CuTe DSL FlashAttention | Attention | -3~5ms | ~395-402ms | 待实施 |
+| P4 | Better RMSNorm (Quack) | Norm | -2~3ms | ~393-400ms | 待实施 |
+| P5 | VAE BF16 | Decoding | -3~5ms | ~390-395ms | 待实施 |
 | — | Nunchaku W4A4 | — | ❌ Not supported on H20 SM90 | — | ❌ |
 
-**FP8 修复结果总结**（Section 23）：
-- **Bug 修复成功**：4 处代码修改（transformer_loader + FeedForward + param_names_mapping + linear.py），scale 加载、图像质量均恢复正常
-- **VRAM 收益显著**：13,620MB → 8,788MB（-35.5%），对多 batch 部署有价值
-- **速度未加速**：Denoising steady step 32.9ms → 38.5ms（+17%），DeepGemm 在 M=768 小矩阵上不如 nvjet BF16
-- **下一步**：nsys kernel 分析确认瓶颈，尝试 CUTLASS FP8 / Triton FP8 替代 DeepGemm，或接受 FP8 仅作为 VRAM 优化手段
+**FP8 nsys 分析结论**（Section 23d）：
+- **DeepGemm GEMM 计算快 1.51×**（260ms → 172ms），FP8 在 GEMM 计算层面有效
+- **但 DeepGemm transpose 开销 139.8ms（49,152 次 kernel launch）完全抵消了加速**
+- **FP8 量化开销仅 11.8ms（可接受）**
+- **VRAM 节省 35.5%**（13,620MB → 8,788MB），对显存受限场景有价值
+- **下一步**：P0 测试 CUTLASS FP8（正确 env var），P1 研究 pre-transpose scale
 
 ---
 
 ## Appendix: How to Reproduce
 
 ```bash
-MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
-PROMPT="A beautiful sunset over the ocean with golden clouds"
+export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
+export PROMPT="A beautiful sunset over the ocean with golden clouds"
 
 # FP32 baseline
 sglang generate --model-path $MODEL --prompt "$PROMPT" \
