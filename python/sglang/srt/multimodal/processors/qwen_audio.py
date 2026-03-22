@@ -1,6 +1,6 @@
 import re
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -30,6 +30,52 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         ).build(_processor)
 
         self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
+
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        audio_feature_lens = kwargs.get("audio_feature_lens", None)
+
+        # Convert audio_feature_lens to token counts for build_input_ids
+        output_lengths = None
+        input_lengths = None
+        if audio_feature_lens is not None:
+            if audio_feature_lens.dim() > 1:
+                audio_feature_lens = audio_feature_lens.flatten()
+            input_lengths = (audio_feature_lens - 1) // 2 + 1
+            output_lengths = (input_lengths - 2) // 2 + 1
+
+        input_ids, offsets, modality_list = self.build_input_ids(
+            prompt,
+            audio_seq_lens=output_lengths,
+        )
+
+        mm_items = []
+        consumed_per_modality = {}
+
+        for modality, offset in zip(modality_list, offsets):
+            num_tokens = offset[1] - offset[0] + 1
+            embedding_start = consumed_per_modality.get(modality, 0)
+            embedding_slice = embeddings[modality][
+                embedding_start : embedding_start + num_tokens
+            ]
+            consumed_per_modality[modality] = embedding_start + num_tokens
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    offsets=offset,
+                    precomputed_embeddings=embedding_slice,
+                )
+            )
+
+        if mm_items:
+            mm_items[0].audio_feature_lens = output_lengths
+
+        return {
+            "mm_items": mm_items,
+            "input_ids": input_ids,
+            "audio_start_id": self.audio_start_id,
+            "audio_token_id": self.audio_token_id,
+            "audio_end_id": self.audio_end_id,
+        }
 
     async def process_mm_data_async(
         self,

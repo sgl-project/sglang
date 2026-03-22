@@ -30,7 +30,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="default", nightly=True)
+register_cpu_ci(est_time=30, suite="stage-a-cpu-only", nightly=True)
 
 _FIXED_EXP_NAME = "my_exp_name"
 
@@ -1718,6 +1718,157 @@ class TestEntrypointAxisAligner:
         assert comp.target.shape == [4, 8]
 
 
+class TestEntrypointSeqTokenEquivalence:
+    """Test s≡t dim name equivalence through the full entrypoint pipeline."""
+
+    def test_s_t_squeeze_single_rank(self, tmp_path, capsys):
+        """Baseline dims='t h' (2D [4,8]), target dims='s 1 h' (3D [4,1,8]) → comparator passes."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="t h",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.unsqueeze(1),
+            dims="s 1 h",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 8]
+        assert comp.target.shape == [4, 8]
+
+    def test_s_t_squeeze_with_tp_unshard(self, tmp_path, capsys):
+        """Baseline TP=2 dims='t h[tp]', target TP=2 dims='s 1 h[tp]' → unshard + squeeze + s≡t."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="t h[tp]",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor.unsqueeze(1),
+            name="hidden",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="s 1 h[tp]",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_s_t_fused_with_squeeze(self, tmp_path, capsys):
+        """Baseline dims='t (num_heads*head_dim)[tp]' (2D), target dims='s 1 num_heads[tp] head_dim' (4D)."""
+        torch.manual_seed(42)
+        num_heads = 8
+        head_dim = 16
+        full_tensor_2d = torch.randn(4, num_heads * head_dim)
+        full_tensor_4d = full_tensor_2d.reshape(4, num_heads, head_dim).unsqueeze(1)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor_2d,
+            name="attn_pre_o_proj",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="t (num_heads*head_dim)[tp]",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor_4d,
+            name="attn_pre_o_proj",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="s 1 num_heads[tp] head_dim",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_pre_o_proj"
+
+    def test_s_t_mismatch_with_named_batch_fails(self, tmp_path, capsys):
+        """Baseline dims='t h', target dims='s b h' (named b, not constant 1) → dim mismatch → skip/error."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="t h",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.unsqueeze(1).expand(4, 1, 8).contiguous(),
+            dims="s b h",
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records, _ = _run_and_parse(argv, capsys)
+        comparisons = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(comparisons) == 1
+        comp = comparisons[0]
+        assert (
+            comp.shape_mismatch
+            or (comp.diff is not None and not comp.diff.passed)
+            or len(comp.errors) > 0
+        )
+
+
 class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
@@ -1934,6 +2085,98 @@ class TestEntrypointReplicatedAxis:
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.failed == 1
+
+    def test_dependent_replicated_axes_error(self, tmp_path, capsys):
+        """TP4 + MOE_TP2 both replicated, tp determines moe_tp → ComparisonErrorRecord."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        # TP4 with MOE_TP2: tp_rank determines moe_tp_rank (rank%2)
+        for side_dir in [baseline_dir, target_dir]:
+            for tp_rank in range(4):
+                _create_rank_dump(
+                    side_dir,
+                    rank=tp_rank,
+                    name="gate_out",
+                    tensor=tensor,
+                    dims="b h # tp:replicated moe_tp:replicated",
+                    parallel_info={
+                        "tp_rank": tp_rank,
+                        "tp_size": 4,
+                        "moe_tp_rank": tp_rank % 2,
+                        "moe_tp_size": 2,
+                    },
+                )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert "not orthogonal" in errors[0].exception_message
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.errored == 1
+        assert exit_code == 1
+
+    def test_sharded_tp_with_dependent_etp_passes(self, tmp_path, capsys):
+        """TP2 sharded + ETP2 dependent (etp=tp) + EP2 replicated → no undeclared error."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(2, 4, 8)
+        tp_shards = list(full_tensor.chunk(2, dim=1))
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            rank = 0
+            for tp_rank in range(2):
+                for ep_rank in range(2):
+                    _create_rank_dump(
+                        side_dir,
+                        rank=rank,
+                        name="attn_v",
+                        tensor=tp_shards[tp_rank],
+                        dims="b num_kv_heads[tp] d # ep:replicated",
+                        parallel_info={
+                            "tp_rank": tp_rank,
+                            "tp_size": 2,
+                            "etp_rank": tp_rank,
+                            "etp_size": 2,
+                            "ep_rank": ep_rank,
+                            "ep_size": 2,
+                        },
+                    )
+                    rank += 1
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
+
+        comp = _assert_single_comparison_passed(records)
+        assert comp.errors == []
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+        assert summary.errored == 0
+        assert exit_code == 0
 
 
 class TestEntrypointAlignment:
@@ -3502,7 +3745,7 @@ class TestEntrypointDpFilter:
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
         assert errors[0].exception_type == "AssertionError"
-        assert "Expected exactly 1 non-empty dp_rank" in errors[0].traceback_str
+        assert "Expected exactly 1 non-empty dp_rank" in errors[0].exception_message
         assert exit_code == 1
 
 
@@ -4461,6 +4704,179 @@ class TestEntrypointAutoDescend:
             run(parse_args(argv))
 
 
+class TestPartialParallelInfo:
+    """Regression tests for _is_jointly_determined with incomplete parallel_info.
+
+    When some ranks lack a parallel axis that other ranks have, the unsharder
+    planner must detect the inconsistency and report the axis as undeclared
+    rather than silently accepting it as jointly determined.
+    """
+
+    def test_missing_parent_axis_triggers_undeclared_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Ranks with inconsistent parallel_info → undeclared axis error.
+
+        # Step 1: Create 4 target ranks where moe_tp is absent from ranks 2-3.
+        #   This makes moe_tp implicitly-sharded (dependent on tp for ranks 0-1),
+        #   but edp is NOT dependent on tp alone (tp=0 maps to edp=0 AND edp=2).
+        # Step 2: _is_jointly_determined is called with parent_axes={tp, moe_tp}
+        #   for child=edp. Ranks 2-3 lack moe_tp → returns False.
+        # Step 3: edp remains undeclared → ValueError emitted as error record.
+        """
+        torch.manual_seed(42)
+        full_tensor = torch.randn(2, 8)
+        shard0 = full_tensor[:, :4]
+        shard1 = full_tensor[:, 4:]
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h",
+        )
+
+        # Ranks 0-1: have tp + moe_tp + edp
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=shard0,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 0,
+                "tp_size": 2,
+                "moe_tp_rank": 0,
+                "moe_tp_size": 2,
+                "edp_rank": 0,
+                "edp_size": 4,
+            },
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=1,
+            name="hidden",
+            tensor=shard1,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 1,
+                "tp_size": 2,
+                "moe_tp_rank": 1,
+                "moe_tp_size": 2,
+                "edp_rank": 1,
+                "edp_size": 4,
+            },
+        )
+
+        # Ranks 2-3: have tp + edp but NO moe_tp
+        _create_rank_dump(
+            target_dir,
+            rank=2,
+            name="hidden",
+            tensor=shard0,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 0,
+                "tp_size": 2,
+                "edp_rank": 2,
+                "edp_size": 4,
+            },
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=3,
+            name="hidden",
+            tensor=shard1,
+            dims="b h[tp]",
+            parallel_info={
+                "tp_rank": 1,
+                "tp_size": 2,
+                "edp_rank": 3,
+                "edp_size": 4,
+            },
+        )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 1
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) >= 1
+        assert any("not declared" in e.traceback_str for e in errors)
+
+    def test_consistent_parallel_info_allows_joint_determination(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """All ranks have complete parallel_info → edp is jointly determined, comparison succeeds.
+
+        # Step 1: 4 target ranks with TP=2, CP=2 (replicated), EDP=4.
+        #   edp is NOT dependent on tp alone (tp=0→edp=0,2) or cp alone (cp=0→edp=0,1).
+        # Step 2: _is_jointly_determined is called with parent_axes={tp, cp}, child=edp.
+        #   All infos have both tp and cp → joint mapping is consistent → True.
+        # Step 3: CP replicated picks one rank per tp group → TP concat → correct shape.
+        """
+        torch.manual_seed(42)
+        full_tensor = torch.randn(2, 8)
+        shard0 = full_tensor[:, :4]
+        shard1 = full_tensor[:, 4:]
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h",
+        )
+
+        # CP=replicated → ranks with different cp_rank have same tensor shard
+        for rank, tp, cp, edp, shard in [
+            (0, 0, 0, 0, shard0),
+            (1, 1, 0, 1, shard1),
+            (2, 0, 1, 2, shard0),
+            (3, 1, 1, 3, shard1),
+        ]:
+            _create_rank_dump(
+                target_dir,
+                rank=rank,
+                name="hidden",
+                tensor=shard,
+                dims="b h[tp] # cp:replicated",
+                parallel_info={
+                    "tp_rank": tp,
+                    "tp_size": 2,
+                    "cp_rank": cp,
+                    "cp_size": 2,
+                    "edp_rank": edp,
+                    "edp_size": 4,
+                },
+            )
+
+        argv = _make_argv(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        assert exit_code == 0
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+
 class TestErrorResilience:
     """Bundle comparison exception → continue with remaining bundles."""
 
@@ -4489,7 +4905,8 @@ class TestErrorResilience:
         assert len(errors) == 1
         assert errors[0].name == "tensor_b"
         assert errors[0].exception_type == "RuntimeError"
-        assert "intentional test error" in errors[0].traceback_str
+        assert "intentional test error" in errors[0].exception_message
+        assert "--override-dims" in errors[0].traceback_str
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -4531,6 +4948,49 @@ class TestErrorResilience:
         errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
         assert len(errors) == 1
         assert errors[0].exception_type == "TypeError"
+
+    def test_error_record_contains_dims_hint(self, tmp_path, capsys, monkeypatch):
+        """Error record includes --override-dims hint with all variant flags."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _raise(**kwargs):
+            raise ValueError("Invalid dim token: 'zzz'")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _raise)
+
+        records, _ = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+
+        assert "Invalid dim token: 'zzz'" in errors[0].exception_message
+        tb = errors[0].traceback_str
+        assert "--override-dims" in tb
+        assert "--override-baseline-dims" in tb
+        assert "--override-target-dims" in tb
+        assert "--override-config" in tb
+        assert "do NOT re-run expensive dumps" in tb
+
+    def test_error_record_hint_appears_before_traceback(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Hint appears before the full stack trace in traceback_str."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        argv = _make_argv(baseline_path, target_path, preset="raw")
+
+        def _raise(**kwargs):
+            raise RuntimeError("some dims problem")
+
+        monkeypatch.setattr(_entrypoint_module, "compare_bundle_pair", _raise)
+
+        records, _ = _run_and_parse(argv, capsys)
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+
+        tb = errors[0].traceback_str
+        hint_pos = tb.index("--override-dims")
+        traceback_pos = tb.index("Traceback (most recent call last)")
+        assert hint_pos < traceback_pos
 
 
 if __name__ == "__main__":

@@ -26,9 +26,10 @@ from sglang.srt.disaggregation.encode_server import (
     handle_scheduler_receive_url_request,
     launch_encoder,
 )
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
 
 logger = logging.getLogger(__name__)
 SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
@@ -96,6 +97,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             for socket in self.send_sockets:
                 await socket.send_pyobj(request_dict)
 
+            # gRPC encode is image-only; encoder.encode() requires modality
             (
                 nbytes,
                 embedding_len,
@@ -104,6 +106,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 error_code,
             ) = await self.encoder.encode(
                 mm_items=list(request.mm_items),
+                modality=Modality.IMAGE,
                 req_id=request.req_id,
                 num_parts=request.num_parts,
                 part_idx=request.part_idx,
@@ -209,9 +212,12 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     port_args = PortArgs.init_new(server_args)
 
     if server_args.dist_init_addr:
-        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+        na = NetworkAddress.parse(server_args.dist_init_addr)
+        dist_init_method = na.to_tcp()
     else:
-        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+        dist_init_method = NetworkAddress(
+            server_args.host or "127.0.0.1", port_args.nccl_port
+        ).to_tcp()
 
     send_sockets: List[zmq.Socket] = []
     for rank in range(1, server_args.tp_size):

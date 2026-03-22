@@ -8,7 +8,7 @@ inputs:
   jobs:
     description: |
       JSON array of job specs to wait for. Each element is either:
-        - a string: exact job name (e.g. "stage-a-test-1")
+        - a string: exact job name (e.g. "stage-a-test-small-1-gpu")
         - an object { "prefix": "...", "expected_count": N }: for matrix jobs
     required: true
   max-wait-minutes:

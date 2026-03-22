@@ -6,6 +6,7 @@ from sglang.srt.parser.reasoning_parser import (
     Glm45Detector,
     KimiDetector,
     KimiK2Detector,
+    Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -510,6 +511,74 @@ class TestGlm45Detector(CustomTestCase):
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "More reasoning")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
+
+
+class TestNemotron3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = Nemotron3Detector()
+
+    def test_init(self):
+        """Test Nemotron3Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+        self.assertFalse(self.detector._force_nonempty_content)
+
+    def test_detect_and_parse_complete_reasoning(self):
+        """Test parsing complete reasoning block."""
+        text = "<think>Let me think about this</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_no_thinking(self):
+        """Test parsing without thinking tokens."""
+        text = "Direct answer without thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_reasoning_only(self):
+        """Test parsing when output is all reasoning (no content after </think>)."""
+        text = "<think>All reasoning, no answer</think>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "All reasoning, no answer")
+        self.assertEqual(result.normal_text, "")
+
+    def test_force_nonempty_content_swaps_when_no_normal_text(self):
+        """Test force_nonempty_content swaps reasoning to content when content is empty."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>All reasoning, no answer</think>"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "All reasoning, no answer")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_swap_when_normal_text_exists(self):
+        """Test force_nonempty_content does not swap when content already exists."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>Reasoning here</think>The answer is 42."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning here")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_force_nonempty_content_truncated_reasoning(self):
+        """Test force_nonempty_content with truncated reasoning (no end token)."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>Truncated reasoning without end token"
+        result = detector.detect_and_parse(text)
+        # Truncated reasoning has no normal_text, so swap should occur
+        self.assertEqual(result.normal_text, "Truncated reasoning without end token")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_thinking_tokens(self):
+        """Test force_nonempty_content with plain text (no thinking tokens)."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "Plain text without any thinking."
+        result = detector.detect_and_parse(text)
+        # Normal text already exists, no swap needed
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
 
 
 class TestReasoningParser(CustomTestCase):

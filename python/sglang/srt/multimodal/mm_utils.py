@@ -48,6 +48,11 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.utils import flatten_nested_list
 
 
+def ensure_numpy(x):
+    """Convert torch.Tensor to numpy array if needed (v5 compat)."""
+    return x.numpy() if isinstance(x, torch.Tensor) else x
+
+
 def has_valid_data(data) -> bool:
     if data is None:
         return False
@@ -237,10 +242,11 @@ def process_anyres_image(image, processor, grid_pinpoints):
     best_resolution = select_best_resolution(image.size, possible_resolutions)
     image_padded = resize_and_pad_image(image, best_resolution)
 
-    # For Siglip processor, only have size but no crop size
+    # For Siglip processor, only have size but no crop size.
+    # In transformers v5, crop_size may exist but be None.
     crop_size = (
         processor.crop_size["height"]
-        if "crop_size" in processor.__dict__
+        if getattr(processor, "crop_size", None) is not None
         else processor.size["height"]
     )
     shortest_edge = (
@@ -257,6 +263,8 @@ def process_anyres_image(image, processor, grid_pinpoints):
         processor.preprocess(image_patch.convert("RGB"))["pixel_values"][0]
         for image_patch in image_patches
     ]
+    # In transformers v5, image processors may return torch.Tensor instead of numpy arrays
+    image_patches = [ensure_numpy(p) for p in image_patches]
     return np.stack(image_patches, axis=0)
 
 
