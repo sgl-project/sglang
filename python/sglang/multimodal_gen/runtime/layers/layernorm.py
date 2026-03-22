@@ -15,8 +15,13 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
-if _is_cuda:
+_is_windows = current_platform.is_windows()
+
+_has_sgl_kernel_rmsnorm = False
+if _is_cuda and not _is_windows:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+    _has_sgl_kernel_rmsnorm = True
 
 if _is_npu:
     import torch_npu
@@ -90,15 +95,20 @@ class RMSNorm(CustomOp):
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x.view(shape), residual.view(residual_shape)
+            if _has_sgl_kernel_rmsnorm:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x.view(shape), residual.view(residual_shape)
+            out = self.forward_triton(x, residual)
+            return out[0].view(shape), out[1].view(residual_shape)
         else:
             if x.shape[-1] <= 128:
                 out = triton_one_pass_rms_norm(
                     x, self.weight.data, self.variance_epsilon
                 )
-            else:
+            elif _has_sgl_kernel_rmsnorm:
                 out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            else:
+                out = self.forward_triton(x, residual=None)
         out = out.view(shape)
 
         return out

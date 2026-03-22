@@ -60,7 +60,7 @@ runtime_common = [
   "mistral_common>=1.9.0",
   "transformers==5.3.0",
   "uvicorn",
-  "uvloop",
+  "uvloop ; sys_platform != 'win32'",
   "xgrammar==0.1.27",
   "smg-grpc-servicer>=0.5.0",
 ]
@@ -138,6 +138,26 @@ srt_mps = [
 diffusion_mps = [
   "sglang[diffusion_common]",
   "cloudpickle==3.1.2",
+  "remote-pdb==2.1.0",
+  "cache-dit==1.2.3",
+  "addict==2.4.0",
+  "av==16.1.0",
+]
+
+# Native Windows CUDA (diffusion-only).
+diffusion_windows = [
+  "sglang[runtime_common]",
+  "torch==2.9.1",
+  "torchao==0.9.0",
+  "torchaudio==2.9.1",
+  "torchvision",
+  "PyYAML==6.0.1",
+  "cloudpickle==3.1.2",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
   "remote-pdb==2.1.0",
   "cache-dit==1.2.3",
   "addict==2.4.0",

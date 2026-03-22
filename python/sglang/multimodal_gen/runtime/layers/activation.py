@@ -16,8 +16,15 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
-if _is_cuda or _is_hip:
-    from sgl_kernel import silu_and_mul
+_has_sgl_kernel_silu = False
+_is_windows = current_platform.is_windows()
+if (_is_cuda or _is_hip) and not _is_windows:
+    try:
+        from sgl_kernel import silu_and_mul
+
+        _has_sgl_kernel_silu = True
+    except Exception:
+        _has_sgl_kernel_silu = False
 
 if _is_npu:
     import torch_npu
@@ -40,6 +47,8 @@ class SiluAndMul(CustomOp):
         super().__init__()
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if not _has_sgl_kernel_silu:
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

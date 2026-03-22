@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
+import platform as host_platform
 import traceback
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,23 @@ def cuda_platform_plugin() -> str | None:
     return (
         "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform" if is_cuda else None
     )
+
+
+def windows_cuda_platform_plugin() -> str | None:
+    """Detect if native Windows CUDA platform policy should be used."""
+    if host_platform.system() != "Windows":
+        return None
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            logger.info("Windows CUDA platform is available")
+            return "sglang.multimodal_gen.runtime.platforms.windows_cuda.WindowsCudaPlatform"
+    except Exception as e:
+        logger.info("Windows CUDA detection failed: %s", e)
+
+    return None
 
 
 def mps_platform_plugin() -> str | None:
@@ -139,6 +157,7 @@ def musa_platform_plugin() -> str | None:
 
 
 builtin_platform_plugins = {
+    "windows_cuda": windows_cuda_platform_plugin,
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "mps": mps_platform_plugin,
@@ -154,6 +173,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Try MPS first on macOS
     platform_cls_qualname = mps_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # On Windows, prefer Windows CUDA policy over generic CUDA plugin.
+    platform_cls_qualname = windows_cuda_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

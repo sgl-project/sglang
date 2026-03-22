@@ -183,6 +183,10 @@ class Platform:
         return self._enum == PlatformEnum.MPS
 
     @lru_cache(maxsize=1)
+    def is_windows(self) -> bool:
+        return False
+
+    @lru_cache(maxsize=1)
     def is_musa(self):
         try:
             return hasattr(torch, "musa") and torch.musa.is_available()

@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
+    if (
+        sys.platform != "win32"
+        and threading.current_thread() is threading.main_thread()
+    ):
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
     if parent_pid is None:
@@ -52,7 +55,8 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
+            if sys.platform != "win32":
+                itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
 
