@@ -1032,6 +1032,70 @@ FP8 input × FP8 weight → FP8 accumulation → scale by weight_scale_inv → B
 2. **为什么性能回退** — 异常大的中间值触发慢速计算路径（FlashAttention 处理极端值效率低）
 3. **为什么 FP8+FFN 和 FP8-noFFN 表现相同** — 问题不在 FFN 是否量化，而是所有 FP8 层的 scale 都没加载
 
+### 23. FP8 修复后验证结果
+
+#### 23a. E2E 时延对比（修复前 vs 修复后）
+
+| 配置 | E2E (ms) | TextEnc (ms) | Denoise (ms) | Decode (ms) | Steady Step (ms) | Peak VRAM |
+|------|---------|-------------|-------------|-------------|-----------------|-----------|
+| FP32 Baseline | 748.8 | 465.1 | 269.0 | 9.8 | 32.9 | 15,109MB |
+| BF16 TextEnc | 485.9 | 201.1 | 271.5 | 9.9 | 32.9 | 13,620MB |
+| ~~FP8 broken (含FFN)~~ | ~~1315.6~~ | ~~746.7~~ | ~~530.4~~ | ~~20.1~~ | ~~64.9~~ | ~~11,706MB~~ |
+| **FP8 fixed (含FFN)** | **547.5** | **188.4** | **350.2** | **5.8** | **38.5** | **8,788MB** |
+
+#### 23b. FP8 Denoising 逐步时延
+
+| Step | BF16 (ms) | FP8 fixed (ms) | Delta |
+|------|-----------|----------------|-------|
+| 0 | 21.4 | 39.5 | +18.1 |
+| 1 | 19.6 | 38.0 | +18.4 |
+| 2 | 27.0 | 38.6 | +11.6 |
+| 3 | 33.2 | 38.3 | +5.1 |
+| 4 | 32.8 | 38.8 | +6.0 |
+| 5 | 32.9 | 38.7 | +5.8 |
+| 6 | 32.8 | 38.9 | +6.1 |
+| 7 | 33.0 | 38.2 | +5.2 |
+| 8 | 32.7 | 38.5 | +5.8 |
+| **Steady avg (3-8)** | **32.9** | **38.5** | **+5.6 (+17%)** |
+
+#### 23c. 结果分析
+
+**FP8 修复已验证成功：**
+- ✅ 图像质量完全正确（不再是噪声/损坏）
+- ✅ "Checkpoint keys not loaded" 日志中不再出现 weight_scale_inv
+- ✅ quant_config 正确解析（`Resolved quantization config from weights path`）
+- ✅ VRAM 从 13,620MB 降至 8,788MB（**-35.5%**）
+
+**但 FP8 没有达到预期的加速效果：**
+
+| 指标 | 预期 | 实际 | 差距 |
+|------|------|------|------|
+| E2E | 375-415ms | **547.5ms** | +32~46% |
+| Denoising | 165-205ms | **350.2ms** | +71~112% |
+| Steady step | ~18-22ms | **38.5ms** | +75~114% |
+| Denoising vs BF16 | 1.4-1.6× 加速 | **1.17× 减速** | 反向 |
+
+**Denoising 阶段 FP8 比 BF16 慢 29%**（350.2ms vs 271.5ms），而非预期的加速。
+
+#### 23d. 初步根因推测
+
+1. **DeepGemm 在小 M 维度效率低**：256×256 的 seq_len=768，GEMM shape 为 M=768, K/N=3840/10240。DeepGemm 针对大 batch（M > 4096）优化，M=768 时 tile 利用率低。相比 nvjet BF16 GEMM（已针对各种 shape 做了 autotuning），DeepGemm 可能没有优势。
+
+2. **FP8 量化 + 反量化开销**：每个 GEMM 前需要 `per_token_group_quant`（BF16→FP8 动态量化），这个额外开销在小矩阵上占比更大。
+
+3. **内存带宽受限场景**：M=768 时 GEMM 可能是 bandwidth-bound 而非 compute-bound。FP8 的优势（2× compute TFLOPS）在 bandwidth-bound 场景下无法发挥，而量化/反量化的额外内存访问反而增加了带宽压力。
+
+**需要 nsys kernel 级分析来确认具体原因。**
+
+#### 23e. 验证清单更新
+
+- [x] 诊断脚本确认 quant_config 正确解析（Fp8Config）
+- [x] FP8 含 FFN 图像质量正常（✅ 正确）
+- [x] "Checkpoint keys not loaded" 不再出现 weight_scale_inv
+- [ ] ~~FP8 E2E < 420ms~~ — **未达标**（547.5ms）
+- [ ] ~~DeepGemm 替换 nvjet~~ — **待 nsys 确认**
+- [x] VRAM 节省显著（-35.5%）
+
 ## Part VII: Cross-Reference — Yikai's Z-Image Profile (1024×1024, H100)
 
 ### 23. Yikai's Profile Summary
@@ -1101,17 +1165,19 @@ At 256×256:
 | Priority | Optimization | Target | Expected Savings | Cumulative E2E | Status |
 |----------|-------------|--------|-----------------|----------------|--------|
 | **✅ Done** | TextEncoder FP32→BF16 | TextEncoding | -264ms (-35.1%) | **486ms** | ✅ 完成 |
-| **P1** | **DiT FP8 block quantization** | Denoising GEMM | ~~-82~112ms~~ | ~~~375-405ms~~ | ⚠️ 已修复 scale 加载 Bug，待重新验证 (Section 22) |
+| **✅ Done** | **DiT FP8 block quantization** | Denoising GEMM + VRAM | VRAM -35.5%, 速度 +17% | **548ms** | ✅ 修复完成，VRAM 收益显著，速度未加速 (Section 23) |
 | P2 | Fused adaLN + gate kernel | Elementwise | -5~10ms | ~475-480ms | 待实施 |
 | P3 | CuTe DSL FlashAttention | Attention | -3~5ms | ~470-477ms | 待实施 |
 | P4 | Better RMSNorm (Quack) | Norm | -2~3ms | ~468-475ms | 待实施 |
 | P5 | VAE BF16 | Decoding | -3~5ms | ~465-470ms | 待实施 |
+| **P6 (新)** | **FP8 GEMM 后端调优** | Denoising GEMM | 待分析 nsys | 待定 | nsys 分析中 |
 | — | Nunchaku W4A4 | — | ❌ Not supported on H20 SM90 | — | ❌ |
 
-**FP8 回退根因已确认并修复**（Section 22）：
-- **根因**：FeedForward 类未传递 quant_config + param_names_mapping 缺少 scale 映射 + BlockQuantScaleParameter loader 未实现 → weight_scale_inv 全部未加载
-- **修复**：3 处代码修改（zimage.py 模型 + zimage.py 配置 + linear.py loader）
-- **状态**：待在 GPU 集群重新验证性能和质量
+**FP8 修复结果总结**（Section 23）：
+- **Bug 修复成功**：4 处代码修改（transformer_loader + FeedForward + param_names_mapping + linear.py），scale 加载、图像质量均恢复正常
+- **VRAM 收益显著**：13,620MB → 8,788MB（-35.5%），对多 batch 部署有价值
+- **速度未加速**：Denoising steady step 32.9ms → 38.5ms（+17%），DeepGemm 在 M=768 小矩阵上不如 nvjet BF16
+- **下一步**：nsys kernel 分析确认瓶颈，尝试 CUTLASS FP8 / Triton FP8 替代 DeepGemm，或接受 FP8 仅作为 VRAM 优化手段
 
 ---
 
