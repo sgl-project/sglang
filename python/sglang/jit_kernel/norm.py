@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -62,9 +64,9 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
     )
 
 
+@torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
-    logger = logging.getLogger(__name__)
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
