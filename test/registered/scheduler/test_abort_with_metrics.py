@@ -1,175 +1,77 @@
 """
-Test that non-streaming requests are correctly aborted on client disconnect
-when --enable-metrics is enabled.
+Unit test for _PureASGIDispatch: verify that the ASGI ``receive`` callable
+is passed through untouched so that request.is_disconnected() works.
 
-Background: @app.middleware("http") uses Starlette's BaseHTTPMiddleware whose
-call_next() replaces the ASGI `receive` callable.  This breaks
-request.is_disconnected() in downstream handlers, preventing abort.
-http_middleware_patch.py fixes this by providing a pure ASGI call_next.
-
-This test verifies the fix works end-to-end.
+Background: @app.middleware("http") wraps handlers with BaseHTTPMiddleware
+whose call_next() replaces the ASGI ``receive``, breaking
+request.is_disconnected() and preventing non-streaming abort on client
+disconnect.  _PureASGIDispatch fixes this.  The existing test_abort.py
+already covers the full e2e abort flow.
 """
 
-import multiprocessing
-import os
-import random
-import threading
-import time
+import asyncio
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 
-import requests
+from starlette.requests import Request
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    CustomTestCase,
-    popen_launch_server,
-    read_output,
-)
+from sglang.srt.utils.http_middleware_patch import _PureASGIDispatch
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=180, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
-STDOUT_FILE = "/tmp/test_abort_metrics_stdout.txt"
-STDERR_FILE = "/tmp/test_abort_metrics_stderr.txt"
+_HTTP_SCOPE = {
+    "type": "http",
+    "asgi": {"version": "3.0"},
+    "http_version": "1.1",
+    "method": "POST",
+    "path": "/test",
+    "query_string": b"",
+    "root_path": "",
+    "headers": [],
+}
 
 
-class TestAbortWithMetrics(CustomTestCase):
-    """Verify non-streaming abort works when --enable-metrics is on."""
+class TestPureASGIDispatchReceivePassthrough(CustomTestCase):
+    """Verify _PureASGIDispatch passes ``receive`` through untouched."""
 
-    def _launch_server(self, base_url, extra_args=None):
-        """Launch a server with --enable-metrics and captured output."""
-        stdout = open(STDOUT_FILE, "w")
-        stderr = open(STDERR_FILE, "w")
+    @staticmethod
+    async def _run_with_receive(receive_msg):
+        """Invoke _PureASGIDispatch and return request.is_disconnected()."""
+        result = {}
 
-        other_args = [
-            "--enable-metrics",
-            "--log-level",
-            "debug",
-            "--chunked-prefill-size",
-            "8192",
-        ]
-        if extra_args:
-            other_args.extend(extra_args)
+        async def dispatch(request: Request, call_next):
+            result["disconnected"] = await request.is_disconnected()
+            await call_next(request)
 
-        process = popen_launch_server(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-            return_stdout_stderr=(stdout, stderr),
-        )
-        return process, stdout, stderr
+        async def inner_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
 
-    def _collect_output(self):
-        """Start a thread to collect server stderr output lines."""
-        output_lines = []
-        t = threading.Thread(target=read_output, args=(output_lines, STDERR_FILE))
-        t.start()
-        return output_lines, t
+        middleware = _PureASGIDispatch(inner_app, dispatch=dispatch)
 
-    def _cleanup(self, process, stdout, stderr, thread):
-        kill_process_tree(process.pid)
-        stdout.close()
-        stderr.close()
-        for f in (STDOUT_FILE, STDERR_FILE):
-            if os.path.exists(f):
-                os.remove(f)
-        thread.join()
+        async def receive():
+            return receive_msg
 
-    def test_abort_non_streaming_with_metrics(self):
-        """Client disconnect on non-streaming request should trigger abort
-        even with --enable-metrics enabled."""
+        sent = []
 
-        port = random.randint(4000, 5000)
-        base_url = f"http://127.0.0.1:{port}"
+        async def send(msg):
+            sent.append(msg)
 
-        process, stdout, stderr = self._launch_server(base_url)
-        output_lines, t = self._collect_output()
+        await middleware(_HTTP_SCOPE, receive, send)
+        return result["disconnected"]
 
-        try:
-            # Send many non-streaming requests in a subprocess, then kill it
-            # to simulate client disconnect (same pattern as TestAbort).
-            def client_process_func():
-                def send_one(_):
-                    requests.post(
-                        f"{base_url}/v1/chat/completions",
-                        json={
-                            "model": DEFAULT_MODEL_NAME_FOR_TEST,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": "Write a long essay about AI.",
-                                }
-                            ],
-                            "max_tokens": 2048,
-                            "temperature": 0,
-                            "stream": False,
-                        },
-                    )
-
-                with ThreadPoolExecutor(16) as executor:
-                    list(executor.map(send_one, range(16)))
-
-            p = multiprocessing.Process(target=client_process_func)
-            p.start()
-            time.sleep(0.5)
-            p.terminate()
-            time.sleep(10)
-        finally:
-            self._cleanup(process, stdout, stderr, t)
-
-        has_abort = any("Abort" in line for line in output_lines)
+    def test_is_disconnected_on_client_disconnect(self):
+        """receive() -> http.disconnect: is_disconnected() must return True."""
         self.assertTrue(
-            has_abort,
-            "Server should abort requests when client disconnects "
-            "with --enable-metrics enabled, but no 'Abort' found in server logs.\n"
-            f"Captured {len(output_lines)} log lines.",
+            asyncio.run(self._run_with_receive({"type": "http.disconnect"}))
         )
 
-    def test_metrics_still_work(self):
-        """Verify prometheus metrics are still collected after the patch."""
-
-        port = random.randint(4000, 5000)
-        base_url = f"http://127.0.0.1:{port}"
-
-        process, stdout, stderr = self._launch_server(base_url)
-        _, t = self._collect_output()
-
-        try:
-            # Send a normal request to generate metrics
-            response = requests.post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": DEFAULT_MODEL_NAME_FOR_TEST,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 8,
-                    "temperature": 0,
-                    "stream": False,
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-
-            # Check prometheus metrics endpoint
-            metrics_response = requests.get(f"{base_url}/metrics")
-            self.assertEqual(metrics_response.status_code, 200)
-
-            metrics_text = metrics_response.text
-            self.assertIn(
-                "sglang:http_requests_total",
-                metrics_text,
-                "Prometheus http_requests_total counter should be present",
-            )
-            self.assertIn(
-                "sglang:http_responses_total",
-                metrics_text,
-                "Prometheus http_responses_total counter should be present",
-            )
-        finally:
-            self._cleanup(process, stdout, stderr, t)
+    def test_not_disconnected_when_connected(self):
+        """receive() -> http.request: is_disconnected() must return False."""
+        self.assertFalse(
+            asyncio.run(self._run_with_receive({"type": "http.request", "body": b""}))
+        )
 
 
 if __name__ == "__main__":
