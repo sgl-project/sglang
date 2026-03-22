@@ -549,6 +549,9 @@ def apply_qk_norm(
         _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
