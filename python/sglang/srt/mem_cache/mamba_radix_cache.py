@@ -889,27 +889,25 @@ class MambaRadixCache(BasePrefixCache):
                 x = self.mamba_lru_list.get_prev_no_lock(x)
         return candidates
 
-    def _rank_candidates_marconi(
-        self, candidates: List[TreeNode]
+    def _rank_candidates_with_efficiencies(
+        self, candidates: List[TreeNode], efficiencies: List[float]
     ) -> List[TreeNode]:
-        """Rank candidates by Marconi utility.
-        """
+        """Rank candidates using the Marconi utility formula."""
         if not candidates:
             return []
 
+        assert len(candidates) == len(
+            efficiencies
+        ), "Candidate and efficiency lengths must match"
+
         current_time = TreeNode.last_access_time_counter_float
 
-        # Compute raw scores
-        efficiencies = []
         recencies = []
         for node in candidates:
-            eff = self._get_flop_efficiency(node)
-            efficiencies.append(eff)
             time_delta = float(current_time - node.last_access_time)
             recency = 1.0 / (time_delta + 1e-8)
             recencies.append(recency)
 
-        # Min-max normalize
         def _normalize(values):
             min_v = min(values)
             max_v = max(values)
@@ -920,7 +918,6 @@ class MambaRadixCache(BasePrefixCache):
         norm_eff = _normalize(efficiencies)
         norm_rec = _normalize(recencies)
 
-        # Compute utility and sort (lowest utility = evict first)
         scored = []
         for i, node in enumerate(candidates):
             utility = self.marconi_eff_weight * norm_eff[i] + norm_rec[i]
@@ -929,26 +926,22 @@ class MambaRadixCache(BasePrefixCache):
         scored.sort(key=lambda x: x[0])
         return [node for _, node in scored]
 
+    def _rank_candidates_marconi(
+        self, candidates: List[TreeNode]
+    ) -> List[TreeNode]:
+        """Rank candidates by Marconi utility.
+        """
+        efficiencies = [self._get_flop_efficiency(node) for node in candidates]
+        return self._rank_candidates_with_efficiencies(candidates, efficiencies)
+
     def _rank_candidates_seglen(
         self, candidates: List[TreeNode]
     ) -> List[TreeNode]:
-        """Rank candidates by replay length from the nearest live Mamba ancestor.
-
-        Lower replay length is less valuable to keep and should be evicted first.
-        Ties fall back to recency so older nodes are evicted first.
-        """
-        scored = []
-        for node in candidates:
-            scored.append(
-                (
-                    self._get_mamba_recompute_length(node),
-                    node.last_access_time,
-                    node,
-                )
-            )
-
-        scored.sort(key=lambda x: (x[0], x[1]))
-        return [node for _, _, node in scored]
+        """Rank candidates like Marconi, but use replay length as the efficiency term."""
+        efficiencies = [
+            float(self._get_mamba_recompute_length(node)) for node in candidates
+        ]
+        return self._rank_candidates_with_efficiencies(candidates, efficiencies)
 
     def _evict_mamba_marconi(self, mamba_num: int) -> int:
         """Evict mamba states using Marconi FLOP-aware scoring."""
