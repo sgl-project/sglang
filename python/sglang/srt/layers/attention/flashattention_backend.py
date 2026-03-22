@@ -11,6 +11,10 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.cp_utils import (
+    cp_allgather_and_save_kv_cache,
+    cp_attn_forward_extend,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -350,6 +354,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        self.attn_cp_size = model_runner.attn_cp_size
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -747,7 +752,14 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
+
+            if save_kv_cache and not is_cp_mode:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -764,6 +776,10 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+            if is_cp_mode:
+                cp_allgather_and_save_kv_cache(
+                    forward_batch, layer, k, v, self.attn_cp_size
+                )
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -866,6 +882,7 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -878,25 +895,61 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                num_splits=self.num_splits,
-                **kwargs,
-            )
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            ):
+
+                def _fa_cp_attn(
+                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
+                ):
+                    return flash_attn_with_kvcache(
+                        q=q_chunk,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens_cp,
+                        cu_seqlens_q=cu_seqlens_q_cp,
+                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        max_seqlen_q=max_seqlen_q_cp,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=self.num_splits,
+                        **kwargs,
+                    )
+
+                result = cp_attn_forward_extend(
+                    forward_batch,
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    self.device,
+                    _fa_cp_attn,
+                )
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
