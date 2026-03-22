@@ -6,7 +6,6 @@ import triton.language as tl  # type: ignore
 from torch import Tensor
 
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 
 
 # RMSNorm-fp32
@@ -370,6 +369,7 @@ def _layer_norm_fwd_impl_cuda(
             HAS_W1=weight1 is not None,
             HAS_B1=bias1 is not None,
         )
+    return None
 
 
 def _layer_norm_fwd_impl(
@@ -445,8 +445,7 @@ def _layer_norm_fwd_impl(
     return y1, mean, rstd, seeds, dropout_mask, dropout_mask1
 
 
-@maybe_wrap_jit_kernel_debug
-def layer_norm_fn(
+def _norm_forward(
     x,
     weight,
     bias,
@@ -607,7 +606,6 @@ def _norm_infer_kernel(
     tl.store(Y + cols, y, mask=cols < N)
 
 
-@maybe_wrap_jit_kernel_debug
 def norm_infer(
     x: Tensor,
     weight: Optional[Tensor],
@@ -648,102 +646,10 @@ def norm_infer(
         num_warps=num_warps,
     )
     return out
-
-
-@maybe_wrap_jit_kernel_debug
-def rms_norm_fn(
-    x,
-    weight,
-    bias,
-    residual=None,
-    x1=None,
-    weight1=None,
-    bias1=None,
-    eps=1e-6,
-    dropout_p=0.0,
-    rowscale=None,
-    prenorm=False,
-    residual_in_fp32=False,
-    zero_centered_weight=False,
-    return_dropout_mask=False,
-    out_dtype=None,
-    out=None,
-    residual_out=None,
-):
-    return LayerNormFn.forward(
-        x,
-        weight,
-        bias,
-        residual,
-        x1,
-        weight1,
-        bias1,
-        eps,
-        dropout_p,
-        rowscale,
-        prenorm,
-        residual_in_fp32,
-        zero_centered_weight,
-        True,
-        return_dropout_mask,
-        out_dtype,
-        out,
-        residual_out,
-    )
-
-
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_mps():
     from .mps_fallback import norm_infer_native, rms_norm_fn_native
 
-    @maybe_wrap_jit_kernel_debug
-    def norm_infer(
-        x: Tensor,
-        weight: Optional[Tensor],
-        bias: Optional[Tensor],
-        eps: float,
-        is_rms_norm: bool = False,
-        out: Optional[Tensor] = None,
-    ):
-        return norm_infer_native(x, weight, bias, eps, is_rms_norm, out)
-
-    @maybe_wrap_jit_kernel_debug
-    def rms_norm_fn(
-        x,
-        weight,
-        bias,
-        residual=None,
-        x1=None,
-        weight1=None,
-        bias1=None,
-        eps=1e-6,
-        dropout_p=0.0,
-        rowscale=None,
-        prenorm=False,
-        residual_in_fp32=False,
-        zero_centered_weight=False,
-        return_dropout_mask=False,
-        out_dtype=None,
-        out=None,
-        residual_out=None,
-    ):
-        return rms_norm_fn_native(
-            x,
-            weight,
-            bias,
-            residual,
-            x1,
-            weight1,
-            bias1,
-            eps,
-            dropout_p,
-            rowscale,
-            prenorm,
-            residual_in_fp32,
-            zero_centered_weight,
-            return_dropout_mask,
-            out_dtype,
-            out,
-            residual_out,
-        )
+    norm_infer = norm_infer_native
+    rms_norm_fn = rms_norm_fn_native
