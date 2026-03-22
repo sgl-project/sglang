@@ -1765,6 +1765,6 @@ class MMSendWrapper:
     
     def send_pyobj(self, obj):
         if self.has_mm_data(obj):
-            self.send_to_scheduler.send_serialized(msg=obj, serialize=self.serialize)
+            return self.send_to_scheduler.send_serialized(msg=obj, serialize=self.serialize)
         else:
-            self.send_to_scheduler.send_pyobj(obj)
+            return self.send_to_scheduler.send_pyobj(obj)
