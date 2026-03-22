@@ -36,11 +36,11 @@ class TestTrinityMini(GSM8KAscendMixin, CustomTestCase):
         "--context-length",
         "4096",
         "--max-running-requests",
-        "64",
+        "128",
         "--chunked-prefill-size",
         "-1",
         "--chat-template",
-        f"{TRINITY_MINI_WEIGHTS_PATH}/chat_template.jinja",
+        f"{model}/chat_template.jinja",
     ]
 
 
