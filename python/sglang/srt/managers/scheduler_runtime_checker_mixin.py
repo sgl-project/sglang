@@ -143,9 +143,17 @@ class SchedulerRuntimeCheckerMixin:
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
         session_held = self._session_held_tokens()
+        waiting_held_mamba_slots = set()
+        for req in getattr(self, "waiting_queue", []):
+            if req.req_pool_idx is None and req.mamba_pool_idx is not None:
+                idx = req.mamba_pool_idx
+                waiting_held_mamba_slots.add(
+                    int(idx.item()) if hasattr(idx, "item") else int(idx)
+                )
         memory_leak = (
             full_num_used != self.tree_cache.full_protected_size() + session_held
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+            or mamba_num_used
+            != self.tree_cache.mamba_protected_size() + len(waiting_held_mamba_slots)
         )
         if memory_leak:
             free_full_pages = set(
@@ -165,9 +173,14 @@ class SchedulerRuntimeCheckerMixin:
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(
+                range(1, self.req_to_token_pool.mamba_pool.size + 1)
+            )
             leaked_mamba_pages = (
-                expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+                expected_mamba_pages
+                - free_mamba_pages
+                - cached_mamba_pages
+                - waiting_held_mamba_slots
             )
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
