@@ -549,6 +549,9 @@ def apply_qk_norm(
         _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -580,14 +583,3 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     )
     output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
     return output.to(dtype=src_dtype)
-
-
-# TODO: Workaround, fuse norm with new select01 kernel
-def apply_layernorm_only(x: torch.Tensor, layernorm_scale_shift: LayerNormScaleShift):
-    return norm_infer(
-        x.view(-1, x.shape[-1]),
-        layernorm_scale_shift.norm.weight,
-        layernorm_scale_shift.norm.bias,
-        eps=layernorm_scale_shift.eps,
-        is_rms_norm=False,
-    ).view(x.shape)

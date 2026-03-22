@@ -242,6 +242,19 @@ class PipelineConfig:
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return sigmas
 
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        return guidance_scale
+
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        # Model-specific CFG variants can override this hook
+        # e.g. Qwen-Image's true-CFG norm matching.
+        return noise_pred
+
     ## For ImageVAEEncodingStage
     def preprocess_condition_image(
         self, image, target_width, target_height, _vae_image_processor
@@ -314,6 +327,9 @@ class PipelineConfig:
 
         return shape
 
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        return prompt_dtype
+
     def allow_set_num_frames(self):
         return False
 
@@ -347,6 +363,15 @@ class PipelineConfig:
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        noise_pred = self.gather_latents_for_sp(noise_pred)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and noise_pred.dim() == 3:
+            orig_s = raw_latent_shape[1]
+            if noise_pred.shape[1] > orig_s:
+                noise_pred = noise_pred[:, :orig_s, :]
+        return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
         pass

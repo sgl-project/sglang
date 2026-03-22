@@ -14,6 +14,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    flush_cache_with_retry,
     popen_launch_pd_server,
 )
 
@@ -114,9 +115,9 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         # Trigger offloading
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
-        # Flush device cache to force remote storage access
+        # Flush device cache to force remote storage access.
         time.sleep(2)
-        requests.post(self.prefill_url + "/flush_cache")
+        flush_cache_with_retry(self.prefill_url)
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

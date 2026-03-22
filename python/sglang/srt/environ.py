@@ -322,6 +322,7 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -333,6 +334,7 @@ class Envs:
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
