@@ -1997,6 +1997,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        # Clear context parallel metadata - CP is only for prefill, not decode
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
+            self.nsa_cp_metadata = None
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info

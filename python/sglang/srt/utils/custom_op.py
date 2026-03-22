@@ -6,6 +6,8 @@ from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 import torch
 import torch.library
 
+from sglang.kernel_api_logging import debug_torch_op
+
 F = TypeVar("F", bound=Callable)
 
 
@@ -159,7 +161,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = getattr(torch.ops.sglang, self.op_name)
+            self._impl = debug_torch_op(self.op_name)
             assert self._impl is not None
         return self._impl
 
@@ -332,4 +334,4 @@ def register_custom_op_from_extern(
         fake_impl=fake_impl,
     )
 
-    return getattr(torch.ops.sglang, name)
+    return debug_torch_op(name)

@@ -71,7 +71,7 @@ See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stage
 
 ### Step 1: Obtain and Study the Reference Implementation
 
-**Before writing any code, ask the user to provide the model's original implementation or Diffusers pipeline code.** You need the actual source code to work from — do not guess or assume the model's architecture. If the user has not provided it, request:
+**Before writing any code, obtain the model's reference implementation or Diffusers pipeline code.** You need the actual source code to work from — do not guess or assume the model's architecture. If the user already gave a HuggingFace model ID or repo, inspect that yourself first. Ask the user only when the reference implementation is private, ambiguous, or otherwise unavailable. Typical sources are:
 - The model's Diffusers pipeline source (e.g., the `pipeline_*.py` file from the `diffusers` library or HuggingFace repo)
 - Or the model's official reference implementation (e.g., from the model author's GitHub repo)
 - Or the HuggingFace model ID so you can look up `model_index.json` and the associated pipeline class
