@@ -1,0 +1,117 @@
+"""Unit tests for OpenAIServingBase — no server, no model loading."""
+
+import sys
+from unittest.mock import MagicMock, Mock
+
+for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
+    if _mod not in sys.modules:
+        sys.modules[_mod] = MagicMock()
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+
+import unittest
+
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+
+
+class _MockTokenizerManager:
+    def __init__(self):
+        self.model_config = Mock()
+        self.server_args = Mock()
+        self.server_args.enable_cache_report = False
+        self.model_path = "test-model"
+        self.tokenizer = Mock()
+        self.tokenizer.chat_template = None
+
+
+class _MockTemplateManager:
+    def __init__(self):
+        self.chat_template_name = None
+        self.jinja_template_content_format = None
+        self.completion_template_name = None
+
+
+def _make_serving():
+    return OpenAIServingBase(_MockTokenizerManager(), _MockTemplateManager())
+
+
+class TestParseModelParameter(unittest.TestCase):
+
+    def setUp(self):
+        self.serving = _make_serving()
+
+    def test_no_colon(self):
+        base, adapter = self.serving._parse_model_parameter("my-model")
+        self.assertEqual(base, "my-model")
+        self.assertIsNone(adapter)
+
+    def test_single_colon(self):
+        base, adapter = self.serving._parse_model_parameter("base-model:adapter-v1")
+        self.assertEqual(base, "base-model")
+        self.assertEqual(adapter, "adapter-v1")
+
+    def test_multiple_colons_splits_on_first(self):
+        """Model paths like 'org:model:adapter' should split on the first colon only."""
+        base, adapter = self.serving._parse_model_parameter("org:model:adapter")
+        self.assertEqual(base, "org")
+        self.assertEqual(adapter, "model:adapter")
+
+    def test_empty_adapter_becomes_none(self):
+        base, adapter = self.serving._parse_model_parameter("base-model:")
+        self.assertEqual(base, "base-model")
+        self.assertIsNone(adapter)
+
+    def test_whitespace_trimmed(self):
+        base, adapter = self.serving._parse_model_parameter("  base : adapter  ")
+        self.assertEqual(base, "base")
+        self.assertEqual(adapter, "adapter")
+
+    def test_whitespace_only_adapter_becomes_none(self):
+        base, adapter = self.serving._parse_model_parameter("base:   ")
+        self.assertEqual(base, "base")
+        self.assertIsNone(adapter)
+
+
+class TestResolveLoraPath(unittest.TestCase):
+
+    def setUp(self):
+        self.serving = _make_serving()
+
+    def test_adapter_from_model_takes_precedence(self):
+        result = self.serving._resolve_lora_path("base:adapter-A", "adapter-B")
+        self.assertEqual(result, "adapter-A")
+
+    def test_fallback_to_explicit_lora_path(self):
+        result = self.serving._resolve_lora_path("base-model", "explicit-adapter")
+        self.assertEqual(result, "explicit-adapter")
+
+    def test_no_adapter_anywhere(self):
+        result = self.serving._resolve_lora_path("base-model", None)
+        self.assertIsNone(result)
+
+    def test_list_lora_path_passthrough(self):
+        """Batch requests pass a list of lora_paths; should be returned as-is."""
+        result = self.serving._resolve_lora_path("base-model", ["a", "b"])
+        self.assertEqual(result, ["a", "b"])
+
+
+class TestCreateErrorResponse(unittest.TestCase):
+
+    def setUp(self):
+        self.serving = _make_serving()
+
+    def test_default_status_code(self):
+        resp = self.serving.create_error_response("Something went wrong")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_custom_status_code(self):
+        resp = self.serving.create_error_response(
+            "Not found", err_type="NotFoundError", status_code=404
+        )
+        self.assertEqual(resp.status_code, 404)
+
+
+if __name__ == "__main__":
+    unittest.main()
