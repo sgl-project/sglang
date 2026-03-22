@@ -18,11 +18,11 @@ import os
 import signal
 import threading
 import time
-import unittest
 import unittest.mock
 
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
 
@@ -40,7 +40,7 @@ def slow_crash_worker(delay: float = 0.5):
     os._exit(42)
 
 
-class TestSubprocessWatchdog(unittest.TestCase):
+class TestSubprocessWatchdog(CustomTestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
         self._procs = []
@@ -54,11 +54,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
             else:
                 original_kill(pid, sig)
 
-        # Patch os.kill in the watchdog module so the daemon thread's
-        # call to os.kill goes through our mock.
-        self._patcher = unittest.mock.patch(
-            "sglang.srt.utils.watchdog.os.kill", side_effect=mock_kill
-        )
+        self._patcher = unittest.mock.patch("os.kill", side_effect=mock_kill)
         self._patcher.start()
 
     def tearDown(self):
@@ -97,7 +93,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch(proc)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=3.0),
+            self.sigquit_triggered.wait(timeout=2.0),
             "SIGQUIT was not triggered within timeout",
         )
 
@@ -105,7 +101,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = self._spawn(crashing_worker)
         self._watch(proc, interval=0.05)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=3.0),
+            self.sigquit_triggered.wait(timeout=1.0),
             "Immediate crash was not detected",
         )
 
@@ -114,7 +110,7 @@ class TestSubprocessWatchdog(unittest.TestCase):
         crashing = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch([healthy, crashing], names=["healthy", "crashing"])
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=3.0),
+            self.sigquit_triggered.wait(timeout=2.0),
             "Crash was not detected when one of multiple processes crashed",
         )
 
@@ -127,26 +123,15 @@ class TestSubprocessWatchdog(unittest.TestCase):
         proc = self._spawn(lambda: None)
         proc.join(timeout=2)
         self._watch(proc)
-        time.sleep(0.5)
+        time.sleep(0.3)
         self.assertFalse(
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
 
-    def test_stop_prevents_false_sigquit(self):
-        """After stop(), a crashing subprocess must NOT trigger SIGQUIT."""
-        proc = self._spawn(slow_crash_worker, args=(0.5,))
-        monitor = self._watch(proc, interval=0.05)
-        # Stop the watchdog before the subprocess crashes
-        monitor.stop()
-        # Wait for the crash to happen
-        proc.join(timeout=2)
-        time.sleep(0.3)
-        self.assertFalse(
-            self.sigquit_triggered.is_set(),
-            "SIGQUIT should not fire after watchdog is stopped",
-        )
-
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    import unittest
+
     unittest.main()

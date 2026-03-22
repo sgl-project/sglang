@@ -17,6 +17,8 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+from __future__ import annotations
+
 import asyncio
 import atexit
 import dataclasses
@@ -112,7 +114,7 @@ class SchedulerInitResult:
     """Result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
-    scheduler_procs: List = dataclasses.field(default_factory=list)
+    scheduler_procs: Optional[List] = None
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
 
@@ -199,6 +201,9 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         self._subprocess_watchdog = subprocess_watchdog
+        # Store watchdog on tokenizer_manager for SIGQUIT handler access
+        if tokenizer_manager is not None:
+            tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
@@ -617,7 +622,7 @@ class Engine(EngineBase):
         TemplateManager,
         PortArgs,
         SchedulerInitResult,
-        Optional["SubprocessWatchdog"],
+        Optional[SubprocessWatchdog],
     ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
@@ -702,16 +707,18 @@ class Engine(EngineBase):
         ]
 
         # Set up subprocess liveness watchdog to detect crashes
-        # (e.g., NCCL timeout causing C++ std::terminate() before Python can handle it)
-        processes = list(scheduler_init_result.scheduler_procs)
+        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+        processes = list(scheduler_init_result.scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        if detoken_proc is not None:
-            processes.append(detoken_proc)
-            names.append("detokenizer")
+        processes.append(detoken_proc)
+        names.append("detokenizer")
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )
         subprocess_watchdog.start()
+
+        # Clear scheduler_procs from the result as it's only needed for watchdog setup
+        scheduler_init_result.scheduler_procs = None
 
         return (
             tokenizer_manager,
@@ -723,8 +730,6 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
-        # Stop the subprocess watchdog before killing children to prevent
-        # false-positive crash detection during normal shutdown.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)

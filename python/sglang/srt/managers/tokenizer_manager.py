@@ -2547,6 +2547,13 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        # Stop subprocess watchdog before killing processes to prevent false-positive
+        # crash detection during normal shutdown
+        if (
+            hasattr(self.tokenizer_manager, "_subprocess_watchdog")
+            and self.tokenizer_manager._subprocess_watchdog is not None
+        ):
+            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 
