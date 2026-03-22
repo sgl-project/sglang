@@ -59,6 +59,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -160,33 +164,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        # Override weight_loader for packed checkpoint format.
-        # Must capture original_loader BEFORE overwriting.
-        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
-            self.in_proj_qkvz
-        )
-        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
-            self.in_proj_ba
-        )
+        # Override weight loaders for packed checkpoint format.
+        # Important: for FP8, this must cover not only `.weight` but also
+        # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
+        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        self._bind_packed_weight_loaders(self.in_proj_ba)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
-        delattr(self.conv1d.weight, "weight_loader")
-        set_weight_attrs(
+        self._override_weight_loader(
             self.conv1d.weight,
-            {
-                "weight_loader": mamba_v2_sharded_weight_loader(
-                    [
-                        query_key_settings,
-                        query_key_settings,
-                        value_settings,
-                    ],
-                    self.attn_tp_size,
-                    self.attn_tp_rank,
-                )
-            },
+            mamba_v2_sharded_weight_loader(
+                [
+                    query_key_settings,
+                    query_key_settings,
+                    value_settings,
+                ],
+                self.attn_tp_size,
+                self.attn_tp_rank,
+            ),
         )
 
         # State parameters
@@ -203,7 +201,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        # RadixLinearAttention layer
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
@@ -219,7 +216,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-        # Normalization layer
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
@@ -229,7 +225,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=config.torch_dtype,
         )
 
-        # Output projection
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -243,39 +238,96 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     @staticmethod
-    def _make_packed_weight_loader(module):
-        """Create a weight_loader that does contiguous TP slicing for fused
-        (packed-format) checkpoint weights (shard_id=None), and delegates
-        to the standard MergedColumnParallelLinear loader for split checkpoint
-        weights (shard_id=int/tuple)."""
-        original_weight_loader = MergedColumnParallelLinear.weight_loader
+    def _override_weight_loader(param, loader):
+        """Robustly override loader for:
+        1) BasevLLMParameter subclasses: real storage is `_weight_loader`
+        2) regular Parameters that already have mutable `weight_loader`
+        3) regular Parameters without `weight_loader` yet
+        """
+        if hasattr(param, "_weight_loader"):
+            # FP8 / quantized BasevLLMParameter path
+            param._weight_loader = loader
+            return
+
+        if hasattr(param, "weight_loader"):
+            # Regular parameter/tensor that already has a mutable attr.
+            # Do NOT call set_weight_attrs here, because it asserts when
+            # overwriting an existing attribute.
+            param.weight_loader = loader
+            return
+
+        # Fresh attribute on a normal tensor/Parameter
+        set_weight_attrs(param, {"weight_loader": loader})
+
+    def _bind_packed_weight_loaders(self, module):
+        """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
+        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+            wrapped_loader = self._make_packed_weight_loader(module, original_loader)
+            self._override_weight_loader(param, wrapped_loader)
+
+    @staticmethod
+    def _get_split_sizes_for_param(module, param, loaded_shard_id):
+        """Return checkpoint-side split sizes for this param type."""
+        if isinstance(param, BlockQuantScaleParameter):
+            # Split by output blocks, not raw output sizes.
+            block_n, _ = module.quant_method.quant_config.weight_block_size
+            block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
+            return [
+                (module.output_sizes[idx] + block_n - 1) // block_n
+                for idx in loaded_shard_id
+            ]
+
+        if isinstance(param, PerTensorScaleParameter):
+            # One logical scale per logical shard.
+            return [1 for _ in loaded_shard_id]
+
+        # Normal weight / non-block quant tensor
+        return [module.output_sizes[idx] for idx in loaded_shard_id]
+
+    @classmethod
+    def _make_packed_weight_loader(cls, module, original_weight_loader):
+        """Wrap the param's original loader so split checkpoints:
+          - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
+          - in_proj_b + in_proj_a   -> merged in_proj_ba
+        can load correctly for both normal and FP8 params.
+        """
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
-            if loaded_shard_id is None:
-                # Case A: checkpoint is fused
-                # just contiguous TP
-                output_dim = getattr(param, "output_dim", None)
-                if output_dim is not None and module.tp_size > 1:
-                    shard_size = param.data.shape[output_dim]
-                    start_idx = module.tp_rank * shard_size
-                    loaded_weight = loaded_weight.narrow(
-                        output_dim, start_idx, shard_size
+            # Only intercept split-checkpoint tuple shards.
+            # int shard_id and None should preserve original behavior.
+            if isinstance(loaded_shard_id, tuple):
+                split_sizes = cls._get_split_sizes_for_param(
+                    module, param, loaded_shard_id
+                )
+
+                if len(loaded_weight.shape) == 0:
+                    # Scalar only makes sense for a single logical shard.
+                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
+                        f"Unexpected scalar for tuple shard load: "
+                        f"{loaded_shard_id=}, {split_sizes=}"
                     )
-                assert param.data.shape == loaded_weight.shape
-                param.data.copy_(loaded_weight)
+                    chunks = [loaded_weight.reshape(1)]
+                else:
+                    split_dim = getattr(param, "output_dim", 0)
+                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
-            elif isinstance(loaded_shard_id, tuple):
-                # Case B: checkpoint
-                # in_proj_qkv has shard 0,1,2
-                output_dim = getattr(param, "output_dim", None)
-                sub_sizes = [module.output_sizes[i] for i in loaded_shard_id]
-                chunks = loaded_weight.split(sub_sizes, dim=output_dim)
+                assert len(chunks) == len(loaded_shard_id), (
+                    f"Chunk/shard mismatch: {len(chunks)=}, "
+                    f"{len(loaded_shard_id)=}, {split_sizes=}"
+                )
+
                 for idx, chunk in zip(loaded_shard_id, chunks):
-                    original_weight_loader(module, param, chunk, idx)
+                    # Delegate each chunk to the param's original int-shard loader.
+                    original_weight_loader(param, chunk, idx)
+                return
 
-            else:
-                # Case C: normal int shard_id
-                original_weight_loader(module, param, loaded_weight, loaded_shard_id)
+            return original_weight_loader(param, loaded_weight, loaded_shard_id)
 
         return weight_loader
 
