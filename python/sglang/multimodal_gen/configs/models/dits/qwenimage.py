@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+def is_transformer_blocks(n: str, m) -> bool:
+    return "transformer_blocks" in n and str.isdigit(n.split(".")[-1])
 
 
 @dataclass
@@ -23,6 +25,7 @@ class QwenImageArchConfig(DiTArchConfig):
     zero_cond_t: bool = False
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_transformer_blocks])
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
