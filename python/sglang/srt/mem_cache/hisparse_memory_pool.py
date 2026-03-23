@@ -4,7 +4,9 @@ import weakref
 from typing import Optional
 
 import torch
+
 from sglang.srt.utils import is_npu
+
 if not is_npu():
     from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
