@@ -876,7 +876,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
-        return -x[0]
+        # Keep batch dim so output shape matches input (e.g. rollout/scheduler expect same ndim).
+        return -torch.stack(x)
 
 
 EntryClass = ZImageTransformer2DModel
