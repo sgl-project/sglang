@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
+from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 try:
     from sgl_kernel import flash_ops
@@ -31,6 +32,7 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -225,6 +227,7 @@ def flash_attn_with_kvcache(
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_varlen_func(
     q,
     k,

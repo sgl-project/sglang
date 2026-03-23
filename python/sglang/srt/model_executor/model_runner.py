@@ -786,7 +786,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            moe_tp_size = self.tp_size // self.moe_ep_size
+            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
 
             moe_intermediate_size = getattr(
                 self.model_config.hf_text_config, "moe_intermediate_size", None
@@ -2726,6 +2726,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        # Release the vocab_mask GPU tensor immediately after it has been applied
+        # to the logits. In overlap scheduling, the sampling_info (and its
+        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # batch_record_buf until the next iteration, causing a steady VRAM leak
+        # when structured output (grammar) is used.
+        sampling_info.vocab_mask = None
 
     def sample(
         self,
