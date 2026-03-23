@@ -123,9 +123,8 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
 
     def reset(self):  # type: ignore[override]
-        if (
-            hasattr(self, "lmcache_connector")
-            and isinstance(self.lmcache_connector, LMCacheMPLayerwiseConnector)
+        if hasattr(self, "lmcache_connector") and isinstance(
+            self.lmcache_connector, LMCacheMPLayerwiseConnector
         ):
             self.lmcache_connector.reset()
         super().reset()
