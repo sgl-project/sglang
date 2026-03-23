@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -90,8 +90,13 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
-        """Launch schedulers as Ray actors."""
+    ) -> Tuple[SchedulerInitResult, None]:
+        """Launch schedulers as Ray actors.
+
+        Returns:
+            Tuple of (RaySchedulerInitResult, None).
+            scheduler_procs is None since Ray uses actors instead of mp.Process.
+        """
         if server_args.dp_size > 1:
             raise NotImplementedError(
                 "Ray support for dp_size > 1 is not yet implemented. "
@@ -187,4 +192,4 @@ class RayEngine(Engine):
             scheduler_infos=scheduler_infos,
             wait_for_completion=wait_for_completion,
             scheduler_actors=scheduler_actors,
-        )
+        ), None

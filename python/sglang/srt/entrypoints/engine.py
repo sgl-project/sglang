@@ -114,7 +114,6 @@ class SchedulerInitResult:
     """Result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
-    scheduler_procs: Optional[List] = None
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
 
@@ -515,9 +514,13 @@ class Engine(EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
+    ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
+
+        Returns:
+            Tuple of (SchedulerInitResult, scheduler_procs).
+            scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
 
@@ -604,10 +607,9 @@ class Engine(EngineBase):
 
         return SchedulerInitResult(
             scheduler_infos=scheduler_infos,
-            scheduler_procs=scheduler_procs,
             wait_for_ready=wait_for_ready,
             wait_for_completion=wait_for_completion,
-        )
+        ), scheduler_procs
 
     @classmethod
     def _launch_subprocesses(
@@ -640,7 +642,7 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
+        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
 
@@ -708,7 +710,7 @@ class Engine(EngineBase):
 
         # Set up subprocess liveness watchdog to detect crashes
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-        processes = list(scheduler_init_result.scheduler_procs or [])
+        processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
         processes.append(detoken_proc)
         names.append("detokenizer")
@@ -716,9 +718,6 @@ class Engine(EngineBase):
             processes=processes, process_names=names
         )
         subprocess_watchdog.start()
-
-        # Clear scheduler_procs from the result as it's only needed for watchdog setup
-        scheduler_init_result.scheduler_procs = None
 
         return (
             tokenizer_manager,
