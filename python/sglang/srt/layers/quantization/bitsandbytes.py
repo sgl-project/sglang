@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from packaging import version
 
+from sglang.kernel_api_logging import debug_torch_op
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -431,7 +432,7 @@ try:
         mutates_args=["out"],
         fake_impl=_apply_bnb_4bit_fake,
     )
-    apply_bnb_4bit = torch.ops.sglang.apply_bnb_4bit
+    apply_bnb_4bit = debug_torch_op("apply_bnb_4bit")
 
 except AttributeError as error:
     raise error

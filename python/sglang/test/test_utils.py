@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
     is_xpu,
     kill_process_tree,
@@ -197,8 +198,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
