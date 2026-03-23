@@ -11,14 +11,12 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.utils import is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip
 
-# sgl_kernel.kvcacheio is not shipped for XPU/MPS (and NPU uses a different stack);
-# keep imports aligned with memory_pool_host.py so engine startup works on those backends.
-_is_npu = is_npu()
-_is_xpu = is_xpu()
-_is_mps = is_mps()
-if not (_is_npu or _is_xpu or _is_mps):
+# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 else:
 
