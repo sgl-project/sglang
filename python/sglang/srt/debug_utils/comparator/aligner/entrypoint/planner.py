@@ -113,11 +113,18 @@ def compute_per_step_sub_plans(
     replicated_axes: frozenset[ParallelAxis] = dims_spec.replicated_axes
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
 
+    dp_axis: ParallelAxis = (
+        ParallelAxis(dims_spec.dp_group_alias)
+        if dims_spec.dp_group_alias
+        else ParallelAxis.DP
+    )
+
     unsharder_plans = compute_unsharder_plan(
         dim_specs=dim_specs,
         parallel_infos=parallel_infos,
         explicit_replicated_axes=replicated_axes,
         thd_global_seq_lens=thd_global_seq_lens,
+        dp_filtered_axis=dims_spec.dp_axis,
     )
     reorderer_plans = compute_reorderer_plans(
         dim_specs=dim_specs,

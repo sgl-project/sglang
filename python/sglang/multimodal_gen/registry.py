@@ -11,6 +11,7 @@ import dataclasses
 import importlib
 import os
 import pkgutil
+import sys
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -360,12 +361,14 @@ def _get_diffusers_model_info(
         DiffusersPipeline,
     )
 
+    sampling_param_cls = DiffusersGenericSamplingParams
     pipeline_config_cls = DiffusersGenericPipelineConfig
 
     # If there is a registered native config for this model, inherit its task_type
     if model_path is not None:
         config_info = _get_config_info(model_path, model_id=model_id)
         if config_info is not None:
+            sampling_param_cls = config_info.sampling_param_cls
             native_task_type = config_info.pipeline_config_cls.task_type
             if native_task_type != DiffusersGenericPipelineConfig.task_type:
                 pipeline_config_cls = dataclasses.make_dataclass(
@@ -379,6 +382,19 @@ def _get_diffusers_model_info(
                     ],
                     bases=(DiffusersGenericPipelineConfig,),
                 )
+                # make_dataclass sets __module__="types"; fix for pickle.
+                pipeline_config_cls.__module__ = (
+                    DiffusersGenericPipelineConfig.__module__
+                )
+                pipeline_config_cls.__qualname__ = (
+                    DiffusersGenericPipelineConfig.__qualname__
+                )
+                parent_module = sys.modules[DiffusersGenericPipelineConfig.__module__]
+                setattr(
+                    parent_module,
+                    DiffusersGenericPipelineConfig.__name__,
+                    pipeline_config_cls,
+                )
                 logger.debug(
                     "Inherited task_type=%s from native config for diffusers backend",
                     native_task_type.name,
@@ -386,7 +402,7 @@ def _get_diffusers_model_info(
 
     return ModelInfo(
         pipeline_cls=DiffusersPipeline,
-        sampling_param_cls=DiffusersGenericSamplingParams,
+        sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
     )
 
@@ -811,6 +827,16 @@ def _register_configs():
             "Efficient-Large-Model/Sana_600M_512px_diffusers",
         ],
         model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
+    )
+
+    # FireRed-Image-Edit
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=[
+            "FireRedTeam/FireRed-Image-Edit-1.0",
+            "FireRedTeam/FireRed-Image-Edit-1.1",
+        ],
     )
 
 
