@@ -562,7 +562,8 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
-    hierarchical_sparse_attention_extra_config: Optional[str] = None
+    enable_hisparse: bool = False
+    hisparse_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -5073,13 +5074,17 @@ class ServerArgs:
 
         # Hierarchical sparse attention
         parser.add_argument(
-            "--hierarchical-sparse-attention-extra-config",
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
+
+        parser.add_argument(
+            "--hisparse-config",
             type=str,
-            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            "Required fields: algorithm (str), backend (str). "
-            "All other fields are algorithm-specific and passed to the algorithm constructor. "
-            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
         )
 
         # LMCache
@@ -6051,6 +6056,12 @@ class ServerArgs:
                 "Multi-item scoring requires chunked prefill to be disabled. "
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
+
+        # Check hisparse
+        if self.enable_hisparse:
+            assert (
+                self.disable_radix_cache
+            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
         assert (
             self.schedule_conservativeness >= 0

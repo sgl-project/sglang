@@ -6,18 +6,34 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 
 ### Jump to sections
 
-- [EAGLE Decoding](#eagle-decoding)
-  - [EAGLE-2 Decoding](#eagle-2-decoding)
-  - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torchcompile)
-  - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
-  - [EAGLE-3 Decoding](#eagle-3-decoding)
-- [Multi Token Prediction](#multi-token-prediction)
-- [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
-- [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
-- [Ngram Speculative Decoding](#ngram-speculative-decoding)
-- [Full Parameter Reference](#full-parameter-reference)
-- [OOM Troubleshooting](#oom-troubleshooting)
-- [References](#references)
+- [Speculative Decoding](#speculative-decoding)
+  - [Summary](#summary)
+    - [Jump to sections](#jump-to-sections)
+    - [Quick guidance](#quick-guidance)
+    - [Method comparison (mini table)](#method-comparison-mini-table)
+    - [Performance Highlights](#performance-highlights)
+  - [EAGLE Decoding](#eagle-decoding)
+    - [EAGLE-2 Decoding](#eagle-2-decoding)
+    - [EAGLE-2 Decoding with `torch.compile`](#eagle-2-decoding-with-torchcompile)
+    - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
+    - [EAGLE-3 Decoding](#eagle-3-decoding)
+  - [Multi Token Prediction](#multi-token-prediction)
+  - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
+  - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
+  - [Ngram Speculative Decoding](#ngram-speculative-decoding)
+    - [Ngram-specific parameters](#ngram-specific-parameters)
+  - [Full Parameter Reference](#full-parameter-reference)
+    - [Core parameters](#core-parameters)
+    - [Ngram-specific parameters](#ngram-specific-parameters-1)
+    - [Environment variables](#environment-variables)
+    - [Other related flags](#other-related-flags)
+  - [OOM Troubleshooting](#oom-troubleshooting)
+    - [Step 1: Lower static memory fraction (most effective)](#step-1-lower-static-memory-fraction-most-effective)
+    - [Step 2: Reduce CUDA graph batch size](#step-2-reduce-cuda-graph-batch-size)
+    - [Step 3: Reduce draft tree size](#step-3-reduce-draft-tree-size)
+    - [Step 4: Limit concurrent requests](#step-4-limit-concurrent-requests)
+    - [Quick OOM recovery recipe](#quick-oom-recovery-recipe)
+  - [References](#references)
 
 ### Quick guidance
 
@@ -393,7 +409,7 @@ Enable it with:
 | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
 | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
-| `--speculative-ngram-max-trie-depth` | How many recent tokens to insert into the cache. | `18` |
+| `--speculative-ngram-max-trie-depth` | The max trie depth for ngram speculative decoding. | `18` |
 | `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
 
 Notes:
@@ -469,7 +485,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 | `--speculative-ngram-min-bfs-breadth` | `int` | `1` | Minimum BFS breadth |
 | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
 | `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
-| `--speculative-ngram-max-trie-depth` | `int` | `18` | Recent tokens to insert into cache |
+| `--speculative-ngram-max-trie-depth` | `int` | `18` | Max trie depth for ngram speculative decoding |
 | `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
 
 ### Environment variables
