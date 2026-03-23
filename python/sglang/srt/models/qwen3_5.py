@@ -1038,7 +1038,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        if name_mapped not in params_dict:
+                        if name_mapped not in params_dict:  # PP ranks only hold [start, end) layers; skip weights for out-of-range PPMissingLayer
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -1371,7 +1371,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        if name_mapped not in params_dict:
+                        if name_mapped not in params_dict:  # PP ranks only hold [start, end) layers; skip weights for out-of-range PPMissingLayer
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
