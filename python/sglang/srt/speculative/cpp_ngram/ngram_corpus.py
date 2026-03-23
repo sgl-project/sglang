@@ -26,8 +26,6 @@ class NgramCorpus:
     def __init__(
         self,
         max_trie_depth=18,
-        min_match_window_size=1,
-        max_match_window_size=10,
         min_bfs_breadth=1,
         max_bfs_breadth=8,
         draft_token_num=8,
@@ -36,8 +34,6 @@ class NgramCorpus:
     ):
         param = ngram_corpus_cpp.Param()
         param.max_trie_depth = max_trie_depth
-        param.min_match_window_size = min_match_window_size
-        param.max_match_window_size = max_match_window_size
         param.min_bfs_breadth = min_bfs_breadth
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num

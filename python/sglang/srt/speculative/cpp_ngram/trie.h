@@ -49,8 +49,7 @@ class Trie {
   void reset();
 
  private:
-  std::vector<std::pair<TrieNode*, int32_t>>
-  match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const;
+  std::vector<std::pair<TrieNode*, int32_t>> match(const int32_t* context, size_t len) const;
 
   TrieNode* getNode() {
     auto node = node_pool_[--free_node_count_];
