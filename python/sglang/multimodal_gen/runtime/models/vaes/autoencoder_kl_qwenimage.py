@@ -792,6 +792,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.input_channels = config.arch_config.input_channels
         self.latents_mean = config.arch_config.latents_mean
         self.config = config.arch_config
+        self.use_parallel_decode = config.use_parallel_decode
 
         self.encoder = QwenImageEncoder3d(
             base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
@@ -844,7 +845,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             .to(cuda_device, dtype)
         )
 
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
 
 
     def enable_tiling(
@@ -1169,7 +1169,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         sample_posterior: bool = False,
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
+    ) -> Union[DecoderOutput, torch.Tensor]:
         """
         Args:
             sample (`torch.Tensor`): Input sample.

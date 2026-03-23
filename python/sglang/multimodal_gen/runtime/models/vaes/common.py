@@ -362,7 +362,9 @@ class ParallelTiledVAE(ABC, nn.Module):
             max_size = max(size.item() for size in gathered_sizes)
         else:
             max_size = 0
-        max_size_tensor = torch.tensor([max_size], device=results.device, dtype=torch.int64)
+        max_size_tensor = torch.tensor(
+            [max_size], device=results.device, dtype=torch.int64
+        )
         dist.broadcast(max_size_tensor, src=0)
         max_size = int(max_size_tensor.item())
 
@@ -420,9 +422,7 @@ class ParallelTiledVAE(ABC, nn.Module):
                     )
                 last_slice_data = slice_data
             dec = torch.cat(result_slices, dim=2)
-            shape_tensor = torch.tensor(
-                dec.shape, device=dec.device, dtype=torch.int64
-            )
+            shape_tensor = torch.tensor(dec.shape, device=dec.device, dtype=torch.int64)
         else:
             dec = None
             shape_tensor = torch.zeros(5, device=z.device, dtype=torch.int64)
