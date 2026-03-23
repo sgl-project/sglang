@@ -1,5 +1,7 @@
 # Adapted from sgl-kernel/tests/test_norm.py
 
+import sys
+
 import pytest
 import torch
 
@@ -135,4 +137,4 @@ def test_rmsnorm_rejects_unsupported_hidden_size(hidden_size):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -1,3 +1,4 @@
+import sys
 from typing import Optional, Tuple
 
 import pytest
@@ -233,4 +234,4 @@ class TestFusedScaleResidualNormScaleShift:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

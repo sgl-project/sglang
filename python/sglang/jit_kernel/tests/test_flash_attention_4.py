@@ -4,6 +4,7 @@
 
 import itertools
 import math
+import sys
 
 import pytest
 import torch
@@ -1501,4 +1502,4 @@ def _generate_block_kvcache(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

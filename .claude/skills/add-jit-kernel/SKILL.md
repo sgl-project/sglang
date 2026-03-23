@@ -456,7 +456,8 @@ def test_scale_unsupported_dtype():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
 ```
 
 ---
