@@ -25,7 +25,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=120, suite="stage-a-cpu-only", nightly=True)
+register_cpu_ci(est_time=120, suite="stage-a-test-cpu", nightly=True)
 
 
 # ==================== Non-E2E Tests ====================
