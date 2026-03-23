@@ -1,12 +1,15 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system, is_hip
 
+is_hip = is_hip()
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
-
+register_amd_ci(
+    est_time=5400, suite="nightly-amd-accuracy-8-gpu-deepseek-v32-cp", nightly=True
+)
 DEEPSEEK_V32_EXP_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 BASE_ARGS = [
@@ -30,6 +33,19 @@ MTP_ARGS = [
     "--mem-frac=0.7",
     "--cuda-graph-max-bs=32",
     "--max-running-requests=32",
+]
+
+HIP_ARGS = [
+    "--trust-remote-code",
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true, "num_threads": 64}',
+    "--nsa-prefill-backend=aiter",
+    "--nsa-decode-backend=aiter",
+    "--chunked-prefill-size=16384",
+    "--tp=8",
+    "--enable-nsa-prefill-context-parallel",
+    "--nsa-prefill-cp-mode=round-robin-split",
+    "--attn-cp-size=8",
 ]
 
 # Accuracy thresholds
@@ -59,24 +75,36 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
     @unittest.skipIf(is_blackwell_system(), "Skip on B200 systems")
     def test_deepseek_v32_cp_variants(self):
         """Run accuracy tests for DeepSeek V3.2 CP variants."""
-        variants = [
-            # Variant: in-seq-split CP mode with DP+MTP
-            ModelLaunchSettings(
-                DEEPSEEK_V32_EXP_MODEL_PATH,
-                tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS + CP_IN_SEQ_SPLIT_ARGS,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
-                variant="CP-in-seq-split",
-            ),
-            # Variant: round-robin-split CP mode (TP only, no DP)
-            ModelLaunchSettings(
-                DEEPSEEK_V32_EXP_MODEL_PATH,
-                tp_size=8,
-                extra_args=BASE_ARGS + MTP_ARGS + CP_ROUND_ROBIN_ARGS,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
-                variant="CP-round-robin-split",
-            ),
-        ]
+        if is_hip:
+            variants = [
+                # Variant: round-robin-split CP mode (TP only, no DP)
+                ModelLaunchSettings(
+                    DEEPSEEK_V32_EXP_MODEL_PATH,
+                    tp_size=8,
+                    extra_args=HIP_ARGS,
+                    env={"SGLANG_USE_AITER": "1"},
+                    variant="CP-round-robin-split",
+                ),
+            ]
+        else:
+            variants = [
+                # Variant: in-seq-split CP mode with DP+MTP
+                ModelLaunchSettings(
+                    DEEPSEEK_V32_EXP_MODEL_PATH,
+                    tp_size=8,
+                    extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS + CP_IN_SEQ_SPLIT_ARGS,
+                    env={"SGLANG_ENABLE_SPEC_V2": "1"},
+                    variant="CP-in-seq-split",
+                ),
+                # Variant: round-robin-split CP mode (TP only, no DP)
+                ModelLaunchSettings(
+                    DEEPSEEK_V32_EXP_MODEL_PATH,
+                    tp_size=8,
+                    extra_args=BASE_ARGS + MTP_ARGS + CP_ROUND_ROBIN_ARGS,
+                    env={"SGLANG_ENABLE_SPEC_V2": "1"},
+                    variant="CP-round-robin-split",
+                ),
+            ]
 
         run_combined_tests(
             models=variants,

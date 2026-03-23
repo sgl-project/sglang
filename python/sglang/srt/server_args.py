@@ -1508,24 +1508,34 @@ class ServerArgs:
 
                 if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
-                        logger.warning(
-                            "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
-                        )
-                        if self.nsa_prefill_cp_mode == "in-seq-split":
-                            # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
-                            self.enable_dp_attention = True
-                            self.moe_dense_tp_size = 1
-                            self.moe_a2a_backend = "deepep"
-                            self.ep_size = self.tp_size
+                        if is_hip():
+                            # TODO(hubert): constraint for nsa_prefill_cp_mode on AMD GPUs:
                             logger.warning(
-                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                                "Context parallel feature is still under experiment. It has only been verified on MI355/gfx950 platform with aiter nsa backend and round-robin-split cp mode."
                             )
-                        else:
-                            self.enable_dp_attention = True
-                            self.moe_dense_tp_size = 1
-                            assert (
-                                self.dp_size == 1
-                            ), "For round-robin split mode, dp attention is not supported."
+                            self.nsa_prefill_cp_mode = "round-robin-split"
+                            self.nsa_prefill_backend = "aiter"
+                            self.nsa_decode_backend = "aiter"
+                        else:  # CUDA
+                            logger.warning(
+                                "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                            )
+                            if self.nsa_prefill_cp_mode == "in-seq-split":
+
+                                # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
+                                self.enable_dp_attention = True
+                                self.moe_dense_tp_size = 1
+                                self.moe_a2a_backend = "deepep"
+                                self.ep_size = self.tp_size
+                                logger.warning(
+                                    "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                                )
+                            else:
+                                self.enable_dp_attention = True
+                                self.moe_dense_tp_size = 1
+                                assert (
+                                    self.dp_size == 1
+                                ), "For round-robin split mode, dp attention is not supported."
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"

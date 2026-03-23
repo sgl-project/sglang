@@ -54,6 +54,8 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 
 # Launch with TP on MI30x/MI35x
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
+# or
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend aiter --nsa-decode-backend aiter
 ```
 
 ### Configuration Tips
@@ -306,7 +308,7 @@ DeepSeek-V3.2-Speciale:
 
 ## DSA long sequence context parallel optimization(experimental)
 
-**Note: This feature is only verified on Hopper machines**
+**Note:** DSA context parallel is primarily validated on Hopper machines. On AMD GPUs, only `round-robin-split` is supported (use `aiter` for NSA prefill/decode).
 
 For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
 
@@ -318,6 +320,7 @@ Note that in sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
 - `moe_dense_tp_size=1`, `moe_a2a_backend = "deepep"`
 - To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
+- This mode is **not supported on AMD GPUs**
 
 For more details, please refer to PR https://github.com/sgl-project/sglang/pull/12065.
 
@@ -333,12 +336,21 @@ This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode roun
 
 In this scenario, compared with the aforementioned method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. But it cannot be enabled with dp attention together.
 
+On AMD GPUs, this is the only supported CP mode. When running on AMD, set:
+- `--nsa-prefill-backend aiter`
+- `--nsa-decode-backend aiter`
+
 For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
 
 Example usage:
 ```bash
 # Launch with FusedMoe + CP8
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+```
+
+AMD example (round-robin-split only):
+```bash
+python3 -m sglang.launch_server --model /data2/deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --trust-remote-code --nsa-prefill-backend aiter --nsa-decode-backend aiter --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --attn-cp-size 8 --chunked-prefill-size 16384
 ```
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
