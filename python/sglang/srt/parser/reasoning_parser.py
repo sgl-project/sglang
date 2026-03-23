@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
@@ -242,6 +243,33 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class DeepSeekV3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for DeepSeek-V3 style reasoning.
+
+    DeepSeek-V3.2 can switch from reasoning mode directly into a DSML function-call
+    block before emitting `</think>`, so the reasoning parser needs to preserve the
+    raw tool-call marker for the downstream function-call parser.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token=f"<{dsml_token}function_calls>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -463,7 +491,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
-        "deepseek-v3": Qwen3Detector,
+        "deepseek-v3": DeepSeekV3Detector,
         "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
