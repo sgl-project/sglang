@@ -480,6 +480,7 @@ To enable online quantization, you can simply specify `--quantization` in the co
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --quantization fp8 \
     --port 30000 --host 0.0.0.0
 ```
 
@@ -516,7 +517,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
 
 Example:
 
