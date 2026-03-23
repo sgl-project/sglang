@@ -385,7 +385,9 @@ class LoRAMemoryPool:
         lora_lm_head_module: Dict[str, BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
+            buffer_view: torch.Tensor,
+            weight: Optional[torch.Tensor],
+            debug_info: str = "",
         ):
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
@@ -394,7 +396,7 @@ class LoRAMemoryPool:
             else:
                 assert (
                     buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}. {debug_info}"
                 buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
@@ -448,12 +450,18 @@ class LoRAMemoryPool:
                 c = get_stacked_multiply(name)
                 target_buffer = self.A_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                load_lora_weight_tensor(buffer_view, weights)
+                load_lora_weight_tensor(
+                    buffer_view, weights,
+                    f"module={name} layer={layer_id} type=A rank={lora_rank} c={c} uid={uid}",
+                )
 
             for name, weights in temp_B_buffer.items():
                 target_buffer = self.B_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                load_lora_weight_tensor(buffer_view, weights)
+                load_lora_weight_tensor(
+                    buffer_view, weights,
+                    f"module={name} layer={layer_id} type=B rank={lora_rank} uid={uid}",
+                )
 
         if lora_adapter.embedding_layers:
 
