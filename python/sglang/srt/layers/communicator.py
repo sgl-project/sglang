@@ -147,7 +147,6 @@ class ScatterMode(Enum):
 
 
 class AttentionInputs:
-
     def __init__(
         self,
         hidden_states: torch.Tensor,
@@ -220,6 +219,7 @@ class AttnTpContext:
     def use_input_scattered(self, forward_batch: ForwardBatch):
         return (
             self.allow_input_scattered
+            and forward_batch is not None
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend()
@@ -309,8 +309,8 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
+                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
@@ -483,7 +483,6 @@ class LayerCommunicator:
                             None,
                         )
                     elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-
                         hidden_states, _, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -500,7 +499,6 @@ class LayerCommunicator:
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
@@ -554,9 +552,9 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        assert hidden_states.shape[0] % self._context.tp_size == 0, (
+            f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        )
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)

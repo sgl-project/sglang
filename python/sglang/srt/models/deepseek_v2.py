@@ -2193,7 +2193,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+        # When input_embeds is provided externally (e.g., from multimodal models
+        # like Kimi-K2.5 via general_mm_embed_routine), the embeddings are already
+        # full (all_reduced). Using input_scattered mode would cause attention layers
+        # to incorrectly all_gather already-complete data, producing garbled output.
+        _scattered_batch = forward_batch if input_embeds is None else None
+        with get_attn_tp_context().maybe_input_scattered(_scattered_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
