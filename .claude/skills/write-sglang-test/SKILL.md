@@ -18,10 +18,10 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 
 | Scenario | Model | CI Registration | Suite |
 |----------|-------|-----------------|-------|
-| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-cpu-only` or `stage-b-test-small-1-gpu` |
-| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-small-1-gpu` |
-| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-small-1-gpu` |
-| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-large-1-gpu` |
+| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-test-cpu` or `stage-b-test-1-gpu-small` |
+| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-1-gpu-small` |
+| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-1-gpu-small` |
+| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-1-gpu-large` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
@@ -43,10 +43,10 @@ Defined in `python/sglang/test/test_utils.py`:
 
 | Suite | Runner | Scenario |
 |-------|--------|----------|
-| `stage-a-cpu-only` | CPU | CPU unit tests |
-| `stage-b-test-small-1-gpu` | 1× 5090 (32GB) | Small model tests |
-| `stage-b-test-large-1-gpu` | 1× H100 (80GB) | 8B model tests |
-| `stage-b-test-large-2-gpu` | 2× H100 | TP=2 tests |
+| `stage-a-test-cpu` | CPU | CPU unit tests |
+| `stage-b-test-1-gpu-small` | 1× 5090 (32GB) | Small model tests |
+| `stage-b-test-1-gpu-large` | 1× H100 (80GB) | 8B model tests |
+| `stage-b-test-2-gpu-large` | 2× H100 | TP=2 tests |
 | `stage-c-test-4-gpu-h100` | 4× H100 | TP=4 / EP tests |
 | `stage-c-test-8-gpu-h200` | 8× H200 | Large-scale multi-GPU |
 | `nightly-1-gpu` | 1 GPU | Nightly-only |
@@ -70,7 +70,7 @@ from sglang.srt.<module> import TargetClass
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 # Prefer CPU. Only use register_cuda_ci when the test truly needs a GPU.
 
 class TestTargetClass(CustomTestCase):
@@ -110,7 +110,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 
 
 class TestMyFeature(CustomTestCase):
@@ -159,7 +159,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-large")
 
 
 class TestMyFeaturePerf(CustomTestCase):
@@ -227,7 +227,7 @@ Every test file in `test/registered/` **must** call a registration function at m
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 ```
 
 Parameters:
