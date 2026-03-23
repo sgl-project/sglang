@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -60,4 +62,4 @@ class TestResolveFutureTokenIds:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

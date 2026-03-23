@@ -1,4 +1,5 @@
 import itertools
+import sys
 from typing import Optional, Tuple
 
 import pytest
@@ -83,4 +84,4 @@ def test_jit_per_tensor_quant_supports_3d(shape):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

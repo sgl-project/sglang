@@ -636,6 +636,7 @@ class AiterAttnBackend(AttentionBackend):
 
         num_kv_splits = None
         swa_page_table = None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
@@ -658,7 +659,6 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     max_q_len = 1
                     page_size = self.page_size
-                    max_kv_len = torch.max(forward_batch.seq_lens).item()
                     max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
                     kv_indices = torch.zeros(
                         bs, max_kv_len, dtype=torch.int32, device=self.device
@@ -1056,8 +1056,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens,
                     forward_batch.seq_lens_sum,
                     forward_batch.extend_seq_lens,
-                    forward_batch.extend_seq_lens.max().item(),
-                    forward_batch.seq_lens.max().item(),
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
 
@@ -1142,8 +1142,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                 )
 
@@ -1414,7 +1414,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1437,7 +1437,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1495,7 +1495,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1566,7 +1566,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1615,7 +1615,7 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         swa_page_table = None
-        max_kv_len = torch.max(seq_lens).item()
+        max_kv_len = seq_lens_cpu.max().item()
 
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
@@ -1798,7 +1798,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1820,7 +1820,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1886,7 +1886,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1952,7 +1952,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -2635,10 +2635,9 @@ class AiterIndicesUpdaterPrefill:
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
 
-            self.max_kv_len = torch.max(paged_kernel_lens).item()
+            # self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
-            self.max_q_len = torch.max(extend_lens).item()
 
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2873,7 +2872,7 @@ class AiterMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)

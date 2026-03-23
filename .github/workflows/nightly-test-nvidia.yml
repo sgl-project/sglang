@@ -59,6 +59,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -81,6 +85,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -110,6 +118,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -191,6 +203,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -220,9 +236,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -233,7 +253,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
       - name: Publish traces to storage repo
         if: always()
@@ -289,6 +309,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -311,6 +335,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -348,6 +376,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -370,6 +402,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -411,6 +447,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -468,6 +508,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -520,9 +564,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 300
@@ -545,9 +593,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 120
