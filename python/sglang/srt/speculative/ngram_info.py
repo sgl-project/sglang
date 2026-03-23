@@ -443,6 +443,7 @@ class NgramVerifyInput(SpecInput):
 
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        batch.seq_lens_sum += int((accept_length_cpu + 1).sum().item())
 
         return logits_output, self.verified_id, num_accepted_tokens
 
