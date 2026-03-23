@@ -68,7 +68,7 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
-    from sgl_kernel.elementwise import copy_to_gpu_no_ce
+    from sglang.jit_kernel.copy import copy_to_gpu_no_ce
 
     tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
