@@ -3,7 +3,7 @@
 
 #include "ngram.h"
 
-PYBIND11_MODULE(ngram_cache_cpp, m) {
+PYBIND11_MODULE(ngram_corpus_cpp, m) {
   using namespace ngram;
   namespace py = pybind11;
   m.doc() = "";
@@ -23,7 +23,7 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
       .def_readwrite("max_bfs_breadth", &Param::max_bfs_breadth)
       .def_readwrite("min_match_window_size", &Param::min_match_window_size)
       .def_readwrite("max_match_window_size", &Param::max_match_window_size)
-      .def_readwrite("branch_length", &Param::branch_length)
+      .def_readwrite("max_trie_depth", &Param::max_trie_depth)
       .def_readwrite("draft_token_num", &Param::draft_token_num)
       .def_readwrite("match_type", &Param::match_type)
       .def_readwrite("batch_min_match_window_size", &Param::batch_min_match_window_size)
@@ -35,9 +35,9 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
       .def("resetBatchReturnTokenNum", &Param::resetBatchReturnTokenNum, "")
       .def("detail", &Param::detail, "");
 
-  py::class_<Ngram::Result>(m, "Result")
+  py::class_<Result>(m, "Result")
       .def(py::init<>())
-      .def_readwrite("token", &Ngram::Result::token)
-      .def_readwrite("mask", &Ngram::Result::mask)
-      .def("truncate", &Ngram::Result::truncate);
+      .def_readwrite("token", &Result::token)
+      .def_readwrite("mask", &Result::mask)
+      .def("truncate", &Result::truncate);
 }

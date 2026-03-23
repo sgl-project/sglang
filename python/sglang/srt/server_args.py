@@ -160,6 +160,8 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
+PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -504,7 +506,7 @@ class ServerArgs:
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
-    speculative_ngram_branch_length: int = 18
+    speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
@@ -560,7 +562,8 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
-    hierarchical_sparse_attention_extra_config: Optional[str] = None
+    enable_hisparse: bool = False
+    hisparse_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -665,6 +668,10 @@ class ServerArgs:
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
+
+    # Context parallelism
+    enable_prefill_context_parallel: bool = False
+    prefill_cp_mode: str = "in-seq-split"
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -2060,6 +2067,7 @@ class ServerArgs:
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
+            and self.attn_cp_size <= 1
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"
@@ -2543,6 +2551,10 @@ class ServerArgs:
                 self.tp_size % (self.dp_size * self.attn_cp_size) == 0
             ), "tp_size must be divisible by dp_size * attn_cp_size"
 
+            assert (
+                not self.enable_aiter_allreduce_fusion
+            ), "Aiter allreduce fusion is not supported with context parallelism"
+
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
@@ -2557,6 +2569,10 @@ class ServerArgs:
                 assert (
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
+
+            assert (
+                not self.enable_aiter_allreduce_fusion
+            ), "Aiter allreduce fusion is not supported with context parallelism"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -2623,7 +2639,8 @@ class ServerArgs:
             assert self.quantization in [
                 "fp8",
                 "mxfp8",
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -4749,10 +4766,10 @@ class ServerArgs:
             help="The match type for cache tree.",
         )
         parser.add_argument(
-            "--speculative-ngram-branch-length",
+            "--speculative-ngram-max-trie-depth",
             type=int,
-            default=ServerArgs.speculative_ngram_branch_length,
-            help="The branch length for ngram speculative decoding.",
+            default=ServerArgs.speculative_ngram_max_trie_depth,
+            help="The max trie depth for ngram speculative decoding.",
         )
         parser.add_argument(
             "--speculative-ngram-capacity",
@@ -5057,13 +5074,17 @@ class ServerArgs:
 
         # Hierarchical sparse attention
         parser.add_argument(
-            "--hierarchical-sparse-attention-extra-config",
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
+
+        parser.add_argument(
+            "--hisparse-config",
             type=str,
-            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            "Required fields: algorithm (str), backend (str). "
-            "All other fields are algorithm-specific and passed to the algorithm constructor. "
-            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
         )
 
         # LMCache
@@ -5526,6 +5547,18 @@ class ServerArgs:
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+        )
+        parser.add_argument(
+            "--enable-prefill-context-parallel",
+            action="store_true",
+            help="Enable context parallelism used in the prefill phase",
+        )
+        parser.add_argument(
+            "--prefill-cp-mode",
+            type=str,
+            default=ServerArgs.prefill_cp_mode,
+            choices=PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default)",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
@@ -6023,6 +6056,12 @@ class ServerArgs:
                 "Multi-item scoring requires chunked prefill to be disabled. "
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
+
+        # Check hisparse
+        if self.enable_hisparse:
+            assert (
+                self.disable_radix_cache
+            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
         assert (
             self.schedule_conservativeness >= 0

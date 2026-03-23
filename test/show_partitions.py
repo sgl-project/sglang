@@ -36,7 +36,7 @@ HW_MAPPING = {
 # Regex to detect run_suite.py invocations from pr-test.yml.
 # Uses lookaheads so --hw and --suite can appear in any order.
 _RUN_SUITE_RE = re.compile(
-    r"^\s*(?:\w+=\S+\s+)?"  # optional env prefix (e.g. IS_BLACKWELL=1)
+    r"^\s*(?:\w+=\S+\s+)?"  # optional env prefix (e.g. VAR=value)
     r"python3\s+run_suite\.py\b"
     r"(?=.*\s--hw\s+(?P<hw>\S+))"
     r"(?=.*\s--suite\s+(?P<suite>\S+))"

@@ -23,7 +23,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "stage-a-cpu-only")
+register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
 class TestParallelToolCalls(unittest.TestCase):
