@@ -180,7 +180,6 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
-        self._subprocess_watchdog = None
         atexit.register(self.shutdown)
 
         # Launch subprocesses
@@ -199,8 +198,6 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
-        self._subprocess_watchdog = subprocess_watchdog
-        # Store watchdog on tokenizer_manager for SIGQUIT handler access
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
@@ -732,8 +729,11 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
-        if self._subprocess_watchdog is not None:
-            self._subprocess_watchdog.stop()
+        if (
+            self.tokenizer_manager is not None
+            and self.tokenizer_manager._subprocess_watchdog is not None
+        ):
+            self.tokenizer_manager._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):

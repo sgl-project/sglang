@@ -204,7 +204,6 @@ class _GlobalState:
     #         )
     # }
     remote_instance_transfer_engine_info: Optional[Dict] = None
-    subprocess_watchdog: Optional[SubprocessWatchdog] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -1995,11 +1994,10 @@ def _setup_and_run_http_server(
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-            subprocess_watchdog=subprocess_watchdog,
         )
     )
 
-    # Store watchdog reference on tokenizer_manager for SIGQUIT handler access
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
