@@ -490,6 +490,7 @@ export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
 export PROMPT="A beautiful sunset over the ocean with golden clouds"
 export WORK=/mnt/geminihzceph/rhyshen/scripts/scripts_collection/sglang-diffusion-benchmark/zimage_fp8
 export OUT_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256
+# export SGLANG_ENABLE_JIT_DEEPGEMM=0
 # ============================================================
 # Step 1: FP8 转换（包含 FFN）
 # ============================================================
@@ -1262,20 +1263,259 @@ At 256×256:
 |----------|-------------|--------|-----------------|----------------|--------|
 | **✅ Done** | TextEncoder FP32→BF16 | TextEncoding | -264ms (-35.1%) | **486ms** | ✅ 完成 |
 | **✅ Done** | **DiT FP8 scale 加载修复** | Bug fix | VRAM -35.5% | 548ms | ✅ 4 处代码修复，图像质量恢复 (Section 22-23) |
-| **P0** | **CUTLASS FP8 测试** (`SGLANG_ENABLE_JIT_DEEPGEMM=0`) | Denoising GEMM | 无 transpose 开销 | 待测 | 待验证 (Section 23e) |
-| **P1** | **Pre-transpose scale** — 权重加载时一次性转置 | 消除 DeepGemm transpose | -139.8ms → 1.42× GEMM 加速 | ~410ms | 待实施 |
-| P2 | Fused adaLN + gate kernel | Elementwise | -5~10ms | ~400-405ms | 待实施 |
-| P3 | CuTe DSL FlashAttention | Attention | -3~5ms | ~395-402ms | 待实施 |
-| P4 | Better RMSNorm (Quack) | Norm | -2~3ms | ~393-400ms | 待实施 |
-| P5 | VAE BF16 | Decoding | -3~5ms | ~390-395ms | 待实施 |
+| **✅ Done** | **CUTLASS FP8 测试** | Denoising GEMM | 比 BF16 快 ~2% (-5ms GEMM) | **~545ms** | ✅ 完成，消除 transpose，收益有限 (Section 24) |
+| **P0** | **BF16 1024×1024 profile** | 验证大分辨率瓶颈 | — | — | 待执行，确认 FP8 在大 M 的收益 (Section 26) |
+| **P1** | **Pre-transpose weight scale** | DeepGemm transpose | -70ms（消除 weight scale transpose） | ~478ms | 待实施，使 DeepGemm 真正有效 (Section 25c) |
+| P2 | Fused adaLN + gate kernel | Elementwise | -5~10ms | ~468-475ms | 待实施 |
+| P3 | CuTe DSL FlashAttention | Attention | -3~5ms | ~463-472ms | 待实施 |
+| P4 | Better RMSNorm (Quack) | Norm | -2~3ms | ~461-470ms | 待实施 |
+| P5 | VAE BF16 | Decoding | -3~5ms | ~458-465ms | 待实施 |
 | — | Nunchaku W4A4 | — | ❌ Not supported on H20 SM90 | — | ❌ |
+| — | 换 H100 芯片 | 硬件升级 | H100 在 256×256 仅快~10% | — | ❌ 不划算（Section 27） |
 
-**FP8 nsys 分析结论**（Section 23d）：
+**当前 FP8 结论总结**（Section 23-28）：
+- **CUTLASS FP8（禁用 DeepGemm）**：消除 transpose，GEMM 总时间 255ms，比 BF16（260ms）略快 5ms（+2%）
+- **DeepGemm FP8**：GEMM 计算快 1.51×，但 139.8ms transpose 开销抵消所有加速，总时间 323ms
+- **根本矛盾**：256×256 下 M=768 的 GEMM 是 **bandwidth-bound**，FP8 的 2× TFLOPs 优势无法发挥
+- **正确场景**：FP8 在 1024×1024（M=12288，compute-bound）预计有 1.4-1.6× 真实加速
+- **换 H100 无显著收益**：256×256 bandwidth-bound 场景，H100/H20 带宽接近（3.35/4.0 TB/s）
+
+**FP8 nsys 分析结论**（Section 23d-24）：
 - **DeepGemm GEMM 计算快 1.51×**（260ms → 172ms），FP8 在 GEMM 计算层面有效
 - **但 DeepGemm transpose 开销 139.8ms（49,152 次 kernel launch）完全抵消了加速**
-- **FP8 量化开销仅 11.8ms（可接受）**
+- **CUTLASS FP8 消除了 transpose，总 GEMM 时间 255ms，比 BF16 略快 2%**
 - **VRAM 节省 35.5%**（13,620MB → 8,788MB），对显存受限场景有价值
-- **下一步**：P0 测试 CUTLASS FP8（正确 env var），P1 研究 pre-transpose scale
+- **下一步**：Pre-transpose weight scale，或在更大分辨率验证 FP8 收益
+
+---
+
+## Part IX: CUTLASS FP8 结果 & 深度优化分析
+
+### 24. CUTLASS FP8 vs DeepGemm vs BF16 三方对比
+
+#### 24a. 三方 Kernel 分类对比（nsys，仅 Denoising 相关部分）
+
+| 类别 | BF16 (ms) | FP8+DeepGemm (ms) | **FP8+CUTLASS (ms)** |
+|------|----------:|------------------:|--------------------:|
+| **FP8 GEMM 计算** | 0 | 171.8 | **238.8** |
+| **DeepGemm transpose** | 0 | **139.8** | **0** |
+| **FP8 量化 (quant)** | 0 | 11.8 | **16.2** |
+| nvjet BF16 GEMM（未量化层） | 279.2 | 59.1 | 59.1 |
+| FlashAttention | 10.8 | 12.9 | 12.9 |
+| Conv/cuDNN | 27.1 | 27.1 | 27.4 |
+| Norm + 其他 | ~390ms | ~76ms | ~76ms |
+| **nsys 全部 kernel 合计** | **~2875ms** | **~474ms** | **~410ms** |
+
+> 注：nsys 全部 kernel 合计包含 TextEncoder 和初始化 overhead，不等于 E2E。
+
+#### 24b. 仅 FP8 量化层 GEMM 时间收支
+
+| 方案 | GEMM 计算 | transpose | quant | **小计** | vs BF16 nvjet (260ms) |
+|------|:---------:|:---------:|:-----:|:--------:|:---------------------:|
+| BF16 nvjet | 260.0ms | 0 | 0 | **260.0ms** | baseline |
+| FP8+DeepGemm | 171.8ms | **+139.8ms** | 11.8ms | **323.4ms** | **+63.4ms 更慢** ❌ |
+| **FP8+CUTLASS** | **238.8ms** | **0ms** | 16.2ms | **255.0ms** | **-5.0ms 略快** ✅ |
+
+#### 24c. 逐 GEMM Shape 分析
+
+| GEMM 用途 | BF16 nvjet (μs) | DeepGemm FP8 (μs) | CUTLASS FP8 (μs) |
+|-----------|:--------------:|:----------------:|:---------------:|
+| FFN w13 (768×3840→10240) | 396 | **227** | ~117 avg |
+| QKV+output (768×3840→3840) | 73.8 | **47.8** | ~117 avg |
+| FFN w2 (768×10240→3840) | 175 | **120** | ~117 avg |
+
+> CUTLASS FP8 所有 shape 都使用同一 tile 配置（128×128×128），单次 GEMM avg=117μs。
+> DeepGemm 根据 shape autotuning，大 N 更快，小 N 相对慢。
+
+#### 24d. CUTLASS FP8 使用的后端
+
+禁用 DeepGemm 后，auto 选择的是 **CUTLASS SM90 BlockwiseFP8 GEMM**，kernel 核心参数：
+```
+CollectiveMma<MainloopSm90TmaGmmaWarpSpecializedBlockwiseFP8
+  tile = 128×128×128
+  float_e4m3_t × float_e4m3_t → bfloat16_t
+  SM90 TMA + WGMMA
+>
+```
+- 使用 SM90 原生 TMA + WGMMA 指令，比 SM80 CUTLASS 实现快
+- 不需要单独的 transpose kernel（scale 处理内置在 kernel 中）
+- 量化 kernel 换为 `_per_token_group_quant_8bit_colmajor`（16.2ms vs 11.8ms，多 4.4ms）
+
+---
+
+### 25. 为什么 DeepGemm FP8 计算更快但有 transpose 开销？
+
+#### 25a. DeepGemm GEMM 为何比 CUTLASS 更快
+
+| 指标 | DeepGemm | CUTLASS FP8 |
+|------|---------|-------------|
+| GEMM avg (per call) | 48~227μs（shape自适应）| 117μs（固定 tile） |
+| 核心技术 | JIT 编译 + Shape-specific autotuning | AOT 编译固定 tile |
+| Scale 格式 | TMA-aligned 列优先（需 transpose） | 内置处理 |
+
+DeepGemm 使用 **JIT 编译**，针对具体 GEMM shape（M=768, K=3840, N=10240 等）生成专用 kernel，能精确匹配最优 tile 大小、warp 排列、pipeline 深度。CUTLASS FP8 使用编译时固定 tile 128×128×128，对 768-row 的矩阵可能不是最优。
+
+#### 25b. transpose_fp32 是什么，为什么需要它
+
+**根本原因**：Hopper SM90 的 TMA（Tensor Memory Accelerator）硬件在加载 block scale 时，要求 scale 张量必须以**列优先（column-major）、16-byte 对齐**的内存布局存储。
+
+DeepGemm 的 block-FP8 GEMM 使用 TMA 硬件单元加载 scale，以便与 warp tile 迭代同步：
+1. **weight scale（Bs）**：checkpoint 保存为行优先 `(N//128, K//128)`，推理时 DeepGemm 内部需要列优先 → **每次 GEMM 调用都 transpose**
+2. **activation scale（As）**：每次前向动态量化生成行优先 scale → 同样需要 transpose
+
+**为什么不预先转置**：
+- Activation scale 每次前向动态生成，无法预先转置（必须每次计算）
+- Weight scale 可以预先转置，但当前实现没有这么做
+
+**49,152 次 transpose 的来源**（2,040 次 GEMM × ~24 次 transpose）：
+- 每个 GEMM 调用包含 2 次 scale transpose（weight scale + activation scale）
+- 每次 scale transpose 被拆分为多个小 tile kernel launch（因为 transpose kernel 设计为固定 tile `<512,64>` 大小）
+- 对 `(80,30)` 大小的 scale：需要 `ceil(80/64) × ceil(30/31) ≈ 2×1 = 2` 次 launch
+- 对 `(30,30)` 大小的 scale：需要 `1×1 = 1` 次 launch
+- 2040 GEMM × ~24 launch/GEMM = 49,152 次（实测匹配）
+
+#### 25c. Pre-transpose Weight Scale 优化思路
+
+对 weight scale 可以在**权重加载时一次性转置**，避免每次推理重复操作：
+
+| | 当前（推理时转置） | Pre-transpose（加载时转置） |
+|-|:-:|:-:|
+| weight scale transpose | 每次推理 ~70ms | **0ms**（仅加载时 1 次） |
+| activation scale transpose | 每次推理 ~70ms | 每次推理 ~70ms（不可消除） |
+| 预期总 transpose 节省 | — | **~70ms** |
+| 预期 FP8+DeepGemm 总时间 | 323.4ms | **~253ms（比 BF16 快 2.7%）** |
+
+实现需要：
+1. 在 `process_weights_after_loading()` 中对 `weight_scale_inv` 执行列优先转置并以连续内存保存
+2. DeepGemm API 需要接受预转置的 `Bs`（`get_mn_major_tma_aligned_tensor` 路径）
+3. 修改 `prepare_block_fp8_matmul_inputs` 中的 shape 检查
+
+> **注意**：即使实现 pre-transpose，FP8+DeepGemm 的总时间预计约 253ms，与 CUTLASS FP8（255ms）相近。真正的加速还需要解决 activation scale transpose（约 70ms）。
+
+---
+
+### 26. 不同分辨率下的 FP8 收益预测
+
+#### 26a. 为什么更大分辨率下 FP8 更有优势
+
+当前 256×256 的 seq_len=768，GEMM 的 M 维度很小。随着分辨率增大：
+
+| 分辨率 | seq_len | M 维度 | GEMM 特性 | FP8 预期优势 |
+|--------|---------|--------|-----------|------------|
+| 256×256 | ~768 | 768 | **Bandwidth-bound** | 弱（带宽差别小，FP8 仅省显存） |
+| 512×512 | ~3,072 | 3,072 | **过渡区** | 中 |
+| 1024×1024 | ~12,288 | 12,288 | **Compute-bound** | **强**（FP8 2× TFLOPs 充分发挥） |
+
+当 M 增大时：
+- GEMM 越来越 **compute-bound**（计算受限）
+- FP8 的 2× TFLOPs 优势（296 TFLOPS vs 148 TFLOPS）充分发挥
+- Transpose 开销相对 GEMM 计算的比例降低（transpose 是 O(M) 线性，GEMM 是 O(M×K×N)）
+
+#### 26b. 是否建议先做更大分辨率 profile？
+
+**建议**：
+
+1. **先用 BF16 profile 1024×1024** — 确认新瓶颈分布（attention 在 1024×1024 可能占 17%，类似 Yikai 的结果）
+2. **再跑 FP8 1024×1024** — 验证 FP8 在 compute-bound 场景下是否真正加速
+3. **不要先做优化，等 profile 数据再决策**
+
+预期在 1024×1024 时：
+- GEMM compute speedup：1.8-2.0×（接近理论 2×，因为充分 compute-bound）
+- Transpose 占比：大幅降低（transpose 是 O(M)，GEMM 是 O(M²)，大 M 时 transpose 变成小头）
+- 总体 FP8 加速：约 **1.4-1.6×**（减去 transpose 和 quant 剩余开销）
+
+**结论：256×256 可能根本不适合 FP8（太短），1024×1024 才是 FP8 的目标场景。**
+
+---
+
+### 27. H100 vs H20 芯片对比
+
+#### 27a. 规格对比
+
+| 规格 | **H100 SXM5** | **H20** | H20/H100 比值 |
+|------|:-----------:|:------:|:-----------:|
+| 架构 | Hopper GH100 | Hopper GH100（缩减版） | — |
+| SM 数量 | **132 SMs** | **78 SMs** | 59% |
+| **BF16 TFLOPs（dense）** | **989 TFLOPS** | **148 TFLOPS** | **15%** |
+| **FP8 TFLOPs（dense）** | **1,979 TFLOPS** | **296 TFLOPS** | **15%** |
+| **HBM 带宽** | **3.35 TB/s** | **4.0 TB/s** | **119%** |
+| 显存容量 | 80 GB HBM3 | 96 GB HBM3 | 120% |
+| TDP | 700 W | 400 W | 57% |
+
+> H20 是受出口管制限制的 H100 缩减版，保留了高带宽内存但削减了算力。
+
+#### 27b. H100 vs H20 在 Z-Image 场景的速度预测
+
+**关键洞察：Z-Image 256×256 是 bandwidth-bound（显存带宽受限），不是 compute-bound。**
+
+H20 带宽（4.0 TB/s）> H100（3.35 TB/s），因此在 bandwidth-bound 的小矩阵场景，H20 与 H100 接近，甚至 H20 略快。
+
+| 操作类型 | 限制因素 | H100 vs H20 速度比 | 说明 |
+|---------|--------|:-----------------:|------|
+| BF16 GEMM M=768（小矩阵） | 带宽受限 | H100 ≈ H20 | 两者带宽相近（3.35 vs 4.0 TB/s） |
+| BF16 GEMM M=12288（大矩阵） | 计算受限 | **H100 6.7× 更快** | 989 vs 148 TFLOPS |
+| FP8 GEMM M=768 | 带宽受限 | H100 ≈ H20 | 同上 |
+| FP8 GEMM M=12288 | 计算受限 | **H100 6.7× 更快** | 1979 vs 296 TFLOPS |
+| FlashAttention (768 tokens) | 带宽受限 | H100 ≈ H20 | — |
+| RMSNorm | 带宽受限 | H100 ≈ H20 | — |
+
+**具体到 256×256 E2E 的预测**：
+
+| 配置 | H20 实测 | H100 预测 | 加速比 |
+|------|:-------:|:--------:|:-----:|
+| BF16 TextEnc+DiT | 486ms | **~430-450ms** | ~1.1× |
+| FP8+CUTLASS | 548ms | **~480-500ms** | ~1.1× |
+
+> **结论**：对 256×256，H100 相比 H20 几乎没有加速（~10%），因为该场景以 bandwidth-bound 为主。H100 的巨大算力优势（6.7×）只在 1024×1024 等 compute-bound 场景才能发挥。
+
+#### 27c. H100 vs H20 在 1024×1024 场景的预测
+
+| 配置 | H20 估算（参考 Yikai H100 数据反推） | H100 预测 | 加速比 |
+|------|:--:|:--:|:--:|
+| BF16 DiT denoising (9 steps) | ~1,200ms | **~230ms** | **~5× 更快** |
+| FP8 DiT denoising (9 steps) | ~700ms（预估） | **~150ms** | **~4.7×** |
+
+> 在 1024×1024，切换到 H100 有 5× 的速度提升。这才是 H100 的正确使用场景。
+
+---
+
+### 28. 下一步优化方向 — 决策分析
+
+#### 28a. 三个优化方向评估
+
+| 方向 | 难度 | 预期收益（256×256） | 说明 |
+|------|:---:|:------------------:|------|
+| **方向 A：DeepGemm transpose 优化（Pre-transpose weight scale）** | 中 | **-70ms（消除 weight scale transpose）** | 需要修改权重加载逻辑 + 确认 DeepGemm API |
+| **方向 B：CUTLASS FP8 性能提升（接近 DeepGemm）** | 高 | 理论上 -80ms | 需要 CUTLASS tile 参数调优或修改 GEMM kernel，门槛很高 |
+| **方向 C：算子融合 + RMSNorm（BF16 路径优化）** | 低~中 | **-15~25ms** | adaLN gate fusion（-10ms）+ RMSNorm 优化（-5ms）|
+
+**推荐**：
+1. 方向 C（融合算子）- 低风险，稳定收益，与 FP8 路径无关
+2. 方向 A（Pre-transpose）- 中等难度，能让 DeepGemm 真正有效，值得研究
+3. 方向 B（CUTLASS 调优）- 工作量大，先通过 nsys 验证瓶颈再决定
+
+#### 28b. 关于先做更大分辨率测试
+
+**强烈建议先做 1024×1024 的 BF16 profile**：
+- 256×256 是 H20 的"特殊"场景（带宽受限，FP8 无优势）
+- 1024×1024 才能真正验证 FP8 的价值
+- 如果 FP8 在 1024×1024 有 1.4× 加速，VRAM 节省也更有实用价值（大模型 batch 部署）
+
+命令（在 GPU 服务器执行）：
+```bash
+# BF16 1024×1024 profile
+sglang generate \
+    --model-path $MODEL --text-encoder-precisions bf16 \
+    --prompt "$PROMPT" --height 1024 --width 1024 \
+    --warmup --save-output --perf-dump-path $OUT_DIR/zimage_bench/baseline_1gpu_bf16_1024x1024.json
+
+# FP8+CUTLASS 1024×1024 profile
+SGLANG_ENABLE_JIT_DEEPGEMM=0 sglang generate \
+    --model-path $MODEL --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 \
+    --prompt "$PROMPT" --height 1024 --width 1024 \
+    --warmup --save-output --perf-dump-path $OUT_DIR/zimage_bench/baseline_1gpu_fp8cutlass_1024x1024.json
+```
 
 ---
 
