@@ -40,6 +40,7 @@ class EvalArgs:
     temperature: Optional[float] = None
     response_answer_regex: str = "(.*)"
     lora_path: Optional[str] = None
+    reasoning_effort: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -119,6 +120,13 @@ class EvalArgs:
             type=str,
             default=EvalArgs.lora_path,
             help="Specify the LoRA path to use for evaluation. If specified, the value will be specified in the body of every request as `lora-path`.",
+        )
+        parser.add_argument(
+            "--reasoning-effort",
+            type=str,
+            default=EvalArgs.reasoning_effort,
+            choices=["none", "high"],
+            help="Reasoning effort for the model (none or high).",
         )
 
     @classmethod

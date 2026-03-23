@@ -5,7 +5,8 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.utils import is_in_ci
 
 
 def torch_top_k_renorm_probs(probs, top_k):
