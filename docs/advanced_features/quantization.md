@@ -278,6 +278,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
     ```bash
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.1-8B-Instruct-FP8 \
+        --quantization modelopt_fp8 \
         --port 30000
     ```
 
@@ -286,6 +287,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
     ```bash
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
+        --quantization modelopt_fp4 \
         --port 30000
     ```
 
