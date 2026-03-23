@@ -1,4 +1,4 @@
-# Test System in SGLang
+# Test and Continuous Integration (CI) System in SGLang
 
 This page introduces the test system, including the CI pipeline, file organization, and how to add and run tests.
 
