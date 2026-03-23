@@ -584,10 +584,15 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_reasoning_from_request(request)
+            )
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
+                force_reasoning=is_force_reasoning,
                 request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -965,8 +970,15 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         reasoning_parser: Optional[ReasoningParser] = None
         if self.reasoning_parser:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_reasoning_from_request(request)
+            )
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=True
+                model_type=self.reasoning_parser,
+                stream_reasoning=True,
+                force_reasoning=is_force_reasoning,
+                request=request,
             )
 
         # Track state for non-Harmony streaming with function tools
@@ -1720,3 +1732,36 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+
+    def _get_reasoning_from_request(self, request: ResponsesRequest) -> bool:
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning_effort is not None
+                and request.reasoning_effort != "none"
+            )
+        return True  # default

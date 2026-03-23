@@ -1241,6 +1241,7 @@ class ResponsesRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.0
+    chat_template_kwargs: Optional[Dict] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
