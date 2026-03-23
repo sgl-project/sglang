@@ -1,7 +1,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -194,11 +193,9 @@ struct QKNormAcrossHeadsKernel {
         .with_device(device)
         .verify(k_weight);
 
-    auto cc_major = host::runtime::get_cc_major(device.unwrap().device_id);
     int hidden_size = static_cast<int>(D.unwrap());
-    if ((cc_major <= 9 && hidden_size <= 8192) || (cc_major >= 10 && hidden_size <= 12288)) {
-      int max_vec_size_byte = cc_major >= 10 ? 32 : 16;
-      int elements_in_vec = max_vec_size_byte / sizeof(DType);
+    if (hidden_size <= (device::kMaxVecBytes == 32 ? 12288 : 8192)) {
+      int elements_in_vec = device::kMaxVecBytes / sizeof(DType);
       int vec_hidden_size = hidden_size / elements_in_vec;
       uint threads = (vec_hidden_size + 31) / 32 * 32;
 
@@ -211,8 +208,7 @@ struct QKNormAcrossHeadsKernel {
           elements_in_vec);
 
       // Launch single kernel for both q and k
-      auto kernel = max_vec_size_byte == 32 ? qknorm_across_heads_reg_kernel<DType, 32>
-                                            : qknorm_across_heads_reg_kernel<DType, 16>;
+      auto kernel = qknorm_across_heads_reg_kernel<DType, device::kMaxVecBytes>;
 
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
