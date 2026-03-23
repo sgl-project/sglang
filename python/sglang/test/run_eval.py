@@ -118,7 +118,7 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
+        filename = getattr(args, "dataset_path", None) or (
             "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
@@ -130,7 +130,7 @@ def run_eval(args):
         from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
 
         # Default to HuggingFace dataset, can be overridden with --dataset-path
-        data_source = args.dataset_path
+        data_source = getattr(args, "dataset_path", None)
         categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
