@@ -42,12 +42,12 @@ jobs:
           REF="${{ inputs.aiter_ref || 'main' }}"
           echo "Resolving AITER ref: ${REF}"
 
-          SHA=$(git ls-remote https://github.com/ROCm/aiter.git "${REF}" | head -1 | cut -f1)
-          if [ -z "$SHA" ]; then
-            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/heads/${REF}" | head -1 | cut -f1)
-          fi
+          SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/heads/${REF}" | head -1 | cut -f1)
           if [ -z "$SHA" ]; then
             SHA=$(git ls-remote https://github.com/ROCm/aiter.git "refs/tags/${REF}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote https://github.com/ROCm/aiter.git "${REF}" | head -1 | cut -f1)
           fi
           if [ -z "$SHA" ]; then
             SHA="${REF}"

@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
+import dataclasses
 import multiprocessing as mp
 import os
 import time
@@ -154,6 +155,24 @@ class DiffGenerator:
             f"{self.server_args.scheduler_endpoint}."
         )
 
+    @staticmethod
+    def _resolve_image_paths_per_prompt(
+        prompts: list[str], image_paths: str | list[str] | None
+    ) -> list[str | list[str] | None]:
+        if len(prompts) <= 1:
+            return [image_paths]
+
+        if not isinstance(image_paths, list) or len(image_paths) <= 1:
+            return [image_paths for _ in prompts]
+
+        if len(image_paths) != len(prompts):
+            raise ValueError(
+                "When using multiple prompts with multiple input images, "
+                "provide either one shared image or exactly one image per prompt."
+            )
+
+        return [[image_path] for image_path in image_paths]
+
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
@@ -165,15 +184,33 @@ class DiffGenerator:
         """
         # 1. prepare requests
         prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
-        sampling_params = SamplingParams.from_user_sampling_params_args(
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
+
+        if len(prompts) > 1 and user_output_file_name is not None:
+            raise ValueError(
+                "Cannot use multiple prompts with a fixed output_file_name. "
+                "Either remove --output-file-name or use a single prompt."
+            )
+
+        sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
 
         requests: list[Req] = []
-        for p in prompts:
-            sampling_params.prompt = p
+        image_paths_per_prompt = self._resolve_image_paths_per_prompt(
+            prompts, sampling_params_orig.image_path
+        )
+
+        for i, p in enumerate(prompts):
+            sampling_params = dataclasses.replace(
+                sampling_params_orig,
+                prompt=p,
+                output_file_name=user_output_file_name,
+                image_path=image_paths_per_prompt[i],
+            )
+            sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
@@ -263,6 +300,9 @@ class DiffGenerator:
                         frame_interpolation_exp=req.frame_interpolation_exp,
                         frame_interpolation_scale=req.frame_interpolation_scale,
                         frame_interpolation_model_path=req.frame_interpolation_model_path,
+                        enable_upscaling=req.enable_upscaling,
+                        upscaling_model_path=req.upscaling_model_path,
+                        upscaling_scale=req.upscaling_scale,
                     )
 
                     for idx in range(len(samples_out)):

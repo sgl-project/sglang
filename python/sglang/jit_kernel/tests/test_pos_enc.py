@@ -1,3 +1,4 @@
+import sys
 import time
 from typing import Optional, Tuple, Union
 
@@ -6,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.pos_enc import rotary_embedding
+from sglang.jit_kernel.rope import rotary_embedding
 
 
 @triton.jit
@@ -486,4 +487,4 @@ def test_performance(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

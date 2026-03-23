@@ -32,8 +32,14 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --rocm-version)
+      ROCM_VERSION="$2"
+      MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
+      MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      echo "Using ROCm version override: ${ROCM_VERSION}"
+      shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -134,12 +140,27 @@ find_latest_image() {
   fi
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
-  echo "Using hard-coded fallback…" >&2
-  if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
-  else
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
-  fi
+  echo "Using hard-coded fallback for ${ROCM_VERSION}…" >&2
+  case "${ROCM_VERSION}" in
+    rocm720)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
+      fi
+      ;;
+    rocm700)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
+      fi
+      ;;
+    *)
+      echo "Error: no hard-coded fallback available for ${ROCM_VERSION}" >&2
+      return 1
+      ;;
+  esac
 }
 
 # Pull and run the latest image

@@ -1,5 +1,7 @@
+import glob
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -251,18 +253,18 @@ def handle_rerun_stage(
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
-        "stage-a-test-1",
-        "stage-a-cpu-only",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-a-test-cpu",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
@@ -272,12 +274,12 @@ def handle_rerun_stage(
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-1-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
         "multimodal-gen-test-1-gpu-amd",
         "multimodal-gen-test-2-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -332,10 +334,12 @@ def handle_rerun_stage(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
             if is_amd_stage:
-                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+                inputs = {
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
             else:
                 inputs = {
-                    "version": "release",
                     "target_stage": stage_name,
                     "pr_head_sha": pr_head_sha,
                 }
@@ -347,7 +351,7 @@ def handle_rerun_stage(
             if is_amd_stage:
                 inputs = {"target_stage": stage_name}
             else:
-                inputs = {"version": "release", "target_stage": stage_name}
+                inputs = {"target_stage": stage_name}
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
@@ -407,6 +411,272 @@ def handle_rerun_stage(
         return False
 
 
+CUDA_SUITE_TO_RUNNER = {
+    "stage-a-test-1-gpu-small": "1-gpu-5090",
+    "stage-a-test-cpu": "ubuntu-latest",
+    "stage-b-test-1-gpu-small": "1-gpu-5090",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
+    "stage-b-test-2-gpu-large": "2-gpu-h100",
+    "stage-b-test-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-4-gpu-h100": "4-gpu-h100",
+    "stage-c-test-8-gpu-h200": "8-gpu-h200",
+    "stage-c-test-8-gpu-h20": "8-gpu-h20",
+    "stage-c-test-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
+    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+}
+
+DEEPEP_SUITES = {
+    "stage-c-test-8-gpu-h20",
+    "stage-c-test-deepep-4-gpu-h100",
+    "stage-c-test-deepep-8-gpu-h200",
+}
+
+
+def resolve_test_file(file_part):
+    """
+    Resolve a user-provided file path to a path relative to test/.
+
+    Supports:
+    - Full path: test/registered/core/test_srt_endpoint.py
+    - Relative to test/: registered/core/test_srt_endpoint.py
+    - Bare filename: test_srt_endpoint.py (glob-matched, must be unique)
+
+    Returns (resolved_path, error_message). On success error_message is None.
+    """
+    if file_part.startswith("test/"):
+        file_part = file_part[len("test/") :]
+
+    if "/" not in file_part:
+        matches = glob.glob(f"test/registered/**/{file_part}", recursive=True)
+        if len(matches) == 0:
+            return (
+                None,
+                f"No test file found matching `{file_part}` under `test/registered/`.",
+            )
+        if len(matches) > 1:
+            match_list = "\n".join(f"- `{m}`" for m in sorted(matches))
+            return None, (
+                f"Ambiguous filename `{file_part}` — matched {len(matches)} files:\n\n"
+                f"{match_list}\n\n"
+                f"Please provide the full path, e.g. `/rerun-ut {matches[0]}`"
+            )
+        return matches[0][len("test/") :], None
+
+    full_path = f"test/{file_part}"
+    if not os.path.isfile(full_path):
+        return None, f"File not found: `{full_path}`"
+    return file_part, None
+
+
+def detect_cuda_suite(file_path_from_test):
+    """
+    Read a test file and extract the suite from register_cuda_ci(suite="...").
+
+    Returns (suite_name, runner_label, use_deepep, error_message).
+    """
+    full_path = f"test/{file_path_from_test}"
+    with open(full_path, "r") as f:
+        content = f.read()
+
+    match = re.search(
+        r'register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']', content
+    )
+    if not match:
+        return (
+            None,
+            None,
+            False,
+            (
+                f"No `register_cuda_ci()` found in `{full_path}`.\n\n"
+                f"This file may not be a registered CUDA CI test."
+            ),
+        )
+
+    suite = match.group(1)
+    runner = CUDA_SUITE_TO_RUNNER.get(suite)
+    if not runner:
+        known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
+        return (
+            suite,
+            None,
+            False,
+            (
+                f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
+                f"Known suites: {known}"
+            ),
+        )
+    use_deepep = suite in DEEPEP_SUITES
+    return suite, runner, use_deepep, None
+
+
+def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
+    """
+    Handles the /rerun-ut <file>::<TestClass.test_method> command.
+    Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
+    """
+    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
+    # This command checks out and executes code from the PR branch on self-hosted GPU
+    # runners, so we must ensure the commenter is a trusted collaborator.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if is_fork:
+        commenter = comment.user.login
+        perm = gh_repo.get_collaborator_permission(commenter)
+        if perm not in ("admin", "write"):
+            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
+                "has write permission on the repo.\n\n"
+                "Please ask a maintainer to run this command, or use the normal CI flow."
+            )
+            return False
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
+
+    if not (
+        user_perms.get("can_rerun_ut", False)
+        or user_perms.get("can_rerun_stage", False)
+    ):
+        print("Permission denied: neither can_rerun_ut nor can_rerun_stage is true.")
+        return False
+
+    if not test_spec:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ Please specify a test: `/rerun-ut <file>::<TestClass.test_method>`\n\n"
+            "Examples:\n"
+            "- `/rerun-ut test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
+            "- `/rerun-ut registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
+            "- `/rerun-ut test_srt_endpoint.py`"
+        )
+        return False
+
+    # Parse spec: split on :: to get file path and optional test selector
+    if "::" in test_spec:
+        file_part, test_selector = test_spec.split("::", 1)
+    else:
+        file_part = test_spec
+        test_selector = None
+
+    file_part = file_part.strip()
+    if test_selector:
+        test_selector = test_selector.strip()
+
+    # Resolve file path
+    resolved_path, err = resolve_test_file(file_part)
+    if err:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(f"❌ {err}")
+        return False
+
+    # Detect suite and runner
+    suite, runner_label, use_deepep, err = detect_cuda_suite(resolved_path)
+    if err:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(f"❌ {err}")
+        return False
+
+    # Build test_command: file path (+ optional test selector as unittest arg)
+    test_command = resolved_path
+    if test_selector:
+        test_command = f"{resolved_path} {test_selector}"
+
+    print(
+        f"Resolved: file={resolved_path}, selector={test_selector}, "
+        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, command='{test_command}'"
+    )
+
+    try:
+        workflow_name = "Rerun UT"
+        workflows = gh_repo.get_workflows()
+        target_workflow = None
+        for wf in workflows:
+            if wf.name == workflow_name:
+                target_workflow = wf
+                break
+
+        if not target_workflow:
+            print(f"Error: {workflow_name} workflow not found")
+            return False
+
+        is_fork = (
+            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+        )
+        print(f"PR is from fork: {is_fork}")
+
+        pr_head_sha = None
+        if is_fork:
+            ref = "main"
+            pr_head_sha = pr.head.sha
+            inputs = {
+                "test_command": test_command,
+                "runner_label": runner_label,
+                "pr_head_sha": pr_head_sha,
+                "use_deepep": str(use_deepep).lower(),
+            }
+        else:
+            ref = pr.head.ref
+            inputs = {
+                "test_command": test_command,
+                "runner_label": runner_label,
+                "use_deepep": str(use_deepep).lower(),
+            }
+
+        dispatch_time = time.time()
+
+        dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
+        dispatch_resp = requests.post(
+            dispatch_url,
+            json={"ref": ref, "inputs": inputs},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        success = dispatch_resp.status_code in (200, 204)
+        if not success:
+            print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
+
+        if success:
+            print(f"Successfully triggered rerun-ut: {test_command}")
+            comment.create_reaction("+1")
+            pr.create_issue_comment(
+                f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:\n"
+                f"```\ncd test/ && python3 {test_command}\n```"
+            )
+
+            run_url = find_workflow_run_url(
+                gh_repo,
+                target_workflow.id,
+                ref,
+                "rerun-ut",
+                token,
+                dispatch_time,
+                pr_head_sha=pr_head_sha,
+                max_wait=30,
+            )
+            if run_url:
+                pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+            else:
+                pr.create_issue_comment(
+                    f"⚠️ Could not retrieve workflow run URL. "
+                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                )
+            return True
+        else:
+            print("Failed to trigger workflow_dispatch")
+            return False
+
+    except Exception as e:
+        print(f"Error triggering rerun-ut: {e}")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            f"❌ Failed to trigger rerun-ut: {str(e)}\n\n"
+            f"Please check the logs or contact maintainers."
+        )
+        return False
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -427,9 +697,10 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun failed CI on their own PRs,
+    # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
+    # Note: /rerun-ut is blocked entirely for fork PRs in handle_rerun_ut() itself.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -442,6 +713,7 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
+        user_perms["can_rerun_ut"] = True
 
     if not user_perms:
         print(f"User {user_login} does not have any configured permissions. Exiting.")
@@ -485,6 +757,11 @@ def main():
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+
+    elif first_line.startswith("/rerun-ut"):
+        parts = first_line.split(maxsplit=1)
+        test_spec = parts[1].strip() if len(parts) > 1 else None
+        handle_rerun_ut(repo, pr, comment, user_perms, test_spec, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")

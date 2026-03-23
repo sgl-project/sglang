@@ -55,7 +55,7 @@ should give the same text output and very similar prefill logits:
 
 - Get the reference output:
   ```bash
-  python3 scripts/playground/reference_hf.py --model-path [new model] --model-type {text,mllm}
+  python3 scripts/playground/reference_hf.py --model-path [new model] --model-type {text,vlm}
   ```
 - Get the SGLang output:
   ```bash
@@ -65,7 +65,7 @@ should give the same text output and very similar prefill logits:
 ### Add the Model to the Test Suite
 
 To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
-the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py)
+the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/models/test_generation_models.py)
 file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
 MMMU-Pro, etc.) in your PR. \\
 For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_a.py), [test_vision_openai_server_b.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_b.py)).
@@ -309,6 +309,206 @@ if __name__ == "__main__":
 ```
 
 Now, when we call `python run.py`, we will get the outputs of our newly created model!
+
+## Serving External Models via the Standard CLI
+
+The previous sections show how to register a model programmatically via `ModelRegistry` and serve it through the Offline Engine. Similar to vLLM model plugin, there is an alternative that lets you keep using the standard `python -m sglang.launch_server` CLI without modifying any SGLang source code: you can register your model using the `SGLANG_EXTERNAL_MODEL_PACKAGE` environment variable.
+
+### The `EntryClass` Variable
+
+When SGLang scans a model package, it looks for the variable `EntryClass` at the module level of your Python file. The [model registry](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/registry.py) imports your file, checks for `EntryClass`, and registers the class assigned to it. If you are using a model based on HuggingFace, the name of this class needs to match the `"architectures"` field in your model's `config.json`.
+
+For example, if you are implementing a Llama wrapper, add this line at the end of your model file:
+
+```python
+# This is what "Add EntryClass at the end" means
+EntryClass = LlamaWrapper
+```
+
+### Example: Text-Only Model
+
+Using the same Llama wrapper from the previous section, here is how to package and serve it via the CLI.
+
+1. Create your project
+
+```
+sglang_custom_project/
+|----setup.py
+|----custom_llm/
+     |----__init__.py
+     |----llama_wrapper.py
+```
+
+Write the `setup.py`:
+
+```python
+# sglang_custom_project/setup.py
+
+from setuptools import setup, find_packages
+setup(
+    name="sglang-custom-plugins",
+    version="0.1",
+    packages=find_packages(),
+)
+```
+
+2. Write your model code
+
+Inside `llama_wrapper.py`, write your model and include `EntryClass`:
+
+```python
+# sglang_custom_project/custom_llm/llama_wrapper.py
+
+import torch
+from typing import Optional
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.llama import LlamaForCausalLM
+
+class LlamaWrapper(LlamaForCausalLM):
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+    @torch.no_grad()
+    def forward(self, input_ids, positions, forward_batch,
+                pp_proxy_tensors=None, input_embeds=None, get_embedding=False):
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        res: LogitsProcessorOutput = self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch,
+        )
+
+        orig = res.next_token_logits
+        res.next_token_logits = torch.where(orig > 0, orig.sqrt(), orig)
+        return res
+
+# Don't forget to add EntryClass
+EntryClass = LlamaWrapper
+```
+
+3. Install your package
+
+Run this inside your `sglang_custom_project` directory to install your code into the active Python environment:
+
+```bash
+pip install -e .
+```
+
+4. Update your `config.json`
+
+Update the `config.json` under your HuggingFace model checkpoint directory so the `architectures` field matches your class name:
+
+```json
+{
+  "architectures": ["LlamaWrapper"],
+  ...
+}
+```
+
+5. Launch the server
+
+Set the environment variable before running the CLI:
+
+```bash
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_llm
+python -m sglang.launch_server \
+    --model-path /path/to/Llama-3.1-8B-Instruct \
+    --port 8000
+```
+
+The `SGLANG_EXTERNAL_MODEL_PACKAGE` should be the parent folder name containing your model-related code. In this example, it should be `custom_llm`.
+
+### Example: Multimodal Model
+
+If you are working with multimodal models, setting `SGLANG_EXTERNAL_MODEL_PACKAGE` alone is not enough. SGLang also needs to recognize your architecture as multimodal to enable the image/video processing pipelines, and it needs a custom processor.
+
+You can handle this by setting two additional environment variables:
+
+- `SGLANG_EXTERNAL_MM_MODEL_ARCH`: Adds your architecture name to SGLang's internal list of multimodal models.
+- `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`: Tells SGLang where to find your custom processor class.
+
+For example, let's build a custom model based on Qwen2-VL-Instruct that takes the square root of the logits.
+
+Create the project:
+
+```
+sglang_custom_project_vl/
+|----setup.py
+|----custom_vlm/
+     |----__init__.py
+     |----qwenvl_wrapper.py
+```
+
+Write `setup.py`:
+
+```python
+# sglang_custom_project_vl/setup.py
+
+from setuptools import setup, find_packages
+setup(
+    name="sglang-custom-plugins-vl",
+    version="0.1",
+    packages=find_packages(),
+)
+```
+
+Write the model in `qwenvl_wrapper.py`:
+
+```python
+# sglang_custom_project_vl/custom_vlm/qwenvl_wrapper.py
+import torch
+from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+class CustomQwen2VL(Qwen2VLForConditionalGeneration):
+    def forward(self, input_ids, positions, forward_batch,
+                input_embeds=None, get_embedding=False):
+        res = super().forward(
+            input_ids, positions, forward_batch,
+            input_embeds=input_embeds, get_embedding=get_embedding
+        )
+        if not get_embedding:
+            orig = res.next_token_logits
+            res.next_token_logits = torch.where(orig > 0, orig.sqrt(), orig)
+        return res
+
+class CustomQwen2VLProcessor(QwenVLImageProcessor):
+    models = [CustomQwen2VL]
+
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+EntryClass = CustomQwen2VL
+```
+
+**Note:** you don't need a separate `EntryClass` for the custom processor as long as you associate the processor with the specific model class.
+
+Install the package, update `config.json`, and launch:
+
+```bash
+pip install -e .
+```
+
+```json
+{
+  "architectures": ["CustomQwen2VL"],
+  ...
+}
+```
+
+```bash
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_vlm
+export SGLANG_EXTERNAL_MM_MODEL_ARCH=CustomQwen2VL
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=custom_vlm
+
+python -m sglang.launch_server \
+    --model-path /path/to/Qwen2-VL-2B-Instruct \
+    --port 8000 \
+    --enable-multimodal
+```
 
 ## Documentation
 

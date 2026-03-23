@@ -19,7 +19,7 @@ struct Param {
   size_t max_bfs_breadth;
   size_t min_match_window_size;
   size_t max_match_window_size;
-  size_t branch_length;
+  size_t max_trie_depth;
   size_t draft_token_num;
   std::string match_type;
 
@@ -109,7 +109,7 @@ struct Param {
     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", min_match_window_size = " << min_match_window_size << ", max_match_window_size = " << max_match_window_size
-       << ", branch_length = " << branch_length << ", draft_token_num = " << draft_token_num
+       << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
        << ", match_type = " << match_type;
     ss << ", batch_min_match_window_size(" << batch_min_match_window_size.size() << ") = ";
     for (int i = 0; i < batch_min_match_window_size.size(); ++i) {
