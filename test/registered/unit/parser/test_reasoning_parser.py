@@ -20,6 +20,7 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
 DEEPSEEK_V32_TOOL_START = f"<{dsml_token}function_calls>"
+DEEPSEEK_V32_FORMATTED_TOOL_START = f"\n\n<{dsml_token}function_calls>"
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -234,7 +235,10 @@ class TestDeepSeekV3Detector(CustomTestCase):
         """Test DeepSeekV3Detector initialization."""
         self.assertEqual(self.detector.think_start_token, "<think>")
         self.assertEqual(self.detector.think_end_token, "</think>")
-        self.assertEqual(self.detector.tool_start_token, DEEPSEEK_V32_TOOL_START)
+        self.assertEqual(
+            self.detector.tool_start_token,
+            (DEEPSEEK_V32_TOOL_START, DEEPSEEK_V32_FORMATTED_TOOL_START),
+        )
         self.assertFalse(self.detector._in_reasoning)
 
     def test_detect_and_parse_tool_interrupt(self):
@@ -256,6 +260,22 @@ class TestDeepSeekV3Detector(CustomTestCase):
         self.assertEqual(reasoning.reasoning_text, "thinking")
         self.assertEqual(tool_call.reasoning_text, "")
         self.assertEqual(tool_call.normal_text, DEEPSEEK_V32_TOOL_START)
+        self.assertEqual(trailing.reasoning_text, "")
+        self.assertEqual(trailing.normal_text, "\n<tool payload>")
+
+    def test_parse_streaming_increment_formatted_tool_interrupt(self):
+        """Test streaming parsing buffers a newline-prefixed DSML marker."""
+        self.detector.parse_streaming_increment("<think>")
+        reasoning = self.detector.parse_streaming_increment("thinking\n\n<")
+        tool_call = self.detector.parse_streaming_increment(
+            f"{dsml_token}function_calls>"
+        )
+        trailing = self.detector.parse_streaming_increment("\n<tool payload>")
+
+        self.assertEqual(reasoning.reasoning_text, "thinking")
+        self.assertEqual(reasoning.normal_text, "")
+        self.assertEqual(tool_call.reasoning_text, "")
+        self.assertEqual(tool_call.normal_text, DEEPSEEK_V32_FORMATTED_TOOL_START)
         self.assertEqual(trailing.reasoning_text, "")
         self.assertEqual(trailing.normal_text, "\n<tool payload>")
 
@@ -778,6 +798,27 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, f"{DEEPSEEK_V32_TOOL_START}\n<invoke>")
+
+    def test_deepseek_v3_formatted_tool_interruption(self):
+        """Test DeepSeek-V3 tool interruption with formatted DSML output."""
+        parser = ReasoningParser("deepseek-v3")
+        chunks = [
+            "<think>",
+            "reasoning\n\n<",
+            f"{dsml_token}function_calls>",
+            "\n<invoke>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            if reasoning:
+                all_reasoning += reasoning
+            if normal:
+                all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, f"{DEEPSEEK_V32_FORMATTED_TOOL_START}\n<invoke>")
 
 
 class TestIntegrationScenarios(CustomTestCase):
