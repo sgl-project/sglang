@@ -14,13 +14,11 @@ def main():
 
     # complex sub commands
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
-
     subparsers.add_parser(
         "serve",
-        help="Launch the SGLang server.",
+        help="Launch an SGLang server.",
         add_help=False,
     )
-
     subparsers.add_parser(
         "generate",
         help="Run inference on a multimodal model.",
