@@ -35,7 +35,6 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
             "--enable-nsa-prefill-context-parallel",
             "--nsa-prefill-cp-mode",
             "in-seq-split",
-            "--model-loader-extra-config",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -50,6 +49,7 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
             "32",
             "--max-running-requests",
             "32",
+            "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         with envs.SGLANG_ENABLE_SPEC_V2.override(True):
@@ -100,8 +100,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
             "8",
             "--enable-nsa-prefill-context-parallel",
             "--nsa-prefill-cp-mode",
-            "--round-robin-split",
-            "--model-loader-extra-config",
+            "round-robin-split",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -116,6 +115,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
             "32",
             "--max-running-requests",
             "32",
+            "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         with envs.SGLANG_ENABLE_SPEC_V2.override(True):
