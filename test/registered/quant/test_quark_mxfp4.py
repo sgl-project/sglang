@@ -5,7 +5,10 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+import time
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike
@@ -45,12 +48,6 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
-        # cls.wait_server_ready(
-        #     cls.base_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        # )
-        import time
-
-        import requests
 
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -149,7 +146,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
 
 class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
-    model = "/shareddata/Qwen/Qwen3-8B"
+    model = "Qwen/Qwen3-8B"
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
@@ -167,7 +164,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # - Qwen/Qwen1.5-MoE-A2.7B => K // 2 = 704 as intermediate size, not multiple of 128.
     # - ibm-granite/granite-3.0-3b-a800m-base: dtype issue with fp16 in AITER MOE MLP activation
     # so using a large model here.
-    model = "/shareddata/Qwen/Qwen3-30B-A3B-Instruct-2507"
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
