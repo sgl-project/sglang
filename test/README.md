@@ -1,36 +1,48 @@
 # Run Unit Tests
 
-SGLang uses the built-in library [unittest](https://docs.python.org/3/library/unittest.html) as the testing framework.
+This page introduces the test system in sglang, including how to run and add tests.
 
-## Test Backend Runtime
+## Run tests locally
+
+### Run a single file or a single test
 ```bash
-cd sglang/test/srt
-
 # Run a single file
-python3 test_srt_endpoint.py
+python3 test/registered/core/test_srt_endpoint.py
 
 # Run a single test
-python3 test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
-
-# Run a suite with multiple files
-python3 run_suite.py --suite per-commit
+python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 ```
 
-## Test Frontend Language
+### Run a suite with multiple files
 ```bash
-cd sglang/test/lang
+# Run the CPU only tests
+python3 test/run_suite.py --hw cpu --suite stage-a-test-cpu
 
-# Run a single file
-python3 test_choices.py
+# Run the small GPU test
+python3 test/run_suite.py --hw cuda --suite stage-a-test-1-gpu-small
 ```
 
-## Adding or Updating Tests in CI
+## Folder organization
+- `registered`: The registered test files. They will be run on CI. Most tests should be in this folder. It uses a custom registry system and use a file as the basic unit.
+- `manual`: Test files that won't be run by CI. You need to manually run them. Typically, these are temporary tests, deprecated tests, or tests that not suitable for running on CI such as taking too long or requires special setup. We still would like to keep some files here in case someone wants to run them locally.
+- `run_suite.py`: The launch scripts to run a test suite.
+- others: some utility scripts, metadata folder
 
-- Create new test files under `test/srt` or `test/lang` depending on the type of test.
-- For nightly tests, place them in `test/srt/nightly/`. Use the `NightlyBenchmarkRunner` helper class in `nightly_utils.py` for performance benchmarking tests.
-- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they are picked up in CI. For most small test cases, they can be added to the `per-commit-1-gpu` suite. Sort the test cases alphabetically by name.
-- Ensure you added `unittest.main()` for unittest and `sys.exit(pytest.main([__file__]))` for pytest in the scripts. The CI run them via `python3 test_file.py`.
-- The CI will run some suites such as `per-commit-1-gpu`, `per-commit-2-gpu`, and `nightly-1-gpu` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
+Since the system use a custom registry system and own launcher `run_suite.py`, it supports both python's built-in [unittest](https://docs.python.org/3/library/unittest.html) or the popular [pytest](https://docs.pytest.org/en/stable/).
+The basic unit is a file and you can use either of them in your file.
+The launcher will call `python filename.py` to run the test, so MAKE SURE you have the following lines in your file. Otherwise, it won't be executed by CI.
+
+```python
+# for unittest
+if __name__ == "__main__":
+    unittest.main()
+```
+
+```python
+# for pytest
+if __name__ == "__main__":
+    pytest.main([__file__])
+```
 
 ## CI Registry System
 
@@ -59,7 +71,7 @@ register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
 register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 
 # Multi-backend test
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=80, suite="stage-a-test-1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 
 # Temporarily disabled test
@@ -72,7 +84,7 @@ When adding 1-GPU tests, choose the appropriate suite based on hardware compatib
 
 | Suite | Runner | GPU | When to Use |
 |-------|--------|-----|-------------|
-| `stage-a-test-1-gpu-small` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | Stage A per-commit smoke on 5090 (CUDA) |
+| `stage-a-test-1-gpu-small` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | Most small tests |
 | `stage-a-test-1-gpu-small-amd` | AMD CI runners | ROCm | Stage A per-commit smoke (AMD) |
 | `stage-b-test-1-gpu-small` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | 5090-compatible tests (preferred) |
 | `stage-b-test-1-gpu-large` | `1-gpu-h100` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
@@ -125,18 +137,18 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
     --auto-partition-id 0 --auto-partition-size 4
 ```
 
-## Writing Elegant Test Cases
+## Overall organization
+As of March, 2026, we use the following test pipeline.
 
-- Learn from existing examples in [sglang/test/srt](https://github.com/sgl-project/sglang/tree/main/test/srt).
-- Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time.
-- Use as few GPUs as possible. Do not run long tests with 8-gpu runners.
+## Multi hardware backends
+
+
+## Tips for Writing Elegant Test Cases
+- Learn from existing examples in [test/registered](https://github.com/sgl-project/sglang/tree/main/test/registered).
+- Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time, so please reuse a single server for many tests instead of launching many servers.
+- Use as few GPUs as possible. Use 1-GPU runners whenever possible. Do not run long tests with 8-gpu runners.
 - If the test cases take too long, considering adding them to nightly tests instead of per-commit tests.
-- Keep each test function focused on a single scenario or piece of functionality.
-- Give tests descriptive names reflecting their purpose.
-- Use robust assertions (e.g., assert, unittest methods) to validate outcomes.
-- Clean up resources to avoid side effects and preserve test independence.
-- Reduce the test time by using smaller models and reusing the server for multiple test cases.
-
+- Each test file `test_xxx.py` should take less than 500s. If a single file takes more than that, split it into multiple files.
 
 ## Adding New Models to Nightly CI
 - **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
