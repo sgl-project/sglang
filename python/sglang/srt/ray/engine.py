@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -90,7 +90,7 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> Tuple[SchedulerInitResult, None]:
+    ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
         Returns:
@@ -188,8 +188,11 @@ class RayEngine(Engine):
             except Exception as e:
                 logger.error(f"Ray scheduler actor terminated with error: {e}")
 
-        return RaySchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
-            scheduler_actors=scheduler_actors,
-        ), None
+        return (
+            RaySchedulerInitResult(
+                scheduler_infos=scheduler_infos,
+                wait_for_completion=wait_for_completion,
+                scheduler_actors=scheduler_actors,
+            ),
+            None,
+        )

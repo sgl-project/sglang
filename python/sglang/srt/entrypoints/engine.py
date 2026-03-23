@@ -605,11 +605,14 @@ class Engine(EngineBase):
                     f"terminated with {proc.exitcode}"
                 )
 
-        return SchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_ready=wait_for_ready,
-            wait_for_completion=wait_for_completion,
-        ), scheduler_procs
+        return (
+            SchedulerInitResult(
+                scheduler_infos=scheduler_infos,
+                wait_for_ready=wait_for_ready,
+                wait_for_completion=wait_for_completion,
+            ),
+            scheduler_procs,
+        )
 
     @classmethod
     def _launch_subprocesses(
