@@ -432,7 +432,7 @@ class TestTokenizerRequestValidation(unittest.TestCase):
 
         self.tokenizer_manager._validate_one_request(req, input_ids)
 
-        self.assertEqual(len(input_ids), 12)
+        self.assertEqual(len(input_ids), 10)
         self.assertEqual(req.sampling_params["max_new_tokens"], 4)
 
     def test_auto_truncate_accounts_for_reserved_tokens(self):
@@ -442,8 +442,17 @@ class TestTokenizerRequestValidation(unittest.TestCase):
 
         self.tokenizer_manager._validate_one_request(req, input_ids)
 
-        self.assertEqual(len(input_ids), 10)
+        self.assertEqual(len(input_ids), 8)
         self.assertEqual(req.sampling_params["max_new_tokens"], 4)
+
+    def test_auto_truncate_does_not_drop_entire_prompt_for_oversized_generation(self):
+        req = GenerateReqInput(text="hello", sampling_params={"max_new_tokens": 100})
+        input_ids = list(range(20))
+
+        self.tokenizer_manager._validate_one_request(req, input_ids)
+
+        self.assertEqual(len(input_ids), 1)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 13)
 
 
 if __name__ == "__main__":
