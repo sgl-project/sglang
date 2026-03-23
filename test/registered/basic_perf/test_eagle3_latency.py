@@ -4,6 +4,8 @@ other one bounds accept length. CUDA only -- AMD bounds are unmeasured.
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.perf_bench_kit import at_least, at_most, check_perf
 from sglang.test.test_utils import (
@@ -16,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagle3Latency(CustomTestCase):
     def test_online_latency_eagle3(self):
         res = run_bench_serving(

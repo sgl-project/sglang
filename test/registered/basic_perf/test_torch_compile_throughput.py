@@ -2,6 +2,8 @@
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.perf_bench_kit import at_least, check_perf
 from sglang.test.test_utils import (
@@ -14,6 +16,7 @@ register_cuda_ci(est_time=75, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=280, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTorchCompileThroughput(CustomTestCase):
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
