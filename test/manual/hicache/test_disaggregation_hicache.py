@@ -7,13 +7,14 @@ from typing import Dict
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    flush_cache_with_retry,
     popen_launch_pd_server,
 )
 
@@ -33,8 +34,8 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -114,9 +115,9 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         # Trigger offloading
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
-        # Flush device cache to force remote storage access
+        # Flush device cache to force remote storage access.
         time.sleep(2)
-        requests.post(self.prefill_url + "/flush_cache")
+        flush_cache_with_retry(self.prefill_url)
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

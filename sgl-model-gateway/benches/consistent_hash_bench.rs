@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg::mesh::consistent_hash::ConsistentHashRing;
+use smg_mesh::consistent_hash::ConsistentHashRing;
 
 fn setup_ring(node_count: usize) -> ConsistentHashRing {
     let mut ring = ConsistentHashRing::new();

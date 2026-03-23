@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
+// Re-export storage config types from data_connector
+pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
 use serde::{Deserialize, Serialize};
 
 use super::ConfigResult;
 use crate::core::ConnectionMode;
-// Re-export storage config types from data_connector
-pub use crate::data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +82,7 @@ pub struct RouterConfig {
     pub ca_certificates: Vec<Vec<u8>>,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
-    pub mcp_config: Option<crate::mcp::McpConfig>,
+    pub mcp_config: Option<smg_mcp::McpConfig>,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,

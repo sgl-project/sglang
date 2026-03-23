@@ -4,15 +4,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::{
-        circuit_breaker::CircuitBreakerConfig,
-        steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
-        worker::{HealthConfig, RuntimeType, WorkerType},
-        BasicWorkerBuilder, ConnectionMode, Worker,
-    },
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+use crate::core::{
+    circuit_breaker::CircuitBreakerConfig,
+    steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
+    worker::{HealthConfig, RuntimeType, WorkerType},
+    BasicWorkerBuilder, ConnectionMode, Worker,
 };
 
 /// Normalize URL for external APIs (ensure https://).

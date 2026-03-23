@@ -1,6 +1,11 @@
 import inspect
 import json
+import math
 import os
+
+import numpy as np
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -13,7 +18,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LTX2AVLatentPreparationStage,
     LTX2TextConnectorStage,
     TextEncodingStage,
-    TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -51,14 +55,9 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
         vae_arch, "temporal_compression_ratio", None
     ) or getattr(server_args.pipeline_config, "vae_temporal_compression", None)
 
-    latent_num_frames = (int(num_frames) - 1) // int(vae_temporal_compression) + 1
-    latent_height = int(height) // int(vae_scale_factor)
-    latent_width = int(width) // int(vae_scale_factor)
-    video_sequence_length = latent_num_frames * latent_height * latent_width
-
     # Values from LTX2Pipeline in diffusers
     mu = calculate_shift(
-        video_sequence_length,
+        4096,
         base_seq_len=1024,
         max_seq_len=4096,
         base_shift=0.95,
@@ -102,6 +101,17 @@ def _filter_kwargs_for_cls(cls, kwargs):
     return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
 
+class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
+    """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
+
+    def _time_shift_exponential(self, mu, sigma, t):
+        if isinstance(t, np.ndarray):
+            t_torch = torch.from_numpy(t).to(torch.float32)
+            result = math.exp(mu) / (math.exp(mu) + (1 / t_torch - 1) ** sigma)
+            return result.numpy()
+        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+
 class LTX2Pipeline(ComposedPipelineBase):
     # NOTE: must match `model_index.json`'s `_class_name` for native dispatch.
     pipeline_name = "LTX2Pipeline"
@@ -117,74 +127,44 @@ class LTX2Pipeline(ComposedPipelineBase):
         "connectors",
     ]
 
+    def initialize_pipeline(self, server_args: ServerArgs):
+        orig = self.get_module("scheduler")
+        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        # 1. Input Validation
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
+        self.add_stages(
+            [
+                InputValidationStage(),
+                TextEncodingStage(
+                    text_encoders=[self.get_module("text_encoder")],
+                    tokenizers=[self.get_module("tokenizer")],
+                ),
+                LTX2TextConnectorStage(connectors=self.get_module("connectors")),
+            ]
         )
 
-        # 2. Text Encoding
-        self.add_stage(
-            stage_name="text_encoding_stage",
-            stage=TextEncodingStage(
-                # LTX-2 needs two contexts (video/audio). We reuse the same
-                # underlying Gemma encoder/tokenizer twice.
-                text_encoders=[
-                    self.get_module("text_encoder"),
-                ],
-                tokenizers=[
-                    self.get_module("tokenizer"),
-                ],
-            ),
-        )
+        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
 
-        # 3. connector stage
-        self.add_stage(
-            stage_name="text_connector_stage",
-            stage=LTX2TextConnectorStage(connectors=self.get_module("connectors")),
-        )
-
-        # 4. Timestep Preparation
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
-            ),
-        )
-
-        # 4. Latent Preparation
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=LTX2AVLatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-                audio_vae=self.get_module("audio_vae"),
-            ),
-        )
-
-        # 5. Denoising
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=LTX2AVDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                vae=self.get_module("vae"),
-                audio_vae=self.get_module("audio_vae"),
-            ),
-        )
-
-        # 6. Decoding
-        self.add_stage(
-            stage_name="decoding_stage",
-            stage=LTX2AVDecodingStage(
-                vae=self.get_module("vae"),
-                audio_vae=self.get_module("audio_vae"),
-                vocoder=self.get_module("vocoder"),
-                pipeline=self,
-            ),
+        self.add_stages(
+            [
+                LTX2AVLatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                    audio_vae=self.get_module("audio_vae"),
+                ),
+                LTX2AVDenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    vae=self.get_module("vae"),
+                    audio_vae=self.get_module("audio_vae"),
+                ),
+                LTX2AVDecodingStage(
+                    vae=self.get_module("vae"),
+                    audio_vae=self.get_module("audio_vae"),
+                    vocoder=self.get_module("vocoder"),
+                    pipeline=self,
+                ),
+            ]
         )
 
 
