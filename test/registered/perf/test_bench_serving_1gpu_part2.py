@@ -5,6 +5,8 @@ Works on 5090 (32GB).
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
@@ -23,6 +25,7 @@ register_cuda_ci(est_time=968, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBenchServing1GPUPart2(CustomTestCase):
     def test_vlm_offline_throughput(self):
         res = run_bench_serving(
