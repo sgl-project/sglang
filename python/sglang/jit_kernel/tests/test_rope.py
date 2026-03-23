@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import triton
@@ -248,4 +250,4 @@ def test_fused_rope_store(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

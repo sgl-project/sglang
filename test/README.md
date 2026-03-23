@@ -99,7 +99,8 @@ if __name__ == "__main__":
 ```python
 # for pytest
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))
 ```
 
 ## Run tests locally

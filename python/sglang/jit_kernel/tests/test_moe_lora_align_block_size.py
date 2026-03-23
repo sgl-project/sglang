@@ -1,5 +1,6 @@
 # Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py, will optimize in future refactor
 import random
+import sys
 
 import pytest
 import torch
@@ -163,4 +164,4 @@ def test_moe_lora_align_block_size(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

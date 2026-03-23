@@ -6,6 +6,8 @@ the reference two-step implementation:
     2. o = fused_recurrent_gated_delta_rule_update(q, k, v, g, beta, ...)
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -228,4 +230,4 @@ def test_mtp_single_step_decode(N: int):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

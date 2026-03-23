@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import triton
@@ -217,4 +219,4 @@ def test_fused_residual_layernorm_scale_shift_gate_select01(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

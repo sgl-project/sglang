@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -13,4 +15,4 @@ def test_add_constant(size: int, constant: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
