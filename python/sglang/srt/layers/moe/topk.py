@@ -282,6 +282,49 @@ class TopK(MultiPlatformOp):
             scoring_func=scoring_func,
         )
 
+    _MOE_OVERRIDE_KEYWORDS = ("FusedMoE",)
+
+    def enter_torch_compile(self, num_tokens, compile_scope="full",
+                            override_layers=None, compile_options=None,
+                            compile_dynamic=False):
+        if self.is_torch_compile:
+            return
+
+        # When a FusedMoE quant-method is being compiled, its forward_native
+        # expects StandardTopKOutput.  Instead of switching TopK to
+        # forward_native, keep forward_cuda but force STANDARD output so the
+        # optimised CUDA topk kernels stay on the hot path.
+        if override_layers is not None and any(
+            kw in name
+            for name in override_layers
+            for kw in self._MOE_OVERRIDE_KEYWORDS
+        ):
+            self._saved_output_format = self.topk_config.output_format
+            self.topk_config.output_format = TopKOutputFormat.STANDARD
+            self.is_torch_compile = True
+            return
+
+        super().enter_torch_compile(
+            num_tokens=num_tokens,
+            compile_scope=compile_scope,
+            override_layers=override_layers,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
+        )
+
+    def leave_torch_compile(self):
+        if not self.is_torch_compile:
+            return
+
+        saved = getattr(self, "_saved_output_format", None)
+        if saved is not None or hasattr(self, "_saved_output_format"):
+            self.topk_config.output_format = self._saved_output_format
+            del self._saved_output_format
+            self.is_torch_compile = False
+            return
+
+        super().leave_torch_compile()
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,

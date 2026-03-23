@@ -663,10 +663,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             fused_moe_forward_native_grouped_mm,
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
+
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise TypeError(
+                f"forward_native requires StandardTopKOutput but received "
+                f"{type(topk_output).__name__}. When torch-compile overrides a "
+                f"FusedMoE method, TopK must also be overridden so it produces "
+                f"StandardTopKOutput. Add 'TopK' to --torch-compile-override-layers."
+            )
 
         output = fused_moe_forward_native_grouped_mm(
             layer=layer,
@@ -675,5 +684,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             moe_runner_config=moe_runner_config,
             activation_fn=self.native_activation_fn,
             activation_fn_args=UnquantizedFusedMoEMethod.create_native_activation_fn_args,
+            weights_pre_transposed=self.use_triton_kernels,
         )
         return StandardCombineInput(hidden_states=output)

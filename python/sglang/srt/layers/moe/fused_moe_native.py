@@ -114,10 +114,16 @@ def fused_moe_forward_native_grouped_mm(
     topk_output: StandardTopKOutput,
     moe_runner_config: MoeRunnerConfig,
     activation_fn: Callable,
-    activation_fn_args: Callable
+    activation_fn_args: Callable,
+    weights_pre_transposed: bool = False,
 ) -> torch.Tensor:
     """
     Native grouped_mm MoE forward pass with configurable activation.
+
+    Args:
+        weights_pre_transposed: If True, w13_weight is already [E, H, 2*I] and
+            w2_weight is already [E, I, H] (e.g. triton_kernel layout), so the
+            transpose is skipped.
 
     Returns:
         torch.Tensor: (num_tokens, hidden_size)
@@ -172,11 +178,11 @@ def fused_moe_forward_native_grouped_mm(
     offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
 
     # --- Up projection per expert (grouped_mm) ---
-    # SGLang w13_weight shape: [num_experts, 2 * intermediate_size, hidden_size]
-    # grouped_mm expects: input @ weight, so we need (E, hidden_size, 2*I)
-    # Transpose w13_weight for grouped_mm
-    w13_weight_t = layer.w13_weight.transpose(-1, -2)  # (E, H, 2*I)
-    gate_up_out = torch._grouped_mm(current_states_g, w13_weight_t, offsets)
+    # grouped_mm computes input @ weight, so weight must be (E, H, 2*I).
+    # Normal layout stores [E, 2*I, H] and needs a transpose;
+    # triton_kernel layout already stores [E, H, 2*I].
+    w13 = layer.w13_weight if weights_pre_transposed else layer.w13_weight.transpose(-1, -2)
+    gate_up_out = torch._grouped_mm(current_states_g, w13, offsets)
 
     # Add bias if present
     w13_bias = getattr(layer, "w13_weight_bias", None)
@@ -188,11 +194,11 @@ def fused_moe_forward_native_grouped_mm(
     hidden_after_activation = hidden_after_activation.to(hidden_states.dtype)
 
     # --- Down projection per expert (grouped_mm) ---
-    # SGLang w2_weight shape: [num_experts, hidden_size, intermediate_size]
-    # grouped_mm expects: input @ weight, so we need (E, I, H)
-    # Transpose w2_weight for grouped_mm
-    w2_weight_t = layer.w2_weight.transpose(-1, -2)  # (E, I, H)
-    out_per_sample_g = torch._grouped_mm(hidden_after_activation, w2_weight_t, offsets)
+    # grouped_mm computes input @ weight, so weight must be (E, I, H).
+    # Normal layout stores [E, H, I] and needs a transpose;
+    # triton_kernel layout already stores [E, I, H].
+    w2 = layer.w2_weight if weights_pre_transposed else layer.w2_weight.transpose(-1, -2)
+    out_per_sample_g = torch._grouped_mm(hidden_after_activation, w2, offsets)
 
     # Add bias if present
     w2_bias = getattr(layer, "w2_weight_bias", None)

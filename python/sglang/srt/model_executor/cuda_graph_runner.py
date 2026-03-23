@@ -109,7 +109,7 @@ def _get_inductor_groupedmm_compile_options():
     compile_options = {
         "max_autotune_gemm_backends": "TRITON",
         "max_autotune_gemm": True,
-        "trace.enabled": True,
+        # "trace.enabled": True,
     }
     if hasattr(torch._inductor.config, "combo_kernels"):
         compile_options["combo_kernels"] = True
