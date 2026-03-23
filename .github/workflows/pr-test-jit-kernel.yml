@@ -23,13 +23,12 @@ on:
         type: string
         default: 'false'
 
-# Workflow-level env is NOT inherited from the caller in reusable workflows.
-# The github context (including github.event_name) IS inherited from the caller.
-env:
-  SGLANG_IS_IN_CI: true
-  SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+# TEMP: env block removed to test whether caller env vars propagate to called workflows
+# env:
+#   SGLANG_IS_IN_CI: true
+#   SGLANG_CUDA_COREDUMP: "1"
+#   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+#   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   jit-kernel-unit-test:
@@ -40,6 +39,15 @@ jobs:
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
+      - name: "[DEBUG] Test env var inheritance from caller"
+        run: |
+          echo "=== Testing whether caller workflow env vars propagate ==="
+          echo "SGLANG_IS_IN_CI=${SGLANG_IS_IN_CI:-UNSET}"
+          echo "SGLANG_CUDA_COREDUMP=${SGLANG_CUDA_COREDUMP:-UNSET}"
+          echo "SGLANG_JIT_DEEPGEMM_FAST_WARMUP=${SGLANG_JIT_DEEPGEMM_FAST_WARMUP:-UNSET}"
+          echo "SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=${SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-UNSET}"
+          echo "=== If all show UNSET, env vars are NOT inherited ==="
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
