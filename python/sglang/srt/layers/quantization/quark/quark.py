@@ -29,6 +29,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
@@ -41,6 +43,7 @@ class QuarkConfig(QuantizationConfig):
     def __init__(
         self,
         quant_config: Optional[dict[str, Any]] = None,
+        hf_config: "PretrainedConfig | None" = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
@@ -54,7 +57,9 @@ class QuarkConfig(QuantizationConfig):
         if online_scheme is not None:
             assert not is_prequantized
             if online_scheme == "quark_mxfp4":
-                quant_config = self._create_online_mxfp4_config()
+                quant_config = self._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
             else:
                 raise ValueError(f"Unsupported online_scheme: {online_scheme}")
 
@@ -204,15 +209,38 @@ class QuarkConfig(QuantizationConfig):
         return []
 
     @staticmethod
-    def _create_online_mxfp4_config() -> dict[str, Any]:
+    def _create_online_mxfp4_config(model_type: str) -> dict[str, Any]:
         """
         Create a synthetic quant_config for online MXFP4 quantization.
         """
+        # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
+        # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
+        exclude = [
+            "re:.*gate$",
+            "re:.*router",
+            "re:.*lm_head",
+            "re:.*embed_tokens",
+        ]
+
+        if model_type == "qwen3_5_moe":
+            # Exclusion for accuracy adapted from
+            # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+            exclude.extend(
+                [
+                    "re:.*n_proj_a",
+                    "re:.*in_proj_b",
+                    "re:.*in_proj_qkv",
+                    "re:.*in_proj_z",
+                    "re:.*o_proj",
+                    "re:.*out_proj",
+                    "re:.*qkv_proj",
+                    "re:.*shared_expert",
+                ]
+            )
+
         return {
             "packed_modules_mapping": {},
-            # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
-            # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
-            "exclude": ["*gate", "*router", "*lm_head", "*embed_tokens"],
+            "exclude": exclude,
             "global_quant_config": {
                 "weight": {
                     "dtype": "fp4",

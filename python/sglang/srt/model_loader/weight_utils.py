@@ -239,7 +239,10 @@ def get_quant_config(
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
-            return quant_cls(online_scheme=model_config.quantization)
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
