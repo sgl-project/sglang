@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -35,22 +35,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
-
-
-def _get_kv_pool_buffer(
-    token_to_kv_pool_allocator: Any, kvcache: Any, attr_name: str
-) -> Any:
-    if hasattr(kvcache, attr_name):
-        return getattr(kvcache, attr_name)
-
-    legacy_kvcache = getattr(token_to_kv_pool_allocator, "_kvcache", None)
-    if legacy_kvcache is not None and hasattr(legacy_kvcache, attr_name):
-        return getattr(legacy_kvcache, attr_name)
-
-    raise ValueError(
-        "LMCache currently supports only SGLang MHA K/V pool buffers. "
-        f"Missing `{attr_name}` on the active KV cache."
-    )
 
 
 class LayerTransferCounter:
@@ -109,19 +93,8 @@ class LMCRadixCache(RadixCache):
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=_get_kv_pool_buffer(
-                self.token_to_kv_pool_allocator,
-                kvcache,
-                "k_buffer",
-            ),
-            v_pool=_get_kv_pool_buffer(
-                self.token_to_kv_pool_allocator,
-                kvcache,
-                "v_buffer",
-            ),
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            kvcache=kvcache,
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
         if global_server_args.lmcache_mp_host is None:
