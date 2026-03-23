@@ -18,9 +18,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=60,
-    suite="stage-b-test-small-1-gpu",
+    suite="stage-b-test-1-gpu-small",
 )
-register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 

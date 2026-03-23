@@ -17,8 +17,8 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileRe
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=8, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestProfileMerger(unittest.TestCase):

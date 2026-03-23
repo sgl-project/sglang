@@ -8,7 +8,7 @@ import yaml
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-cpu-only", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
 
 SAMPLE_MODULE_NAME = "_source_patcher_test_fixtures.sample_module"
 
