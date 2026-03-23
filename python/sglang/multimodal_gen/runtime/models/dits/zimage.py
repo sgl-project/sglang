@@ -922,8 +922,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
 
         for layer_id, layer in enumerate(self.layers):
-            if hasattr(layer, "attention"):
-                layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
             unified = layer(
                 unified,
                 unified_freqs_cis,
