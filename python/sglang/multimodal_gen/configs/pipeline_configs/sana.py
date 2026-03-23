@@ -112,3 +112,11 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     def post_denoising_loop(self, latents, batch):
         return latents
+
+    def shard_latents_for_sp(self, batch, latents):
+        # Sana's DiT uses local attention kernels and does not preserve semantics
+        # when spatial latents are sequence-sharded.
+        return latents, False
+
+    def gather_latents_for_sp(self, latents):
+        return latents

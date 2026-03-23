@@ -32,10 +32,11 @@ python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/
 
 ## Index
 
-Before running any benchmark, profiler, or kernel-validation command, use
-`scripts/diffusion_skill_env.py` to derive the repo root from `sglang.__file__`,
-verify the repo is writable, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and
-choose idle GPU(s) before starting perf work.
+Before running any benchmark, profiler, or kernel-validation command:
+- use `scripts/diffusion_skill_env.py` to derive the repo root from `sglang.__file__`
+- verify the repo is writable
+- export `FLASHINFER_DISABLE_VERSION_CHECK=1`
+- choose idle GPU(s) before starting perf work
 
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py)
 
@@ -75,4 +76,4 @@ Loaded by `add-cuda-kernel.md`. Adapted from [HuggingFace kernels cuda-kernels s
 
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark: JIT CUDA vs PyTorch, correctness check, bandwidth efficiency analysis
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark via `sglang generate`, baseline vs custom kernels comparison table
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; save perf dumps by label and compare them with `compare_perf.py`

@@ -12,6 +12,7 @@ import os
 from typing import List, Tuple
 
 import torch
+from sglang.multimodal_gen.csrc.render import load_extension_with_recovery
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
 _custom_rasterizer_kernel = None
@@ -24,9 +25,7 @@ def _load_custom_rasterizer():
     if _custom_rasterizer_kernel is not None:
         return _custom_rasterizer_kernel
 
-    from torch.utils.cpp_extension import load
-
-    _custom_rasterizer_kernel = load(
+    _custom_rasterizer_kernel = load_extension_with_recovery(
         name="custom_rasterizer_kernel",
         sources=[
             f"{_abs_path}/rasterizer.cpp",

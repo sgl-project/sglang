@@ -57,17 +57,26 @@ def sample_block_noise(
     _, ph, pw = patch_size
     block_size = ph * pw
 
-    # Explicitly use CPU to avoid requiring MAGMA for cholesky on ROCm/CUDA
+    # Explicitly use CPU to avoid requiring MAGMA on ROCm/CUDA.
+    #
+    # For the default Helios stage-2 setting gamma=1/3 with a 2x2 block, the
+    # covariance has eigenvalues {0, 1+gamma, 1+gamma, 1+gamma} and is therefore
+    # only positive semidefinite. `MultivariateNormal(covariance_matrix=...)`
+    # requires a strictly positive-definite matrix and fails in the Cholesky
+    # factorization path, so sample from the PSD covariance via eigen-decomposition.
     cov = (
-        torch.eye(block_size, device="cpu") * (1 + gamma)
-        - torch.ones(block_size, block_size, device="cpu") * gamma
-    )
-    dist = torch.distributions.MultivariateNormal(
-        torch.zeros(block_size, device="cpu"), covariance_matrix=cov
+        torch.eye(block_size, device="cpu", dtype=torch.float64) * (1 + gamma)
+        - torch.ones(block_size, block_size, device="cpu", dtype=torch.float64) * gamma
     )
     block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
-
-    noise = dist.sample((block_number,))
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    eigvals = eigvals.clamp_min(0.0)
+    transform = eigvecs @ torch.diag(torch.sqrt(eigvals))
+    base_noise = torch.randn(
+        block_number, block_size, device="cpu", dtype=torch.float64
+    )
+    noise = (base_noise @ transform.T).to(dtype=torch.float32)
     noise = noise.view(
         batch_size, channel, num_frames, height // ph, width // pw, ph, pw
     )
