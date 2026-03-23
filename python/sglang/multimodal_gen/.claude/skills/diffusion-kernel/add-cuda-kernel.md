@@ -420,7 +420,8 @@ def test_rmsnorm_correctness(dtype, shape, has_weight):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
 ```
 
 ---
