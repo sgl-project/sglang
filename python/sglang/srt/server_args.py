@@ -3047,8 +3047,10 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = min(
-                    self.speculative_ngram_max_trie_depth, 12
+                self.speculative_num_draft_tokens = 12
+                logger.warning(
+                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+                    "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
