@@ -212,7 +212,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -322,7 +322,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

@@ -1,5 +1,6 @@
 import argparse
 import glob
+import os
 import sys
 from typing import List
 
@@ -22,34 +23,35 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-cpu-only"],
+    HWBackend.CPU: ["stage-a-test-cpu"],
     HWBackend.AMD: [
-        "stage-a-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
-        "stage-a-test-small-1-gpu",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
+        "stage-b-test-4-gpu-b200",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-4-gpu-b200",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-b200",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
-        "stage-a-test-small-1-gpu",
+        "stage-a-test-1-gpu-small",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
@@ -169,9 +171,13 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # All tests (per-commit and nightly) are now in registered/
+    # Use absolute paths so the script works from any working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     files = [
         f
-        for f in glob.glob("registered/**/*.py", recursive=True)
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
         if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
     ]
     # Strict: all registered files must have proper registration
