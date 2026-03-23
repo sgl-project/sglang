@@ -346,11 +346,19 @@ class RoutingMethodType(IntEnum):
     Unspecified = 6
 
 
+AITER_PADDING_SIZE = 128
+TRITON_PADDING_SIZE = 128
+
+
 def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
-        return 128
+        return AITER_PADDING_SIZE
     else:
-        return 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+        return (
+            TRITON_PADDING_SIZE
+            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+            else 0
+        )
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):

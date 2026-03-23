@@ -130,17 +130,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             requires_grad=False,
         )
 
-        W2_SCALE_DIVIDEND = w2_down_dim * 2
-        W2_SCALE_DIVISOR = intermediate_size_per_partition
-        scaling_up = lambda dividend, divisor: (dividend * W2_SCALE_DIVIDEND) // (
-            divisor * W2_SCALE_DIVISOR
-        )
-
+        # 1. w2 scale is floor division of inter_dim by blockscale.
+        # 2. w2 scale needs to scale up just as w2.
+        # We combine 1. and 2. to keep the integer precision.
         w2_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
                 hidden_size,
-                scaling_up(intermediate_size_per_partition, OCP_MX_BLOCK_SIZE),
+                (w2_down_dim * 2) // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
             requires_grad=False,
