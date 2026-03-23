@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -98,66 +97,45 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
+        params_dtype = torch.uint8
+
         original_weight_loader = extra_weight_attrs.get("weight_loader")
 
         if self.is_checkpoint_mxfp4_serialized:
             weight_loader = original_weight_loader
-            weight_device = torch.get_default_device()
-            weight_dtype = torch.uint8
         else:
-            # Online quantization: use original dtype and meta device
             weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
-            weight_device = torch.device("meta")
-            weight_dtype = params_dtype
-
-        params_dtype = torch.uint8
-
-        layer._load_device = torch.get_default_device()
-        layer._w13_loaded_numel = 0
-        layer._w2_loaded_numel = 0
 
         extra_weight_attrs["weight_loader"] = weight_loader
 
-        # WEIGHTS
-        w13_shape = (
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size // 2 if self.is_checkpoint_mxfp4_serialized else hidden_size,
-        )
+        # WEIGHTS — always uint8 (packed mxfp4), always on device
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                w13_shape,
-                dtype=weight_dtype,
-                device=weight_device,
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
-
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_shape = (
-            num_experts,
-            hidden_size,
-            (
-                intermediate_size_per_partition // 2
-                if self.is_checkpoint_mxfp4_serialized
-                else intermediate_size_per_partition
-            ),
-        )
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                w2_shape,
-                dtype=weight_dtype,
-                device=weight_device,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
-
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
+        extra_weight_attrs["weight_loader"] = original_weight_loader
+
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
@@ -176,15 +154,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             ),
             requires_grad=False,
         )
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
     def get_online_weight_loader(self, layer, original_weight_loader):
         """
-        Wrap the original weight loader to perform online MXFP4 quantization for MoE layers.
+        Wrap the original weight loader to perform online MXFP4 quantization.
         """
 
         def online_mxfp4_moe_weight_loader(
@@ -199,118 +176,38 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                     "Online MXFP4 quantization for MoE is only supported on AMD GPUs."
                 )
 
-            # Determine which weight parameter we're loading (w13 or w2)
-            is_w13 = "w13" in weight_name
-            is_w2 = "w2" in weight_name
+            # Materialize on device the loaded weight.
+            loaded_weight = loaded_weight.to(param.device)
 
-            # Initialize weight on device if first load
-            if is_w13 and layer._w13_loaded_numel == 0:
-                layer.w13_weight = torch.nn.Parameter(
-                    torch.empty_like(param.data, device=layer._load_device),
-                    requires_grad=False,
-                )
-                param = layer.w13_weight
-            elif is_w2 and layer._w2_loaded_numel == 0:
-                layer.w2_weight = torch.nn.Parameter(
-                    torch.empty_like(param.data, device=layer._load_device),
-                    requires_grad=False,
-                )
-                param = layer.w2_weight
+            # Quantize the high-precision shard loaded_weight to MXFP4.
+            qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
 
-            # Move to device for faster quantization
-            loaded_weight = loaded_weight.to(layer._load_device)
+            original_weight_loader(param, qweight, weight_name, shard_id, expert_id)
 
-            if is_w13:
-                param = layer.w13_weight
-            elif is_w2:
-                param = layer.w2_weight
-
-            # In case TP>1, the weight loader logic uses narrow so we cannot directly rely on `param.shape` or `loaded_weight.shape`.
-            copy_numel_counter = CopyNumelCounter()
-            with copy_numel_counter:
-                original_weight_loader(
-                    param, loaded_weight, weight_name, shard_id, expert_id
-                )
-
-            if is_w13:
-                layer._w13_loaded_numel += copy_numel_counter.copied_numel
-                target_loaded_numel = layer.w13_weight.numel()
-                current_loaded = layer._w13_loaded_numel
-            elif is_w2:
-                layer._w2_loaded_numel += copy_numel_counter.copied_numel
-                target_loaded_numel = layer.w2_weight.numel()
-                current_loaded = layer._w2_loaded_numel
+            if "w13" in weight_name:
+                scale_param = layer.w13_weight_scale
+                scale_weight_name = "w13_weight_scale"
             else:
-                raise ValueError("Expected w13 or w2.")
+                # w2.
+                scale_param = layer.w2_weight_scale
+                scale_weight_name = "w2_weight_scale"
 
-            assert (
-                current_loaded <= target_loaded_numel
-            ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
-
-            # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
-            if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
-                self._quantize_w13_online(layer, dynamic_mxfp4_quant)
-            elif is_w2 and layer._w2_loaded_numel == target_loaded_numel:
-                self._quantize_w2_online(layer, dynamic_mxfp4_quant)
+            scale_param.weight_loader(
+                scale_param, weight_scale, scale_weight_name, shard_id, expert_id
+            )
 
         return online_mxfp4_moe_weight_loader
 
-    def _quantize_w13_online(self, layer, dynamic_mxfp4_quant):
-        qw13_weight = torch.empty(
-            layer.w13_weight.shape[0],
-            layer.w13_weight.shape[1],
-            layer.w13_weight.shape[2] // 2,
-            dtype=torch.uint8,
-            device=layer._load_device,
-        )
-
-        for expert in range(layer.w13_weight.shape[0]):
-            qweight, weight_scale = dynamic_mxfp4_quant(layer.w13_weight.data[expert])
-            assert qw13_weight[expert].shape == qweight.shape
-            assert qw13_weight[expert].dtype == qweight.dtype
-            qw13_weight[expert] = qweight
-
-            assert layer.w13_weight_scale[expert].shape == weight_scale.shape
-            assert layer.w13_weight_scale[expert].dtype == weight_scale.dtype
-            layer.w13_weight_scale[expert] = weight_scale
-
-        layer.w13_weight = torch.nn.Parameter(qw13_weight, requires_grad=False)
-
-    def _quantize_w2_online(self, layer, dynamic_mxfp4_quant):
-        qw2_weight = torch.empty(
-            layer.w2_weight.shape[0],
-            layer.w2_weight.shape[1],
-            layer.w2_weight.shape[2] // 2,
-            dtype=torch.uint8,
-            device=layer._load_device,
-        )
-
-        for expert in range(layer.w2_weight.shape[0]):
-            qweight, weight_scale = dynamic_mxfp4_quant(layer.w2_weight.data[expert])
-            qw2_weight[expert] = qweight
-            layer.w2_weight_scale[expert] = weight_scale
-
-        layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not self.is_checkpoint_mxfp4_serialized:
-            # Quantization already happened during weight loading via get_online_weight_loader.
-            assert layer.w13_weight.dtype == torch.uint8
-            assert layer.w2_weight.dtype == torch.uint8
-            assert layer.w13_weight_scale.dtype == torch.uint8
-            assert layer.w2_weight_scale.dtype == torch.uint8
-
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
         w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        # layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
         layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
         s0, s1, _ = layer.w2_weight_scale.shape
         w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
         w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
         # Pre-shuffle weight
