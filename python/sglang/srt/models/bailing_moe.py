@@ -498,8 +498,8 @@ class BailingMoEAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            base=config.rope_parameters["rope_theta"],
+            rope_scaling=config.rope_parameters,
         )
 
         self.attn = RadixAttention(

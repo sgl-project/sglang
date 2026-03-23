@@ -1,7 +1,6 @@
 from typing import Tuple, Union
 
 import torch
-from einops import rearrange
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -151,9 +150,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         return self.kernel_dispatcher.decode(
             q=q,
@@ -232,9 +231,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
