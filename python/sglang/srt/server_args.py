@@ -506,7 +506,7 @@ class ServerArgs:
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
-    speculative_ngram_branch_length: int = 18
+    speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
@@ -4766,10 +4766,10 @@ class ServerArgs:
             help="The match type for cache tree.",
         )
         parser.add_argument(
-            "--speculative-ngram-branch-length",
+            "--speculative-ngram-max-trie-depth",
             type=int,
-            default=ServerArgs.speculative_ngram_branch_length,
-            help="The branch length for ngram speculative decoding.",
+            default=ServerArgs.speculative_ngram_max_trie_depth,
+            help="The max trie depth for ngram speculative decoding.",
         )
         parser.add_argument(
             "--speculative-ngram-capacity",

@@ -11,9 +11,9 @@
 namespace ngram {
 
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
-  if (!(param_.branch_length > 1)) {
+  if (!(param_.max_trie_depth > 1)) {
     throw std::runtime_error(
-        "param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
+        "param_.max_trie_depth must be greater than 1, current value: " + std::to_string(param_.max_trie_depth));
   }
   if (!(param_.min_match_window_size > 0)) {
     throw std::runtime_error(
@@ -26,11 +26,11 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
         std::to_string(param_.min_match_window_size) +
         ", max_match_window_size: " + std::to_string(param_.max_match_window_size));
   }
-  if (!(param_.max_match_window_size < param_.branch_length)) {
+  if (!(param_.max_match_window_size < param_.max_trie_depth)) {
     throw std::runtime_error(
-        "max_match_window_size must be less than branch_length, current "
+        "max_match_window_size must be less than max_trie_depth, current "
         "max_match_window_size: " +
-        std::to_string(param_.max_match_window_size) + ", branch_length: " + std::to_string(param_.branch_length));
+        std::to_string(param_.max_match_window_size) + ", max_trie_depth: " + std::to_string(param_.max_trie_depth));
   }
   if (!(param_.min_bfs_breadth > 0)) {
     throw std::runtime_error(
