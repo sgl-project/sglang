@@ -1987,7 +1987,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(self.tree_cache, num_tokens, reqs=self.reqs)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
@@ -2083,7 +2083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(self.tree_cache, num_tokens, reqs=self.reqs)
 
         req.reset_for_retract()
 
