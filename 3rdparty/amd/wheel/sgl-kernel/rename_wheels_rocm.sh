@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Repack wheels so +rocm* in the filename matches METADATA/WHEEL (same strategy as sgl-kernel/rename_wheels.sh).
-set -ex
+# Same idempotency contract as sgl-kernel/rename_wheels.sh — see header comments there before editing.
+set -e
 
 WHEEL_DIR="dist"
 
@@ -45,9 +46,12 @@ ROCM_SUFFIX=$(detect_rocm_suffix)
 
 patch_wheel_platform_tags() {
     local wheel_file="$1"
+    # Use end-of-line anchors: "linux_x86_64" is a substring of "manylinux2014_x86_64",
+    # so a global /g replace would corrupt already-patched tags on a second run.
+    # Tag lines always end with the platform token, so $ is safe and idempotent.
     sed -i \
-        -e 's/linux_x86_64/manylinux2014_x86_64/g' \
-        -e 's/linux_aarch64/manylinux2014_aarch64/g' \
+        -e 's/-linux_x86_64$/-manylinux2014_x86_64/' \
+        -e 's/-linux_aarch64$/-manylinux2014_aarch64/' \
         "$wheel_file"
 }
 
@@ -55,14 +59,21 @@ wheel_files=("$WHEEL_DIR"/*.whl)
 for wheel in "${wheel_files[@]}"; do
     [[ -f "$wheel" ]] || continue
 
-    intermediate_wheel="${wheel/linux/manylinux2014}"
-    # Filename may already include +rocm* from a prior mv-only rename while METADATA
-    # is still wrong (#20953-style). Do not skip here; idempotency is handled after unpack.
-
+    # Suffix-only rename (see sgl-kernel/rename_wheels.sh): substring replace is not idempotent
+    # when the filename no longer contains the literal "manylinux2014" after a bad run.
+    intermediate_wheel="$wheel"
+    case "$wheel" in
+        *-linux_x86_64.whl)
+            intermediate_wheel="${wheel%-linux_x86_64.whl}-manylinux2014_x86_64.whl"
+            ;;
+        *-linux_aarch64.whl)
+            intermediate_wheel="${wheel%-linux_aarch64.whl}-manylinux2014_aarch64.whl"
+            ;;
+    esac
     if [[ "$wheel" != "$intermediate_wheel" ]]; then
         mv -- "$wheel" "$intermediate_wheel"
+        wheel="$intermediate_wheel"
     fi
-    wheel="$intermediate_wheel"
 
     if [[ -z "$ROCM_SUFFIX" ]]; then
         continue

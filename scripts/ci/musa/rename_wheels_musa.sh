@@ -6,6 +6,13 @@ set -euo pipefail
 #   rename_wheels_musa.sh <musa_suffix> [wheel_dir]
 # Example:
 #   rename_wheels_musa.sh 43 sgl-kernel/dist
+#
+# Idempotency contract (same rules as sgl-kernel/rename_wheels.sh):
+#   - Platform suffix: only rewrite exact PEP 427 end patterns (*-linux_x86_64.whl /
+#     *-linux_aarch64.whl). Do NOT use ${path/linux/manylinux2014} — "linux" is a
+#     substring of "manylinux2014", so repeated runs produce manymanylinux20142014.
+#   - +musa suffix: skip wheels whose filename already contains "+musa", so a second
+#     run is a no-op instead of inserting +musa+musa.
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage: $0 <musa_suffix> [wheel_dir]" >&2
@@ -23,22 +30,40 @@ if [[ ! -e "${wheel_files[0]}" ]]; then
 fi
 
 for wheel in "${wheel_files[@]}"; do
-  # Normalize platform tag to manylinux2014
-  intermediate_wheel="${wheel/linux/manylinux2014}"
+  base="$(basename "$wheel")"
 
-  # Extract Python ABI version (e.g. cp310)
-  if [[ $intermediate_wheel =~ -cp([0-9]+)- ]]; then
-    cp_version="${BASH_REMATCH[1]}"
-  else
-    echo "Could not extract Python version from wheel name: $intermediate_wheel" >&2
+  # Idempotency guard: skip if +musa suffix already present in filename.
+  if [[ "$base" == *"+musa"* ]]; then
+    echo "Skipping $base: already has +musa suffix."
     continue
   fi
 
-  # Insert +musa<suffix> before the Python ABI tag
-  new_wheel="${intermediate_wheel/-cp${cp_version}/+musa${MUSA_SUFFIX}-cp${cp_version}}"
+  # Normalize platform suffix (PEP 427 end patterns only — not substring replace).
+  intermediate_wheel="$wheel"
+  case "$wheel" in
+    *-linux_x86_64.whl)
+      intermediate_wheel="${wheel%-linux_x86_64.whl}-manylinux2014_x86_64.whl" ;;
+    *-linux_aarch64.whl)
+      intermediate_wheel="${wheel%-linux_aarch64.whl}-manylinux2014_aarch64.whl" ;;
+  esac
+  if [[ "$wheel" != "$intermediate_wheel" ]]; then
+    mv -- "$wheel" "$intermediate_wheel"
+    wheel="$intermediate_wheel"
+  fi
+
+  # Extract Python ABI version (e.g. cp310) from the (possibly renamed) path.
+  if [[ "$wheel" =~ -cp([0-9]+)- ]]; then
+    cp_version="${BASH_REMATCH[1]}"
+  else
+    echo "Could not extract Python version from wheel name: $(basename "$wheel")" >&2
+    continue
+  fi
+
+  # Insert +musa<suffix> before the Python ABI tag.
+  new_wheel="${wheel/-cp${cp_version}/+musa${MUSA_SUFFIX}-cp${cp_version}}"
 
   if [[ "$wheel" != "$new_wheel" ]]; then
-    echo "Renaming $wheel -> $new_wheel"
+    echo "Renaming $(basename "$wheel") -> $(basename "$new_wheel")"
     mv -- "$wheel" "$new_wheel"
   fi
 done

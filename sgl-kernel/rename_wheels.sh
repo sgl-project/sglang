@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # Repack wheels so the filename local version (+cu124/+cu128/+cu130) matches METADATA/WHEEL.
 # Uses `wheel unpack` / `wheel pack` only (no manual RECORD); patches WHEEL Tag so pack emits manylinux2014_*, not linux_*.
-set -ex
+#
+# Contract (read before editing — avoids "fix one string, break another"):
+#   - Idempotency: running this script repeatedly on the same dist/ must not change
+#     filenames or METADATA after the first successful +cu* repack. Regression:
+#     sgl-kernel/tests/smoke/rename_wheels_smoke.sh (CUDA consecutive runs).
+#   - Filenames: only rewrite the PEP 427 platform suffix via exact end patterns
+#     (*-linux_x86_64.whl / *-linux_aarch64.whl). Do not use ${path/linux_x86_64/...}
+#     or similar substring replace; do not gate renames on *manylinux2014* in the path.
+#   - WHEEL Tag lines: patch with line-ending anchors only (see patch_wheel_platform_tags).
+#     Avoid unanchored s/linux_x86_64/manylinux.../g — "linux_x86_64" can appear inside
+#     already-patched tags depending on layout.
+# Future platform tags (e.g. new manylinux_2_3x): add new explicit suffix branches here
+# and extend smoke — do not broaden substring hacks.
+set -e
 
 WHEEL_DIR="dist"
 
@@ -33,9 +46,15 @@ resolve_python() {
 PYTHON="$(resolve_python)"
 
 # Optional: SGL_KERNEL_CUDA_SUFFIX_OVERRIDE=+cu130 for tests/CI without /usr/local/cuda-* layout.
+# Optional: SGL_KERNEL_CUDA_SKIP_SUFFIX=1 forces no +cu* suffix (smoke tests on hosts with CUDA dirs).
 detect_cuda_suffix() {
     if [[ -n "${SGL_KERNEL_CUDA_SUFFIX_OVERRIDE:-}" ]]; then
         echo "${SGL_KERNEL_CUDA_SUFFIX_OVERRIDE}"
+        return
+    fi
+    # For smoke tests / sandboxes without a CUDA layout but with unrelated /usr/local entries.
+    if [[ "${SGL_KERNEL_CUDA_SKIP_SUFFIX:-}" == "1" ]]; then
+        echo ""
         return
     fi
     if ls /usr/local/ 2>/dev/null | grep -q "12.4"; then
@@ -53,10 +72,12 @@ CUDA_SUFFIX=$(detect_cuda_suffix)
 
 patch_wheel_platform_tags() {
     local wheel_file="$1"
-    # wheel pack reads Tag lines to build the filename; must match manylinux2014_* not linux_*.
+    # Use end-of-line anchors: "linux_x86_64" is a substring of "manylinux2014_x86_64",
+    # so a global /g replace would corrupt already-patched tags on a second run.
+    # Tag lines always end with the platform token, so $ is safe and idempotent.
     sed -i \
-        -e 's/linux_x86_64/manylinux2014_x86_64/g' \
-        -e 's/linux_aarch64/manylinux2014_aarch64/g' \
+        -e 's/-linux_x86_64$/-manylinux2014_x86_64/' \
+        -e 's/-linux_aarch64$/-manylinux2014_aarch64/' \
         "$wheel_file"
 }
 
@@ -64,11 +85,23 @@ wheel_files=("$WHEEL_DIR"/*.whl)
 for wheel in "${wheel_files[@]}"; do
     [[ -f "$wheel" ]] || continue
 
-    intermediate_wheel="${wheel/linux/manylinux2014}"
+    # Rename only the wheel filename suffix (PEP 427): ...-linux_x86_64.whl -> ...-manylinux2014_x86_64.whl
+    # Do NOT use ${path/linux_x86_64/manylinux2014_x86_64}: after a bad run the name may no longer
+    # contain the substring "manylinux2014", so a naive *manylinux2014* guard fails and re-substitution
+    # can produce manymanymanylinux201420142014_x86_64-style corruption.
+    intermediate_wheel="$wheel"
+    case "$wheel" in
+        *-linux_x86_64.whl)
+            intermediate_wheel="${wheel%-linux_x86_64.whl}-manylinux2014_x86_64.whl"
+            ;;
+        *-linux_aarch64.whl)
+            intermediate_wheel="${wheel%-linux_aarch64.whl}-manylinux2014_aarch64.whl"
+            ;;
+    esac
     if [[ "$wheel" != "$intermediate_wheel" ]]; then
         mv -- "$wheel" "$intermediate_wheel"
+        wheel="$intermediate_wheel"
     fi
-    wheel="$intermediate_wheel"
 
     if [[ -z "$CUDA_SUFFIX" ]]; then
         continue
