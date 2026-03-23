@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from typing import Optional
 
 import torch
-from einops import rearrange
 from torch import nn
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -399,9 +398,11 @@ class KimiDeltaAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+        norm_gate = g_proj_states.unflatten(
+            -1, (-1, self.head_dim)
+        )  # ... (h d) -> ... h d
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         return self.o_proj(core_attn_out)[0]
 

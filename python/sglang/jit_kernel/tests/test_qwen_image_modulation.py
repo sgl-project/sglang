@@ -6,7 +6,6 @@ from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
-    fuse_scale_shift_gate_select01_kernel,
 )
 from sglang.jit_kernel.utils import get_ci_test_range
 
@@ -56,17 +55,9 @@ def _baseline_select01_modulation(
         eps=eps,
         is_rms_norm=False,
     ).view_as(x)
-    output, gate_out = fuse_scale_shift_gate_select01_kernel(
-        normalized,
-        scale0=scale0,
-        shift0=shift0,
-        gate0=gate0,
-        scale1=scale1,
-        shift1=shift1,
-        gate1=gate1,
-        index=index,
+    return _apply_select01_modulation(
+        normalized, scale0, shift0, gate0, scale1, shift1, gate1, index
     )
-    return output, gate_out
 
 
 def _baseline_residual_select01_modulation(
@@ -92,17 +83,27 @@ def _baseline_residual_select01_modulation(
         eps=eps,
         is_rms_norm=False,
     ).view_as(residual_out)
-    output, gate_out = fuse_scale_shift_gate_select01_kernel(
-        normalized,
-        scale0=scale0,
-        shift0=shift0,
-        gate0=gate0,
-        scale1=scale1,
-        shift1=shift1,
-        gate1=gate1,
-        index=index,
+    output, gate_out = _apply_select01_modulation(
+        normalized, scale0, shift0, gate0, scale1, shift1, gate1, index
     )
     return output, residual_out, gate_out
+
+
+def _apply_select01_modulation(
+    x: torch.Tensor,
+    scale0: torch.Tensor,
+    shift0: torch.Tensor,
+    gate0: torch.Tensor,
+    scale1: torch.Tensor,
+    shift1: torch.Tensor,
+    gate1: torch.Tensor,
+    index: torch.Tensor,
+):
+    idx = index.bool().unsqueeze(-1)
+    scale = torch.where(idx, scale1.unsqueeze(1), scale0.unsqueeze(1))
+    shift = torch.where(idx, shift1.unsqueeze(1), shift0.unsqueeze(1))
+    gate = torch.where(idx, gate1.unsqueeze(1), gate0.unsqueeze(1))
+    return x * (1 + scale) + shift, gate
 
 
 @pytest.fixture(autouse=True)

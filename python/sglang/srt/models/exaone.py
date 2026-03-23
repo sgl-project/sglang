@@ -182,8 +182,8 @@ class ExaoneDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 500000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
