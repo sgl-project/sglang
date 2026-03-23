@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+
 def _shard_sequence_for_sp(sequence: torch.Tensor) -> torch.Tensor:
     sp_world_size = get_sp_world_size()
     if sp_world_size <= 1:
@@ -890,9 +891,7 @@ class QwenImageTransformerBlock(nn.Module):
                 scale_result = torch.where(
                     index, scale1.unsqueeze(1), scale0.unsqueeze(1)
                 )
-                gate_result = torch.where(
-                    index, gate1.unsqueeze(1), gate0.unsqueeze(1)
-                )
+                gate_result = torch.where(index, gate1.unsqueeze(1), gate0.unsqueeze(1))
             else:
                 shift_result = shift.unsqueeze(1)
                 scale_result = scale.unsqueeze(1)
