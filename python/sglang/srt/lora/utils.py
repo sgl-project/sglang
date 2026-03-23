@@ -87,9 +87,17 @@ def get_hidden_dim(
         # Resolve VLM configs to text sub-config for hidden_size etc.
         tc = get_text_config(config)
         head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
+
+        # Qwen 3.5 (and similar hybrid models) use attn_output_gate which
+        # doubles the Q projection size in attention layers. The gate values
+        # are interleaved with the Q outputs in the same projection.
+        attn_output_gate = getattr(tc, "attn_output_gate", False)
+        q_heads_multiplier = 2 if attn_output_gate else 1
+
         if module_name == "qkv_proj":
             return tc.hidden_size, head_dim * (
-                tc.num_attention_heads + tc.num_key_value_heads * 2
+                tc.num_attention_heads * q_heads_multiplier
+                + tc.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
             return (
