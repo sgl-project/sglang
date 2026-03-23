@@ -70,6 +70,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.utils import WeightsMapper
 
 # Utils
 from sglang.srt.utils import (
@@ -1075,6 +1076,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    # Qwen3.5 already remaps weight names in load_weights().
+    # Keep mapper simple so quant ignore names still match Qwen3.5 layer names.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+    )
+
     def __init__(
         self,
         config: Qwen3_5Config,
@@ -1184,6 +1193,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+    )
 
     def __init__(
         self,

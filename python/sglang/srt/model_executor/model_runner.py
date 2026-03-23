@@ -164,6 +164,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
@@ -777,6 +778,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
+
+        if (
+            self.hybrid_gdn_config is not None
+            and getattr(self.hybrid_gdn_config, "model_type", None)
+            in {"qwen3_5_text", "qwen3_5_moe_text"}
+            and is_blackwell()
+            and server_args.attention_backend == "flashinfer"
+        ):
+            logger.info(
+                "Switching attention backend to triton for Qwen3.5 hybrid GDN on Blackwell."
+            )
+            server_args.attention_backend = "triton"
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
