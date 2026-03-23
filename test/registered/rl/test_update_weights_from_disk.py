@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import torch
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
@@ -29,6 +30,7 @@ register_cuda_ci(
 ###############################################################################
 # Engine Mode Tests (Single-configuration)
 ###############################################################################
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEngineUpdateWeightsFromDisk(CustomTestCase):
     def setUp(self):
         self.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -81,6 +83,7 @@ class TestEngineUpdateWeightsFromDisk(CustomTestCase):
 ###############################################################################
 # HTTP Server Mode Tests (Single-configuration)
 ###############################################################################
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDisk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -231,6 +234,7 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         self.assertEqual(origin_response[:32], updated_response[:32])
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -314,6 +318,7 @@ class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
 # - In a non-CI environment: test both Engine and Server modes, and enumerate all combinations
 #   with tp and dp ranging from 1 to 2.
 ###############################################################################
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUpdateWeightsFromDiskParameterized(CustomTestCase):
     def run_common_test(self, mode, tp, dp):
         """
