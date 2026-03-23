@@ -70,12 +70,10 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
 
   trie_ = std::make_unique<Trie>(capacity, param_);
 
-  quit_flag_ = false;
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
 }
 
 Ngram::~Ngram() {
-  quit_flag_ = true;
   insert_queue_.close();
   if (insert_worker_.joinable()) {
     insert_worker_.join();
@@ -98,10 +96,10 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 }
 
 void Ngram::insertWorker() {
-  while (!quit_flag_) {
+  for (;;) {
     std::vector<int32_t> data;
     if (!insert_queue_.dequeue(data)) {
-      continue;
+      break;
     }
     std::unique_lock<std::mutex> lock(mutex_);
     trie_->insert(data.data(), data.size());

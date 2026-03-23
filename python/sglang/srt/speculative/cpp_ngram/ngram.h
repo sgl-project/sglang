@@ -22,7 +22,6 @@ class Ngram {
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
   size_t pending_count_ = 0;
-  bool quit_flag_ = false;
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;
 
