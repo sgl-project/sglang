@@ -922,7 +922,23 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
 
         for layer_id, layer in enumerate(self.layers):
-            layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            # When cache-dit is enabled, self.layers may contain CachedBlocks
+            # wrappers instead of raw ZImageTransformerBlock objects. The
+            # wrapper stores original blocks in .transformer_blocks.  We need
+            # to set skip_sequence_parallel on every *original* block's
+            # attention so the flag is correct regardless of which blocks
+            # cache-dit decides to execute vs skip in a given step.
+            if hasattr(layer, "transformer_blocks"):
+                # CachedBlocks wrapper — set on all original blocks inside
+                for block in layer.transformer_blocks:
+                    block.attention.attn.skip_sequence_parallel = (
+                        use_full_unified_sequence
+                    )
+            else:
+                # Normal ZImageTransformerBlock
+                layer.attention.attn.skip_sequence_parallel = (
+                    use_full_unified_sequence
+                )
             unified = layer(
                 unified,
                 unified_freqs_cis,
