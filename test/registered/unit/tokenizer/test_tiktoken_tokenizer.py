@@ -1,11 +1,11 @@
 """Unit tests for tiktoken_tokenizer — no server, no model loading."""
 
-import sys
 import os
+import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../../python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../python"))
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -49,10 +49,11 @@ class TestConstants(unittest.TestCase):
         self.assertIn(SEP, DEFAULT_SPECIAL_TOKENS)
 
     def test_default_control_tokens_values(self):
-        # Note: "sep" maps to EOS and "eos" maps to SEP in the source code 
+        # Note: "sep" maps to EOS and "eos" maps to SEP in the source code
         self.assertEqual(DEFAULT_CONTROL_TOKENS["pad"], PAD)
         self.assertEqual(DEFAULT_CONTROL_TOKENS["sep"], EOS)
         self.assertEqual(DEFAULT_CONTROL_TOKENS["eos"], SEP)
+
 
 class TestTiktokenProcessor(unittest.TestCase):
     def setUp(self):
