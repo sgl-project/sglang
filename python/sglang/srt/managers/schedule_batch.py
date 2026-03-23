@@ -873,10 +873,17 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
-        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
+        # NOTE: Non-Mamba caches leave one token uncached so the next prefill can compute
+        # prompt logprobs / first-token logits from the last prompt token. Mamba caches can
+        # reuse the full recurrent state, so allow an exact prefix hit when logprobs are not
+        # requested.
+        supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+        max_prefix_len = input_len if supports_mamba else input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        elif not supports_mamba:
+            # Keep at least one uncached token for non-Mamba models.
+            max_prefix_len = min(max_prefix_len, input_len - 1)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
