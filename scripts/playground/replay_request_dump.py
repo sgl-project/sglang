@@ -10,7 +10,6 @@ python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_du
 import argparse
 import glob
 import json
-import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict

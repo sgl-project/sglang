@@ -1,7 +1,6 @@
 import asyncio
 import itertools
 import logging
-import pickle
 import random
 import threading
 import time
