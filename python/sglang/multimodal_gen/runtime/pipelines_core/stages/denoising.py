@@ -58,8 +58,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_with_logprob import (
-    sde_step_with_logprob,
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import SchedulerRLMixin
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -131,6 +132,43 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _maybe_prepare_rollout(self, batch: Req):
+        """Prepare denoising loop for rollout."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        self.scheduler.release_rollout_resources(batch)
+        if batch.rollout:
+            self.scheduler.prepare_rollout(
+                batch=batch,
+                pipeline_config=self.server_args.pipeline_config,
+            )
+
+    def _maybe_collect_rollout_log_probs(self, batch: Req):
+        """Get rollout log probs and store into batch for reward calculation."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        if batch.rollout:
+            if batch.rollout_trajectory_data is None:
+                batch.rollout_trajectory_data = RolloutTrajectoryData()
+            batch.rollout_trajectory_data.rollout_log_probs = self.scheduler.collect_rollout_log_probs(
+                batch
+            )
+            if getattr(batch, "rollout_debug_mode", False):
+                batch.rollout_trajectory_data.rollout_debug_tensors = (
+                    self.scheduler.collect_rollout_debug_tensors(batch)
+                )
+            self.scheduler.release_rollout_resources(batch)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -559,11 +597,13 @@ class DenoisingStage(PipelineStage):
             server_args.model_loaded["transformer"] = True
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
+        
+        self._maybe_prepare_rollout(batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta},
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
@@ -710,7 +750,6 @@ class DenoisingStage(PipelineStage):
         latents: torch.Tensor,
         trajectory_latents: list,
         trajectory_timesteps: list,
-        trajectory_log_probs: list,
         server_args: ServerArgs,
         is_warmup: bool = False,
     ):
@@ -721,10 +760,9 @@ class DenoisingStage(PipelineStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
-        if trajectory_log_probs:
-            trajectory_log_probs_tensor = torch.stack(trajectory_log_probs, dim=1)
-        else:
-            trajectory_log_probs_tensor = None
+
+        # Gather log probs for rollout
+        self._maybe_collect_rollout_log_probs(batch)
 
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
@@ -747,8 +785,6 @@ class DenoisingStage(PipelineStage):
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
             batch.trajectory_latents = trajectory_tensor.cpu()
-        if trajectory_log_probs_tensor is not None:
-            batch.trajectory_log_probs = trajectory_log_probs_tensor.cpu()
 
         # Update batch with final latents
         batch.latents = self.server_args.pipeline_config.post_denoising_loop(
@@ -1004,11 +1040,6 @@ class DenoisingStage(PipelineStage):
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
-        trajectory_log_probs: list[torch.Tensor] = []
-        rollout_enabled = bool(batch.rollout)
-        rollout_sde_type = batch.rollout_sde_type
-
-        rollout_noise_level = batch.rollout_noise_level
 
         # Run denoising loop
         denoising_start_time = time.time()
@@ -1017,13 +1048,6 @@ class DenoisingStage(PipelineStage):
         is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
-        rollout_step_indices: list[int] = []
-        if rollout_enabled:
-            scheduler_timesteps = self.scheduler.timesteps
-            rollout_step_indices = [
-                self.scheduler.index_for_timestep(t.to(scheduler_timesteps.device))
-                for t in timesteps_cpu
-            ]
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -1097,31 +1121,18 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
-
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample
-                        if rollout_enabled:
-                            latents, step_log_prob = sde_step_with_logprob(
-                                self.scheduler,
-                                model_output=noise_pred,
-                                sample=latents,
-                                step_index=rollout_step_indices[i],
-                                generator=batch.generator,
-                                sde_type=rollout_sde_type,
-                                noise_level=rollout_noise_level,
-                            )
-                            trajectory_log_probs.append(step_log_prob)
-                        else:
-                            latents = self.scheduler.step(
-                                model_output=noise_pred,
-                                timestep=t_device,
-                                sample=latents,
-                                **extra_step_kwargs,
-                                return_dict=False,
-                            )[0]
+                        latents = self.scheduler.step(
+                            model_output=noise_pred,
+                            timestep=t_device,
+                            sample=latents,
+                            **extra_step_kwargs,
+                            return_dict=False,
+                        )[0]
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
@@ -1156,7 +1167,6 @@ class DenoisingStage(PipelineStage):
             latents=latents,
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
-            trajectory_log_probs=trajectory_log_probs,
             server_args=server_args,
             is_warmup=is_warmup,
         )
