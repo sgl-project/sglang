@@ -4,7 +4,11 @@ import weakref
 from typing import Optional
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+
+from sglang.srt.utils import is_npu
+
+if not is_npu():
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
