@@ -2,6 +2,31 @@
 
 This page introduces the test system in sglang, including how to run and add tests.
 
+## Three Stage CI Pipeline
+
+
+## Folder organization
+- `registered`: The registered test files. They will be run on CI. Most tests should be in this folder. It uses a custom registry system and use a file as the basic unit.
+- `manual`: Test files that won't be run by CI. You need to manually run them. Typically, these are temporary tests, deprecated tests, or tests that not suitable for running on CI such as taking too long or requires special setup. We still would like to keep some files here in case someone wants to run them locally.
+- `run_suite.py`: The launch script to run a test suite.
+- others: some utility scripts, metadata folder. The `srt` folder is our old CI system and should be deprecated as soon as possible.
+
+Since the system use a custom registry and launcher `run_suite.py`, it supports both python's built-in [unittest](https://docs.python.org/3/library/unittest.html) or the popular [pytest](https://docs.pytest.org/en/stable/).
+The basic unit is a file and you can use either of them in your file.
+The launcher will call `python filename.py` to run the test, so MAKE SURE you have the following lines in your file. Otherwise, a file won't be executed by CI.
+
+```python
+# for unittest
+if __name__ == "__main__":
+    unittest.main()
+```
+
+```python
+# for pytest
+if __name__ == "__main__":
+    pytest.main([__file__])
+```
+
 ## Run tests locally
 
 ### Run a single file or a single test
@@ -22,27 +47,6 @@ python3 test/run_suite.py --hw cpu --suite stage-a-test-cpu
 python3 test/run_suite.py --hw cuda --suite stage-a-test-1-gpu-small
 ```
 
-## Folder organization
-- `registered`: The registered test files. They will be run on CI. Most tests should be in this folder. It uses a custom registry system and use a file as the basic unit.
-- `manual`: Test files that won't be run by CI. You need to manually run them. Typically, these are temporary tests, deprecated tests, or tests that not suitable for running on CI such as taking too long or requires special setup. We still would like to keep some files here in case someone wants to run them locally.
-- `run_suite.py`: The launch scripts to run a test suite.
-- others: some utility scripts, metadata folder. The `srt` folder is our old ci test system and will be deprecated soon.
-
-Since the system use a custom registry system and own launcher `run_suite.py`, it supports both python's built-in [unittest](https://docs.python.org/3/library/unittest.html) or the popular [pytest](https://docs.pytest.org/en/stable/).
-The basic unit is a file and you can use either of them in your file.
-The launcher will call `python filename.py` to run the test, so MAKE SURE you have the following lines in your file. Otherwise, it won't be executed by CI.
-
-```python
-# for unittest
-if __name__ == "__main__":
-    unittest.main()
-```
-
-```python
-# for pytest
-if __name__ == "__main__":
-    pytest.main([__file__])
-```
 
 ## CI Registry System
 
@@ -78,6 +82,20 @@ register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky - see #12345")
 ```
 
+### Available Suites
+
+**Per-Commit (CUDA)**:
+- Stage A: `stage-a-test-1-gpu-small` (5090), `stage-a-test-2`, `stage-a-test-cpu`
+- Stage B: `stage-b-test-1-gpu-small` (5090), `stage-b-test-1-gpu-large` (H100), `stage-b-test-2-gpu-large`
+- Stage C (4-GPU): `stage-c-test-4-gpu-h100`, `stage-c-test-4-gpu-b200`, `stage-c-test-4-gpu-gb200`, `stage-c-test-deepep-4-gpu-h100`
+- Stage C (8-GPU): `stage-c-test-8-gpu-h20`, `stage-c-test-8-gpu-h200`, `stage-c-test-8-gpu-b200`, `stage-c-test-deepep-8-gpu-h200`
+
+**Per-Commit (AMD)**:
+- `stage-a-test-1-gpu-small-amd`, `stage-b-test-1-gpu-small-amd`, `stage-b-test-2-gpu-large-amd`
+
+**Nightly**:
+- `nightly-1-gpu`, `nightly-2-gpu`, `nightly-4-gpu`, `nightly-8-gpu`, etc.
+
 ### Choosing Between 1-GPU Suites (5090 vs H100)
 
 When adding 1-GPU tests, choose the appropriate suite based on hardware compatibility:
@@ -109,20 +127,6 @@ When adding 1-GPU tests, choose the appropriate suite based on hardware compatib
 
 If a test cannot run on 5090 due to any of the above, use `stage-b-test-1-gpu-large` which runs on H100.
 
-### Available Suites
-
-**Per-Commit (CUDA)**:
-- Stage A: `stage-a-test-1-gpu-small` (5090), `stage-a-test-2`, `stage-a-test-cpu`
-- Stage B: `stage-b-test-1-gpu-small` (5090), `stage-b-test-1-gpu-large` (H100), `stage-b-test-2-gpu-large`
-- Stage C (4-GPU): `stage-c-test-4-gpu-h100`, `stage-c-test-4-gpu-b200`, `stage-c-test-4-gpu-gb200`, `stage-c-test-deepep-4-gpu-h100`
-- Stage C (8-GPU): `stage-c-test-8-gpu-h20`, `stage-c-test-8-gpu-h200`, `stage-c-test-8-gpu-b200`, `stage-c-test-deepep-8-gpu-h200`
-
-**Per-Commit (AMD)**:
-- `stage-a-test-1-gpu-small-amd`, `stage-b-test-1-gpu-small-amd`, `stage-b-test-2-gpu-large-amd`
-
-**Nightly**:
-- `nightly-1-gpu`, `nightly-2-gpu`, `nightly-4-gpu`, `nightly-8-gpu`, etc.
-
 ### Running Tests with run_suite.py
 
 ```bash
@@ -137,8 +141,6 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
     --auto-partition-id 0 --auto-partition-size 4
 ```
 
-## Overall organization
-As of March, 2026, we use the following test pipeline.
 
 ## Multi hardware backends
 
@@ -150,6 +152,7 @@ As of March, 2026, we use the following test pipeline.
 - If the test cases take too long, considering adding them to nightly tests instead of per-commit tests.
 - Each test file `test_xxx.py` should take less than 500s. If a single file takes more than that, split it into multiple files.
 
-## Adding New Models to Nightly CI
+## Other Notes
+### Adding New Models to Nightly CI
 - **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
 - **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`
