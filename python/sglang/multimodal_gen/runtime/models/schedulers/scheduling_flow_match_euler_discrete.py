@@ -32,10 +32,10 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
     SchedulerRLMixin,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -54,7 +54,9 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     prev_sample: torch.FloatTensor
 
 
-class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin):
+class FlowMatchEulerDiscreteScheduler(
+    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin
+):
     """
     Euler scheduler.
 
@@ -451,7 +453,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
         generator: torch.Generator | None = None,
         per_token_timesteps: torch.Tensor | None = None,
         batch=None,
-        return_dict: bool = True
+        return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor, ...]:
         """
         Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
@@ -521,10 +523,14 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
             dt = sigma_next - sigma
 
         if batch is not None and self.already_prepared_rollout(batch):
-            prev_sample, log_prob_local_sum, log_prob_local_count = self.flow_sde_sampling(
-                batch, model_output, sample, current_sigma, next_sigma, generator
+            prev_sample, log_prob_local_sum, log_prob_local_count = (
+                self.flow_sde_sampling(
+                    batch, model_output, sample, current_sigma, next_sigma, generator
+                )
             )
-            self.append_local_rollout_log_probs(batch, log_prob_local_sum, log_prob_local_count)
+            self.append_local_rollout_log_probs(
+                batch, log_prob_local_sum, log_prob_local_count
+            )
         else:
             if self.config.stochastic_sampling:
                 x0 = sample - current_sigma * model_output

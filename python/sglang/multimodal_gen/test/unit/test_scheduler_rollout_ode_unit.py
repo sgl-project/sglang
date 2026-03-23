@@ -5,7 +5,9 @@ import unittest
 import torch
 
 import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import SchedulerRLMixin
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
 
 
 class _DummyScheduler(SchedulerRLMixin):
@@ -57,7 +59,9 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
 
         expected_prev = sample + (next_sigma - current_sigma) * model_output
         self.assertTrue(torch.allclose(prev_sample, expected_prev, atol=1e-6, rtol=0.0))
-        self.assertTrue(torch.allclose(log_prob_local_sum, torch.zeros_like(log_prob_local_sum)))
+        self.assertTrue(
+            torch.allclose(log_prob_local_sum, torch.zeros_like(log_prob_local_sum))
+        )
         self.assertEqual(tuple(log_prob_local_sum.shape), (sample.shape[0],))
         self.assertEqual(tuple(local_elem_count.shape), (sample.shape[0],))
         self.assertTrue(torch.all(local_elem_count == float(sample[0].numel())))
@@ -93,56 +97,75 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         self.assertEqual(tuple(prev_sample_means.shape), (2, 1, 4, 8, 8))
         self.assertEqual(tuple(model_outputs.shape), (2, 1, 4, 8, 8))
         self.assertEqual(tuple(noise_std_devs.shape), (2, 1, 1))
-        self.assertTrue(torch.allclose(noise_std_devs, torch.zeros_like(noise_std_devs)))
-        self.assertTrue(torch.allclose(variance_noises, torch.zeros_like(variance_noises)))
+        self.assertTrue(
+            torch.allclose(noise_std_devs, torch.zeros_like(noise_std_devs))
+        )
+        self.assertTrue(
+            torch.allclose(variance_noises, torch.zeros_like(variance_noises))
+        )
 
 
-def _flowgrpo_reference_one_step(
+def _flowgrpo_sde_step_with_logprob(
     *,
     model_output: torch.Tensor,
     sample: torch.Tensor,
     variance_noise: torch.Tensor,
-    current_sigma: torch.Tensor,
-    next_sigma: torch.Tensor,
+    sigma: torch.Tensor,
+    sigma_prev: torch.Tensor,
+    sigma_max: float,
     noise_level: float,
     sde_type: str,
-    sigma_max: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference one-step update from FlowGRPO formulas."""
-    dt = next_sigma - current_sigma
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Verbatim from FlowGRPO sd3_sde_with_logprob.py ``sde_step_with_logprob``.
+
+    Returns (prev_sample, log_prob, prev_sample_mean, noise_std_dev).
+    ``sigma`` / ``sigma_prev`` follow FlowGRPO convention (current / next).
+    """
+    model_output = model_output.float()
+    sample = sample.float()
+
+    dt = sigma_prev - sigma
 
     if sde_type == "sde":
-        std_dev_t = torch.sqrt(
-            current_sigma
-            / (
-                1
-                - torch.where(
-                    torch.isclose(current_sigma, current_sigma.new_tensor(1.0)),
-                    current_sigma.new_tensor(sigma_max),
-                    current_sigma,
-                )
-            )
-        ) * noise_level
-        noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+        std_dev_t = (
+            torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))
+            * noise_level
+        )
         prev_sample_mean = (
-            sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
-            + model_output
-            * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma))
-            * dt
+            sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
+            + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
         )
+        noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+        prev_sample = prev_sample_mean + noise_std_dev * variance_noise
+
+        log_prob = (
+            -((prev_sample.detach() - prev_sample_mean) ** 2)
+            / (2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2))
+            - torch.log(std_dev_t * torch.sqrt(-1 * dt))
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+
     elif sde_type == "cps":
-        std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
+        std_dev_t = sigma_prev * math.sin(noise_level * math.pi / 2)
         noise_std_dev = std_dev_t
-        pred_original_sample = sample - current_sigma * model_output
-        noise_estimate = sample + model_output * (1 - current_sigma)
-        prev_sample_mean = pred_original_sample * (1 - next_sigma) + noise_estimate * torch.sqrt(
-            next_sigma**2 - std_dev_t**2
-        )
+        pred_original_sample = sample - sigma * model_output
+        noise_estimate = sample + model_output * (1 - sigma)
+        prev_sample_mean = pred_original_sample * (
+            1 - sigma_prev
+        ) + noise_estimate * torch.sqrt(sigma_prev**2 - std_dev_t**2)
+        prev_sample = prev_sample_mean + std_dev_t * variance_noise
+
+        log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
+
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
 
-    prev_sample = prev_sample_mean + noise_std_dev * variance_noise
-    return prev_sample, prev_sample_mean, noise_std_dev
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+    return prev_sample, log_prob, prev_sample_mean, noise_std_dev
+
+
+# FlowGRPO convention: SDE uses full Gaussian log-prob, CPS uses no_const.
+_FLOWGRPO_LOG_PROB_NO_CONST = {"sde": False, "cps": True}
 
 
 class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
@@ -153,9 +176,11 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
     def tearDown(self):
         rl_mixin_module.get_sp_world_size = self._orig_get_sp_world_size
 
-    def _build_batch(self, *, sde_type: str, shape: tuple[int, ...]) -> types.SimpleNamespace:
+    def _build_batch(
+        self, *, sde_type: str, shape: tuple[int, ...]
+    ) -> types.SimpleNamespace:
         return types.SimpleNamespace(
-            rollout_log_prob_no_const=True,
+            rollout_log_prob_no_const=_FLOWGRPO_LOG_PROB_NO_CONST[sde_type],
             rollout_noise_level=0.5,
             rollout_sde_type=sde_type,
             rollout_debug_mode=True,
@@ -164,11 +189,13 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         )
 
     def test_single_step_matches_flowgrpo_reference(self):
+        """Verify prev_sample, prev_sample_mean, noise_std_dev, and log_prob
+        all match FlowGRPO's ``sde_step_with_logprob`` for SDE and CPS."""
         scheduler = _DummyScheduler()
         current_sigma = torch.tensor(0.5, dtype=torch.float32)
         next_sigma = torch.tensor(0.3, dtype=torch.float32)
         shape = (1, 16, 1, 32, 32)
-        atol = 1e-3
+        atol = 1e-6
         pipeline_config = types.SimpleNamespace(
             shard_latents_for_sp=lambda _batch, latents: (latents, False)
         )
@@ -187,7 +214,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     lambda _batch, *_args, **_kwargs: variance_noise
                 )
 
-                prev_sgl, _, _ = scheduler.flow_sde_sampling(
+                prev_sgl, log_prob_sum, elem_count = scheduler.flow_sde_sampling(
                     batch,
                     model_output=model_output,
                     sample=sample,
@@ -202,40 +229,43 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     _model_outputs,
                 ) = scheduler.consume_local_rollout_debug_tensors(batch)
 
-                prev_ref, prev_mean_ref, noise_std_ref = _flowgrpo_reference_one_step(
-                    model_output=model_output,
-                    sample=sample,
-                    variance_noise=variance_noise,
-                    current_sigma=current_sigma,
-                    next_sigma=next_sigma,
-                    noise_level=0.5,
-                    sde_type=sde_type,
-                    sigma_max=scheduler.sigmas[1].item(),
+                prev_ref, log_prob_ref, prev_mean_ref, noise_std_ref = (
+                    _flowgrpo_sde_step_with_logprob(
+                        model_output=model_output,
+                        sample=sample,
+                        variance_noise=variance_noise,
+                        sigma=current_sigma,
+                        sigma_prev=next_sigma,
+                        sigma_max=scheduler.sigmas[1].item(),
+                        noise_level=0.5,
+                        sde_type=sde_type,
+                    )
                 )
 
-                max_abs_prev = float((prev_sgl - prev_ref).abs().max().item())
-                max_abs_mean = float(
-                    (prev_sample_means[:, 0] - prev_mean_ref).abs().max().item()
-                )
-                max_abs_std = float(
-                    (noise_std_devs[:, 0, 0] - noise_std_ref.reshape(-1)).abs().max().item()
-                )
+                log_prob_mean = log_prob_sum / elem_count
 
-                self.assertLessEqual(
-                    max_abs_prev,
-                    atol,
-                    msg=f"{sde_type} seed={seed} prev_sample max_abs={max_abs_prev:.6f}",
-                )
-                self.assertLessEqual(
-                    max_abs_mean,
-                    atol,
-                    msg=f"{sde_type} seed={seed} prev_sample_mean max_abs={max_abs_mean:.6f}",
-                )
-                self.assertLessEqual(
-                    max_abs_std,
-                    atol,
-                    msg=f"{sde_type} seed={seed} noise_std max_abs={max_abs_std:.6f}",
-                )
+                errs = {
+                    "prev_sample": float((prev_sgl - prev_ref).abs().max().item()),
+                    "prev_sample_mean": float(
+                        (prev_sample_means[:, 0] - prev_mean_ref).abs().max().item()
+                    ),
+                    "noise_std": float(
+                        (noise_std_devs[:, 0, 0] - noise_std_ref.reshape(-1))
+                        .abs()
+                        .max()
+                        .item()
+                    ),
+                    "log_prob": float(
+                        (log_prob_mean - log_prob_ref).abs().max().item()
+                    ),
+                }
+
+                for name, err in errs.items():
+                    self.assertLessEqual(
+                        err,
+                        atol,
+                        msg=f"{sde_type} seed={seed} {name} max_abs={err:.9f}",
+                    )
 
 
 if __name__ == "__main__":

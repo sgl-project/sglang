@@ -44,4 +44,3 @@ class RolloutTrajectoryData:
 
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
-

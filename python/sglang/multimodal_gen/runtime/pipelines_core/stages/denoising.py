@@ -58,10 +58,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import SchedulerRLMixin
-from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutTrajectoryData,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -76,6 +72,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -161,8 +163,8 @@ class DenoisingStage(PipelineStage):
         if batch.rollout:
             if batch.rollout_trajectory_data is None:
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
-            batch.rollout_trajectory_data.rollout_log_probs = self.scheduler.collect_rollout_log_probs(
-                batch
+            batch.rollout_trajectory_data.rollout_log_probs = (
+                self.scheduler.collect_rollout_log_probs(batch)
             )
             if getattr(batch, "rollout_debug_mode", False):
                 batch.rollout_trajectory_data.rollout_debug_tensors = (
@@ -597,7 +599,7 @@ class DenoisingStage(PipelineStage):
             server_args.model_loaded["transformer"] = True
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-        
+
         self._maybe_prepare_rollout(batch)
 
         # Prepare extra step kwargs for scheduler

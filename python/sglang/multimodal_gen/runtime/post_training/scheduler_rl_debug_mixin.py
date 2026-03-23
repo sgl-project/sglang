@@ -35,7 +35,9 @@ class SchedulerRLDebugMixin:
         batch_size = variance_noise.shape[0]
         rollout_session_data.local_variance_noises.append(variance_noise)
         rollout_session_data.local_prev_sample_means.append(prev_sample_mean)
-        rollout_session_data.local_noise_std_devs.append(noise_std_dev.expand((batch_size, 1)))
+        rollout_session_data.local_noise_std_devs.append(
+            noise_std_dev.expand((batch_size, 1))
+        )
         rollout_session_data.local_model_outputs.append(model_output)
 
     def consume_local_rollout_debug_tensors(
@@ -44,15 +46,15 @@ class SchedulerRLDebugMixin:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rollout_session_data = batch._rollout_session_data
         variance_noises = torch.stack(rollout_session_data.local_variance_noises, dim=1)
-        prev_sample_means = torch.stack(rollout_session_data.local_prev_sample_means, dim=1)
+        prev_sample_means = torch.stack(
+            rollout_session_data.local_prev_sample_means, dim=1
+        )
         noise_std_devs = torch.stack(rollout_session_data.local_noise_std_devs, dim=1)
         model_outputs = torch.stack(rollout_session_data.local_model_outputs, dim=1)
         self._reset_rollout_debug_tensors(rollout_session_data)
         return variance_noises, prev_sample_means, noise_std_devs, model_outputs
 
-    def collect_rollout_debug_tensors(
-        self, batch: Req
-    ) -> RolloutDebugTensors:
+    def collect_rollout_debug_tensors(self, batch: Req) -> RolloutDebugTensors:
         """
         Consume rollout debug tensors and merge for all SP ranks.
 
