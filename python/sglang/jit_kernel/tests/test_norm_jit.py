@@ -1,15 +1,25 @@
 # Adapted from sgl-kernel/tests/test_norm.py
 
+import sys
+
 import pytest
 import torch
 
-# JIT rmsnorm: fp16/bf16 only; hidden_size must be a multiple of 256, > 256, and <=8192
-RMSNORM_HIDDEN_SIZES = [512, 1024, 3072, 3584, 4096, 8192]
+# JIT rmsnorm: fp16/bf16 only
+# - Warp norm path (one warp per token):  hidden_size in {64, 128, 256}
+# - CTA norm path (multi-warp per token): hidden_size is a multiple of 256, > 256, and <=8192
+RMSNORM_HIDDEN_SIZES = [64, 128, 256, 512, 1024, 3072, 3584, 4096, 8192]
 
 # JIT fused_add_rmsnorm: fp16/bf16 only; hidden_size % 8 == 0, <=8192
 FUSED_ADD_RMSNORM_HIDDEN_SIZES = [1024, 3072, 3584, 4096, 8192]
 
-BS_LIST = [1, 19, 99, 989]
+BS_LIST = [
+    1,
+    19,
+    99,
+    989,
+    8192,
+]  # 8192 ensures num_tokens > max_occupancy * kNumSM on any GPU
 
 
 def _jit_rmsnorm(input, weight, output, eps):
@@ -81,5 +91,50 @@ def test_fused_add_rmsnorm_jit(batch_size, hidden_size, dtype):
     torch.testing.assert_close(r_jit, r_ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    ("hidden_size", "expected"),
+    [
+        (0, False),
+        (64, True),
+        (128, True),
+        (256, True),
+        (512, True),
+        (8192, True),
+        (16384, False),
+    ],
+)
+def test_rmsnorm_hidden_size_support(hidden_size, expected):
+    from sglang.jit_kernel.norm import _is_supported_rmsnorm_hidden_size
+
+    assert _is_supported_rmsnorm_hidden_size(hidden_size) is expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "expected"),
+    [
+        (64, "RMSNormWarpKernel"),
+        (128, "RMSNormWarpKernel"),
+        (256, "RMSNormWarpKernel"),
+        (512, "RMSNormKernel"),
+        (8192, "RMSNormKernel"),
+    ],
+)
+def test_rmsnorm_kernel_dispatch(hidden_size, expected):
+    from sglang.jit_kernel.norm import _rmsnorm_kernel_class
+
+    assert _rmsnorm_kernel_class(hidden_size) == expected
+
+
+@pytest.mark.parametrize("hidden_size", [0, 16384])
+def test_rmsnorm_rejects_unsupported_hidden_size(hidden_size):
+    from sglang.jit_kernel.norm import rmsnorm
+
+    x = torch.randn(1, hidden_size)
+    w = torch.randn(hidden_size)
+
+    with pytest.raises(RuntimeError, match=f"unsupported hidden_size={hidden_size}"):
+        rmsnorm(x, w)
+
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

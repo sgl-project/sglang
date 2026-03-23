@@ -8,6 +8,7 @@ This test suite verifies:
 4. Performance benchmarks and speedup measurements
 """
 
+import sys
 import time
 
 import pytest
@@ -1064,4 +1065,4 @@ def test_fused_metadata_copy_multi_large_batch(bs):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -502,7 +502,8 @@ def test_<op>_cpu_error():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
 ```
 
 ---
