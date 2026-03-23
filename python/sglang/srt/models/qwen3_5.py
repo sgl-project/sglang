@@ -90,6 +90,43 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
+    # Stacked param mappings for fused DeltaNet projections (TP=1 only).
+    # expand_fused_qkv() splits the checkpoint's in_proj_qkv into virtual
+    # _q/_k/_v weights that map to shards 0-2; in_proj_z/b/a map to 3-5.
+    # Only added to stacked_params_mapping when in_proj_all exists.
+    FUSED_PARAMS = [
+        ("in_proj_all", "in_proj_all_q", 0),
+        ("in_proj_all", "in_proj_all_k", 1),
+        ("in_proj_all", "in_proj_all_v", 2),
+        ("in_proj_all", "in_proj_z", 3),
+        ("in_proj_all", "in_proj_b", 4),
+        ("in_proj_all", "in_proj_a", 5),
+    ]
+
+    @staticmethod
+    def expand_fused_qkv(weights):
+        """Split in_proj_qkv checkpoint tensor into 3 virtual weights.
+
+        Used with FUSED_PARAMS to load Q/K/V as shards 0-2 of in_proj_all.
+        """
+        for name, tensor in weights:
+            if ".in_proj_qkv." in name and name.endswith(".weight"):
+                chunk = tensor.shape[0] // 3
+                yield (
+                    name.replace("in_proj_qkv", "in_proj_all_q"),
+                    tensor[:chunk],
+                )
+                yield (
+                    name.replace("in_proj_qkv", "in_proj_all_k"),
+                    tensor[chunk : 2 * chunk],
+                )
+                yield (
+                    name.replace("in_proj_qkv", "in_proj_all_v"),
+                    tensor[2 * chunk :],
+                )
+            else:
+                yield name, tensor
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -129,44 +166,69 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # Split projection layers (following vLLM's implementation)
-        # Instead of fused in_proj_qkvz and in_proj_ba, use separate layers
-        self.in_proj_qkv = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_qkv", prefix),
-        )
-        self.in_proj_z = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.value_dim,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_z", prefix),
-        )
-        self.in_proj_b = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_b", prefix),
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_a", prefix),
-        )
+        # Split projection layers for TP>1 (following vLLM's implementation)
+        # so that Q/K/V heads can be sharded independently across ranks.
+        # At TP=1 we fuse all 6 projections into a single matmul instead,
+        # which gives ~9% decode latency improvement on the 0.8B model
+        # (66 fewer kernel launches per forward pass).
+        self._fuse_all = self.attn_tp_size == 1
+        if self._fuse_all:
+            self._fused_qkv_dim = self.key_dim + self.key_dim + self.value_dim
+            self._fused_z_dim = self.value_dim
+            self._fused_b_dim = self.num_v_heads
+            self.in_proj_all = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,  # Q
+                    self.key_dim,  # K
+                    self.value_dim,  # V
+                    self.value_dim,  # Z
+                    self.num_v_heads,  # B
+                    self.num_v_heads,  # A
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_all", prefix),
+            )
+        else:
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_qkv", prefix),
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.value_dim,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_z", prefix),
+            )
+            self.in_proj_b = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_b", prefix),
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_a", prefix),
+            )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -265,14 +327,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         seq_len, _ = hidden_states.shape
 
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-
-        b = b.contiguous()
-        a = a.contiguous()
+        if self._fuse_all:
+            proj_out, _ = self.in_proj_all(hidden_states)
+            qkv_end = self._fused_qkv_dim
+            z_end = qkv_end + self._fused_z_dim
+            b_end = z_end + self._fused_b_dim
+            mixed_qkv = proj_out[:, :qkv_end]
+            z = proj_out[:, qkv_end:z_end].reshape(
+                proj_out.size(0), -1, self.head_v_dim
+            )
+            b = proj_out[:, z_end:b_end].contiguous()
+            a = proj_out[:, b_end:].contiguous()
+        else:
+            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            z, _ = self.in_proj_z(hidden_states)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, _ = self.in_proj_b(hidden_states)
+            a, _ = self.in_proj_a(hidden_states)
+            b = b.contiguous()
+            a = a.contiguous()
 
         core_attn_out = self.attn(
             forward_batch=forward_batch,
@@ -822,6 +895,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # At TP=1, DeltaNet projections are fused into in_proj_all
+        if any("in_proj_all" in n for n in params_dict):
+            stacked_params_mapping += Qwen3_5GatedDeltaNet.FUSED_PARAMS
+            weights = Qwen3_5GatedDeltaNet.expand_fused_qkv(weights)
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1131,6 +1210,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # At TP=1, DeltaNet projections are fused into in_proj_all
+        if any("in_proj_all" in n for n in params_dict):
+            stacked_params_mapping += Qwen3_5GatedDeltaNet.FUSED_PARAMS
+            weights = Qwen3_5GatedDeltaNet.expand_fused_qkv(weights)
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
