@@ -829,6 +829,16 @@ def _register_configs():
         model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
     )
 
+    # FireRed-Image-Edit
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=[
+            "FireRedTeam/FireRed-Image-Edit-1.0",
+            "FireRedTeam/FireRed-Image-Edit-1.1",
+        ],
+    )
+
 
 _register_configs()
 

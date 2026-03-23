@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 
 # Registering the test for CUDA CI with appropriate parameters
 # Increasing estimated time since we run evaluation twice
-register_cuda_ci(est_time=600, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=600, suite="stage-b-test-2-gpu-large")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")

@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=60,
-    suite="stage-b-test-large-2-gpu",
+    suite="stage-b-test-2-gpu-large",
     disabled="Temporarily disabled",
 )
 

@@ -1779,6 +1779,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
     ):
 
         override_dim = (
@@ -1802,6 +1803,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        if index_buf_size is None:
+            index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
@@ -1823,7 +1826,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
                     (
-                        (size + page_size + 1) // self.page_size,
+                        (index_buf_size + page_size + 1) // self.page_size,
                         self.page_size
                         * (
                             index_head_dim + index_head_dim // self.quant_block_size * 4

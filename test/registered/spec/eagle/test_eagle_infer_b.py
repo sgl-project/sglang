@@ -22,7 +22,7 @@ from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
-register_cuda_ci(est_time=1100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=1100, suite="stage-b-test-1-gpu-large")
 
 
 class TestEAGLEServerBasic(EagleServerBase):
