@@ -178,8 +178,8 @@ You can find the available suites for each hardware backend at [`test/run_suite.
 | Suite | Runner (label) | Description |
 | --- | --- | --- |
 | `stage-a-test-1-gpu-small` | `1-gpu-5090` | Quick checks on a small NVIDIA GPU before heavier stages |
-| `stage-b-test-1-gpu-small` | `1-gpu-5090` | Core engine tests that fit a 5090-class card; work is split across parallel jobs |
-| `stage-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FP8, FA3) |
+| `stage-b-test-1-gpu-small` | `1-gpu-5090` | Core engine tests that fit a 5090-class card |
+| `stage-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
 | `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP-style workloads) on H100 |
 | `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (e.g. SM100+ paths) on four GPUs |
 | `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
@@ -188,7 +188,7 @@ You can find the available suites for each hardware backend at [`test/run_suite.
 | `stage-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and related networking on four H100s. |
 | `stage-c-test-deepep-8-gpu-h200` | `8-gpu-h200` | DeepEP at 8-GPU H200 scale. |
 | `stage-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on blackwell |
-| `stage-c-test-4-gpu-gb200` | `4-gpu-gb200`| 4-GPU GB200 suite for large models on blackwell |
+| `stage-c-test-4-gpu-gb200` | `4-gpu-gb200`| 4-GPU GB200 suite for large models on grace blackwell |
 
 Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
