@@ -3,7 +3,7 @@ index 33c50e0cb..e7853543f 100644
 --- a/python/sglang/multimodal_gen/configs/models/dits/zimage.py
 +++ b/python/sglang/multimodal_gen/configs/models/dits/zimage.py
 @@ -49,8 +49,32 @@ class ZImageArchConfig(DiTArchConfig):
- 
+
      param_names_mapping: dict = field(
          default_factory=lambda: {
 +            # Weight mappings: w1/w3 -> w13
@@ -56,7 +56,7 @@ index f74309a53..b297281e6 100644
                  return
 @@ -617,21 +625,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
          tp_size = self.tp_size
- 
+
          if isinstance(param, BlockQuantScaleParameter):
 -            raise NotImplementedError("FP8 is not implemented yet")
 -            # FIXME(will): add fp8 support
@@ -129,8 +129,8 @@ index ae0e421b6..6dfbc9b2a 100644
 --- a/python/sglang/multimodal_gen/runtime/models/dits/zimage.py
 +++ b/python/sglang/multimodal_gen/runtime/models/dits/zimage.py
 @@ -99,13 +99,31 @@ class TimestepEmbedder(nn.Module):
- 
- 
+
+
  class FeedForward(nn.Module):
 -    def __init__(self, dim: int, hidden_dim: int):
 +    def __init__(
@@ -161,7 +161,7 @@ index ae0e421b6..6dfbc9b2a 100644
          )
 -        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
          self.act = SiluAndMul()
- 
+
      def forward(self, x):
 @@ -326,7 +344,12 @@ class ZImageTransformerBlock(nn.Module):
              if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
@@ -174,6 +174,6 @@ index ae0e421b6..6dfbc9b2a 100644
 +                quant_config=quant_config,
 +                prefix=f"{prefix}.feed_forward",
 +            )
- 
+
          self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
          self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)

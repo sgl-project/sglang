@@ -12,11 +12,13 @@ FP8 Scale Loading Diagnostic Script
   Part B — 模型加载后 scale 参数状态（是否仍为默认初始值）
   Part C — 加载过程中 skipped / missing keys 的详细日志
 """
+
 import glob
 import logging
 import sys
-import torch
 from pathlib import Path
+
+import torch
 
 # ============================================================
 # Configuration
@@ -27,6 +29,7 @@ FP8_NOFFN_DIR = f"{MODEL_DIR}/transformer-FP8-block128-no-ffn"
 
 # Default init value used in fp8.py:274
 DEFAULT_INIT_VALUE = torch.finfo(torch.float32).min  # -3.40282e+38
+
 
 # ============================================================
 # Part A: 检查 checkpoint 中的 scale 键名
@@ -53,9 +56,11 @@ def check_checkpoint_scales():
                     if "scale" in key:
                         t = sf.get_tensor(key)
                         print(f"  SCALE: {key}")
-                        print(f"         shape={t.shape}, dtype={t.dtype}, "
-                              f"min={t.min().item():.6g}, max={t.max().item():.6g}, "
-                              f"mean={t.mean().item():.6g}")
+                        print(
+                            f"         shape={t.shape}, dtype={t.dtype}, "
+                            f"min={t.min().item():.6g}, max={t.max().item():.6g}, "
+                            f"mean={t.mean().item():.6g}"
+                        )
                         scale_count += 1
                     elif key.endswith(".weight"):
                         t = sf.get_tensor(key)
@@ -102,7 +107,9 @@ def check_model_loaded_scales():
 
     print("\n--- Loading transformer directly via TransformerLoader ---")
     try:
-        from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import TransformerLoader
+        from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+            TransformerLoader,
+        )
         from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
         # Build ServerArgs with FP8 config
@@ -145,20 +152,30 @@ def check_model_loaded_scales():
 
                 print(f"  {name}:")
                 print(f"    shape={data.shape}, dtype={param.dtype}")
-                print(f"    min={data.min().item():.6g}, max={data.max().item():.6g}, "
-                      f"mean={data.mean().item():.6g}")
+                print(
+                    f"    min={data.min().item():.6g}, max={data.max().item():.6g}, "
+                    f"mean={data.mean().item():.6g}"
+                )
                 print(f"    status: {status}")
 
-        print(f"\n  Summary: {total_scales} scale params, "
-              f"{correct_scales} OK, {default_scales} DEFAULT (broken)")
+        print(
+            f"\n  Summary: {total_scales} scale params, "
+            f"{correct_scales} OK, {default_scales} DEFAULT (broken)"
+        )
 
         if total_scales == 0:
             print("\n  ⚠️⚠️⚠️  NO SCALE PARAMS FOUND!")
-            print("  This means quant_config was not resolved → FP8 layers not initialized")
-            print("  Check: does transformer-FP8-block128/config.json have quantization_config?")
+            print(
+                "  This means quant_config was not resolved → FP8 layers not initialized"
+            )
+            print(
+                "  Check: does transformer-FP8-block128/config.json have quantization_config?"
+            )
         elif default_scales > 0:
             print("\n  ⚠️⚠️⚠️  Some FP8 scales are NOT being loaded!")
-            print(f"  {default_scales}/{total_scales} scales still at default init value")
+            print(
+                f"  {default_scales}/{total_scales} scales still at default init value"
+            )
         else:
             print("\n  ✅ All FP8 scales loaded correctly!")
 
@@ -169,6 +186,7 @@ def check_model_loaded_scales():
     except Exception as e:
         print(f"\n  ❌ Failed to load model: {e}")
         import traceback
+
         traceback.print_exc(file=sys.stdout)
 
 
@@ -204,7 +222,7 @@ def check_mapping_simulation():
         if "scale" not in key:
             continue
         target_name, merge_idx, num_merge = mapping_fn(key)
-        was_mapped = (target_name != key)
+        was_mapped = target_name != key
 
         # Classify: keys with w1/w3 NEED mapping; others (to_k, to_q, to_v, to_out, w2)
         # are pass-through and should match model params directly
@@ -221,7 +239,9 @@ def check_mapping_simulation():
             passthrough_scales.append(key)
 
         print(f"  {key}")
-        print(f"    -> target={target_name}, merge_idx={merge_idx}, num_merge={num_merge}")
+        print(
+            f"    -> target={target_name}, merge_idx={merge_idx}, num_merge={num_merge}"
+        )
         print(f"    {status}")
 
     print(f"\n  Mapped (w1/w3→w13): {len(mapped_scales)}")

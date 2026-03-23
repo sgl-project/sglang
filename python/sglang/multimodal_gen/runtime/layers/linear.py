@@ -642,12 +642,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             assert weight_block_size is not None
             block_n = weight_block_size[0]
             shard_offset = (
-                sum(self.output_sizes[:loaded_shard_id]) + block_n - 1
-            ) // block_n // tp_size
-            shard_size = (
-                (self.output_sizes[loaded_shard_id] + block_n - 1)
+                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1)
                 // block_n
                 // tp_size
+            )
+            shard_size = (
+                (self.output_sizes[loaded_shard_id] + block_n - 1) // block_n // tp_size
             )
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
