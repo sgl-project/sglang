@@ -46,6 +46,23 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def get_text_config(config: AutoConfig) -> AutoConfig:
+    """Resolve VLM configs to their text sub-config.
+
+    VLM models (e.g. Qwen3_5, InternVL) store model-architecture attributes
+    like hidden_size, num_hidden_layers, etc. on a text_config sub-object
+    rather than the top-level config. SGLang's LoRA serving currently supports
+    adapters targeting the text (language) backbone of VLMs by reading these
+    attributes from text_config when present.
+
+    For text-only models, the top-level config already has these attributes
+    and is returned as-is.
+    """
+    if hasattr(config, "text_config"):
+        return config.text_config
+    return config
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -67,30 +84,26 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        # Resolve VLM configs to text sub-config for hidden_size etc.
+        tc = get_text_config(config)
+        head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
         if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
+            return tc.hidden_size, head_dim * (
+                tc.num_attention_heads + tc.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
             return (
-                head_dim * config.num_attention_heads,
-                config.hidden_size,
+                head_dim * tc.num_attention_heads,
+                tc.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            return config.hidden_size, config.intermediate_size * 2
+            return tc.hidden_size, tc.intermediate_size * 2
         elif module_name == "down_proj":
-            return config.intermediate_size, config.hidden_size
+            return tc.intermediate_size, tc.hidden_size
         elif module_name == "embed_tokens":
-            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.vocab_size + lora_added_vocab_size, config.hidden_size
+            return config.vocab_size + lora_added_vocab_size, tc.hidden_size
         elif module_name == "lm_head":
-            # For lm_head: input is hidden_size, output is vocab_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.hidden_size, config.vocab_size + lora_added_vocab_size
+            return tc.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
             raise NotImplementedError(
                 "get_hidden_dim not implemented for " + module_name
