@@ -44,9 +44,10 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 import unittest
 
 from sglang.srt.<module> import TargetClass
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTargetClass(unittest.TestCase):
+class TestTargetClass(CustomTestCase):
     def test_basic_behavior(self):
         obj = TargetClass(...)
         self.assertEqual(obj.method(), expected)
@@ -60,5 +61,5 @@ if __name__ == "__main__":
 
 - **No** `popen_launch_server()` or `Engine(...)`.
 - **No** model weight loading.
-- Use `unittest.TestCase` or `CustomTestCase` (from `sglang.test.test_utils`, adds CI retry).
+- Use `CustomTestCase` (from `sglang.test.test_utils`, adds CI retry).
 - Use `unittest.mock` for dependencies that are expensive to construct.

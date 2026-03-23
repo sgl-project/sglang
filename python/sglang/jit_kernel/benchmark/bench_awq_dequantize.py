@@ -5,7 +5,8 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.utils import is_in_ci
 
 try:
     from sgl_kernel import awq_dequantize as aot_awq_dequantize

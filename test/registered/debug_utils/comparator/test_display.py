@@ -11,8 +11,9 @@ from rich.console import Console
 from sglang.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
+    _extract_parallel_info,
+    _render_polars_as_rich_table,
     _render_polars_as_text,
-    extract_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
@@ -20,7 +21,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only", nightly=True)
 
 
 def _render_rich(renderable: object) -> str:
@@ -408,27 +409,91 @@ class TestExtractParallelInfo:
             "pp_size": 2,
         }
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info=info)
+        _extract_parallel_info(row_data=row_data, info=info)
 
         assert row_data["tp"] == "1/4"
         assert row_data["pp"] == "0/2"
 
     def test_skips_error_info(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(
+        _extract_parallel_info(
             row_data=row_data, info={"error": True, "tp_rank": 0, "tp_size": 1}
         )
         assert row_data == {}
 
     def test_skips_empty_info(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info={})
+        _extract_parallel_info(row_data=row_data, info={})
         assert row_data == {}
 
     def test_ignores_rank_without_size(self) -> None:
         row_data: dict = {}
-        extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
+        _extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
         assert "tp" not in row_data
+
+
+class TestRenderPolarsAsRichTable:
+    def test_basic_dataframe_renders_table(self) -> None:
+        df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 2
+        assert table.row_count == 2
+
+    def test_empty_dataframe_returns_table_with_no_rows(self) -> None:
+        df = pl.DataFrame(
+            {"a": pl.Series([], dtype=pl.Int64), "b": pl.Series([], dtype=pl.Utf8)}
+        )
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 2
+        assert table.row_count == 0
+
+    def test_title_passed_to_table(self) -> None:
+        df = pl.DataFrame({"a": [1]})
+        table = _render_polars_as_rich_table(df, title="My Title")
+        assert table.title == "My Title"
+
+    def test_no_title_defaults_to_none(self) -> None:
+        df = pl.DataFrame({"x": [1]})
+        table = _render_polars_as_rich_table(df)
+        assert table.title is None
+
+    def test_column_names_match_dataframe(self) -> None:
+        df = pl.DataFrame({"alpha": [1], "beta": [2], "gamma": [3]})
+        table = _render_polars_as_rich_table(df)
+        column_headers: list[str] = [col.header for col in table.columns]
+        assert column_headers == ["alpha", "beta", "gamma"]
+
+    def test_values_converted_to_strings(self) -> None:
+        """Numeric and None values should be stringified in the rendered output."""
+        df = pl.DataFrame({"num": [42], "text": ["hello"]})
+        table = _render_polars_as_rich_table(df)
+        rendered: str = _render_rich(table)
+        assert "42" in rendered
+        assert "hello" in rendered
+
+    def test_single_column_dataframe(self) -> None:
+        df = pl.DataFrame({"only_col": [10, 20, 30]})
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 1
+        assert table.row_count == 3
+
+    def test_many_rows_all_present(self) -> None:
+        """All rows from the dataframe appear in the rich table."""
+        df = pl.DataFrame({"val": list(range(50))})
+        table = _render_polars_as_rich_table(df)
+        assert table.row_count == 50
+
+    def test_null_values_rendered_as_string(self) -> None:
+        """Null values should be converted to their string representation."""
+        df = pl.DataFrame({"a": [1, None, 3]})
+        table = _render_polars_as_rich_table(df)
+        assert table.row_count == 3
+        rendered: str = _render_rich(table)
+        assert (
+            "null" in rendered.lower()
+            or "none" in rendered.lower()
+            or "None" in rendered
+        )
 
 
 if __name__ == "__main__":

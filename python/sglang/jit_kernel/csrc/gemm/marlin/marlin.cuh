@@ -40,8 +40,6 @@ struct Vec {
 
 using I4 = Vec<int, 4>;
 
-using host::div_ceil;
-
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 // No support for async
 #else
