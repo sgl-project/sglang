@@ -12,15 +12,15 @@ on:
         default: 'all'
         options:
           - 'all'
-          - 'nightly-test-general-1-gpu-runner'
+          - 'nightly-test-general-1-gpu-h100'
           - 'nightly-test-general-4-gpu-h100'
           - 'nightly-test-general-8-gpu-h200'
           - 'nightly-test-general-8-gpu-h20'
           - 'nightly-test-general-8-gpu-b200'
-          - 'nightly-test-text-accuracy-2-gpu-runner'
-          - 'nightly-test-text-perf-2-gpu-runner'
-          - 'nightly-test-vlm-accuracy-2-gpu-runner'
-          - 'nightly-test-vlm-perf-2-gpu-runner'
+          - 'nightly-test-text-accuracy-2-gpu-h100'
+          - 'nightly-test-text-perf-2-gpu-h100'
+          - 'nightly-test-vlm-accuracy-2-gpu-h100'
+          - 'nightly-test-vlm-perf-2-gpu-h100'
           - 'nightly-test-multimodal-server-1-gpu'
           - 'nightly-test-multimodal-server-2-gpu'
           - 'nightly-test-perf-4-gpu-b200'
@@ -50,14 +50,18 @@ env:
 
 jobs:
   # General tests - 1 GPU
-  nightly-test-general-1-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-runner')
-    runs-on: 1-gpu-runner
+  nightly-test-general-1-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-h100')
+    runs-on: 1-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -81,6 +85,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -110,6 +118,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -157,7 +169,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-h200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -191,6 +203,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -219,6 +235,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -257,7 +277,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-b200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -280,14 +300,18 @@ jobs:
           artifact-suffix: ${{ matrix.partition }}
 
   # Text model accuracy tests
-  nightly-test-text-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-text-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -303,14 +327,18 @@ jobs:
         if: always()
 
   # Text model performance tests
-  nightly-test-text-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-text-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -321,7 +349,7 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
           rm -rf performance_profiles_text_models/
@@ -339,14 +367,18 @@ jobs:
         if: always()
 
   # VLM accuracy tests
-  nightly-test-vlm-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-vlm-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -362,14 +394,18 @@ jobs:
         if: always()
 
   # VLM performance tests
-  nightly-test-vlm-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-vlm-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -380,7 +416,7 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
           rm -rf performance_profiles_vlms/
@@ -400,7 +436,7 @@ jobs:
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-1-gpu')
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -412,6 +448,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -421,7 +461,7 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GPU_CONFIG: "1-gpu-runner"
+          GPU_CONFIG: "1-gpu-h100"
 
         timeout-minutes: 60
         run: |
@@ -434,8 +474,8 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
-            --gpu-config 1-gpu-runner \
+          python3 scripts/ci/utils/save_diffusion_metrics.py \
+            --gpu-config 1-gpu-h100 \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-1gpu-partition-${{ matrix.part }}.json \
             --results-json python/diffusion-results.json
@@ -456,7 +496,7 @@ jobs:
 
   nightly-test-multimodal-server-2-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-2-gpu')
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -468,6 +508,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -477,7 +521,7 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
 
         timeout-minutes: 60
         run: |
@@ -490,8 +534,8 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
-            --gpu-config 2-gpu-runner \
+          python3 scripts/ci/utils/save_diffusion_metrics.py \
+            --gpu-config 2-gpu-h100 \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-2gpu-partition-${{ matrix.part }}.json \
             --results-json python/diffusion-results.json
@@ -520,6 +564,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: |
           IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
@@ -544,6 +592,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+        with:
+          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -589,7 +641,7 @@ jobs:
 
       - name: Merge metrics
         run: |
-          python3 scripts/ci/merge_metrics.py \
+          python3 scripts/ci/utils/merge_metrics.py \
             --input-dir metrics/ \
             --output consolidated-metrics-${{ github.run_id }}.json \
             --run-id ${{ github.run_id }} \
@@ -608,15 +660,15 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - nightly-test-general-1-gpu-runner
+      - nightly-test-general-1-gpu-h100
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
       - nightly-test-general-8-gpu-b200
-      - nightly-test-text-accuracy-2-gpu-runner
-      - nightly-test-text-perf-2-gpu-runner
-      - nightly-test-vlm-accuracy-2-gpu-runner
-      - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-text-accuracy-2-gpu-h100
+      - nightly-test-text-perf-2-gpu-h100
+      - nightly-test-vlm-accuracy-2-gpu-h100
+      - nightly-test-vlm-perf-2-gpu-h100
       - nightly-test-multimodal-server-1-gpu
       - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
