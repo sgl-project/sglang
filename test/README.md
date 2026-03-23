@@ -26,7 +26,7 @@ python3 test/run_suite.py --hw cuda --suite stage-a-test-1-gpu-small
 - `registered`: The registered test files. They will be run on CI. Most tests should be in this folder. It uses a custom registry system and use a file as the basic unit.
 - `manual`: Test files that won't be run by CI. You need to manually run them. Typically, these are temporary tests, deprecated tests, or tests that not suitable for running on CI such as taking too long or requires special setup. We still would like to keep some files here in case someone wants to run them locally.
 - `run_suite.py`: The launch scripts to run a test suite.
-- others: some utility scripts, metadata folder
+- others: some utility scripts, metadata folder. The `srt` folder is our old ci test system and will be deprecated soon.
 
 Since the system use a custom registry system and own launcher `run_suite.py`, it supports both python's built-in [unittest](https://docs.python.org/3/library/unittest.html) or the popular [pytest](https://docs.pytest.org/en/stable/).
 The basic unit is a file and you can use either of them in your file.
