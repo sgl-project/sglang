@@ -172,11 +172,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
-from sglang.srt.utils.json_response import (
-    SGLangORJSONResponse,
-    dumps_json,
-    orjson_response,
-)
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -203,7 +199,7 @@ class _GlobalState:
     #         )
     # }
     remote_instance_transfer_engine_info: Optional[Dict] = None
-    subprocess_watchdog: Optional["SubprocessWatchdog"] = None
+    subprocess_watchdog: Optional[SubprocessWatchdog] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -1974,7 +1970,7 @@ def _setup_and_run_http_server(
     template_manager,
     port_args: PortArgs,
     scheduler_infos: List[Dict],
-    subprocess_watchdog: Optional["SubprocessWatchdog"],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
