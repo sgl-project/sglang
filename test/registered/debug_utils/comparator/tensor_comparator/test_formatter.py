@@ -68,6 +68,14 @@ _DEFAULT_PERCENTILE_LINES: list[str] = [
     "      [blue]p99       [/]     1.8000       1.8000   [dim]+0.00e+00[/]",
 ]
 
+_DEFAULT_PERCENTILE_LINES: list[str] = [
+    "      [blue]p1        [/]    -1.8000      -1.8000   [dim]+0.00e+00[/]",
+    "      [blue]p5        [/]    -1.5000      -1.5000   [dim]+0.00e+00[/]",
+    "      [blue]p50       [/]     0.0000       0.0000   [dim]+0.00e+00[/]",
+    "      [blue]p95       [/]     1.5000       1.5000   [dim]+0.00e+00[/]",
+    "      [blue]p99       [/]     1.8000       1.8000   [dim]+0.00e+00[/]",
+]
+
 
 # Snapshot strings below are intentionally spelled out in full per test.
 # The shared skeleton (stats block, diff block) looks duplicated, but keeping

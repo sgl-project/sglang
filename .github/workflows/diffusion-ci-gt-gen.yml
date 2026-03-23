@@ -47,7 +47,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
@@ -81,7 +80,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact

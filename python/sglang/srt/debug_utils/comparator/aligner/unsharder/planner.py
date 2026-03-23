@@ -261,24 +261,6 @@ def _compute_dependent_axes(
     )
 
 
-def _is_dependent_axis(
-    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
-    *,
-    parent: ParallelAxis,
-    child: ParallelAxis,
-) -> bool:
-    """True if child's rank is uniquely determined by parent's rank."""
-    parent_rank_to_child_rank: dict[int, int] = {}
-    for info in parallel_infos:
-        if parent not in info or child not in info:
-            continue
-        parent_rank = info[parent].axis_rank
-        child_rank = info[child].axis_rank
-        if parent_rank_to_child_rank.setdefault(parent_rank, child_rank) != child_rank:
-            return False
-    return True
-
-
 def _is_jointly_determined(
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
     *,
@@ -318,6 +300,24 @@ def _is_jointly_determined(
             return False
 
     return bool(mapping)
+
+
+def _is_dependent_axis(
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    *,
+    parent: ParallelAxis,
+    child: ParallelAxis,
+) -> bool:
+    """True if child's rank is uniquely determined by parent's rank."""
+    parent_rank_to_child_rank: dict[int, int] = {}
+    for info in parallel_infos:
+        if parent not in info or child not in info:
+            continue
+        parent_rank = info[parent].axis_rank
+        child_rank = info[child].axis_rank
+        if parent_rank_to_child_rank.setdefault(parent_rank, child_rank) != child_rank:
+            return False
+    return True
 
 
 def _group_and_project(
