@@ -449,8 +449,14 @@ class TestLongContext(CustomTestCase):
 
         ids, _ = corpus.batch_get([[2, 3, 4, 5, 6]])
         ids_list = ids.tolist()
-        self.assertIn(7, ids_list, "Longest stored suffix should contribute a continuation")
-        self.assertIn(8, ids_list, "Shorter matching suffixes should still contribute continuations")
+        self.assertIn(
+            7, ids_list, "Longest stored suffix should contribute a continuation"
+        )
+        self.assertIn(
+            8,
+            ids_list,
+            "Shorter matching suffixes should still contribute continuations",
+        )
 
 
 class TestDraftBudgetSaturation(CustomTestCase):
