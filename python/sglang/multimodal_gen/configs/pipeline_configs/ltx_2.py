@@ -14,7 +14,6 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfi
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
-    preprocess_text,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -189,8 +188,8 @@ class LTX2PipelineConfig(PipelineConfig):
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
     postprocess_text_funcs: tuple[
         Callable[[BaseEncoderOutput, dict], torch.Tensor], ...

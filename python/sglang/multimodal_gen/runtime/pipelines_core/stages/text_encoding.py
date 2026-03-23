@@ -212,7 +212,7 @@ class TextEncodingStage(PipelineStage):
 
         attn_masks_list: list[torch.Tensor] = []
 
-        preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
+        preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs or ()
         postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
         text_encoder_extra_args = server_args.pipeline_config.text_encoder_extra_args
         encoder_cfgs = server_args.pipeline_config.text_encoder_configs
@@ -238,7 +238,7 @@ class TextEncodingStage(PipelineStage):
 
             processed_text_list: list[str] = []
             for prompt_str in texts:
-                preprocessed = preprocess_func(prompt_str)
+                preprocessed = preprocess_func(prompt_str) if preprocess_func is not None else prompt_str
                 processed_text_list.append(preprocessed)
 
             # Prepare tokenizer args

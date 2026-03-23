@@ -97,9 +97,6 @@ class STA_Mode(str, Enum):
     NONE = None
 
 
-def preprocess_text(prompt: str) -> str:
-    return prompt
-
 
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
@@ -206,8 +203,8 @@ class PipelineConfig:
     def postprocess_image(self, image):
         return image.last_hidden_state
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
 
     # get prompt_embeds from encoder output
@@ -706,11 +703,6 @@ class PipelineConfig:
         if len(self.text_encoder_configs) != len(self.preprocess_text_funcs):
             raise ValueError(
                 f"Length of text encoder configs ({len(self.text_encoder_configs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
-            )
-
-        if len(self.preprocess_text_funcs) != len(self.postprocess_text_funcs):
-            raise ValueError(
-                f"Length of text postprocess functions ({len(self.postprocess_text_funcs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
             )
 
     def dump_to_json(self, file_path: str):
