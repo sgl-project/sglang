@@ -118,8 +118,15 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
-  constexpr auto max_type = stdr::max(map | stdv::keys);
-  auto result = std::array<std::string_view, max_type + 1>{};
+  constexpr auto max_type = [&]() {
+    auto result = map[0].first;
+    for (std::size_t i = 1; i < map.size(); ++i) {
+        if (map[i].first > result) result = map[i].first;
+    }
+    return result;
+  }();
+  constexpr auto result_size = static_cast<std::size_t>(max_type) + 1;
+  auto result = std::array<std::string_view, result_size>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
   }
