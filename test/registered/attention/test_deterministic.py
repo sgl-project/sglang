@@ -9,6 +9,8 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
@@ -20,6 +22,7 @@ register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
@@ -35,6 +38,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
@@ -50,6 +54,7 @@ class TestFa3Deterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod
