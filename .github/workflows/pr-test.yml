@@ -140,6 +140,7 @@ jobs:
               - "python/pyproject.toml"
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
+              - ".github/workflows/pr-test-sgl-kernel.yml"
               - "sgl-kernel/**"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
@@ -173,7 +174,7 @@ jobs:
           echo "..."
 
           # Check for sgl-kernel changes
-          if echo "$CHANGED_FILES" | grep -q "^sgl-kernel/"; then
+          if echo "$CHANGED_FILES" | grep -qE "^(sgl-kernel/|\.github/workflows/pr-test-sgl-kernel\.yml)"; then
             echo "sgl_kernel=true" >> $GITHUB_OUTPUT
             echo "Detected sgl-kernel changes"
           else
@@ -1315,6 +1316,7 @@ jobs:
         check-changes,
 
         sgl-kernel-build-wheels,
+        sgl-kernel-build-wheels-arm,
         call-sgl-kernel-tests,
 
         wait-for-stage-a,
