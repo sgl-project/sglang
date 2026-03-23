@@ -136,6 +136,7 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 ## CI Registry System
 
 Tests in `test/registered/` use a registry-based CI system for flexible backend/schedule configuration.
+For every test file you add, you need to register it in a suite and provide an estimate execution time.
 
 ### Registration Functions
 
@@ -162,6 +163,7 @@ register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 # Multi-backend test
 register_cuda_ci(est_time=80, suite="stage-a-test-1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
+register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
 register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky - see #12345")
@@ -169,41 +171,13 @@ register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky 
 
 ### Available Suites
 
-### Choosing Between 1-GPU Suites (5090 vs H100)
-
-When adding 1-GPU tests, choose the appropriate suite based on hardware compatibility:
-
-| Suite | Runner | GPU | When to Use |
-|-------|--------|-----|-------------|
-| `stage-a-test-1-gpu-small` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | Most small tests |
-| `stage-a-test-1-gpu-small-amd` | AMD CI runners | ROCm | Stage A per-commit smoke (AMD) |
-| `stage-b-test-1-gpu-small` | `1-gpu-5090` | RTX 5090 (32GB, SM120) | 5090-compatible tests (preferred) |
-| `stage-b-test-1-gpu-large` | `1-gpu-h100` | H100 (80GB, SM90) | Large models or 5090-incompatible tests |
-
-**Use `stage-b-test-1-gpu-small` (5090) whenever possible** - this is the preferred suite for most 1-GPU tests.
-
-**Use `stage-b-test-1-gpu-large` (H100) if ANY of these apply:**
-
-1. **Architecture incompatibility (SM120/Blackwell)**:
-   - FA3 attention backend (requires SM≤90)
-   - MLA with FA3 backend
-   - FP8/MXFP4 quantization (not supported on SM120)
-   - Certain Triton kernels (shared memory limits)
-
-2. **Memory requirements**:
-   - Models >30B params or large MoE
-   - Tests requiring >32GB VRAM
-
-3. **Known 5090 failures**:
-   - Weight update/sync tests
-   - Certain spec decoding tests
-
-If a test cannot run on a 5090 for any of the above reasons, use `stage-b-test-1-gpu-large`, which runs on H100.
-
-
+## Steps for Adding a Test
+Please refer to [.claude/skills/write-sglang-test/SKILL.md](../.claude/skills/write-sglang-test/SKILL.md)
 
 ## Multi-hardware backends
-
+This README mostly describes the CI pipeline for NVIDIA GPU backends.
+Other hardware backends should follow the same practices, use the multi-backend registry system, and build their own pipelines.
+A scheduled job summarizes test coverage across all backends; [here is an example run](https://github.com/sgl-project/sglang/actions/runs/23424304300).
 
 ## Tips for Writing Elegant Test Cases
 - Learn from existing examples in [test/registered](https://github.com/sgl-project/sglang/tree/main/test/registered).
