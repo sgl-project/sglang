@@ -23,7 +23,6 @@ import functools
 import importlib
 import inspect
 import io
-import ipaddress
 import itertools
 import json
 import logging
@@ -36,7 +35,6 @@ import re
 import resource
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +47,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -79,22 +78,19 @@ import psutil
 import pybase64
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
-import zmq
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
-from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -124,7 +120,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps
 # each line of output with some prefix.
-BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 
 
 @lru_cache(maxsize=1)
@@ -192,6 +188,11 @@ def is_musa() -> bool:
     except ImportError:
         return False
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -291,7 +292,7 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
@@ -343,7 +344,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -357,17 +358,6 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except ValueError:
-        return default
-
-
-def get_float_env_var(name: str, default: float = 0.0) -> float:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
     except ValueError:
         return default
 
@@ -596,6 +586,8 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+    elif device == "mps":
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -630,7 +622,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -696,206 +688,70 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr.port == port:
-            try:
-                return psutil.Process(conn.pid)
-            except psutil.NoSuchProcess:
-                # It could happen by race condition (the proc dies when psutil.Process is called).
-                pass
-
-    return None
-
-
-def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
-) -> bool:
-    for i in range(timeout_s):
-        if is_port_available(port):
-            return True
-
-        if i > 10 and i % 5 == 0:
-            process = find_process_using_port(port)
-            if process is None:
-                logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
-                )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
-        time.sleep(0.1)
-
-    if raise_exception:
-        raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
-        )
-    return False
-
-
-def is_port_available(port):
-    """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
-            return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-
-def decode_video_base64(video_base64):
-    from PIL import Image
-
-    # Decode the base64 string
-    video_bytes = pybase64.b64decode(video_base64, validate=True)
-
-    # Placeholder for the start indices of each PNG image
-    img_starts = []
-
-    frame_format = "PNG"  # str(os.getenv('FRAME_FORMAT', "JPEG"))
-
-    assert frame_format in [
-        "PNG",
-        "JPEG",
-    ], "FRAME_FORMAT must be either 'PNG' or 'JPEG'"
-
-    if frame_format == "PNG":
-        # Find each PNG start signature to isolate images
-        i = 0
-        while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
-            # Check if we found the start of a PNG file
-            if (
-                video_bytes[i] == 0x89
-                and video_bytes[i + 1] == 0x50
-                and video_bytes[i + 2] == 0x4E
-                and video_bytes[i + 3] == 0x47
-                and video_bytes[i + 4] == 0x0D
-                and video_bytes[i + 5] == 0x0A
-                and video_bytes[i + 6] == 0x1A
-                and video_bytes[i + 7] == 0x0A
-            ):
-                img_starts.append(i)
-                i += 8  # Skip the PNG signature
-            else:
-                i += 1
-    else:
-        # Find each JPEG start (0xFFD8) to isolate images
-        i = 0
-        while (
-            i < len(video_bytes) - 1
-        ):  # Adjusted for the length of the JPEG SOI signature
-            # Check if we found the start of a JPEG file
-            if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
-                img_starts.append(i)
-                # Move to the next byte to continue searching for the next image start
-                i += 2
-            else:
-                i += 1
-
-    frames = []
-    for start_idx in img_starts:
-        # Assuming each image is back-to-back, the end of one image is the start of another
-        # The last image goes until the end of the byte string
-        end_idx = (
-            img_starts[img_starts.index(start_idx) + 1]
-            if img_starts.index(start_idx) + 1 < len(img_starts)
-            else len(video_bytes)
-        )
-        img_bytes = video_bytes[start_idx:end_idx]
-
-        # Convert bytes to a PIL Image
-        img = Image.open(BytesIO(img_bytes))
-
-        # Convert PIL Image to a NumPy array
-        frame = np.array(img)
-
-        # Append the frame to the list of frames
-        frames.append(frame)
-
-    # Ensure there's at least one frame to avoid errors with np.stack
-    if frames:
-        return np.stack(frames, axis=0), img.size
-    else:
-        return np.array([]), (
-            0,
-            0,
-        )  # Return an empty array and size tuple if no frames were found
-
-
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
+    if sr is None:
+        sr = 16000
+
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
+    if isinstance(audio_file, bytes):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str):
+        source = audio_file
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
     import soundfile as sf
     import torch
     import torchaudio
 
-    if sr is None:
-        sr = 16000
-
-    # Load audio data
-    if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
-    elif audio_file.startswith("file://"):
-        audio_file = unquote(urlparse(audio_file).path)
-        audio, original_sr = sf.read(audio_file)
-    elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
     else:
-        raise ValueError(f"Invalid audio format: {audio_file}")
+        audio, original_sr = sf.read(source)
 
-    # Convert to mono first (before resampling) to reduce computation
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
-    # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
         else:
-            audio_tensor = audio_tensor.T  # (time, channel) -> (channel, time)
-
+            audio_tensor = audio_tensor.T
         audio_tensor = torchaudio.functional.resample(
             audio_tensor, orig_freq=original_sr, new_freq=sr
         )
-
         if audio_tensor.shape[0] == 1:
             audio = audio_tensor.squeeze(0).numpy()
         else:
-            audio = audio_tensor.T.numpy()  # (channel, time) -> (time, channel)
+            audio = audio_tensor.T.numpy()
 
     return audio
 
@@ -1075,6 +931,11 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def suppress_other_loggers():
     suppress_noisy_warnings()
@@ -1115,7 +976,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.4")
+        min_version: Minimum version required (e.g., "0.6.6")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1233,6 +1094,12 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    # Suppress noisy httpx/httpcore loggers in every process that calls
+    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+    # don't inherit the parent's logger state, so this must run here too.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -1383,161 +1250,6 @@ def point_to_point_pyobj(
     return []
 
 
-step_counter = 0
-
-
-def pytorch_profile(name, func, *args, data_size=-1):
-    """
-    Args:
-        name (string): the name of recorded function.
-        func: the function to be profiled.
-        args: the arguments of the profiled function.
-        data_size (int): some measurement of the computation complexity.
-            Usually, it could be the batch size.
-    """
-    global step_counter
-    os.makedirs("trace", exist_ok=True)
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
-            result = func(*args)
-    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
-    step_counter += 1
-    return result
-
-
-def get_zmq_socket(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    endpoint: Optional[str] = None,
-    bind: bool = True,
-) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
-        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
-
-    Returns:
-        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
-        If endpoint is provided: The configured ZeroMQ socket.
-    """
-    socket = context.socket(socket_type)
-
-    if endpoint is None:
-        # Bind to random TCP port
-        config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
-    else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
-            socket.setsockopt(zmq.IPV6, 1)
-
-        config_socket(socket, socket_type)
-
-        if bind:
-            socket.bind(endpoint)
-        else:
-            socket.connect(endpoint)
-
-        return socket
-
-
-def get_zmq_socket_on_host(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    host: Optional[str] = None,
-) -> Tuple[int, zmq.Socket]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
-
-    Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
-    """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port
-    config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
-
-
-def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-
-def dump_to_file(dirpath, name, value):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() != 0:
-        return
-
-    os.makedirs(dirpath, exist_ok=True)
-    if value.dtype is torch.bfloat16:
-        value = value.float()
-    value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
-
-
-def is_triton_3():
-    return triton.__version__.startswith("3.")
-
-
-def maybe_torch_compile(*args, **kwargs):
-    """
-    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
-    Therefore, we disable it here.
-    """
-
-    def decorator(func):
-        if is_triton_3():
-            return torch.compile(*args, **kwargs)(func)
-        return func
-
-    return decorator
-
-
 def delete_directory(dirpath):
     try:
         # This will remove the directory and all its contents
@@ -1632,6 +1344,12 @@ def add_prometheus_track_response_middleware(app):
         )
     )
 
+    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
+    # that passes `receive` through, so request.is_disconnected() keeps working.
+    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
+
+    patch_app_http_middleware(app)
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
@@ -1671,15 +1389,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
             return route.path, True
 
     return request.url.path, False
-
-
-def bind_port(port):
-    """Bind to a specific port, assuming it's available."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
-    sock.bind(("", port))
-    sock.listen(1)
-    return sock
 
 
 def get_amdgpu_memory_capacity():
@@ -2089,7 +1798,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2457,6 +2171,44 @@ def nullable_str(val: str):
     return val
 
 
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
+
+
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
     try:
@@ -2611,80 +2363,6 @@ def _configure_uvicorn_access_log_filter(
             loggers_cfg["uvicorn.access"]["filters"] = filters_list
         if filter_name not in filters_list:
             filters_list.append(filter_name)
-
-
-def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
-    if port is not None:
-        port = int(port)
-        while True:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", port))
-                    return port
-            except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
-
-
-def maybe_wrap_ipv6_address(address: str) -> str:
-    if is_valid_ipv6_address(address):
-        return f"[{address}]"
-    return address
-
-
-def format_tcp_address(ip: str, port: int) -> str:
-    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
-
-
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -2864,8 +2542,18 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
+    # Check if the model_path is a local path
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    from huggingface_hub import try_to_load_from_cache
+
+    # Check if the model_path is a HuggingFace model ID and exists locally
+    result = try_to_load_from_cache(model_path, "hf_quant_config.json")
+    if isinstance(result, str):
+        return True
+
+    # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
         from huggingface_hub import HfApi
 
@@ -2915,107 +2603,6 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
-
-
-def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
-        return None
-    try:
-        import netifaces
-    except ImportError as e:
-        raise ImportError(
-            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
-        ) from e
-
-    try:
-        addresses = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addresses:
-            for addr_info in addresses[netifaces.AF_INET]:
-                ip = addr_info.get("addr")
-                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-                    return ip
-        if netifaces.AF_INET6 in addresses:
-            for addr_info in addresses[netifaces.AF_INET6]:
-                ip = addr_info.get("addr")
-                if ip and not ip.startswith("fe80::") and ip != "::1":
-                    return ip.split("%")[0]
-    except (ValueError, OSError) as e:
-        logger.warning(
-            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
-        )
-    return None
-
-
-def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
-    return None
-
-
-def get_local_ip_auto(fallback: str = None) -> str:
-    """
-    Automatically detect the local IP address using multiple fallback strategies.
-
-    This function attempts to obtain the local IP address through several methods.
-    If all methods fail, it returns the specified fallback value or raises an exception.
-
-    Args:
-        fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to
-            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
-            Defaults to None.
-
-    Returns:
-        str: The detected local IP address, or the fallback value if detection fails.
-
-    Raises:
-        ValueError: If IP detection fails and no fallback value is provided.
-
-    Note:
-        The function tries detection methods in the following order:
-        1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
-    """
-    # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    logger.debug("get_ip failed")
-    # Fallback
-    if ip := get_local_ip_by_nic():
-        return ip
-    logger.debug("get_local_ip_by_nic failed")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed")
-    if fallback:
-        return fallback
-    raise ValueError("Can not get local ip")
 
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.

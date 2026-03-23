@@ -79,6 +79,7 @@ class NpuFuseEPDispatcher(BaseDispatcher):
             gmm2_weight_scale=kwargs["gmm2_weight_scale"],
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             num_experts=self.num_experts,
+            fuse_mode=envs.SGLANG_NPU_FUSED_MOE_MODE.get(),
         )
         return FuseEPDispatchOutput(hidden_states)
 

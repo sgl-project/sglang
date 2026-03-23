@@ -35,18 +35,18 @@ class NgramEmbedding(torch.nn.Module):
         )
         self.n_grams = (over_embedding_n - 1) * over_embedding_k
         oe_hidden_dim = embedding_dim // (over_embedding_k * (over_embedding_n - 1))
-        self.exclusive_oe_embeder_size_sums = torch.zeros(
+        self.exclusive_oe_embedder_size_sums = torch.zeros(
             [over_embedding_k * (over_embedding_n - 1) + 1],
             dtype=torch.int32,
             device="cuda",
         )
         for i in range(over_embedding_k * (over_embedding_n - 1)):
-            self.exclusive_oe_embeder_size_sums[i + 1] = (
-                self.exclusive_oe_embeder_size_sums[i]
+            self.exclusive_oe_embedder_size_sums[i + 1] = (
+                self.exclusive_oe_embedder_size_sums[i]
                 + int(over_embedding_m + i * 2 + 1)
             )
         self.oe_embeder = VocabParallelEmbedding(
-            num_embeddings=self.exclusive_oe_embeder_size_sums[-1],
+            num_embeddings=self.exclusive_oe_embedder_size_sums[-1],
             embedding_dim=oe_hidden_dim,
             enable_tp=is_dp_attention_enabled(),
         )
@@ -100,8 +100,8 @@ class NgramEmbedding(torch.nn.Module):
                     ".weight", ""
                 )
             )
-            oe_weight_start = self.exclusive_oe_embeder_size_sums[index]
-            oe_weight_end = self.exclusive_oe_embeder_size_sums[index + 1]
+            oe_weight_start = self.exclusive_oe_embedder_size_sums[index]
+            oe_weight_end = self.exclusive_oe_embedder_size_sums[index + 1]
             assert (
                 oe_weight_end - oe_weight_start == loaded_weight.shape[0]
             ), f"{oe_weight_end - oe_weight_start=} {loaded_weight.shape[0]=}"
@@ -147,7 +147,7 @@ class NgramEmbedding(torch.nn.Module):
                 ne_weights=self.oe_weights,
                 ne_mods=self.oe_mods,
                 tokens=input_ids.to(torch.int32),
-                exclusive_ne_embeder_size_sums=self.exclusive_oe_embeder_size_sums,
+                exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
                 exclusive_req_len_sums=self.exclusive_req_len_sums[
                     : forward_batch.batch_size + 1
                 ],

@@ -6,6 +6,8 @@ from typing import Dict
 
 import torch
 
+from sglang.srt.utils import is_npu
+
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
 
@@ -32,6 +34,9 @@ class ForwardInputBuffers:
         return new_buffer.as_strided(buffer_size, buffer_stride)
 
     def share_buffers(self):
+        # disable share input buffer on npu due to accuracy issue
+        if is_npu():
+            return
 
         for f in fields(self):
             name = f.name

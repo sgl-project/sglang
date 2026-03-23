@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -15,6 +16,15 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+@cache_once
+def _jit_rotary_embedding_module() -> Module:
+    return load_jit(
+        "rotary_embedding",
+        cuda_files=["elementwise/pos_enc.cuh"],
+        cuda_wrappers=[("rotary_embedding", "RotaryEmbeddingKernel::run")],
+    )
 
 
 @cache_once
@@ -29,6 +39,56 @@ def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> 
             ("run_rope_store", f"FusedRopeKernel<{args}>::run_fused"),
         ],
     )
+
+
+@register_custom_op(
+    op_name="rotary_embedding_with_key",
+    mutates_args=["query", "key"],
+)
+def rotary_embedding_with_key(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    module = _jit_rotary_embedding_module()
+    module.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+
+@register_custom_op(
+    op_name="rotary_embedding_without_key",
+    mutates_args=["query"],
+)
+def rotary_embedding_without_key(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    module = _jit_rotary_embedding_module()
+    module.rotary_embedding(positions, query, None, head_size, cos_sin_cache, is_neox)
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+):
+    if key is None:
+        rotary_embedding_without_key(
+            positions, query, head_size, cos_sin_cache, is_neox
+        )
+    else:
+        rotary_embedding_with_key(
+            positions, query, key, head_size, cos_sin_cache, is_neox
+        )
+    return query, key
 
 
 @dataclass
@@ -117,6 +177,7 @@ def apply_rope_inplace_with_kvcache(
 
 
 # NOTE: this name is intentionally set as the old kernel in `sgl_kernel`
+@maybe_wrap_jit_kernel_debug
 def apply_rope_with_cos_sin_cache_inplace(
     q: torch.Tensor,
     k: torch.Tensor,

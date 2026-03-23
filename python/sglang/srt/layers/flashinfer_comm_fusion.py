@@ -4,8 +4,12 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
@@ -14,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _flashinfer_comm = None
 _workspace_manager = None
+_flashinfer_allreduce_unavailable = False
 
 if is_flashinfer_available():
     try:
@@ -24,15 +29,21 @@ if is_flashinfer_available():
         ):
             _flashinfer_comm = comm
         else:
+            _flashinfer_allreduce_unavailable = True
             logger.warning(
                 "flashinfer.comm unified allreduce_fusion API is not available, "
                 "falling back to standard implementation"
             )
     except ImportError:
+        _flashinfer_allreduce_unavailable = True
         logger.warning(
             "flashinfer.comm is not available, falling back to standard "
             "implementation"
         )
+
+
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
 
 
 class FlashInferWorkspaceManager:
@@ -57,7 +68,7 @@ class FlashInferWorkspaceManager:
         """Initialize workspace"""
         if _flashinfer_comm is None:
             logger.warning(
-                "FlashInfer comm not available, skipping workspace " "initialization"
+                "FlashInfer comm not available, skipping workspace initialization"
             )
             return
 
@@ -73,7 +84,12 @@ class FlashInferWorkspaceManager:
                 force_oneshot_support=bool(use_oneshot),
             )
         except Exception as e:
-            logger.warning(f"Failed to initialize FlashInfer workspace: {e}")
+            global _flashinfer_allreduce_unavailable
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                f"Failed to initialize FlashInfer workspace: {e}. "
+                "Disabling flashinfer allreduce fusion permanently."
+            )
             self.workspace = None
             self.initialized = False
             return
@@ -138,16 +154,32 @@ def ensure_workspace_initialized(
     dtype: torch.dtype = torch.float16,
     token_num: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized"""
+    if _flashinfer_allreduce_unavailable:
+        return False
+
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        rank = get_attn_tensor_model_parallel_rank()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            rank = get_moe_expert_parallel_rank()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            rank = get_moe_tensor_parallel_rank()
+
     if world_size <= 1:
         return False
 
-    rank = get_tensor_model_parallel_rank()
     token_num = token_num or max_token_num
 
     if (
@@ -182,6 +214,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
@@ -201,6 +234,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Use FlashInfer's fused allreduce + residual + RMS norm operation
@@ -214,17 +248,28 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
         fp32_acc: Whether to use fp32 precision
+        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
-            "FlashInfer not available, falling back to standard " "implementation"
+            "FlashInfer not available, falling back to standard implementation"
         )
         return None, None
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
@@ -244,6 +289,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         dtype=input_tensor.dtype,
         token_num=input_tensor.shape[0],
         use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None

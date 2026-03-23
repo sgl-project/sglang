@@ -8,15 +8,27 @@ Compares:
 Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels
 
 Usage:
-    python scripts/bench_diffusion_rmsnorm.py
+    cd /path/to/sglang
+    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_rmsnorm.py
 
 Requirements:
-    pip install triton  # for triton.testing timing utilities
-    # SGLang must be installed and CUDA available
+    # Run inside the configured SGLang diffusion container shell.
+    # This script auto-selects an idle GPU when CUDA_VISIBLE_DEVICES is unset.
 """
 
+import os
+import sys
 import time
+from pathlib import Path
 from typing import Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from diffusion_skill_env import configure_runtime_env
+
+configure_runtime_env(required_gpus=1)
 
 import torch
 
@@ -75,6 +87,7 @@ def run_benchmark():
     print("=" * 72)
     print("SGLang Diffusion RMSNorm Micro-Benchmark: JIT CUDA vs PyTorch")
     print("=" * 72)
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     print(f"Device: {torch.cuda.get_device_name(0)}")
     cap = torch.cuda.get_device_capability()
     print(f"Compute Capability: sm_{cap[0]}{cap[1]}")
@@ -169,21 +182,25 @@ def run_benchmark():
     jit_avg, _ = benchmark_kernel(diffusion_rmsnorm, (x, weight, 1e-6))
 
     bandwidth_gbps = (total_bytes / 1e9) / (jit_avg / 1000)
-    theoretical_bw = {
-        (9, 0): 3350,  # H100: 3.35 TB/s
-        (8, 0): 2000,  # A100 80GB
-    }.get(
-        cap, 320
-    )  # T4: 320 GB/s
+    device_name = torch.cuda.get_device_name(0)
+    if "H200" in device_name:
+        theoretical_bw = 4800  # H200 SXM: ~4.8 TB/s
+    else:
+        theoretical_bw = {
+            (9, 0): 3350,  # H100: 3.35 TB/s
+            (8, 0): 2000,  # A100 80GB
+        }.get(
+            cap, 320
+        )  # T4: 320 GB/s
     efficiency = bandwidth_gbps / theoretical_bw * 100
 
     print(f"  Shape: [{bt} × {hid}]  dtype: {dtype}")
     print(f"  Total data: {total_bytes / 1e6:.1f} MB")
     print(f"  Achieved: {bandwidth_gbps:.1f} GB/s")
-    print(f"  Theoretical ({torch.cuda.get_device_name(0)}): {theoretical_bw} GB/s")
+    print(f"  Theoretical ({device_name}): {theoretical_bw} GB/s")
     print(f"  Bandwidth efficiency: {efficiency:.1f}%")
     print()
-    print("Target: ≥ 30% efficiency (H100/A100), ≥ 40% (T4)")
+    print("Target: ≥ 30% efficiency (H200/H100/A100), ≥ 40% (T4)")
 
 
 if __name__ == "__main__":

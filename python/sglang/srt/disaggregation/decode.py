@@ -21,10 +21,11 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -82,6 +83,11 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
         req.bootstrap_host is None
         and server_args.disaggregation_transfer_backend == "fake"
     )
+
+
+def _bootstrap_addr(req: Req) -> str:
+    # FIXME: make a property of a req
+    return f"{req.bootstrap_host}:{req.bootstrap_port}"
 
 
 class DecodeReqToTokenPool:
@@ -265,6 +271,10 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
+        self._ensure_retry_count: Dict[str, int] = {}
+        self._max_ensure_retries: int = 20  # scheduling cycles
+        self._ensure_last_attempt_time: Dict[str, float] = {}
+        self._ensure_retry_interval: float = 1.0  # seconds
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -352,22 +362,23 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is None:
-                self.pending_reqs.append(req)
+            # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
+            if _is_fake_transfer(req, self.scheduler.server_args):
+                self._create_receiver_and_enqueue(req, 0)
                 return
-            self._create_receiver_and_enqueue(req, prefill_dp_rank)
+
+            # Fast path: cache-only lookup, no network calls
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                self._create_receiver_and_enqueue(req, prefill_dp_rank)
+            else:
+                self.pending_reqs.append(req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
             return req.disagg_prefill_dp_rank
 
-        if _is_fake_transfer(req, self.scheduler.server_args):
-            return 0
-
-        bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
-
-        prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         if prefill_info is None:
             return None
 
@@ -389,7 +400,7 @@ class DecodePreallocQueue:
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
             prefill_dp_rank=prefill_dp_rank,
         )
@@ -493,47 +504,91 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _ensure_prefill_info(
+        self, addr_to_reqs: Dict[str, List[Req]]
+    ) -> Tuple[Dict[str, List[Req]], List[Req]]:
+        """Non-blocking ensure parallel info for each addr.
+        Returns (ready_addrs, remaining_reqs)."""
+        ready: Dict[str, List[Req]] = {}
+        remaining: List[Req] = []
+
+        now = time.monotonic()
+        for bootstrap_addr, reqs in addr_to_reqs.items():
+            last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
+            if last_attempt is not None and (
+                now - last_attempt < self._ensure_retry_interval
+            ):
+                remaining.extend(reqs)
+                continue
+
+            self._ensure_last_attempt_time[bootstrap_addr] = now
+
+            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+                if bootstrap_addr in self._ensure_retry_count:
+                    del self._ensure_retry_count[bootstrap_addr]
+                if bootstrap_addr in self._ensure_last_attempt_time:
+                    del self._ensure_last_attempt_time[bootstrap_addr]
+                ready[bootstrap_addr] = reqs
+                continue
+
+            count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
+            self._ensure_retry_count[bootstrap_addr] = count
+
+            if count >= self._max_ensure_retries:
+                error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
+                logger.error(error_msg)
+                for req in reqs:
+                    prepare_abort(
+                        req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    self.scheduler.stream_output([req], req.return_logprob)
+                del self._ensure_retry_count[bootstrap_addr]
+                del self._ensure_last_attempt_time[bootstrap_addr]
+            else:
+                remaining.extend(reqs)
+
+        return ready, remaining
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
             return
 
-        bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
-
-        # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the prefill_dp_ranks
-        # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving it.
-        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-            return
-
-        resolved = []
-        need_query = []
+        # Group pending requests by bootstrap_addr
+        addr_to_reqs: Dict[str, List[Req]] = {}
         for req in self.pending_reqs:
-            # NOTE: we need resolve it again because we may ensure the parallel info here
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is not None:
-                resolved.append((req, prefill_dp_rank))
-            else:
-                need_query.append(req)
+            addr = _bootstrap_addr(req)
+            addr_to_reqs.setdefault(addr, []).append(req)
 
-        if need_query:
-            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+        # Pass 1: ensure parallel info for each addr
+        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-            rooms = [req.bootstrap_room for req in need_query]
-            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                bootstrap_addr, rooms
-            )
-            remaining = []
-            for req in need_query:
-                room_key = str(req.bootstrap_room)
-                if room_key in room_to_rank:
-                    resolved.append((req, int(room_to_rank[room_key])))
+        # Pass 2: resolve dp rank for addrs whose info is available
+        resolved = []
+        for bootstrap_addr, reqs in ready_addrs.items():
+            need_query: List[Req] = []
+            for req in reqs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                if prefill_dp_rank is not None:
+                    resolved.append((req, prefill_dp_rank))
                 else:
-                    remaining.append(req)
-            self.pending_reqs = remaining
-        else:
-            self.pending_reqs = []
+                    need_query.append(req)
+
+            if need_query:
+                rooms = [req.bootstrap_room for req in need_query]
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr, rooms
+                )
+                for req in need_query:
+                    prefill_dp_rank = room_to_rank.get(str(req.bootstrap_room))
+                    if prefill_dp_rank is not None:
+                        resolved.append((req, int(prefill_dp_rank)))
+                    else:
+                        remaining.append(req)
+
+        self.pending_reqs = remaining
 
         for req, prefill_dp_rank in resolved:
             self._create_receiver_and_enqueue(req, prefill_dp_rank)

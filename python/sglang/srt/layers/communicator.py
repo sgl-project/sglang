@@ -21,9 +21,11 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -50,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -100,6 +103,10 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and not is_flashinfer_allreduce_unavailable()
+        # FlashInfer's TRT-LLM allreduce backend creates its own NCCL communicator
+        # which doesn't support PyTorch sub-process groups used by context parallelism
+        and get_global_server_args().attn_cp_size <= 1
     )
 
 
@@ -135,6 +142,7 @@ class ScatterMode(Enum):
         """The scatter mode for model forward pass input and output data"""
         if is_nsa_enable_prefill_cp():
             return ScatterMode.SCATTERED
+
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -452,11 +460,11 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual
+                            hidden_states, residual, use_attn_tp_group=True
                         )
                     )
                 else:
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -668,7 +676,9 @@ class CommunicateContext:
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
             # TODO: support --moe-dense-tp-size > 1
-            ScatterMode.FULL: tp_size,
+            # With context parallel enabled, we should exclude
+            # the attn_cp_size from the total tp_size
+            ScatterMode.FULL: tp_size // attn_cp_size,
         }
         return cls(
             process_group_sizes=process_group_sizes,
@@ -840,18 +850,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
@@ -870,12 +878,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
+                    hidden_states, residual, use_attn_tp_group=True
                 )
                 handled = True
 
             if not handled:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
