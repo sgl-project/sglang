@@ -20,9 +20,8 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_sp_parallel_rank,
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -55,28 +54,20 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _shard_sequence_for_sp(sequence: torch.Tensor) -> torch.Tensor:
-    sp_world_size = get_sp_world_size()
-    if sp_world_size <= 1:
-        return sequence
-
-    seq_len = sequence.shape[0]
-    if seq_len % sp_world_size != 0:
-        pad_len = sp_world_size - (seq_len % sp_world_size)
-        pad = sequence[-1:].repeat(pad_len)
-        sequence = torch.cat([sequence, pad], dim=0)
-
-    local_len = sequence.shape[0] // sp_world_size
-    rank = get_sp_parallel_rank()
-    start = rank * local_len
-    end = start + local_len
-    return sequence[start:end]
-
-
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
     NunchakuFeedForward = None
+
+
+def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
+    """get the local seq len, from seq_len padding to the next multiple of sp_world_size, then shard to local"""
+    if sp_world_size <= 1:
+        return seq_len
+    padded_len = seq_len
+    if padded_len % sp_world_size != 0:
+        padded_len += sp_world_size - (padded_len % sp_world_size)
+    return padded_len // sp_world_size
 
 
 def _get_qkv_projections(
@@ -671,6 +662,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_query,
             joint_key,
             joint_value,
+            num_replicated_prefix=seq_len_txt,
         )
 
         # Reshape back
@@ -712,11 +704,6 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
-        mod_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "svdquant")
-            else None
-        )
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
@@ -1134,19 +1121,23 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        sp_world_size = get_sp_world_size()
+
         modulate_index_list = []
         for sample in img_shapes:
-            segment_indices = []
-            for segment_idx, shape in enumerate(sample):
-                segment_size = shape[0] * shape[1] * shape[2]
-                segment_index = torch.full(
-                    (segment_size,),
-                    segment_idx,
-                    device=device,
-                    dtype=torch.int32,
+            first_size = sample[0][0] * sample[0][1] * sample[0][2]
+            total_size = sum(s[0] * s[1] * s[2] for s in sample)
+            if sp_world_size > 1:
+                first_local_size = _local_seq_len(first_size, sp_world_size)
+                tail_local_size = _local_seq_len(total_size - first_size, sp_world_size)
+                idx = torch.cat(
+                    [
+                        torch.zeros(first_local_size, device=device, dtype=torch.int),
+                        torch.ones(tail_local_size, device=device, dtype=torch.int),
+                    ]
                 )
-                segment_indices.append(_shard_sequence_for_sp(segment_index))
-            idx = torch.cat(segment_indices, dim=0)
+            else:
+                idx = (torch.arange(total_size, device=device) >= first_size).int()
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)

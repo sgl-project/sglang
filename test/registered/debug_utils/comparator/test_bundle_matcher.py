@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.comparator.bundle_matcher import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="stage-a-cpu-only", nightly=True)
 
 
 def _make_row(
