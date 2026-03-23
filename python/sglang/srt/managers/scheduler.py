@@ -2135,7 +2135,24 @@ class Scheduler(
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            _, token_usage, _, _ = self._get_token_info()
+            # Get token usage from several pools
+            token_usage = None
+            if self.is_hybrid_swa:
+                _, _, full_token_usage, swa_token_usage, *_ = self._get_swa_token_info()
+                token_usage = max(full_token_usage, swa_token_usage)
+            if self.is_hybrid_ssm:
+                _, _, full_token_usage, mamba_token_usage, *_ = (
+                    self._get_mamba_token_info()
+                )
+                token_usage = (
+                    max(token_usage, mamba_token_usage)
+                    if token_usage is not None
+                    else max(full_token_usage, mamba_token_usage)
+                )
+            if token_usage is None:
+                _, token_usage, _, _ = self._get_token_info()
+
+            assert token_usage is not None
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=token_usage
             )
@@ -2616,6 +2633,16 @@ class Scheduler(
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+
+        # Release the closure and large GPU tensors that are no longer needed.
+        # The delay_sample_func closure captures forward_batch (which holds
+        # sampling_info with vocab_mask) and logits_output (which holds
+        # next_token_logits). Without clearing these, they stay alive via
+        # batch_result in result_queue and batch_record_buf until the next
+        # iteration, causing a steady VRAM leak with structured output.
+        batch_result.delay_sample_func = None
+        if batch_result.logits_output is not None:
+            batch_result.logits_output.next_token_logits = None
 
     def process_batch_result(
         self,

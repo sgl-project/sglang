@@ -5,7 +5,7 @@ This script reads benchmark result JSON files from performance profile directori
 and saves them with metadata for artifact collection in CI.
 
 Usage:
-    python3 scripts/ci/save_metrics.py \
+    python3 scripts/ci/utils/save_metrics.py \
         --gpu-config 8-gpu-h200 \
         --partition 0 \
         --run-id 12345678 \

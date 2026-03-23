@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 import torch
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -168,3 +169,11 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
+    return wrap_method_with_debug_kernel_once(
+        attn_impl,
+        "forward",
+        op_name=f"diffusion.attn_impl.{attn_impl.__class__.__name__}.forward",
+    )

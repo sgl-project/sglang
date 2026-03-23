@@ -10,7 +10,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
@@ -23,18 +34,6 @@ if _is_npu:
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
-
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
-from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
-from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 
 # Copied and adapted from sglang
@@ -74,14 +73,14 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
-        device = x.device
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
             residual = residual.view(-1, shape[-1])
 
         if x.dtype == torch.float:
-            # fp32
+            if residual is None and self.variance_size_override is None:
+                return self.forward_native(x).view(shape)
             out = self.forward_triton(x, residual)
             if residual is not None:
                 return out[0].view(shape), out[1].view(residual_shape)
@@ -209,9 +208,7 @@ class RMSNorm(CustomOp):
         return out
 
     def extra_repr(self) -> str:
-        s = f"hidden_size={self.weight.data.size(0)}"
-        s += f", eps={self.variance_epsilon}"
-        return s
+        return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
 
 
 # Copied and adapted from sglang
@@ -549,6 +546,9 @@ def apply_qk_norm(
         _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
