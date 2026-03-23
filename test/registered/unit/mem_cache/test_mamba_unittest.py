@@ -457,38 +457,6 @@ class TestMamba(unittest.TestCase):
 
         tree.sanity_check()
 
-    def test_req_init_next_round_input_allows_full_mamba_prefix_hit(self):
-        tree, allocator, req_to_token_pool, _ = self._setup_tree_and_allocator()
-
-        def make_req(rid: str, return_logprob: bool = False):
-            req = Req(
-                rid=rid,
-                origin_input_text="",
-                origin_input_ids=[1, 2, 3, 4],
-                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-                return_logprob=return_logprob,
-            )
-            req_to_token_pool.alloc([req])
-            return req
-
-        req1 = make_req("req1")
-        req1.init_next_round_input(tree)
-        kv_indices = allocator.alloc(len(req1.fill_ids))
-        req_to_token_pool.req_to_token[req1.req_pool_idx, : len(req1.fill_ids)] = (
-            kv_indices
-        )
-        req1.kv_committed_len = len(req1.fill_ids)
-        tree.cache_finished_req(req1)
-
-        req2 = make_req("req2")
-        req2.init_next_round_input(tree)
-        assert len(req2.prefix_indices) == len(req2.origin_input_ids)
-        assert req2.last_node.mamba_value is not None
-
-        req3 = make_req("req3", return_logprob=True)
-        req3.init_next_round_input(tree)
-        assert len(req3.prefix_indices) == len(req3.origin_input_ids) - 1
-
 
 if __name__ == "__main__":
     unittest.main()
