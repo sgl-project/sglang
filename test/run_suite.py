@@ -1,5 +1,6 @@
 import argparse
 import glob
+import os
 import sys
 from typing import List
 
@@ -169,9 +170,13 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # All tests (per-commit and nightly) are now in registered/
+    # Use absolute paths so the script works from any working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     files = [
         f
-        for f in glob.glob("registered/**/*.py", recursive=True)
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
         if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
     ]
     # Strict: all registered files must have proper registration
