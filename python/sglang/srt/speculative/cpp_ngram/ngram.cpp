@@ -1,10 +1,8 @@
 #include "ngram.h"
 
-#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <thread>
 
 #include "trie.h"
 
@@ -72,12 +70,10 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
 
   trie_ = std::make_unique<Trie>(capacity, param_);
 
-  quit_flag_ = false;
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
 }
 
 Ngram::~Ngram() {
-  quit_flag_ = true;
   insert_queue_.close();
   if (insert_worker_.joinable()) {
     insert_worker_.join();
@@ -85,25 +81,31 @@ Ngram::~Ngram() {
 }
 
 void Ngram::synchronize() const {
-  while (!insert_queue_.empty()) {
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
-  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
 }
 
 void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_count_ += tokens.size();
+  }
   for (auto&& token : tokens) {
     insert_queue_.enqueue(std::move(token));
   }
 }
 
 void Ngram::insertWorker() {
-  while (!quit_flag_) {
+  for (;;) {
     std::vector<int32_t> data;
     if (!insert_queue_.dequeue(data)) {
-      continue;
+      break;
     }
     std::unique_lock<std::mutex> lock(mutex_);
     trie_->insert(data.data(), data.size());
+    --pending_count_;
+    lock.unlock();
+    sync_cv_.notify_all();
   }
 }
 

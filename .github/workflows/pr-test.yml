@@ -345,7 +345,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-small-1-gpu", "stage-a-cpu-only"]'
+          jobs: '["stage-a-test-1-gpu-small", "stage-a-test-cpu"]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -377,9 +377,9 @@ jobs:
           stage-name: stage-b
           jobs: |
             [
-              {"prefix": "stage-b-test-small-1-gpu", "expected_count": 8},
-              {"prefix": "stage-b-test-large-1-gpu", "expected_count": 14},
-              {"prefix": "stage-b-test-large-2-gpu", "expected_count": 4},
+              {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
+              {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
+              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4},
               {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
             ]
           max-wait-minutes: '480'
@@ -833,12 +833,12 @@ jobs:
   # =============================================== primary ====================================================
 
   # Runs on 5090 (32GB, SM120)
-  stage-a-test-small-1-gpu:
+  stage-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-small-1-gpu') ||
+        (inputs.target_stage == 'stage-a-test-1-gpu-small') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -876,17 +876,17 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-small-1-gpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
 
-  stage-a-cpu-only:
+  stage-a-test-cpu:
     needs: [check-changes, call-gate]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-cpu-only') ||
+        (inputs.target_stage == 'stage-a-test-cpu') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -932,15 +932,15 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
-  stage-b-test-small-1-gpu:
+  stage-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu') ||
+        (inputs.target_stage == 'stage-b-test-1-gpu-small') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -988,7 +988,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -996,12 +996,12 @@ jobs:
           artifact-suffix: ${{ matrix.partition }}
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
-  stage-b-test-large-1-gpu:
+  stage-b-test-1-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu') ||
+        (inputs.target_stage == 'stage-b-test-1-gpu-large') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1044,19 +1044,19 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
-  stage-b-test-large-2-gpu:
+  stage-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu') ||
+        (inputs.target_stage == 'stage-b-test-2-gpu-large') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1101,7 +1101,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1502,12 +1502,12 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.part }}
 
-  stage-c-test-deepep-4-gpu:
+  stage-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-c-test-deepep-4-gpu') ||
+        (inputs.target_stage == 'stage-c-test-deepep-4-gpu-h100') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1557,7 +1557,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1753,16 +1753,16 @@ jobs:
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
 
-        stage-a-test-small-1-gpu,
-        stage-a-cpu-only,
-        stage-b-test-small-1-gpu,
-        stage-b-test-large-1-gpu,
-        stage-b-test-large-2-gpu,
+        stage-a-test-1-gpu-small,
+        stage-a-test-cpu,
+        stage-b-test-1-gpu-small,
+        stage-b-test-1-gpu-large,
+        stage-b-test-2-gpu-large,
         stage-b-test-4-gpu-b200,
         stage-c-test-4-gpu-h100,
         stage-c-test-8-gpu-h20,
         stage-c-test-8-gpu-h200,
-        stage-c-test-deepep-4-gpu,
+        stage-c-test-deepep-4-gpu-h100,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
         # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
