@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
+    wrap_attention_impl_forward,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
@@ -73,6 +74,7 @@ class UlyssesAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -252,6 +254,7 @@ class LocalAttention(nn.Module):
             causal=causal,
             **extra_impl_args,
         )
+        wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -338,6 +341,7 @@ class USPAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -354,6 +358,7 @@ class USPAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         num_replicated_prefix: int = 0,
+        num_replicated_suffix: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -364,6 +369,9 @@ class USPAttention(nn.Module):
                 in FLUX joint attention.  These tokens are excluded from the
                 Ulysses all-to-all so they appear exactly once in the gathered
                 sequence, preserving correct attention weights.
+            num_replicated_suffix: number of trailing tokens in q/k/v that are
+                replicated across all SP ranks, e.g. caption tokens appended
+                after image tokens in Z-Image joint attention.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -378,9 +386,17 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
+        if num_replicated_prefix > 0 and num_replicated_suffix > 0:
+            raise ValueError(
+                "USPAttention does not support replicated prefix and suffix at the same time."
+            )
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
                 q, k, v, ctx_attn_metadata, num_replicated_prefix
+            )
+        if sp_size > 1 and num_replicated_suffix > 0:
+            return self._forward_with_replicated_suffix(
+                q, k, v, ctx_attn_metadata, num_replicated_suffix
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -468,3 +484,34 @@ class USPAttention(nn.Module):
         out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    def _forward_with_replicated_suffix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        num_rep: int,
+    ) -> torch.Tensor:
+        """Ulysses attention where the last num_rep tokens are replicated
+        across SP ranks and should not be duplicated by the all-to-all."""
+        if num_rep <= 0:
+            raise ValueError("num_rep must be positive for replicated suffix.")
+
+        q_shard, q_rep = q[:, :-num_rep], q[:, -num_rep:]
+        k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
+        v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
+
+        # dense self-attention is permutation equivariant for non-causal use.
+        # 1. rotate the replicated suffix to the front
+        # 2. reuse the validated replicated-prefix path, then
+        # 3. rotate the output back
+        out = self._forward_with_replicated_prefix(
+            torch.cat([q_rep, q_shard], dim=1),
+            torch.cat([k_rep, k_shard], dim=1),
+            torch.cat([v_rep, v_shard], dim=1),
+            ctx_attn_metadata,
+            num_rep,
+        )
+        out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
+        return torch.cat([out_shard, out_rep], dim=1)

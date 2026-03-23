@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -799,6 +800,9 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
+        # For hisparse
+        self.staging = False
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1342,6 +1346,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
     def init_new(
@@ -1997,6 +2004,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        # Clear context parallel metadata - CP is only for prefill, not decode
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
+            self.nsa_cp_metadata = None
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -2058,6 +2071,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+            )
 
         if get_global_server_args().enable_mamba_extra_buffer():
             if len(self.reqs) == 0:

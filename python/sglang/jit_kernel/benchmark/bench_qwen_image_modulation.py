@@ -8,7 +8,6 @@ from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
-    fuse_scale_shift_gate_select01_kernel,
 )
 from sglang.utils import is_in_ci
 
@@ -21,7 +20,7 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-6
 LINE_VALS = ["split", "fused"]
-LINE_NAMES = ["Split Kernels", "Fused Triton"]
+LINE_NAMES = ["Triton Norm + Torch Select", "Fused Triton"]
 STYLES = [("red", "-"), ("blue", "--")]
 CONFIG = [(b, s, d) for b in B_RANGE for s in S_RANGE for d in D_RANGE]
 
@@ -38,6 +37,23 @@ def _make_common_inputs(batch_size: int, seq_len: int, hidden_size: int):
     shift1 = torch.randn(batch_size, hidden_size, dtype=DTYPE, device=DEVICE)
     gate1 = torch.randn(batch_size, hidden_size, dtype=DTYPE, device=DEVICE)
     return x, weight, bias, index, scale0, shift0, gate0, scale1, shift1, gate1
+
+
+def _apply_select01_modulation(
+    x: torch.Tensor,
+    scale0: torch.Tensor,
+    shift0: torch.Tensor,
+    gate0: torch.Tensor,
+    scale1: torch.Tensor,
+    shift1: torch.Tensor,
+    gate1: torch.Tensor,
+    index: torch.Tensor,
+):
+    idx = index.bool().unsqueeze(-1)
+    scale = torch.where(idx, scale1.unsqueeze(1), scale0.unsqueeze(1))
+    shift = torch.where(idx, shift1.unsqueeze(1), shift0.unsqueeze(1))
+    gate = torch.where(idx, gate1.unsqueeze(1), gate0.unsqueeze(1))
+    return x * (1 + scale) + shift, gate
 
 
 @triton.testing.perf_report(
@@ -70,15 +86,8 @@ def bench_layernorm_scale_shift_gate_select01(
                 eps=EPS,
                 is_rms_norm=False,
             ).view_as(x)
-            return fuse_scale_shift_gate_select01_kernel(
-                normalized,
-                scale0=scale0,
-                shift0=shift0,
-                gate0=gate0,
-                scale1=scale1,
-                shift1=shift1,
-                gate1=gate1,
-                index=index,
+            return _apply_select01_modulation(
+                normalized, scale0, shift0, gate0, scale1, shift1, gate1, index
             )
 
     else:
@@ -134,15 +143,8 @@ def bench_residual_layernorm_scale_shift_gate_select01(
                 eps=EPS,
                 is_rms_norm=False,
             ).view_as(residual_out)
-            return fuse_scale_shift_gate_select01_kernel(
-                normalized,
-                scale0=scale0,
-                shift0=shift0,
-                gate0=gate0,
-                scale1=scale1,
-                shift1=shift1,
-                gate1=gate1,
-                index=index,
+            return _apply_select01_modulation(
+                normalized, scale0, shift0, gate0, scale1, shift1, gate1, index
             )
 
     else:
