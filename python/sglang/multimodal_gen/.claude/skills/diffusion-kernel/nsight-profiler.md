@@ -62,29 +62,37 @@ nsys export -t json report.nsys-rep
 nsys stats report.nsys-rep
 ```
 
+Child-process note:
+- If the target launches worker processes, add `--trace-fork-before-exec=true`.
+- For `sglang generate`, this is usually required to capture the real worker trace.
+
 ### 2. Nsight Compute Profiling
 
 Detailed kernel analysis:
 
 ```bash
 # Profile all kernels
-ncu -o profile ./cuda_program
+ncu --target-processes all -o profile ./cuda_program
 
 # Profile specific kernel
-ncu --kernel-name myKernel -o profile ./cuda_program
+ncu --target-processes all --kernel-name myKernel -o profile ./cuda_program
 
 # Full metric collection
-ncu --set full -o profile ./cuda_program
+ncu --target-processes all --set full -o profile ./cuda_program
 
 # Roofline analysis
-ncu --set roofline -o profile ./cuda_program
+ncu --target-processes all --set roofline -o profile ./cuda_program
 
 # Memory analysis
-ncu --section MemoryWorkloadAnalysis -o profile ./cuda_program
+ncu --target-processes all --section MemoryWorkloadAnalysis -o profile ./cuda_program
 
-# Compare two runs
-ncu --import baseline.ncu-rep --diff ./cuda_program
+# Import an existing report
+ncu --import profile.ncu-rep --page details --csv
 ```
+
+Child-process note:
+- If the target forks or spawns subprocesses, use `--target-processes all`.
+- For `sglang generate`, this is the safer default.
 
 ### 3. Occupancy Analysis
 
@@ -175,10 +183,10 @@ Compare kernel variants:
 
 ```bash
 # Step 1: Profile baseline
-ncu --set full -o baseline ./program_v1
+ncu --target-processes all --set full -o baseline ./program_v1
 
 # Step 2: Profile optimized version
-ncu --set full -o optimized ./program_v2
+ncu --target-processes all --set full -o optimized ./program_v2
 
 # Step 3: Export both profiles to CSV, then compare with Python (no GUI needed)
 # Note: --import can only be specified once; --page diff is not a valid page value.
@@ -197,6 +205,7 @@ for k in sorted(set(b) | set(o)):
     if bv != ov:
         print(f'{k[:55]:<55} {bv} -> {ov}')
 "
+```
 
 ### 8. Performance Recommendations
 
