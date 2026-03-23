@@ -1,9 +1,12 @@
 import hashlib
+import json
 import logging
 import os
+import time
+import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -11,6 +14,9 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
+
+# Bump when MetadataEntry/Snapshot structure changes
+METADATA_SCHEMA_VERSION = 1
 
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
@@ -42,6 +48,36 @@ def hash_str_to_int64(hash_str: str) -> int:
     if uint64_val >= 2**63:
         return uint64_val - 2**64
     return uint64_val
+
+
+@dataclass
+class MetadataEntry:
+    """Single KV cache page metadata, the minimal unit of a snapshot."""
+
+    hash_key: str  # SHA256 hash of this page (the L3 storage key)
+    parent_hash: Optional[str]  # parent page hash (prior_hash in chain), None for root
+    token_ids: list  # token ids in this page (len = page_size)
+    # element type: int; EAGLE bigram mode: tuple[int, int]
+    schema_version: int = METADATA_SCHEMA_VERSION
+    priority: int = 0
+    extra_key: Optional[str] = None  # tenant / namespace
+    ts_unix_ms: int = 0
+
+
+@dataclass
+class MetadataSnapshot:
+    """Metadata snapshot of valid KV cache pages in L3 at a point in time."""
+
+    schema_version: int  # METADATA_SCHEMA_VERSION at write time
+    version: str  # snapshot version id (timestamp or UUID)
+    scope: Dict[str, str]  # model/tp/pp/page_size identifiers
+    entries: List[MetadataEntry]
+
+
+@dataclass
+class StorageMetadataQuery:
+    scope: Optional[Dict[str, str]] = None
+    since_version: Optional[str] = None  # incremental: only entries after this version
 
 
 @dataclass
@@ -184,6 +220,29 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    def metadata_put_entries(
+        self,
+        scope: Dict[str, str],
+        entries: List[MetadataEntry],
+    ) -> None:
+        """Write/update metadata entries. Idempotent: same hash_key overwrites."""
+        return
+
+    def metadata_get_snapshot(
+        self,
+        query: StorageMetadataQuery,
+    ) -> MetadataSnapshot:
+        """Get metadata snapshot.
+        - query.since_version=None: full snapshot
+        - query.since_version=X: incremental entries since version X
+        """
+        return MetadataSnapshot(
+            schema_version=METADATA_SCHEMA_VERSION,
+            version="0",
+            scope={},
+            entries=[],
+        )
+
 
 class HiCacheFile(HiCacheStorage):
 
@@ -198,6 +257,7 @@ class HiCacheFile(HiCacheStorage):
             storage_config.model_name,
             storage_config.is_mla_model,
         )
+        self.tp_rank = tp_rank
         model_name = "-".join(model_name.split("/")) if model_name else ""
         if is_mla_model:
             self.config_suffix = f"_{model_name}"
@@ -291,3 +351,183 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    # ---- Metadata implementation ----
+
+    def _metadata_dir(self) -> str:
+        return os.path.join(self.file_path, f"__metadata__{self.config_suffix}")
+
+    def _entries_dir(self) -> str:
+        return os.path.join(self._metadata_dir(), "entries")
+
+    def _versions_file(self) -> str:
+        return os.path.join(self._metadata_dir(), f"versions_{self.tp_rank}.jsonl")
+
+    def metadata_put_entries(
+        self,
+        scope: Dict[str, str],
+        entries: List[MetadataEntry],
+    ) -> None:
+        if not entries:
+            return
+        try:
+            entries_dir = self._entries_dir()
+            os.makedirs(entries_dir, exist_ok=True)
+
+            added_keys = []
+            for entry in entries:
+                entry_path = os.path.join(entries_dir, f"{entry.hash_key}.json")
+                try:
+                    data = asdict(entry)
+                    with open(entry_path, "w") as f:
+                        json.dump(data, f)
+                    added_keys.append(entry.hash_key)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to write metadata entry {entry.hash_key}: {e}"
+                    )
+
+            if added_keys:
+                ts_ms = int(time.time() * 1000)
+                version = f"{ts_ms}_{uuid.uuid4().hex[:8]}"
+                version_line = json.dumps(
+                    {"version": version, "ts": ts_ms, "added_keys": added_keys}
+                )
+                try:
+                    with open(self._versions_file(), "a") as f:
+                        f.write(version_line + "\n")
+                except Exception as e:
+                    logger.warning(f"Failed to append version log: {e}")
+        except Exception as e:
+            logger.warning(f"metadata_put_entries failed: {e}")
+
+    def metadata_get_snapshot(
+        self,
+        query: StorageMetadataQuery,
+    ) -> MetadataSnapshot:
+        meta_dir = self._metadata_dir()
+        entries_dir = self._entries_dir()
+
+        # Rolling upgrade: directory may not exist yet
+        if not os.path.isdir(meta_dir):
+            return MetadataSnapshot(
+                schema_version=METADATA_SCHEMA_VERSION,
+                version="0",
+                scope=query.scope or {},
+                entries=[],
+            )
+
+        if query.since_version is not None:
+            # Incremental: collect added_keys from all versions_*.jsonl after since_version
+            target_keys = self._collect_incremental_keys(meta_dir, query.since_version)
+        else:
+            target_keys = None  # full scan
+
+        entries = []
+        latest_version = "0"
+
+        if target_keys is not None:
+            # Incremental mode: only read specified entry files
+            for hk in target_keys:
+                entry = self._read_entry_file(entries_dir, hk)
+                if entry is not None:
+                    entries.append(entry)
+            # Get latest version from version logs
+            latest_version = self._get_latest_version(meta_dir) or "0"
+        else:
+            # Full scan: read all entry files
+            if os.path.isdir(entries_dir):
+                for fname in os.listdir(entries_dir):
+                    if not fname.endswith(".json"):
+                        continue
+                    hk = fname[:-5]
+                    entry = self._read_entry_file(entries_dir, hk)
+                    if entry is not None:
+                        entries.append(entry)
+            latest_version = self._get_latest_version(meta_dir) or "0"
+
+        return MetadataSnapshot(
+            schema_version=METADATA_SCHEMA_VERSION,
+            version=latest_version,
+            scope=query.scope or {},
+            entries=entries,
+        )
+
+    def _read_entry_file(
+        self, entries_dir: str, hash_key: str
+    ) -> Optional[MetadataEntry]:
+        entry_path = os.path.join(entries_dir, f"{hash_key}.json")
+        try:
+            with open(entry_path, "r") as f:
+                data = json.load(f)
+            sv = data.get("schema_version", 1)
+            if sv > METADATA_SCHEMA_VERSION:
+                logger.warning(
+                    f"Skipping entry {hash_key} with unknown schema_version={sv}"
+                )
+                return None
+            return MetadataEntry(
+                hash_key=data["hash_key"],
+                parent_hash=data.get("parent_hash"),
+                token_ids=data.get("token_ids", []),
+                schema_version=sv,
+                priority=data.get("priority", 0),
+                extra_key=data.get("extra_key"),
+                ts_unix_ms=data.get("ts_unix_ms", 0),
+            )
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to read metadata entry {hash_key}: {e}")
+            return None
+
+    def _collect_incremental_keys(self, meta_dir: str, since_version: str) -> List[str]:
+        """Collect added_keys from all versions_*.jsonl after since_version."""
+        all_versions = self._parse_all_version_logs(meta_dir)
+        keys = []
+        found = False
+        for ver_entry in all_versions:
+            if found:
+                keys.extend(ver_entry.get("added_keys", []))
+            elif ver_entry.get("version") == since_version:
+                found = True
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                deduped.append(k)
+        return deduped
+
+    def _get_latest_version(self, meta_dir: str) -> Optional[str]:
+        all_versions = self._parse_all_version_logs(meta_dir)
+        if all_versions:
+            return all_versions[-1].get("version", "0")
+        return None
+
+    def _parse_all_version_logs(self, meta_dir: str) -> List[dict]:
+        """Parse and merge all versions_*.jsonl files, sorted by ts."""
+        all_entries = []
+        try:
+            for fname in os.listdir(meta_dir):
+                if not fname.startswith("versions_") or not fname.endswith(".jsonl"):
+                    continue
+                fpath = os.path.join(meta_dir, fname)
+                try:
+                    with open(fpath, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                all_entries.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                logger.warning(f"Skipping corrupted line in {fname}")
+                except Exception as e:
+                    logger.warning(f"Failed to read version log {fname}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to list version logs: {e}")
+        # Sort by timestamp
+        all_entries.sort(key=lambda x: x.get("ts", 0))
+        return all_entries

@@ -655,8 +655,20 @@ class HiRadixCache(RadixCache):
             else None
         )
 
+        parent_hash = None
+        if (
+            node.parent is not None
+            and node.parent.hash_value
+            and len(node.parent.key) > 0
+        ):
+            parent_hash = node.parent.hash_value[-1]
+
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys
+            node.host_value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
+            parent_hash=parent_hash,
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()

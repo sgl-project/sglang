@@ -22,8 +22,10 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    METADATA_SCHEMA_VERSION,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    MetadataEntry,
 )
 
 if TYPE_CHECKING:
@@ -197,6 +199,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        parent_hash: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -204,6 +207,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.parent_hash = parent_hash
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -992,12 +996,17 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        parent_hash: Optional[str] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            parent_hash=parent_hash,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1038,6 +1047,61 @@ class HiCacheController:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
+    def _build_metadata_entries(
+        self, operation: StorageOperation
+    ) -> List[MetadataEntry]:
+        """Build MetadataEntry list from a completed backup operation."""
+        import time as _time
+
+        entries = []
+        completed_pages = operation.completed_tokens // self.page_size
+        if completed_pages == 0:
+            return entries
+
+        ts_ms = int(_time.time() * 1000)
+        # operation.token_ids is actually a RadixKey at runtime
+        token_ids_raw = operation.token_ids
+        raw_list = getattr(token_ids_raw, "token_ids", token_ids_raw)
+        extra_key = getattr(token_ids_raw, "extra_key", None)
+
+        for i in range(min(completed_pages, len(operation.hash_value))):
+            page_tokens = raw_list[i * self.page_size : (i + 1) * self.page_size]
+            if i == 0:
+                parent_hash = operation.parent_hash
+            else:
+                parent_hash = operation.hash_value[i - 1]
+
+            entries.append(
+                MetadataEntry(
+                    hash_key=operation.hash_value[i],
+                    parent_hash=parent_hash,
+                    token_ids=list(page_tokens),
+                    schema_version=METADATA_SCHEMA_VERSION,
+                    extra_key=extra_key,
+                    ts_unix_ms=ts_ms,
+                )
+            )
+        return entries
+
+    def _record_storage_metadata(self, operation: StorageOperation) -> None:
+        """Record metadata for a completed backup operation. Failure only warns."""
+        try:
+            entries = self._build_metadata_entries(operation)
+            if not entries:
+                return
+            scope = {
+                "model_name": self.storage_config.model_name or "",
+                "tp_size": str(self.storage_config.tp_size),
+                "tp_rank": str(self.storage_config.tp_rank),
+                "pp_size": str(self.storage_config.pp_size),
+                "pp_rank": str(self.storage_config.pp_rank),
+                "is_mla": str(self.storage_config.is_mla_model),
+                "page_size": str(self.page_size),
+            }
+            self.storage_backend.metadata_put_entries(scope, entries)
+        except Exception as e:
+            logger.warning(f"Failed to record storage metadata: {e}")
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1050,6 +1114,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
+                    self._record_storage_metadata(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
