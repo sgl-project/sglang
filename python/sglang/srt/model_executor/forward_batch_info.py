@@ -58,7 +58,6 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    get_compiler_backend,
     is_cuda,
     is_hip,
     is_npu,
@@ -1187,13 +1186,9 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if is_cuda():
+if is_cuda() or is_hip():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
-elif is_hip():
-    clamp_position = torch.compile(
-        _clamp_position_native, dynamic=True, backend=get_compiler_backend()
-    )
 else:
     clamp_position = _clamp_position_native
