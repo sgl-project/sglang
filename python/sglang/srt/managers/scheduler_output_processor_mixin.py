@@ -10,7 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
-    AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
