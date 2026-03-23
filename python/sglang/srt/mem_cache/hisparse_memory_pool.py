@@ -4,7 +4,6 @@ import weakref
 from typing import Optional
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
@@ -12,6 +11,22 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.utils import is_mps, is_npu, is_xpu
+
+# sgl_kernel.kvcacheio is not shipped for XPU/MPS (and NPU uses a different stack);
+# keep imports aligned with memory_pool_host.py so engine startup works on those backends.
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+_is_mps = is_mps()
+if not (_is_npu or _is_xpu or _is_mps):
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+else:
+
+    def transfer_kv_all_layer_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+            "It is not available on this backend."
+        )
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
