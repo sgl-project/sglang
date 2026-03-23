@@ -136,7 +136,7 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 ## CI Registry System
 
 Tests in `test/registered/` use a registry-based CI system for flexible backend/schedule configuration.
-For every test file you add, you need to register it in a suite and provide an estimate execution time.
+For every test file you add, you need to register it in a suite and provide an estimate execution time in seconds.
 
 ### Registration Functions
 
@@ -169,7 +169,64 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky - see #12345")
 ```
 
-### Available Suites
+## Available Suites
+
+You can find the available suites for each hardware backend at [`test/run_suite.py`](run_suite.py) (`PER_COMMIT_SUITES`, `NIGHTLY_SUITES`). Here we briefly describe some suites.
+
+### Per-commit (CUDA)
+
+| Suite | Runner (label) | Description |
+| --- | --- | --- |
+| `stage-a-test-1-gpu-small` | `1-gpu-5090` | Quick checks on a small NVIDIA GPU before heavier stages |
+| `stage-b-test-1-gpu-small` | `1-gpu-5090` | Core engine tests that fit a 5090-class card; work is split across parallel jobs |
+| `stage-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FP8, FA3) |
+| `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP-style workloads) on H100 |
+| `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (e.g. SM100+ paths) on four GPUs |
+| `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
+| `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
+| `stage-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
+| `stage-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and related networking on four H100s. |
+| `stage-c-test-deepep-8-gpu-h200` | `8-gpu-h200` | DeepEP at 8-GPU H200 scale. |
+| `stage-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on blackwell |
+| `stage-c-test-4-gpu-gb200` | `4-gpu-gb200`| 4-GPU GB200 suite for large models on blackwell |
+
+Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+
+### Per-commit (CPU)
+
+| Suite | Runner (label) | Description |
+| --- | --- | --- |
+| `stage-a-test-cpu` | `ubuntu-latest` | CPU-only unit tests |
+
+### Per-commit (AMD)
+
+| Suite | Runner (label) | Description |
+| --- | --- | --- |
+| `stage-a-test-1-gpu-small-amd` | `linux-mi325-1gpu-sglang` | Quick checks on one MI325-class GPU in the AMD CI container. |
+| `stage-b-test-2-gpu-large-amd` | `linux-mi325-2gpu-sglang` | 2-GPU ROCm correctness and parallel setups. |
+| `stage-b-test-large-8-gpu-35x-disaggregation-amd` | `linux-mi35x-gpu-8.fabric` | Prefill–decode disaggregation and RDMA-oriented tests on an 8×MI35x fabric runner. |
+| `stage-c-test-large-8-gpu-amd` | `linux-mi325-8gpu-sglang` | 8-GPU MI325 scaling and integration. |
+
+### Nightly
+
+Nightly registry suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](run_suite.py). They are not driven by `pr-test.yml` / `pr-test-amd*.yml`; see workflows such as `nightly-test-nvidia.yml` and `nightly-test-amd.yml`. Examples:
+
+- `nightly-1-gpu` (CUDA)
+- `nightly-8-gpu-h200` (CUDA)
+- `nightly-eval-vlm-2-gpu` (CUDA)
+- `nightly-amd` (AMD)
+- `nightly-amd-8-gpu-mi35x` (AMD)
+
+### Choosing a suite for your test
+
+Use the lightest suite that still meets your test's needs.
+
+- Prefer the CPU suite (`stage-a-test-cpu`) when no GPU is required.
+- For most small GPU workloads that fit a 5090-class card in CI, use `stage-b-test-1-gpu-small`. Most tests should go here.
+- If you really need more GPU memory capacity or Hopper-specific features, use `stage-b-test-1-gpu-large`.
+- Use multi-GPU suites only when the test actually needs multiple GPUs or other advanced multi-GPU behavior.
+
+In rare cases, if you need a new runner or custom setup, you might need to add a new suite.
 
 ## Steps for Adding a Test
 Please refer to [.claude/skills/write-sglang-test/SKILL.md](../.claude/skills/write-sglang-test/SKILL.md)
