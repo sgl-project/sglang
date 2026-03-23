@@ -35,7 +35,7 @@ on:
           - ''
           - sgl-kernel-unit-test-amd
           - sgl-kernel-unit-test-2-gpu-amd
-          - stage-a-test-1-amd
+          - stage-a-test-small-1-gpu-amd
           - jit-kernel-unit-test-amd
           - stage-b-test-small-1-gpu-amd
           - stage-b-test-small-1-gpu-amd-nondeterministic
@@ -246,12 +246,12 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-amd:
+  stage-a-test-small-1-gpu-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-small-1-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -283,7 +283,7 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-small-1-gpu-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
     needs: [check-changes]
@@ -984,7 +984,7 @@ jobs:
         multimodal-gen-test-1-gpu-amd,
         multimodal-gen-test-2-gpu-amd,
 
-        stage-a-test-1-amd,
+        stage-a-test-small-1-gpu-amd,
         jit-kernel-unit-test-amd,
         stage-b-test-small-1-gpu-amd,
         stage-b-test-small-1-gpu-amd-nondeterministic,
