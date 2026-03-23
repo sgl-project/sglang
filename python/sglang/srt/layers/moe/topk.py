@@ -291,14 +291,18 @@ class TopK(MultiPlatformOp):
             return
 
         # When a FusedMoE quant-method is being compiled, its forward_native
-        # expects StandardTopKOutput.  Instead of switching TopK to
-        # forward_native, keep forward_cuda but force STANDARD output so the
-        # optimised CUDA topk kernels stay on the hot path.
-        if override_layers is not None and any(
+        # expects StandardTopKOutput.  If TopK is NOT explicitly in the
+        # override list, keep forward_cuda but force STANDARD output so the
+        # optimised CUDA topk kernels stay on the hot path.  If TopK IS in
+        # the list, fall through to super() so it gets torch.compiled too
+        # (forward_native already returns StandardTopKOutput).
+        _has_moe = override_layers is not None and any(
             kw in name
             for name in override_layers
             for kw in self._MOE_OVERRIDE_KEYWORDS
-        ):
+        )
+        _topk_explicit = override_layers is not None and "TopK" in override_layers
+        if _has_moe and not _topk_explicit:
             self._saved_output_format = self.topk_config.output_format
             self.topk_config.output_format = TopKOutputFormat.STANDARD
             self.is_torch_compile = True
