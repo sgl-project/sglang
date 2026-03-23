@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -335,4 +336,4 @@ def test_moe_wna16_marlin_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

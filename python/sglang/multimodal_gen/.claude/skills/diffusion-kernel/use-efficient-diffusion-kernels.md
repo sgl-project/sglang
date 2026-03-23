@@ -50,6 +50,7 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - Kernel: `triton_one_pass_rms_norm`
 - Locations: `triton/rmsnorm_onepass.py`, `layernorm.py`
 - Use case: `hidden_size <= 128` in `RMSNorm.forward_cuda`.
+- `torch.compile` note: keep this path behind the custom-op wrapper in `rmsnorm_onepass.py`; direct `wrap_triton` can recompile on dynamic row counts.
 
 5. Triton RoPE fusion
 - Kernel: `apply_rotary_embedding`
@@ -62,7 +63,11 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 
 1. sgl-kernel RMSNorm and fused add RMSNorm
 - Location: `layernorm.py`
-- Behavior: CUDA uses `sgl_kernel.fused_add_rmsnorm` and `sgl_kernel.rmsnorm`. `hidden_size <= 128` uses Triton one-pass. ROCm falls back to native.
+- Behavior:
+- Standard `bf16`/`fp16` CUDA paths use `sgl_kernel.fused_add_rmsnorm` and `sgl_kernel.rmsnorm`.
+- The Z-Image `fp32` `32x2560` path under `torch.compile` avoids `wrap_triton` and uses the native fp32 path.
+- `hidden_size <= 128` uses Triton one-pass.
+- ROCm falls back to native.
 
 2. Attention backend selection (FlashAttention, Sage, SDPA)
 - Locations: `platforms/cuda.py`, `attention/selector.py`, `docs/diffusion/performance/attention_backends.md`
@@ -109,4 +114,4 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - Keep CuTe compile cache keys aligned to `(dtype, ndim, D)`.
 - Avoid implicit broadcasts that force hidden `contiguous()` copies.
 - Preserve NPU and ROCm fallback paths.
-- **Always verify with ncu** (`ncu --set full`) that the kernel achieves adequate memory bandwidth utilization (>70% of peak for bandwidth-bound ops) and occupancy (>50%). See `diffusion-benchmark-and-profile.md` Step 3.5 for the ncu workflow.
+- **Always verify with ncu** (`ncu --set full`) and compare against both the unfused baseline and the hardware roofline. Do not rely on a single universal bandwidth/occupancy threshold; the right target depends on whether the kernel is memory-bound, compute-bound, or launch-limited. See `diffusion-benchmark-and-profile.md` Step 3.5 for the ncu workflow.

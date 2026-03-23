@@ -68,6 +68,7 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
         (4608, 7168),
         (512, 7168),
         (7168, 2048),
+        (7168, 2304),
         (7168, 16384),
         (7168, 256),
         (8192, 1024),
@@ -91,14 +92,16 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
+    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
     def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
