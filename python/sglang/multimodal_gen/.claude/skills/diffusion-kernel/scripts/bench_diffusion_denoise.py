@@ -323,12 +323,16 @@ def run_benchmark_once(
                 float(total_ms) / 1000.0 if total_ms is not None else None
             )
 
-            # denoise latency: look in "steps" list for the "DenoisingStage" entry
+            # denoise latency: accept the canonical "DenoisingStage" plus
+            # model-specific variants such as "MOVADenoisingStage" and
+            # "HeliosChunkedDenoisingStage".
             # steps = [{"name": "DenoisingStage", "duration_ms": 1234.5}, ...]
             denoise_latency_s = None
             for step in perf.get("steps", []):
+                step_name = step.get("name")
                 if (
-                    step.get("name") == "DenoisingStage"
+                    isinstance(step_name, str)
+                    and "DenoisingStage" in step_name
                     and step.get("duration_ms") is not None
                 ):
                     denoise_latency_s = float(step["duration_ms"]) / 1000.0

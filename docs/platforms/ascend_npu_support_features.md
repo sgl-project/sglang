@@ -229,7 +229,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental. `BFS` uses recency-based expansion; `PROB` uses frequency-based expansion. |
-| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`max-trie-depth`         | `18`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          |   Experimental   |
 
 ## Expert parallelism

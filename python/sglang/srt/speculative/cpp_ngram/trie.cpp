@@ -21,7 +21,7 @@ Trie::Trie(size_t capacity, const Param& param) : param_(param) {
 void Trie::insert(const int32_t* tokens, size_t len) {
   for (size_t i = 0; i + param_.min_match_window_size < len; ++i) {
     auto start = tokens + i;
-    auto end = start + std::min(len - i, param_.branch_length);
+    auto end = start + std::min(len - i, param_.max_trie_depth);
 
     if (static_cast<size_t>(end - start) > free_node_count_) {
       squeeze(end - start - free_node_count_);
