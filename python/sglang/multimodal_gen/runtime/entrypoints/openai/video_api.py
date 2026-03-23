@@ -81,6 +81,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
+        rollout_log_prob_no_const=request.rollout_log_prob_no_const,
+        rollout_debug_mode=request.rollout_debug_mode,
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
@@ -187,15 +189,14 @@ async def create_video(
     frame_interpolation_exp: Optional[int] = Form(1),
     frame_interpolation_scale: Optional[float] = Form(1.0),
     frame_interpolation_model_path: Optional[str] = Form(None),
-<<<<<<< HEAD
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
-=======
     rollout: Optional[bool] = Form(False),
     rollout_sde_type: Optional[str] = Form("sde"),
     rollout_noise_level: Optional[float] = Form(0.7),
->>>>>>> f1d30d1be ([diffusion] feat: add rollout log_prob with flow-matching SDE/CPS support)
+    rollout_log_prob_no_const: Optional[bool] = Form(False),
+    rollout_debug_mode: Optional[bool] = Form(False),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -271,15 +272,14 @@ async def create_video(
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
             frame_interpolation_model_path=frame_interpolation_model_path,
-<<<<<<< HEAD
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
-=======
             rollout=rollout,
             rollout_sde_type=rollout_sde_type,
             rollout_noise_level=rollout_noise_level,
->>>>>>> f1d30d1be ([diffusion] feat: add rollout log_prob with flow-matching SDE/CPS support)
+            rollout_log_prob_no_const=rollout_log_prob_no_const,
+            rollout_debug_mode=rollout_debug_mode,
             output_compression=output_compression,
             output_quality=output_quality,
             **(
