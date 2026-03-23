@@ -3,6 +3,9 @@ from typing import Tuple, Union
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
+    CuteDSLKDAKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -46,11 +49,7 @@ class KDAKernelDispatcher:
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
-                raise ValueError("CuTe DSL backend requires CUDA")
-            from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
-                CuteDSLKDAKernel,
-            )
-
+                raise ValueError("KDA CuTe DSL backend requires CUDA")
             self.decode_kernel = CuteDSLKDAKernel()
         else:
             raise ValueError(
