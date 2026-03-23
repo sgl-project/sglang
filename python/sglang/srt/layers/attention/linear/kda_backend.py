@@ -1,7 +1,6 @@
 from typing import Tuple, Union
 
 import torch
-from einops import rearrange
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -136,52 +135,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        q_proj_states, k_proj_states, v_proj_states = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-        q_conv_weights, k_conv_weights, v_conv_weights = layer.conv_weights
-        q_conv_bias, k_conv_bias, v_conv_bias = layer.bias
-
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
+        conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        q_conv_state = q_conv_state.transpose(-1, -2)
-        k_conv_state = k_conv_state.transpose(-1, -2)
-        v_conv_state = v_conv_state.transpose(-1, -2)
-
-        q = causal_conv1d_update(
-            q_proj_states,
-            q_conv_state,
-            q_conv_weights,
-            q_conv_bias,
+        qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_states.transpose(-1, -2),
+            layer.conv_weights,
+            layer.bias,
             activation="silu",
             conv_state_indices=cache_indices,
         )
-        k = causal_conv1d_update(
-            k_proj_states,
-            k_conv_state,
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-        v = causal_conv1d_update(
-            v_proj_states,
-            v_conv_state,
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         return self.kernel_dispatcher.decode(
             q=q,
@@ -205,71 +176,64 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        q_proj_states, k_proj_states, v_proj_states = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-        q_conv_weights, k_conv_weights, v_conv_weights = layer.conv_weights
-        q_conv_bias, k_conv_bias, v_conv_bias = layer.bias
-
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_state_q, conv_state_k, conv_state_v = mamba_cache_params.conv
-        # deal with strides
-        conv_state_q = conv_state_q.transpose(-1, -2)
-        conv_state_k = conv_state_k.transpose(-1, -2)
-        conv_state_v = conv_state_v.transpose(-1, -2)
+        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
-        q_proj_states = q_proj_states.transpose(0, 1)
-        k_proj_states = k_proj_states.transpose(0, 1)
-        v_proj_states = v_proj_states.transpose(0, 1)
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        if layer.bias is not None:
+            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        else:
+            q_bias, k_bias, v_bias = None, None, None
 
         q = causal_conv1d_fn(
-            q_proj_states,
-            q_conv_weights,
-            q_conv_bias,
+            q,
+            q_conv_weight,
+            q_bias,
             activation="silu",
-            conv_states=conv_state_q,
+            conv_states=q_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-
         k = causal_conv1d_fn(
-            k_proj_states,
-            k_conv_weights,
-            k_conv_bias,
+            k,
+            k_conv_weight,
+            k_bias,
             activation="silu",
-            conv_states=conv_state_k,
+            conv_states=k_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-
         v = causal_conv1d_fn(
-            v_proj_states,
-            v_conv_weights,
-            v_conv_bias,
+            v,
+            v_conv_weight,
+            v_bias,
             activation="silu",
-            conv_states=conv_state_v,
+            conv_states=v_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
-        q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
-        k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
-        v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,

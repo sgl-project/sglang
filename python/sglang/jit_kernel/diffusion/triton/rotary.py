@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
         triton.Config({"BLOCK_HS_HALF": 128}, num_warps=4),
         triton.Config({"BLOCK_HS_HALF": 256}, num_warps=8),
     ],
-    key=["head_size", "interleaved"],
+    key=["head_size"],
 )
 @triton.jit
 def _rotary_embedding_kernel(
@@ -26,7 +26,6 @@ def _rotary_embedding_kernel(
     stride_x_row,
     stride_cos_row,
     stride_sin_row,
-    interleaved: tl.constexpr,
     BLOCK_HS_HALF: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -101,7 +100,6 @@ def apply_rotary_embedding(
         x_reshaped.stride(0),
         cos.stride(0),
         sin.stride(0),
-        interleaved,
     )
 
     return output
@@ -109,5 +107,10 @@ def apply_rotary_embedding(
 
 if current_platform.is_npu():
     from .npu_fallback import apply_rotary_embedding_native
+
+    apply_rotary_embedding = apply_rotary_embedding_native
+
+if current_platform.is_mps():
+    from .mps_fallback import apply_rotary_embedding_native
 
     apply_rotary_embedding = apply_rotary_embedding_native
