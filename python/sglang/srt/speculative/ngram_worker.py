@@ -1,19 +1,17 @@
 import logging
-import time
 from typing import List, Optional
 
 import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.observability.req_time_stats import convert_time_to_realtime_ns
-from sglang.srt.observability.trace import get_global_tracing_enabled
-
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -254,23 +252,11 @@ class NGRAMWorker:
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        tracing_enabled = get_global_tracing_enabled()
-
-        if tracing_enabled:
-            draft_start_ts = convert_time_to_realtime_ns(time.perf_counter())
-            for req in batch.reqs:
-                req.time_stats.trace_ctx.trace_slice_start(
-                    "spec_draft", 2, draft_start_ts
-                )
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
         self._prepare_for_speculative_decoding(batch)
 
-        if tracing_enabled:
-            draft_end_ts = convert_time_to_realtime_ns(time.perf_counter())
-            for req in batch.reqs:
-                req.time_stats.trace_ctx.trace_slice_end(
-                    "spec_draft", 2, draft_end_ts
-                )
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
@@ -286,12 +272,7 @@ class NGRAMWorker:
                     spec_info.retrive_next_token.shape
                 ).cpu()
 
-            if tracing_enabled:
-                verify_start_ts = convert_time_to_realtime_ns(time.perf_counter())
-                for req in batch.reqs:
-                    req.time_stats.trace_ctx.trace_slice_start(
-                        "spec_verify", 2, verify_start_ts
-                    )
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
@@ -327,23 +308,15 @@ class NGRAMWorker:
             )
             accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
 
-            if tracing_enabled:
-                verify_end_ts = convert_time_to_realtime_ns(time.perf_counter())
+            if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
                     accepted = (
                         verify_input.accept_length[idx].item()
                         if verify_input.accept_length is not None
                         else 0
                     )
-                    req.time_stats.trace_ctx.trace_slice_end(
-                        "spec_verify", 2, verify_end_ts
-                    )
-                    req.time_stats.trace_ctx.trace_event(
-                        "spec_accept",
-                        2,
-                        verify_end_ts,
-                        {"accepted_tokens": accepted},
-                    )
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
