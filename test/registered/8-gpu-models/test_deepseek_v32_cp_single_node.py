@@ -7,7 +7,7 @@ from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
-DEEPSEEK_V32_EXP_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+DEEPSEEK_V32_EXP_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 BASE_ARGS = [
     "--trust-remote-code",
@@ -80,7 +80,7 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="DeepSeek-V3.2-Exp CP Single Node",
+            test_name="DeepSeek-V3.2 CP Single Node",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
