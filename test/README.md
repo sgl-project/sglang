@@ -1,8 +1,83 @@
-# Run Unit Tests
+# Test System in SGLang
 
-This page introduces the test system in sglang, including how to run and add tests.
+This page introduces the test system, including the CI pipeline, the organization, and how to add and run tests.
 
 ## Three Stage CI Pipeline
+
+The CI pipeline runs in three sequential stages after building the kernel:
+
+- **Stage A** (pre-flight check, ~3 min): Quick smoke tests on small GPUs and CPU to catch obvious breakages early.
+- **Stage B** (basic tests, ~30 min): Core functional tests on both small GPUs (e.g., 5090) and large GPUs (e.g., H100), including 1-GPU and 2-GPU configurations. Kernel tests and multimodal generation tests also run in parallel at this stage.
+- **Stage C** (advanced tests, ~30 min): Multi-GPU and specialized hardware tests (H100, H200, B200), plus advanced features such as DeepEP, PD disaggregation, and GB300.
+
+Here is an illustration
+```
+ ┌──────────────┐
+ │ build kernel │
+ └──────┬───────┘
+        │
+        ├─────────────────────────────────────────────────────┐
+        │                                                     │
+        ▼                                                     │
+ ┌─────────────────────────────────────┐                      │
+ │          Stage A (~3 min)           │                      │
+ │         pre-flight check            │                      │
+ │                                     │                      │
+ │  ┌─────────────────────────────┐    │                      │
+ │  │ stage-a-test-1-gpu-small    │    │                      │
+ │  │ (small GPUs)                │    │                      │
+ │  └─────────────────────────────┘    │                      │
+ │  ┌─────────────────────────────┐    │                      │
+ │  │ stage-a-test-cpu            │    │                      │
+ │  │ (CPU)                       │    │                      │
+ │  └─────────────────────────────┘    │                      │
+ └──────┬──────────────────────────────┘                      │
+        │                                                     │
+        ▼                                                     ▼
+ ┌─────────────────────────────────────┐          ┌──────────────────────────┐
+ │          Stage B (~30 min)          │          │      kernel test         │
+ │           basic tests               │          └──────────────────────────┘
+ │                                     │          ┌──────────────────────────┐
+ │  ┌─────────────────────────────┐    │          │   multimodal gen test    │
+ │  │ stage-b-test-1-gpu-small    │    │          └──────────────────────────┘
+ │  │ (small GPUs, e.g. 5090)     │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-b-test-1-gpu-large    │    │
+ │  │ (large GPUs, e.g. H100)     │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-b-test-2-gpu-large    │    │
+ │  │ (large GPUs, e.g. H100)     │    │
+ │  └─────────────────────────────┘    │
+ └──────┬──────────────────────────────┘
+        │
+        ▼
+ ┌─────────────────────────────────────┐
+ │          Stage C (~30 min)          │
+ │          advanced tests             │
+ │                                     │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-1-gpu-h100     │    │
+ │  │ (H100 GPUs)                 │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-8-gpu-h200     │    │
+ │  │ (8 x H200 GPUs)             │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-4-gpu-b200     │    │
+ │  │ (4 x B200 GPUs)             │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ Other advanced tests        │    │
+ │  │ (DeepEP, PD Disagg, GB300)  │    │
+ │  └─────────────────────────────┘    │
+ └─────────────────────────────────────┘
+```
+
+- Stage naming convention: `stage-{a,b,c}-test-{gpu_count}-gpu-{hardware}`
+- CI runner naming convention: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
 
 
 ## Folder organization
@@ -150,7 +225,8 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 - Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time, so please reuse a single server for many tests instead of launching many servers.
 - Use as few GPUs as possible. Use 1-GPU runners whenever possible. Do not run long tests with 8-gpu runners.
 - If the test cases take too long, considering adding them to nightly tests instead of per-commit tests.
-- Each test file `test_xxx.py` should take less than 500s. If a single file takes more than that, split it into multiple files.
+- Each test file `test_xxx.py` should take less than 500 seconds. If a single file takes more than that, split it into multiple files.
+- Each github action job should take less than 30 mins. If a single job takes more than that, we should split it into multiple jobs.
 
 ## Other Notes
 ### Adding New Models to Nightly CI
