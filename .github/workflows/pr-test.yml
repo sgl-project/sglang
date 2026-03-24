@@ -131,7 +131,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
             jit_kernel:
