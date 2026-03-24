@@ -176,6 +176,8 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -448,6 +450,8 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()

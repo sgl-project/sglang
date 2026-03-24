@@ -28,6 +28,24 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
 
+# Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
+# that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
+# (``flash_attn_func``, etc.).  HuggingFace remote model code (e.g. Kimi-VL)
+# guarded by that check will crash with ImportError at module load time.
+# Force it to False when the real v2 API is absent.
+try:
+    import flash_attn as _flash_attn_mod
+
+    if not hasattr(_flash_attn_mod, "flash_attn_func"):
+        import transformers.utils as _hf_utils
+        import transformers.utils.import_utils as _hf_import_utils
+
+        _hf_import_utils.is_flash_attn_2_available = lambda: False
+        _hf_utils.is_flash_attn_2_available = lambda: False
+    del _flash_attn_mod
+except ImportError:
+    pass
+
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig
@@ -779,11 +797,6 @@ def get_tokenizer(
     # when trust_remote_code=False and the model requires a custom tokenizer.
     # Detect this and auto-retry with trust_remote_code=True.
     if not trust_remote_code and type(tokenizer).__name__ == "TokenizersBackend":
-        logger.info(
-            "Detected generic TokenizersBackend for %s, "
-            "retrying with trust_remote_code=True",
-            tokenizer_name,
-        )
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
