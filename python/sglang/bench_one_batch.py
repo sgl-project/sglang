@@ -594,6 +594,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    benchmark = False,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -625,7 +626,11 @@ def latency_test_run_once(
 
     synchronize(device)
     tic = time.perf_counter()
+    if benchmark:
+        torch.cuda.nvtx.range_push("prefill")
     next_token_ids, _, batch = extend(reqs, model_runner)
+    if benchmark:
+        torch.cuda.nvtx.range_pop()
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
 
@@ -669,7 +674,11 @@ def latency_test_run_once(
             )
 
         tic = time.perf_counter()
+        if benchmark:
+            torch.cuda.nvtx.range_push(f"decode_{i}")
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        if benchmark:
+            torch.cuda.nvtx.range_pop()
         synchronize(device)
         latency = time.perf_counter() - tic
 
@@ -776,6 +785,8 @@ def latency_test(
     custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
     custom_input_len = len(custom_inputs)
 
+    torch.cuda.cudart().cudaProfilerStart()
+
     # Run the sweep
     result_list = []
     for bs, il, ol in itertools.product(
@@ -820,6 +831,7 @@ def latency_test(
             tp_rank,
             bench_args.profile_start_step,
             bench_args.profile_steps,
+            benchmark=True,
         )
         if ret is not None:
             result_list.append(ret)
