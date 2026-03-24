@@ -482,3 +482,112 @@ launch configs).
    focuses on the minimal RoPE + KV fusion. The two plans compose: once
    `forward_native` handles KV scatter, the `CompilableRegion` approach
    can wrap norm + rope + kv-write and compile them together.
+
+---
+
+## Implementation Update (2026-03-24)
+
+The plan above has been implemented. This section documents the actual
+changes made and issues discovered during implementation.
+
+### What was implemented
+
+All four steps from the plan were completed as designed:
+
+1. **KV scatter in `forward_native`** — `base.py` and the sgl-kernel
+   testing copy now perform the scatter when `fused_set_kv_buffer_arg`
+   is not None.
+
+2. **`dynamic=True` override** — `RotaryEmbedding` overrides
+   `_get_local_torch_compile_forward_method` to force `dynamic=True`.
+
+3. **SWA compile gate** — `enable_fused_set_kv_buffer` accepts
+   `is_compiled` kwarg; `create_fused_set_kv_buffer_arg` picks
+   `out_cache_loc_swa` for SWA layers.
+
+4. **gpt_oss.py call sites** — `forward_prepare` and `forward_core`
+   pass `is_compiled=self.rotary_emb.is_torch_compile`.
+
+### Additional changes beyond the original plan
+
+#### Fix 1: MRO-based override layer matching (`multi_platform.py`)
+
+`--torch-compile-override-layers RotaryEmbedding` did not match
+subclasses like `YaRNScalingRotaryEmbedding` because the check used
+`self.__class__.__name__` (exact match). Added
+`_matches_override_layers` that walks `type(self).__mro__`, so
+specifying a base class name now matches all subclasses. Tests added
+in `test_multi_platform.py`.
+
+#### Fix 2: `index_put_` instead of `__setitem__` (`base.py`)
+
+**Critical performance bug.** The original plan used
+`k_buffer[cache_loc] = value`. During CUDA graph capture, `cache_loc`
+was `None` on the first Dynamo trace (because `out_cache_loc_swa` is
+not populated by the regular `CudaGraphRunner` — see Fix 3). Python's
+`k_buffer[None] = value` silently unsqueezes and broadcasts to the
+*entire* buffer. Dynamo encoded this as graph 0 with an
+`expand → copy_` pattern that iterated over `pool_size × head_dim`
+elements (1.19 billion for gpt-oss-20b), overwriting every row of the
+KV pool instead of writing 1 row. This made the compiled path ~100x
+slower than the JIT kernel.
+
+Switched to explicit `index_put_`:
+
+```python
+k_buffer.index_put_([cache_loc], key.view(-1, k_buffer.shape[-1]))
+v_buffer.index_put_([cache_loc], value.view(-1, v_buffer.shape[-1]))
+```
+
+This forces the `index_put` decomposition regardless of how Dynamo
+traces `cache_loc`, and fails loudly on `None` instead of silently
+corrupting the cache.
+
+#### Fix 3: Guard against missing `out_cache_loc_swa` (`utils.py`)
+
+The regular `CudaGraphRunner` does not populate
+`forward_batch.out_cache_loc_swa` (only `PiecewiseCudaGraphRunner`
+does). For SWA models during CUDA graph capture, `cache_loc` resolved
+to `None`. Two layers of defense:
+
+1. `enable_fused_set_kv_buffer` now requires
+   `forward_batch.out_cache_loc_swa is not None` when operating on an
+   `SWAKVPool` under compile. When the SWA loc is missing, the fused
+   path is disabled entirely, so both the RoPE scatter and
+   `save_kv_cache` flag stay consistent.
+
+2. `create_fused_set_kv_buffer_arg` returns `None` if `cache_loc`
+   resolves to `None` (belt-and-suspenders).
+
+### Files changed (final)
+
+| File | Change |
+|------|--------|
+| `srt/layers/rotary_embedding/base.py` | Replace assert with `index_put_` scatter; override `_get_local_torch_compile_forward_method` for `dynamic=True` |
+| `sgl-kernel/python/sgl_kernel/testing/rotary_embedding.py` | Same: replace assert with `index_put_` scatter |
+| `srt/models/utils.py` | `is_compiled` kwarg + `out_cache_loc_swa` guard in `enable_fused_set_kv_buffer`; `cache_loc is None` guard in `create_fused_set_kv_buffer_arg` |
+| `srt/models/gpt_oss.py` | Pass `is_compiled` kwarg |
+| `srt/layers/utils/multi_platform.py` | MRO-based `_matches_override_layers` for subclass matching |
+| `test/registered/unit/layers/test_multi_platform.py` | Tests for MRO matching |
+| `test/registered/unit/layers/test_fused_kv_buffer.py` | Unit tests for enable/create helpers + numerics vs CUDA kernel |
+
+### Still needs validation
+
+The `out_cache_loc_swa` guard (Fix 3) means that **SWA models using
+the regular `CudaGraphRunner` will not use the fused RoPE+KV path** —
+they fall back to the two-kernel eager path during CUDA graph capture
+because `out_cache_loc_swa` is `None`. The fused path only activates
+for SWA models when:
+
+- Using `PiecewiseCudaGraphRunner` (which populates `out_cache_loc_swa`), OR
+- Running outside CUDA graph capture (e.g. prefill)
+
+To fully enable the fused path for SWA models under the regular
+`CudaGraphRunner`, it would need to allocate and populate
+`out_cache_loc_swa` in `DecodeInputBuffers` and
+`capture_one_batch_size`, similar to what `PiecewiseCudaGraphRunner`
+does. This is left for a follow-up.
+
+End-to-end validation with `bench_one_batch` for both standard and SWA
+models (as described in the Validation section above) should be run to
+confirm the compiled path produces correct output and no regressions.

@@ -138,8 +138,8 @@ class RotaryEmbedding(torch.nn.Module):
             k_buffer = fused_set_kv_buffer_arg.k_buffer
             v_buffer = fused_set_kv_buffer_arg.v_buffer
             value = fused_set_kv_buffer_arg.value
-            k_buffer[cache_loc] = key.view(-1, k_buffer.shape[-1])
-            v_buffer[cache_loc] = value.view(-1, v_buffer.shape[-1])
+            k_buffer.index_put_([cache_loc], key.view(-1, k_buffer.shape[-1]))
+            v_buffer.index_put_([cache_loc], value.view(-1, v_buffer.shape[-1]))
 
         # Modification: convert to the correct dtype
         query = query.to(self.dtype)

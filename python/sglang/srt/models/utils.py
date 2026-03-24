@@ -110,12 +110,16 @@ def enable_fused_set_kv_buffer(
 ):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
     When is_compiled=True (torch.compile path), also allows SWAKVPool
-    since forward_native handles the dual-pool addressing in pure PyTorch."""
+    since forward_native handles the dual-pool addressing in pure PyTorch,
+    but only when out_cache_loc_swa is available."""
+    pool = forward_batch.token_to_kv_pool
+    is_swa = isinstance(pool, SWAKVPool)
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and (is_compiled or not isinstance(forward_batch.token_to_kv_pool, SWAKVPool))
+        and hasattr(pool, "dtype")
+        and pool.dtype == torch.bfloat16
+        and (is_compiled or not is_swa)
+        and (not (is_compiled and is_swa) or forward_batch.out_cache_loc_swa is not None)
     )
 
 
@@ -138,6 +142,9 @@ def create_fused_set_kv_buffer_arg(
         _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
         if is_swa_layer:
             cache_loc = forward_batch.out_cache_loc_swa
+
+    if cache_loc is None:
+        return None
 
     return FusedSetKVBufferArg(
         value=value,
