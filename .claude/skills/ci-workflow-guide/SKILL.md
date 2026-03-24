@@ -51,9 +51,27 @@ PR event
   └─ pr-test-finish ─── aggregates all job results, fails if any failed/cancelled
 ```
 
-**Every stage test job** includes a `check-stage-health` step after checkout — if any job in the run has already failed, remaining steps are skipped (job shows green with grey skipped steps).
+**Every stage test job** includes a `check-stage-health` step after checkout — if any job in the run has already failed, the job fast-fails (red X) with a root cause annotation.
 
-**Scheduled runs** skip `wait-for-stage-*` jobs, running all stages in parallel.
+**Scheduled runs** skip `wait-for-stage-*` jobs, running all stages in parallel. Fast-fail is also disabled.
+
+---
+
+## Fast-Fail Layers
+
+4 layers of fast-fail, from fine to coarse:
+
+| Layer | Mechanism | Granularity | Disabled on schedule? |
+|-------|-----------|-------------|----------------------|
+| **1. Test method → file** | `unittest -f` (failfast) | One test method fails → entire test file stops immediately | Yes |
+| **2. File → suite** | `run_unittest_files()` default | One test file fails → entire suite stops (`--continue-on-error` off) | Yes |
+| **3. Job → job (same stage)** | `check-stage-health` action | One job fails → other waiting jobs in same stage fast-fail (red X) | Yes |
+| **4. Stage → stage (cross-stage)** | `wait-for-stage` + `needs` | Stage A fails → stage B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
+
+- **Layer 1**: `-f` flag appended to all `python3 -m pytest` / `unittest` invocations in `ci_utils.py`
+- **Layer 2**: `--continue-on-error` flag in `run_suite.py` — off for PRs, on for scheduled runs
+- **Layer 3**: `check-stage-health` auto-detects `schedule` event and skips; filters out cascade failures to show only root cause jobs
+- **Layer 4**: `wait-for-stage-*` jobs are conditioned on `github.event_name == 'pull_request'` — skipped for scheduled runs
 
 ---
 
