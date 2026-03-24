@@ -1698,5 +1698,726 @@ FP8 对 Denoising 阶段的加速随分辨率增大而显著增强：
 
 ---
 
+## Part XI: Cache-DiT 调优分析
+
+> 当前 benchmark 仅使用 `SGLANG_CACHE_DIT_ENABLED=true` 默认配置。
+> 本节分析默认配置的实际缓存行为，并提出调优方案。
+
+### 37. 默认配置及其含义
+
+#### 37a. 当前默认参数
+
+| 参数 | 环境变量 | 默认值 | 含义 |
+|------|---------|:------:|------|
+| **Fn** | `SGLANG_CACHE_DIT_FN` | 1 | 前 N 个 block 始终计算（30 层中只有第 1 层）|
+| **Bn** | `SGLANG_CACHE_DIT_BN` | 0 | 后 N 个 block 始终计算（无）|
+| **W (Warmup)** | `SGLANG_CACHE_DIT_WARMUP` | **4** | 前 4 步不做缓存（cache-dit 默认 8，sglang 对少步蒸馏模型特意调低） |
+| **R (Threshold)** | `SGLANG_CACHE_DIT_RDT` | **0.24** | 残差 L1 距离阈值（越高越激进，cache-dit 默认 0.12）|
+| **MC** | `SGLANG_CACHE_DIT_MC` | 3 | 最大连续缓存步数 |
+| **TaylorSeer** | `SGLANG_CACHE_DIT_TAYLORSEER` | false | 代码注释明确说"不适合少步蒸馏模型" |
+| **SCM Preset** | `SGLANG_CACHE_DIT_SCM_PRESET` | none | 未启用步级掩码（SCM）|
+
+#### 37b. 实际缓存行为分析（9 步）
+
+从 benchmark per-step 数据还原缓存模式：
+
+**1024×1024 — BF16+CacheDiT（默认配置）：**
+
+| Step | Time (ms) | vs Baseline (423ms) | 行为 |
+|:----:|:---------:|:-------------------:|------|
+| 0 | 27.9 | — | Warmup（step 0 始终快，模型初始化） |
+| 1 | 423.3 | +0.0 | Warmup（W=4，无缓存） |
+| 2 | 422.8 | -0.0 | Warmup |
+| 3 | 422.9 | +0.0 | Warmup |
+| 4 | **437.0** | **+14.0** | **首次缓存构建**（计算 + 存储残差，有 overhead） |
+| 5 | **59.7** | **-363.3** | **缓存命中 ✅**（跳过 blocks，仅 14% 计算量） |
+| 6 | 423.9 | +1.0 | 完整计算（残差超 R=0.24 阈值 或 MC=3 限制） |
+| 7 | 424.0 | +1.0 | 完整计算 |
+| 8 | 423.7 | +0.7 | 完整计算 |
+
+```
+Step:  0    1    2    3    4       5     6    7    8
+       W    W    W    W    Build   ☑HIT  C    C    C
+
+W = Warmup (无缓存)    Build = 构建缓存    ☑ = 缓存命中    C = 完整计算
+```
+
+**关键问题**：9 步中只有 **1 步命中缓存**（step 5），缓存命中率仅 11%。
+
+原因分析：
+1. **W=4 消耗了前 4 步**：9 步中 44% 用于 warmup，留给缓存的窗口太小
+2. **Step 4 是首次构建**，不节省时间（反而增加 ~14ms overhead）
+3. **Steps 6-8 未命中**：residual 差异超 R=0.24 阈值，或 cache-dit 判断需要刷新
+
+#### 37c. 各分辨率净收益
+
+| 分辨率 | Step 5 节省 | Step 4 overhead | 净收益 | 占 Denoising % |
+|--------|:----------:|:---------------:|:------:|:--------------:|
+| 256×256 | -11.1ms | +3.8ms | **~7ms** | 2.6% |
+| 512×512 | -77.0ms | +13.0ms | **~64ms** | 7.6% |
+| 1024×1024 | -363.3ms | +14.0ms | **~349ms** | 10.2% |
+
+> 收益随分辨率增大（因为被跳过的计算量与 seq_len 成正比），但缓存命中率始终只有 1/9。
+
+### 38. 调优方案
+
+#### 方案 1（推荐优先）：降低 Warmup + 提高阈值 + 增大 MC
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_WARMUP=2 \
+SGLANG_CACHE_DIT_RDT=0.35 \
+SGLANG_CACHE_DIT_MC=5 \
+sglang generate ...
+```
+
+| 参数 | 默认 → 调整 | 理由 |
+|------|:---------:|------|
+| W | 4 → **2** | 9 步中 4 步 warmup 过多。降到 2，从 step 2 开始缓存 |
+| R | 0.24 → **0.35** | 当前 steps 6-8 因残差超阈值全部 miss。提高到 0.35 提高命中率 |
+| MC | 3 → **5** | 允许最多 5 步连续缓存，避免强制刷新打断连续命中 |
+
+预期缓存模式变化：
+```
+默认:   W W W W Build ☑ C  C  C     → 1/9 cached (11%)
+方案1:  W W Build ☑ ☑  ☑ Build ☑ ☑  → ~4-5/9 cached (~50%)
+```
+
+预期 Denoising 加速：
+- 1024×1024：从 3069ms 降至 ~2000-2300ms（+30-50% 额外加速）
+- 512×512：从 779ms 降至 ~550-650ms
+
+**⚠️ 质量风险**：R 越高缓存越激进，图像可能出现细节丢失。必须固定 seed 对比质量。
+
+#### 方案 2：使用 SCM 预设（步级掩码）
+
+```bash
+# fast 预设（~35% 计算率，9 步约 3 步计算）
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_SCM_PRESET=fast \
+SGLANG_CACHE_DIT_SCM_POLICY=dynamic \
+sglang generate ...
+
+# ultra 预设（~25% 计算率，9 步约 2 步计算）
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_SCM_PRESET=ultra \
+SGLANG_CACHE_DIT_SCM_POLICY=dynamic \
+sglang generate ...
+```
+
+SCM（Steps Computation Masking）直接指定哪些步计算、哪些步缓存。来自 LeMiCa 和 EasyCache 的研究发现：**早期缓存会放大下游误差，后期缓存影响较小**，因此 SCM 采用非均匀分布（前密后疏）。
+
+| 预设 | 近似计算率 | 9 步约计算 | 适用场景 |
+|------|:---------:|:--------:|---------|
+| slow | ~75% | ~7 步 | 保守，质量优先 |
+| medium | ~50% | ~5 步 | 平衡 |
+| **fast** | **~35%** | **~3 步** | **推荐起点** |
+| ultra | ~25% | ~2 步 | 最激进，需验质量 |
+
+> **注意**：cache-dit 文档说"SCM 需要 ≥8 步才有效"，ZImage 的 9 步刚好在边界线上。
+
+SCM 的 `dynamic` 模式会结合 DBCache 的残差判断，不会盲目缓存；`static` 模式则严格按掩码执行。推荐用 `dynamic`。
+
+#### 方案 3：自定义 SCM bins（精细控制）
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_SCM_COMPUTE_BINS="2,1,1,1" \
+SGLANG_CACHE_DIT_SCM_CACHE_BINS="1,1,1,1" \
+SGLANG_CACHE_DIT_SCM_POLICY=dynamic \
+sglang generate ...
+```
+
+`compute_bins` 和 `cache_bins` 将 9 步分成多个时间段（bin），每段内指定计算步数和缓存步数：
+- `compute_bins="2,1,1,1"` → 4 个 bin，前 2 步 compute 多，后面逐减
+- `cache_bins="1,1,1,1"` → 每个 bin 内 1 步缓存
+
+两者必须同时设置，且 `sum(compute_bins) + sum(cache_bins) = total_steps (9)`。
+
+#### 不推荐的方向
+
+| 方向 | 原因 |
+|------|------|
+| **TaylorSeer** | 代码注释明确说"不适合少步蒸馏模型"，ZImage-Turbo 仅 9 步，Taylor 展开无法建立准确的导数估计 |
+| **Bn > 0** | 增加尾部 always-compute blocks 会减少可缓存的 block 数，降低收益 |
+| **SCM static** | `static` 模式不考虑残差，可能在关键步缓存导致质量下降；`dynamic` 模式更安全 |
+| **W=0** | 至少需要 1 步 warmup 建立初始残差基线 |
+
+### 39. 建议测试矩阵
+
+在 **1024×1024 + FP8-DeepGemm** 配置上测试（FP8 收益最大的场景）：
+
+```bash
+export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
+export PROMPT="A beautiful sunset over the ocean with golden clouds"
+
+# 方案 1a: W=2, R=0.35, MC=5（温和调优）
+SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_WARMUP=2 SGLANG_CACHE_DIT_RDT=0.35 SGLANG_CACHE_DIT_MC=5 \
+SGLANG_ENABLE_JIT_DEEPGEMM=1 sglang generate \
+    --model-path $MODEL --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 --prompt "$PROMPT" \
+    --height 1024 --width 1024 --warmup --save-output --seed 42
+
+# 方案 1b: W=1, R=0.40, MC=6（更激进）
+SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_WARMUP=1 SGLANG_CACHE_DIT_RDT=0.40 SGLANG_CACHE_DIT_MC=6 \
+SGLANG_ENABLE_JIT_DEEPGEMM=1 sglang generate \
+    --model-path $MODEL --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 --prompt "$PROMPT" \
+    --height 1024 --width 1024 --warmup --save-output --seed 42
+
+# 方案 2: SCM fast + dynamic
+SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_SCM_PRESET=fast SGLANG_CACHE_DIT_SCM_POLICY=dynamic \
+SGLANG_ENABLE_JIT_DEEPGEMM=1 sglang generate \
+    --model-path $MODEL --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 --prompt "$PROMPT" \
+    --height 1024 --width 1024 --warmup --save-output --seed 42
+
+# 方案 3: SCM ultra + dynamic（最激进）
+SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_SCM_PRESET=ultra SGLANG_CACHE_DIT_SCM_POLICY=dynamic \
+SGLANG_ENABLE_JIT_DEEPGEMM=1 sglang generate \
+    --model-path $MODEL --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 --prompt "$PROMPT" \
+    --height 1024 --width 1024 --warmup --save-output --seed 42
+
+# 对照组：默认 cache-dit + FP8（已有数据）
+# baseline_1gpu_tebf16_cachedit_fp8_deepgemm.json → E2E 2186ms
+```
+
+**质量验证**：每个方案都固定 `--seed 42`，与默认 cache-dit 输出对比。如果出现可见质量下降，降低 R 或换更保守的 SCM 预设。
+
+**性能指标**：关注 `denoise_steps_ms` 中每步的时间分布 —— 命中缓存的步应显著低于 baseline step 时间（~248ms for FP8-DeepGemm at 1024×1024）。
+
+### 40. Cache-DiT 原理详解：DBCache / SCM / TaylorSeer
+
+#### 40a. 组件架构总览
+
+```
+cache-dit 框架
+│
+├── DBCache（核心缓存算法）            ← 控制"哪些 block 在哪些步被缓存"
+│   ├── Fn / Mn / Bn block 三段式分区
+│   ├── R (residual_diff_threshold)   ← 缓存判断阈值
+│   ├── W (max_warmup_steps)          ← 前几步不缓存
+│   └── MC (max_continuous_cached)    ← 最多连续缓存几步
+│
+├── SCM（Steps Computation Masking）  ← 在 DBCache 之上叠加"步级掩码"
+│   ├── preset: slow/medium/fast/ultra
+│   └── policy: dynamic / static
+│
+├── TaylorSeer（校准器）              ← 可选模块，用 Taylor 展开预测特征，替代 Bn
+│   └── taylorseer_order: 1 or 2
+│
+└── DBPrune（动态剪枝）              ← 更激进的变体，整块跳过
+```
+
+#### 40b. DBCache 核心算法 — Fn / Mn / Bn 三段式
+
+DBCache（Dual Block Cache）将 DiT 的 transformer block 分成三段：
+
+| 段 | 名称 | 行为 | 作用 |
+|:--:|------|------|------|
+| **Fn** | First N blocks | **始终完整计算** | 前几层提取低层特征，步间变化大，不可缓存 |
+| **Mn** | Middle blocks | **动态判断缓存/计算** | 根据 L1 残差距离决定是否复用上一步结果 |
+| **Bn** | Bottom N blocks | **始终完整计算** | 最后几层负责"自动缩放"纠正缓存累积误差 |
+
+以 Z-Image 的 30 层 DiT 为例（当前默认 Fn=1, Bn=0）：
+
+```
+Block:  0  │  1   2   3  ...  28  29  │ (无)
+        Fn │  ←── Mn (可缓存区) ──→     │  Bn=0
+     始终算 │  根据 R 判断缓存/计算       │ (无尾部校准)
+```
+
+**每步决策流程**：
+
+1. **完整计算** 前 Fn 个 block，得到中间特征 `hidden_t`
+2. 计算 **L1 残差距离**：`L1_diff = ||hidden_t - hidden_{t-1}||₁`
+3. 如果 `L1_diff < R`：**缓存命中** ✅ → 跳过所有 Mn block，复用上一步的输出
+4. 如果 `L1_diff ≥ R`：**缓存未命中** ❌ → 完整计算所有 Mn block
+5. **完整计算** 后 Bn 个 block，对输出做校准
+6. 额外约束：连续缓存超过 MC 步后强制重新计算
+
+> **"残差"**就是相邻两步在 Fn block 输出层的 **L1 范数差**。它衡量"这一步的去噪方向跟上一步有多不同"——差异小则说明可以复用，差异大则必须重算。
+
+#### 40c. DBCache 与 TeaCache 的关系
+
+TeaCache（Timestep Embedding Aware Cache）是一篇学术论文提出的方法，核心思想同样是：用相邻步之间的特征相似度（L1 距离）判断是否可以缓存。
+
+**cache-dit 的 DBCache 是对 TeaCache 类思想的工程实现和扩展**：
+- 增加了 Fn/Bn 分区（TeaCache 原文无此设计）
+- 增加了 MC 限制防止误差累积
+- 增加了 W warmup 机制
+- 可与 SCM、TaylorSeer 组合使用
+
+> 简单理解：TeaCache ≈ DBCache 的学术原型，DBCache ≈ TeaCache 的工程增强版。
+
+#### 40d. SCM 与 DBCache 的关系
+
+SCM 是在 DBCache **之上叠加**的一层策略，预先标记哪些步允许缓存：
+
+| 组合方式 | 行为 |
+|---------|------|
+| **仅 DBCache（当前）** | 每步都让 DBCache 自主判断（基于 R 阈值） |
+| **SCM + dynamic** | SCM 预标记某些步为"可缓存"，但 DBCache 的 R 判断仍生效（残差太大还是会计算） |
+| **SCM + static** | 严格按 SCM 掩码执行，不管 DBCache 的 R 判断 |
+
+SCM 的掩码源自 LeMiCa 和 EasyCache 的研究发现：**去噪早期的步更关键**（早期缓存会放大下游误差），**后期的步相对可以缓存**（影响小）。因此 SCM 掩码是前密后疏的非均匀分布。
+
+#### 40e. TaylorSeer 原理
+
+**问题**：当缓存多步后，复用的旧特征与真实特征偏差越来越大，导致图像质量下降。
+
+**普通缓存**（DBCache 默认）：
+```
+feature_t ≈ feature_{t-1}   （直接复用上一步的值）
+```
+
+**TaylorSeer**：用 Taylor 级数展开**预测**未来步的特征值，而非简单复用：
+```
+Order 1（一阶展开）:
+  feature_t ≈ feature_{t-1} + Δt × f'(t-1)
+
+Order 2（二阶展开，更精确）:
+  feature_t ≈ feature_{t-1} + Δt × f'(t-1) + ½Δt² × f''(t-1)
+```
+
+其中导数通过**有限差分近似**：
+```
+f'(t) ≈ (feature_t - feature_{t-1}) / Δt
+f''(t) ≈ (f'(t) - f'(t-1)) / Δt
+```
+
+**TaylorSeer vs Bn 的角色对比**：
+
+| | Bn（尾部 block 校准） | TaylorSeer（Taylor 展开校准） |
+|---|---|---|
+| 原理 | 完整计算最后 N 层纠正误差 | 数学预测纠正误差 |
+| 额外计算 | 要算 N 层（有实际 GEMM 开销） | 几乎为零（只是加减乘） |
+| 推荐搭配 | Fn>0, Bn>0, TaylorSeer=off | Fn>0, **Bn=0**, TaylorSeer=on |
+| 适用场景 | 通用 | **步数多（≥20）的非蒸馏模型** |
+
+#### 40f. TaylorSeer 开启方式与适用性
+
+**开启方式**：
+```bash
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=1 \
+SGLANG_CACHE_DIT_BN=0 \
+sglang generate ...
+```
+
+**为什么不适合 ZImage-Turbo（9 步蒸馏模型）**：
+
+sglang 代码注释原文：*"not suitable for few steps distilled models"*
+
+原因：
+1. ZImage-Turbo 只有 9 步，步间间隔极大
+2. Taylor 展开假设相邻步之间特征**平滑变化**
+3. 蒸馏模型将原本 50 步的变化压缩到 9 步 → 每步变化剧烈
+4. 有限差分近似的导数 `f'(t)` 不准确 → Taylor 预测的特征可能比直接复用更差
+
+**适用场景**：FLUX.1-Dev (28 步)、SD3 (50 步)、HunyuanVideo (50 步) 等多步非蒸馏模型。
+
+#### 40g. 所有参数速查表
+
+| 参数 | 环境变量 | 属于 | 当前值 | 一句话解释 |
+|------|---------|:----:|:-----:|---------|
+| Fn | `SGLANG_CACHE_DIT_FN` | DBCache | 1 | 前 N 层始终算（提供稳定特征基线） |
+| Bn | `SGLANG_CACHE_DIT_BN` | DBCache | 0 | 后 N 层始终算（校准缓存误差） |
+| W | `SGLANG_CACHE_DIT_WARMUP` | DBCache | 4 | 前 W 步不缓存（热身） |
+| R | `SGLANG_CACHE_DIT_RDT` | DBCache | 0.24 | 特征变化多大以内可以缓存 |
+| MC | `SGLANG_CACHE_DIT_MC` | DBCache | 3 | 最多连续缓存几步 |
+| SCM preset | `SGLANG_CACHE_DIT_SCM_PRESET` | SCM | none | 步级掩码预设 |
+| SCM policy | `SGLANG_CACHE_DIT_SCM_POLICY` | SCM | dynamic | dynamic=与 R 结合，static=严格掩码 |
+| SCM compute bins | `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | SCM | — | 自定义计算 bin |
+| SCM cache bins | `SGLANG_CACHE_DIT_SCM_CACHE_BINS` | SCM | — | 自定义缓存 bin |
+| TaylorSeer | `SGLANG_CACHE_DIT_TAYLORSEER` | TaylorSeer | false | 开启 Taylor 展开预测 |
+| TS order | `SGLANG_CACHE_DIT_TS_ORDER` | TaylorSeer | 1 | Taylor 展开阶数（1 或 2） |
+
+---
+
+## Part VIII: 实锤 256×256 GEMM 为 Memory-Bound（ncu 验证方案）
+
+### 29. 问题背景
+
+256×256 下 sequence length = 768 tokens，DiT 线性层的 GEMM 形状为 M=768, N/K∈{3840, 10240}。
+我们预测此时 GEMM 是 **bandwidth-bound** 而非 compute-bound，因此 FP8 的 2× TFLOPS 优势
+（296 vs 148 TFLOPS on H20）无法转化为实际加速。
+
+要实锤此结论，需要 **Nsight Compute (ncu)** 提供 kernel 级别的硬件利用率数据。
+nsys 只告诉"哪个 kernel 花了多少时间"，而 ncu 告诉"这个 kernel **为什么**慢——是卡在
+内存带宽还是算力上"。
+
+### 30. 核心判断指标
+
+| 指标 | 含义 | Bandwidth-bound 表现 | Compute-bound 表现 |
+|------|------|---------------------|-------------------|
+| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | HBM 带宽利用率 | **高** (>60%) | 低 (<40%) |
+| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | SM 计算利用率 | **低** (<30%) | 高 (>60%) |
+| Arithmetic Intensity (FLOP/byte) | 计算密度 | **低于 ridge point** | 高于 ridge point |
+
+**判断逻辑**：
+
+```
+if DRAM利用率 >> SM利用率:
+    → Memory-bound ✓ （FP8 的 2× TFLOPS 无用，瓶颈在搬数据）
+
+if SM利用率 >> DRAM利用率:
+    → Compute-bound （FP8 有优势）
+
+if 两者都低:
+    → Latency-bound （kernel launch / occupancy 问题）
+```
+
+### 31. H20 Roofline Ridge Point 理论分析
+
+| 精度 | H20 TFLOPS | H20 HBM BW | Ridge Point (FLOP/byte) |
+|------|-----------|------------|------------------------|
+| BF16 | 148 | 4.0 TB/s | 148000 / 4000 = **37** |
+| FP8  | 296 | 4.0 TB/s | 296000 / 4000 = **74** |
+
+如果 GEMM kernel 的实际 arithmetic intensity 低于 37 FLOP/byte，即使 BF16 也已经
+是 memory-bound，切换到 FP8 不会有任何加速（瓶颈在 HBM bandwidth，不在 Tensor Core）。
+
+**理论估算 M=768 GEMM 的 arithmetic intensity**：
+
+```
+以 feedforward.w13 为例: M=768, K=3840, N=10240*2=20480
+
+FLOPs = 2 × M × K × N = 2 × 768 × 3840 × 20480 ≈ 120.8 GFLOPs
+
+Bytes（BF16）:
+  Weight: K × N × 2B = 3840 × 20480 × 2 = 150 MB  （权重读取，占绝对主导）
+  Input:  M × K × 2B = 768 × 3840 × 2 = 5.6 MB
+  Output: M × N × 2B = 768 × 20480 × 2 = 30 MB
+  Total ≈ 186 MB
+
+Arithmetic Intensity = 120.8 GFLOP / 0.186 GB ≈ 650 FLOP/byte
+                                                    ↑ 看起来很高？
+```
+
+但这是 **理论值**。实际上 GEMM kernel 的 M 维度决定了 **tile reuse 效率**：
+
+```
+cuBLAS/nvjet 典型 tile: 128×128 或 256×128
+M=768 只有 768/128 = 6 个 tile rows → weight tile 最多被复用 6 次
+M=16384 (1024×1024) 有 128 个 tile rows → weight tile 被复用 128 次
+
+当 M 很小时：
+  - GPU SM 数量（H20=132）> tile 数量 → 大量 SM 空闲
+  - Occupancy 极低，kernel launch overhead 占比大
+  - 实际带宽利用远低于 peak
+  - 数据搬运开销（weight读取）相对计算量偏高
+```
+
+因此理论 arithmetic intensity 很高，但 **实际运行效率受限于 tile utilization 和 wave
+quantization**，表现为 memory-bound 行为。这就是必须用 ncu 实测的原因。
+
+### 32. ncu 实测命令
+
+#### 32a. 收集 256×256 BF16 GEMM 的 ncu 数据
+
+```bash
+export MODEL=/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo
+export NCU_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256/ncu_reports
+mkdir -p $NCU_DIR
+
+# 收集 GEMM kernel（nvjet/cutlass/ampere）的完整指标
+ncu --target-processes all \
+    --kernel-name-base demangled \
+    --kernel-name regex:"gemm|cutlass|ampere|nvjet" \
+    --launch-skip 20 --launch-count 10 \
+    --set full \
+    -o "${NCU_DIR}/zimage_256_bf16_gemm" \
+    sglang generate \
+      --model-path $MODEL \
+      --text-encoder-precisions bf16 \
+      --prompt='test' \
+      --width=256 --height=256 --num-inference-steps=9 \
+      --guidance-scale=0.0 --seed=42 \
+      --dit-cpu-offload false --text-encoder-cpu-offload false
+```
+
+#### 32b. 收集 256×256 FP8 GEMM 的 ncu 数据（对比）
+
+```bash
+# FP8 DeepGemm kernel
+ncu --target-processes all \
+    --kernel-name-base demangled \
+    --kernel-name regex:"gemm|cutlass|ampere|nvjet|deep_gemm" \
+    --launch-skip 20 --launch-count 10 \
+    --set full \
+    -o "${NCU_DIR}/zimage_256_fp8_gemm" \
+    sglang generate \
+      --model-path $MODEL \
+      --transformer-path $MODEL/transformer-FP8-block128 \
+      --text-encoder-precisions bf16 \
+      --prompt='test' \
+      --width=256 --height=256 --num-inference-steps=9 \
+      --guidance-scale=0.0 --seed=42 \
+      --dit-cpu-offload false --text-encoder-cpu-offload false
+```
+
+#### 32c. 收集 1024×1024 BF16 GEMM 的 ncu 数据（对照组）
+
+```bash
+# 1024×1024 (M=16384) 作为 compute-bound 对照
+ncu --target-processes all \
+    --kernel-name-base demangled \
+    --kernel-name regex:"gemm|cutlass|ampere|nvjet" \
+    --launch-skip 20 --launch-count 10 \
+    --set full \
+    -o "${NCU_DIR}/zimage_1024_bf16_gemm" \
+    sglang generate \
+      --model-path $MODEL \
+      --text-encoder-precisions bf16 \
+      --prompt='test' \
+      --width=1024 --height=1024 --num-inference-steps=9 \
+      --guidance-scale=0.0 --seed=42 \
+      --dit-cpu-offload false --text-encoder-cpu-offload false
+```
+
+### 33. 提取关键指标的分析脚本
+
+```bash
+# 提取 bandwidth vs compute 利用率
+ncu --import "${NCU_DIR}/zimage_256_bf16_gemm.ncu-rep" \
+    --page raw --csv 2>/dev/null | python3 -c "
+import csv, sys, collections
+
+kernels = collections.defaultdict(dict)
+reader = csv.DictReader(sys.stdin)
+target_metrics = [
+    'gpu__time_duration.avg',                                    # 耗时
+    'dram__throughput.avg.pct_of_peak_sustained_elapsed',        # HBM 带宽利用率 ★
+    'sm__throughput.avg.pct_of_peak_sustained_elapsed',          # SM 计算利用率 ★
+    'sm__warps_active.avg.pct_of_peak_sustained_active',         # Achieved Occupancy
+    'dram__bytes.sum',                                           # 实际搬运字节数
+    'smsp__sass_thread_inst_executed_op_ffma_pred_on.sum',       # FMA 指令数
+]
+for row in reader:
+    kernel = row.get('Kernel Name', '')[:80]
+    metric = row.get('Metric Name', '')
+    value  = row.get('Metric Value', '')
+    if any(m in metric for m in target_metrics):
+        kernels[kernel][metric] = value
+
+print(f'{'Kernel':<80}')
+print('='*120)
+for kname, metrics in sorted(kernels.items()):
+    print(f'\n--- {kname} ---')
+    for m, v in sorted(metrics.items()):
+        label = '★' if 'throughput' in m and 'pct' in m else ' '
+        print(f'  {label} {m:<60} {v}')
+"
+```
+
+### 34. Roofline 分析（终极实锤）
+
+```bash
+# 收集 roofline 数据
+ncu --target-processes all \
+    --kernel-name-base demangled \
+    --kernel-name regex:"gemm|cutlass|nvjet" \
+    --launch-skip 20 --launch-count 5 \
+    --set roofline \
+    -o "${NCU_DIR}/zimage_256_roofline" \
+    sglang generate \
+      --model-path $MODEL \
+      --text-encoder-precisions bf16 \
+      --prompt='test' \
+      --width=256 --height=256 --num-inference-steps=9 \
+      --guidance-scale=0.0 --seed=42 \
+      --dit-cpu-offload false --text-encoder-cpu-offload false
+
+# 同时收集 1024×1024 作为对比
+ncu --target-processes all \
+    --kernel-name-base demangled \
+    --kernel-name regex:"gemm|cutlass|nvjet" \
+    --launch-skip 20 --launch-count 5 \
+    --set roofline \
+    -o "${NCU_DIR}/zimage_1024_roofline" \
+    sglang generate \
+      --model-path $MODEL \
+      --text-encoder-precisions bf16 \
+      --prompt='test' \
+      --width=1024 --height=1024 --num-inference-steps=9 \
+      --guidance-scale=0.0 --seed=42 \
+      --dit-cpu-offload false --text-encoder-cpu-offload false
+```
+
+### 35. 预期结果与判读
+
+#### 预期：256×256 (M=768) GEMM — Memory-Bound
+
+```
+=== 256×256 BF16 nvjet GEMM ===
+  ★ dram__throughput.avg.pct_of_peak_sustained_elapsed    ~70-85%  ← HBM 接近饱和
+  ★ sm__throughput.avg.pct_of_peak_sustained_elapsed      ~10-25%  ← SM 大量空闲
+    sm__warps_active.avg.pct_of_peak_sustained_active     ~30-50%  ← 中等 occupancy
+```
+
+#### 预期：1024×1024 (M=16384) GEMM — Compute-Bound（对照）
+
+```
+=== 1024×1024 BF16 nvjet GEMM ===
+  ★ dram__throughput.avg.pct_of_peak_sustained_elapsed    ~30-50%  ← HBM 未饱和
+  ★ sm__throughput.avg.pct_of_peak_sustained_elapsed      ~60-80%  ← SM 高利用
+    sm__warps_active.avg.pct_of_peak_sustained_active     ~60-80%  ← 高 occupancy
+```
+
+#### 判读总结表
+
+| 场景 | DRAM Util | SM Util | 瓶颈类型 | FP8 加速预期 |
+|------|-----------|---------|---------|------------|
+| 256×256 (M=768) | **高** | **低** | **Memory-bound** | **无加速** — 瓶颈在带宽 |
+| 1024×1024 (M=16384) | 中 | 高 | Compute-bound | **有加速** — 2× TFLOPS 有效 |
+
+如果 ncu 数据满足上表模式，即为 **"256×256 GEMM 是 bandwidth-bound，FP8 无法发挥"** 的铁证。
+
+#### 补充：wave quantization 效应
+
+H20 有 132 个 SM。对于 M=768, N=3840 的 GEMM（如 QKV projection）：
+
+```
+tile 128×128: grid = ceil(768/128) × ceil(3840/128) = 6 × 30 = 180 tiles
+wave 数 = ceil(180/132) = 2 waves
+最后一个 wave: 180 - 132 = 48 tiles → 48/132 = 36% SM 利用率
+
+对比 M=16384:
+tile 128×128: grid = ceil(16384/128) × ceil(3840/128) = 128 × 30 = 3840 tiles
+wave 数 = ceil(3840/132) = 30 waves (nearly full)
+最后一个 wave 利用率: (3840 - 29*132) / 132 = 12/132 ≈ 9%，但 29 个 wave 都是满的
+→ 平均 SM 利用率远高于 256×256
+```
+
+M=768 的 GEMM 只需要 ~2 个 wave，其中最后一个 wave 仅用 36% SM，这进一步解释了
+为什么小分辨率下 SM 利用率低、kernel 表现为 memory-bound。
+
+---
+
+---
+
+## 8. torch.compile 收益分析：为什么收益极小？
+
+### 8.1 实测数据汇总
+
+| 分辨率 | 无 compile Denoising (ms) | 有 compile Denoising (ms) | 稳态 step 无 compile (ms) | 稳态 step 有 compile (ms) | step 级别变化 | 总时延变化 |
+|---|---|---|---|---|---|---|
+| **256×256** | 267.4 | 431.0 | ~33 | ~47 | **+42% 更慢** | **+48% 负收益** |
+| **512×512** | 837.5 | 816.6 | ~104 | ~102 | **-2% 微弱** | **-1.8%** |
+| **1024×1024** | 3413.3 | 3324.8 | ~422 | ~415 | **-1.7%** | **-5.7%** |
+
+> **基准对比组**: `baseline_1gpu_tebf16.json` vs `baseline_1gpu_tebf16_compile.json`（三个分辨率目录下）
+
+**关键发现**: torch.compile 在 256×256 下产生严重负收益 (+48%)，在 512×512 和 1024×1024 下仅有微弱收益 (1.8%~5.7%)。
+
+### 8.2 根本原因：关键路径已被 custom CUDA kernel 全覆盖
+
+torch.compile 的本质是将 PyTorch eager 模式的算子图编译成融合 kernel，减少 kernel launch overhead 和内存读写。但该模型的关键路径上几乎所有重计算操作都已被 custom kernel 覆盖：
+
+| 操作 | 计算占比（估算） | 已有优化 | torch.compile 能否优化 |
+|---|---|---|---|
+| **Attention (QKV→FlashAttn→Out)** | ~40-50% | FlashAttention v3/v4 (sgl_kernel) | ❌ 不透明 custom op，compile 直接 passthrough |
+| **Linear (GEMM)** | ~30-40% | cuBLAS GEMM（本身已极致优化） | ❌ cuBLAS 调用无法被 Inductor 改写 |
+| **RMSNorm** | ~3-5% | Triton JIT / sgl_kernel fused | ❌ 已是 custom kernel |
+| **SiLU+Mul (SwiGLU)** | ~2-3% | sgl_kernel fused | ❌ 已是 custom kernel |
+| **QK Norm** | ~1-2% | fused_inplace_qknorm | ❌ 已是 custom kernel |
+| **ROPE** | ~1-2% | FlashInfer kernel | ❌ 已是 custom kernel |
+| **AdaLN modulation (scale/shift/gate)** | ~2-3% | ❌ **纯 PyTorch eager** | ✅ 可以融合 |
+| **reshape/cat/chunk/view** | ~1-2% | ❌ **纯 PyTorch eager** | ✅ 可以消除 |
+| **patchify/unpatchify** | <1% | ❌ **纯 PyTorch eager** | ✅ 可以融合 |
+
+**结论**: torch.compile 实际只能优化最后 ~5% 的"胶水代码"——AdaLN modulation 中的 `chunk`、`tanh`、`1.0 + scale`、`gate * x` 这类小运算，以及 tensor reshape。
+
+### 8.3 torch.compile 的 Overhead 来源
+
+当前 compile 配置为（见 `denoising.py` L141-158）:
+```python
+compile_kwargs = {"fullgraph": False, "dynamic": None}
+mode = "max-autotune-no-cudagraphs"  # 来自 SGLANG_TORCH_COMPILE_MODE 环境变量
+```
+
+#### (a) `fullgraph=False`：允许 graph break
+
+- 每遇到 custom op (FlashAttn, fused RMSNorm, etc.)，图就断了
+- 一个 transformer block 内可能产生 **5-8 个 graph break**（每个 custom kernel 断一次）
+- 断裂的小子图，每个只包含 1-2 个 element-wise op，Inductor 生成的 kernel 反而比 eager PyTorch dispatch 更慢（JIT overhead > 计算）
+
+#### (b) `max-autotune-no-cudagraphs`：不使用 CUDA Graph
+
+- 没有 CUDA Graph 意味着无法消除 kernel launch overhead
+- 而 kernel launch overhead 正是小 size（256×256）的瓶颈（见第 7 节 SM 利用率分析）
+
+#### (c) `dynamic=None`：动态 shape guard
+
+- 每次 forward 前会做 shape guard 检查
+- 对于 bs=1、小 seq_len 场景，这个 overhead 相对显著
+
+### 8.4 为什么 256×256 反而变慢？
+
+256×256 的 token 数量很少（256×256 / 16 / 16 = 256 tokens），每个 step 只需 ~33ms：
+
+- **GEMM 时间**: 256 tokens × hidden_dim 的 GEMM 极小（微秒级别），**kernel launch overhead 占比极高**
+- torch.compile 把少量 element-wise op 编译成 Triton kernel，但这些 kernel 的 **launch overhead** 比原来 eager mode 的 PyTorch CUDA dispatch 更大
+- 同时有 **graph break overhead**（进出 compiled region 的开销）
+- 稳态 step: 33ms → 47ms，**每个 step 增加约 14ms 纯 overhead**
+- 结果: overhead > 收益，净负
+
+### 8.5 优化方向与预估上限
+
+#### 方向 A: 让 torch.compile 真正生效（潜力 ~10-20%）
+
+| 策略 | 做法 | 预估收益 | 难度 |
+|---|---|---|---|
+| **A1. 启用 CUDA Graphs** | `SGLANG_TORCH_COMPILE_MODE=max-autotune`（而非 no-cudagraphs） | +10-20% | 中，需验证 custom op 兼容性 |
+| **A2. 减少 graph break** | 为所有 custom op 注册 `torch.library.custom_op` + `fake_impl`，使 Inductor 能"看穿" | +5-10% | 高，需逐个 op 适配 |
+| **A3. reduce-overhead 模式** | `SGLANG_TORCH_COMPILE_MODE=reduce-overhead`，专门针对 launch overhead | +5-15%（小 size） | 低，改环境变量即可 |
+
+> 注: Flash Attention v4 已注册了 `@register_custom_op(fake_impl=...)`（见 `flash_attn.py`），但 RMSNorm、SiLU+Mul 等其他 op 尚未注册。
+
+#### 方向 B: 绕过 torch.compile，直接写 fused kernel（潜力 ~5-15%）
+
+| 策略 | 做法 | 预估收益 | 难度 |
+|---|---|---|---|
+| **B1. Fused AdaLN Triton kernel** | 将 AdaLN modulation（Linear + chunk + tanh + add）的 7 个 kernel 融合为 1 个 | +3-5% | 中 |
+| **B2. 确保 ScaleResidualNormScaleShift 全覆盖** | 代码中已有 `_ScaleResidualNormScaleShift` fused kernel（见 `layernorm.py` L329-443），确认所有 block 均启用 | +3-5% | 低 |
+
+> AdaLN modulation 当前 eager 代码（`zimage.py` ZImageTransformerBlock.forward）:
+> ```python
+> scale_msa_gate, _ = self.adaLN_modulation(adaln_input)    # Linear
+> scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(1).chunk(4, dim=2)
+> gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()     # 2x tanh kernel
+> scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp   # 2x add kernel
+> ```
+> 共 7 个 kernel launch，可融合为 1 个 Triton kernel。
+
+#### 方向 C: 减少 kernel 数量的其他手段
+
+- **Persistent Kernel / Stream Pipelining**: H20 上 kernel launch ~5-10μs，256×256 一个 step ~200 个 kernel launch，launch overhead 占 ~3-6%
+- **CUDA Graphs 捕获整个 denoising step**: 把一个完整 step 的所有 kernel 打包执行
+
+### 8.6 优化上限汇总
+
+| 优化项 | 预估收益 | 难度 | 状态 |
+|---|---|---|---|
+| 现状 torch.compile | -48% ~ +5.7% | 已实现 | ⚠️ 几乎无用 |
+| CUDA Graphs 模式 | +10-20% | 中 | 🔴 待验证 |
+| Fused AdaLN Triton kernel | +3-5% | 中 | 🔴 待实现 |
+| 全部 custom op 注册 fake_impl | +5-10% | 高 | 🔴 待实现 |
+| ScaleResidualNormScaleShift 全覆盖 | +3-5% | 低 | 🟡 待确认是否全启用 |
+| reduce-overhead 模式 | +5-15% (小 size) | 低 | 🔴 待测试 |
+| **总计理论上限** | **~20-35%** | | 相对 tebf16 baseline |
+
+### 8.7 建议优先级
+
+1. **🔴 关掉 torch.compile** — 对 256×256 是严重负收益，对 512/1024 收益太小且不值得首请求的编译等待时间
+2. **🟡 验证 `_ScaleResidualNormScaleShift` 是否在所有 block 生效** — 已有 fused kernel 实现，确认全覆盖即可获得收益
+3. **🟡 尝试 `SGLANG_TORCH_COMPILE_MODE=reduce-overhead`** — 可能对小 size 有帮助（低成本试验）
+4. **🟢 手写 Triton fused AdaLN kernel** — 确定性收益，不依赖 compile
+5. **🟢 为所有 custom op 注册 fake_impl** — 长期投资，让 compile 真正有效
+
+---
+
 *Generated by analyze_profile.py + generate_multi_res_charts.py + manual analysis*
 *Charts: analysis_report/*.png*
