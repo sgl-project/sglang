@@ -361,6 +361,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 saved_draft = self.draft_runner.server_args.speculative_num_draft_tokens
                 saved_worker_steps = self.speculative_num_steps
                 saved_worker_draft = self.speculative_num_draft_tokens
+                saved_draft_attn = self.draft_attn_backend
                 self.draft_runner.server_args.speculative_num_steps = num_steps
                 self.draft_runner.server_args.speculative_num_draft_tokens = num_steps + 1
                 self.speculative_num_steps = num_steps
@@ -379,6 +380,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend_for_steps[num_steps] = draft_attn
                 self.draft_extend_attn_backend_for_steps[num_steps] = draft_extend_attn
                 self.draft_runner.draft_attn_backend = draft_attn
+                self.draft_attn_backend = draft_attn
 
                 # Capture draft CUDA graph
                 if num_steps > 1:
@@ -408,6 +410,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner.server_args.speculative_num_draft_tokens = saved_draft
                 self.speculative_num_steps = saved_worker_steps
                 self.speculative_num_draft_tokens = saved_worker_draft
+                self.draft_attn_backend = saved_draft_attn
+                self.draft_runner.draft_attn_backend = saved_draft_attn
 
         # Restore current backends
         self.draft_attn_backend = self.draft_attn_backend_for_steps[default_step]

@@ -320,6 +320,7 @@ class EAGLEWorker(TpModelWorker):
                 saved_draft = self.draft_model_runner.server_args.speculative_num_draft_tokens
                 saved_worker_steps = self.speculative_num_steps
                 saved_worker_draft = self.speculative_num_draft_tokens
+                saved_draft_attn = self.draft_attn_backend
                 self.draft_model_runner.server_args.speculative_num_steps = num_steps
                 self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
                 self.speculative_num_steps = num_steps
@@ -338,6 +339,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend_for_steps[num_steps] = draft_attn
                 self.draft_extend_attn_backend_for_steps[num_steps] = draft_extend_attn
                 self.draft_model_runner.draft_attn_backend = draft_attn
+                self.draft_attn_backend = draft_attn
 
                 # Capture draft CUDA graph for this step
                 if num_steps > 1:
@@ -367,6 +369,8 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.server_args.speculative_num_draft_tokens = saved_draft
                 self.speculative_num_steps = saved_worker_steps
                 self.speculative_num_draft_tokens = saved_worker_draft
+                self.draft_attn_backend = saved_draft_attn
+                self.draft_model_runner.draft_attn_backend = saved_draft_attn
 
         # Also init verify-side multi-step graphs on the target model runner
         target_runner = self.target_worker.model_runner
