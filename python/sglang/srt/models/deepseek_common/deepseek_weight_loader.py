@@ -472,6 +472,7 @@ class DeepseekV2WeightLoaderMixin:
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
                 )
+                is_mxfp8 = bool(getattr(selected_quant_config, "use_mxfp8", False))
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
                         self_attn.kv_b_proj, "weight_scale"
@@ -490,10 +491,7 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
 
-                    if (
-                        bool(getattr(selected_quant_config, "use_mxfp8", False))
-                        and _is_cuda
-                    ):
+                    if is_mxfp8 and _is_cuda:
                         from flashinfer import block_scale_interleave
 
                         w_kc, w_vc = weight.unflatten(
@@ -539,7 +537,7 @@ class DeepseekV2WeightLoaderMixin:
                         continue
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if bool(getattr(selected_quant_config, "use_mxfp8", False)):
+                    if is_mxfp8:
                         weight_scale = (
                             (weight_scale.to(torch.int32) << 23)
                             .view(torch.float32)
