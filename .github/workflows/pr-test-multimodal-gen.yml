@@ -62,12 +62,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: inputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -75,10 +79,12 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
@@ -92,7 +98,7 @@ jobs:
             $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -116,12 +122,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: inputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -129,11 +139,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
@@ -147,7 +159,7 @@ jobs:
             $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -167,12 +179,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: inputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -180,11 +196,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion unit tests
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 60
         run: |
           cd python

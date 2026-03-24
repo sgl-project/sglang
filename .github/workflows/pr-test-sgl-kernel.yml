@@ -34,16 +34,22 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Cleanup
+        if: steps.stage-health.outputs.healthy == 'true'
         run: |
           ls -alh sgl-kernel/dist || true
           rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -51,11 +57,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         run: |
           cd sgl-kernel
@@ -69,16 +77,22 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Cleanup
+        if: steps.stage-health.outputs.healthy == 'true'
         run: |
           ls -alh sgl-kernel/dist || true
           rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -86,11 +100,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         run: |
           cd test/registered/mla
@@ -104,16 +120,22 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Cleanup
+        if: steps.stage-health.outputs.healthy == 'true'
         run: |
           ls -alh sgl-kernel/dist || true
           rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -121,11 +143,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run benchmark tests
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 45
         run: |
           cd sgl-kernel/benchmark
@@ -151,16 +175,22 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Cleanup
+        if: steps.stage-health.outputs.healthy == 'true'
         run: |
           ls -alh sgl-kernel/dist || true
           rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -168,11 +198,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run sgl-kernel unit tests on B200
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         run: |
           cd sgl-kernel
