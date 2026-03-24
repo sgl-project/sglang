@@ -1,3 +1,4 @@
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -29,7 +30,16 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
+
+_use_aiter_conv = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -53,6 +63,10 @@ elif is_hip():
     from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update_triton,
     )
+    if _use_aiter_conv and os.getenv("SGLANG_CONV1D_UPDATE_IMPL", "aiter") == "aiter":
+        from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
+            causal_conv1d_update,
+        )
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu as causal_conv1d_fn,
