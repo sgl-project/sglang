@@ -430,15 +430,27 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             image_content="blank",
             image_format="png",
             image_resolution="8x8",
-            backend="custom-backend",
+            backend="sglang",
             random_image_count=False,
         )
+        row = rows[0]
         self.assertEqual(len(rows), 1)
-        self.assertFalse(rows[0].prompt.startswith("<image>"))
-        self.assertEqual(
-            rows[0].prompt_len, len(self.tokenizer.encode(rows[0].prompt)) + 4
+        # backend="sglang" => row.prompt is the raw text_prompt.
+        # Independently compute text-only token count to verify the fix:
+        # text_prompt_len must come from the chat-templated text, not raw text.
+        text_only_templated = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": row.prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+            return_dict=False,
         )
-        self.assertGreater(rows[0].vision_prompt_len, 0)
+        self.assertEqual(
+            row.text_prompt_len, len(self.tokenizer.encode(text_only_templated))
+        )
+        self.assertEqual(
+            row.text_prompt_len + row.vision_prompt_len, row.prompt_len,
+        )
+        self.assertGreater(row.vision_prompt_len, 0)
 
     def test_mooncake_scheduler(self):
         records = [

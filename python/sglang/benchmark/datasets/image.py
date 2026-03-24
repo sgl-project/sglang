@@ -102,6 +102,7 @@ def create_mm_data_row(
                 [
                     {
                         "role": "user",
+                        # <|endoftext10|> is the image token used in the phi-4-multimodal model.
                         "content": text_prompt.replace("image 1", "|endoftext10|"),
                     }
                 ],
@@ -182,17 +183,21 @@ def create_mm_data_row(
             add_generation_prompt=True,
             tokenize=False,
         )
+    except Exception:
+        # Fall back to the raw text only when chat template is unavailable.
+        text_only_prompt = text_prompt
+
+    tokenizer_to_use = (
+        processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    )
+    try:
         text_prompt_len = processor(
             text=[text_only_prompt],
             padding=False,
             return_tensors="pt",
         )["input_ids"].numel()
     except Exception:
-        # Fallback: just tokenize the text prompt directly
-        tokenizer_to_use = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
+        text_prompt_len = len(tokenizer_to_use.encode(text_only_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
