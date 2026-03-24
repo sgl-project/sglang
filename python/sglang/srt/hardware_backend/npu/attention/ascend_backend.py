@@ -210,6 +210,7 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
+        self.speculative_step_offset_npu = torch.tensor(speculative_step_id + 1, device='npu')
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
@@ -452,7 +453,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_id + 1
+            seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
