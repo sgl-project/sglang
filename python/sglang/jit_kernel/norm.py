@@ -31,14 +31,33 @@ def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
     )
 
 
+_RMSNORM_WARP_SIZES = frozenset({64, 128, 256})
+_RMSNORM_MAX_HIDDEN_SIZE = 8192
+
+
+def _is_supported_rmsnorm_hidden_size(hidden_size: int) -> bool:
+    return hidden_size in _RMSNORM_WARP_SIZES or (
+        hidden_size > 256
+        and hidden_size % 256 == 0
+        and hidden_size <= _RMSNORM_MAX_HIDDEN_SIZE
+    )
+
+
+def _rmsnorm_kernel_class(hidden_size: int) -> str:
+    if hidden_size in _RMSNORM_WARP_SIZES:
+        return "RMSNormWarpKernel"
+    return "RMSNormKernel"
+
+
 @cache_once
 def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
+    kernel_class = f"{_rmsnorm_kernel_class(hidden_size)}<{args}>"
     return load_jit(
         "rmsnorm",
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
-        cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
+        cuda_wrappers=[("rmsnorm", f"{kernel_class}::run")],
     )
 
 
@@ -104,6 +123,12 @@ def rmsnorm(
 ) -> None:
     output = output if output is not None else input
     hidden_size = input.size(-1)
+    if not _is_supported_rmsnorm_hidden_size(hidden_size):
+        raise RuntimeError(
+            f"jit rmsnorm: unsupported hidden_size={hidden_size}. "
+            f"Supported: {sorted(_RMSNORM_WARP_SIZES)}, and multiples of 256 in "
+            f"(256, {_RMSNORM_MAX_HIDDEN_SIZE}]."
+        )
     module = _jit_rmsnorm_module(hidden_size, input.dtype)
     module.rmsnorm(input, weight, output, eps)
 

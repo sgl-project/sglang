@@ -1,6 +1,8 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_sampling.py
 # and /sgl-workspace/sglang/sgl-kernel/tests/test_sampling.py
 
+import sys
+
 import pytest
 import sgl_kernel
 import torch
@@ -115,4 +117,4 @@ def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -31,10 +31,14 @@ class HWBackend(Enum):
 class CIRegistry:
     backend: HWBackend
     filename: str
+    # Estimated time to run the test in seconds.
     est_time: float
+    # The suite this test is registered in.
     suite: str
+    # Whether the test is a nightly test.
     nightly: bool = False
-    disabled: Optional[str] = None  # None = enabled, string = disabled with reason
+    # Reason for disabling the test. None = enabled, string = disabled with reason.
+    disabled: Optional[str] = None
 
 
 def register_cpu_ci(

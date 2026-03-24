@@ -1,9 +1,11 @@
 ---
 name: write-sglang-test
-description: Guide for writing SGLang CI/UT tests following project conventions. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
+description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
 ---
 
 # Writing SGLang CI / UT Tests
+
+**Before or while applying this skill, read [`test/README.md`](../../../test/README.md)** in the repo root’s `test/` tree. It documents the three-stage CI pipeline, suite naming, how tests are discovered and executed, file layout, and practical tips that complement the sections below.
 
 ## Core Rules
 
@@ -44,8 +46,8 @@ Defined in `python/sglang/test/test_utils.py`:
 | Suite | Runner | Scenario |
 |-------|--------|----------|
 | `stage-a-test-cpu` | CPU | CPU unit tests |
-| `stage-b-test-1-gpu-small` | 1× 5090 (32GB) | Small model tests |
-| `stage-b-test-1-gpu-large` | 1× H100 (80GB) | 8B model tests |
+| `stage-b-test-1-gpu-small` | 1× 5090 (32GB) | Small model tests (1B, 8B) |
+| `stage-b-test-1-gpu-large` | 1× H100 (80GB) | Large model tests or performance related |
 | `stage-b-test-2-gpu-large` | 2× H100 | TP=2 tests |
 | `stage-c-test-4-gpu-h100` | 4× H100 | TP=4 / EP tests |
 | `stage-c-test-8-gpu-h200` | 8× H200 | Large-scale multi-GPU |

@@ -1,4 +1,5 @@
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -175,4 +176,4 @@ def test_timestep_embedding_perf():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

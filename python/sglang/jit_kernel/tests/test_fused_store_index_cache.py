@@ -16,6 +16,7 @@ Design Notes:
 
 from __future__ import annotations
 
+import sys
 from typing import Optional, Tuple
 
 import pytest
@@ -450,4 +451,4 @@ def test_reference_writes_nonzero():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
