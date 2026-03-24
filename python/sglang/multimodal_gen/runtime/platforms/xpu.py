@@ -101,8 +101,21 @@ class XPUPlatform(Platform):
         return "SDPA"
 
     def get_torch_distributed_backend_str(self) -> str:
-        # Intel XPU uses oneCCL (Intel Collective Communications Library)
-        return "ccl"
+        # Intel XPU uses oneCCL (Intel Collective Communications Library).
+        # Importing oneccl_bindings_for_pytorch registers the 'ccl' backend
+        # with torch.distributed. Fall back to gloo if not installed.
+        try:
+            import oneccl_bindings_for_pytorch  # noqa: F401
+
+            return "ccl"
+        except ImportError:
+            logger.warning(
+                "oneccl_bindings_for_pytorch not found, falling back to gloo "
+                "backend. For multi-XPU support install it via: "
+                "pip install oneccl_bind_pt --extra-index-url "
+                "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
+            )
+            return "gloo"
 
     @classmethod
     def is_xpu(cls) -> bool:
