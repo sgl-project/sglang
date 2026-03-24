@@ -617,14 +617,17 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
         """Initialize graph input tensors and create the buffers dataclass."""
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            out_cache_loc = torch.ones((self.max_num_token,), dtype=self._cache_loc_dtype())
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
 
-            if self.eagle_worker.speculative_algorithm.is_eagle3():
+            if (
+                self.eagle_worker.speculative_algorithm.is_eagle3()
+                and self.eagle_worker.eagle_use_aux_hidden_state
+            ):
                 hidden_dim = (
                     self.model_runner.model_config.hf_config.target_hidden_size * 3
                     if hasattr(
