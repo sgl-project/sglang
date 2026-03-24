@@ -350,13 +350,13 @@ class LTX2PipelineConfig(PipelineConfig):
 
         return latents, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         """Gather latents after SP. For packed token latents [B, S_local, D], gather on dim=1."""
         if get_sp_world_size() <= 1:
             return latents
         if isinstance(latents, torch.Tensor) and latents.ndim == 3:
             return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
-        return super().gather_latents_for_sp(latents)
+        return super().gather_latents_for_sp(latents, batch=batch)
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing

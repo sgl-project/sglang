@@ -233,7 +233,8 @@ def test_scale_cpu_input():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
+    import sys
+    sys.exit(pytest.main([__file__, "-q"]))
 ```
 
 ---
@@ -244,18 +245,15 @@ Create `sgl-kernel/benchmark/bench_scale.py`:
 
 ```python
 import itertools
-import os
 
 import torch
 import triton
 import triton.testing
 
 import sgl_kernel
+from sglang.utils import is_in_ci
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 dtypes  = [torch.float16] if IS_CI else [torch.float16, torch.bfloat16, torch.float32]
 sizes   = [4096] if IS_CI else [2**n for n in range(10, 20)]  # 1K … 512K

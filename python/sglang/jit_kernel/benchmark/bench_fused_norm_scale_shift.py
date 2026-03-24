@@ -8,13 +8,17 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNormScaleShift,
     ScaleResidualLayerNormScaleShift,
     ScaleResidualRMSNormScaleShift,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=17, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [1024]

@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=400, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=400, suite="stage-b-test-2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):

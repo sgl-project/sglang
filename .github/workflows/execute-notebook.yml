@@ -28,7 +28,7 @@ jobs:
 
   run-all-notebooks:
     needs: [call-gate]
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     if: github.event_name != 'pull_request' || needs.call-gate.result == 'success'
     steps:
       - name: Checkout code
