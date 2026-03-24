@@ -8,9 +8,22 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils import get_bool_env_var, is_hip
+
 from .causal_conv1d_triton import PAD_SLOT_ID
 from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
 from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_aiter_conv1d_update = None
+if _use_aiter:
+    try:
+        from aiter import conv1d_update as _aiter_conv1d_update
+    except ImportError:
+        try:
+            from aiter import causal_conv1d_update as _aiter_conv1d_update
+        except ImportError:
+            pass
 
 try:
     from sgl_kernel import causal_conv1d_fwd
@@ -141,6 +154,30 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    # Use aiter conv1d_update when available (HIP + SGLANG_USE_AITER)
+    if _aiter_conv1d_update is not None:
+        if activation not in [None, "silu", "swish"]:
+            raise NotImplementedError(
+                f"activation must be None, silu, or swish, actual: {activation}"
+            )
+        activation_val = activation in ["silu", "swish"]
+        unsqueeze = x.dim() == 2
+        if unsqueeze:
+            x = x.unsqueeze(-1)
+        _aiter_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation_val,
+            cache_seqlens,
+            conv_state_indices,
+            pad_slot_id,
+        )
+        if unsqueeze:
+            x = x.squeeze(-1)
+        return x
+
     use_triton = not _HAS_SGL_KERNEL
     if use_triton:
         return _causal_conv1d_update_triton(

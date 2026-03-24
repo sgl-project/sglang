@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -48,6 +48,10 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+elif is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_update,
+    )
 
 
 class GDNKernelDispatcher:
@@ -79,6 +83,17 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
+        elif decode_backend.is_aiter():
+            if not is_hip() or not get_bool_env_var("SGLANG_USE_AITER"):
+                raise ValueError(
+                    "Aiter GDN backend requires HIP and SGLANG_USE_AITER=1"
+                )
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                AiterGDNKernel,
+            )
+
+            aiter_kernel = AiterGDNKernel()
+            self.decode_kernel = aiter_kernel
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -102,12 +117,32 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_aiter():
+            if not is_hip() or not get_bool_env_var("SGLANG_USE_AITER"):
+                raise ValueError(
+                    "Aiter GDN backend requires HIP and SGLANG_USE_AITER=1"
+                )
+            if decode_backend.is_aiter():
+                self.extend_kernel = self.decode_kernel
+            else:
+                from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                    AiterGDNKernel,
+                )
+
+                self.extend_kernel = AiterGDNKernel()
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
+        # Verify kernel: use FlashInfer if either decode or prefill selected it;
+        # AiterGDNKernel implements target_verify via Triton fallback
         if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
             self.verify_kernel = flashinfer_kernel
+        elif decode_backend.is_aiter() or prefill_backend.is_aiter():
+            self.verify_kernel = (
+                self.decode_kernel
+                if decode_backend.is_aiter()
+                else self.extend_kernel
+            )
         else:
             self.verify_kernel = triton_kernel
 
