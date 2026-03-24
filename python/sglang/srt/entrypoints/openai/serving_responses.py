@@ -328,6 +328,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=self._get_reasoning_from_request(request),
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -432,6 +433,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=request.stream,
                 tools=function_tools,
                 tool_choice=request.tool_choice,
+                chat_template_kwargs=request.chat_template_kwargs,
+                reasoning_effort=(
+                    request.reasoning.effort if request.reasoning else None
+                ),
             )
 
             # Follow SGLang's _process_messages pattern
@@ -451,8 +456,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Fallback to simple encoding
             prompt_text = ""
             for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                else:
+                    role = msg.role if hasattr(msg, "role") else "user"
+                    content = msg.content if hasattr(msg, "content") else ""
                 prompt_text += f"{role}: {content}\n"
             prompt_ids = tokenizer.encode(prompt_text)
             request_prompts = [prompt_ids]
@@ -521,6 +530,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
             elif "prompt_token_ids" in final_res and "outputs" in final_res:
                 # Fallback calculation if meta_info not available
                 num_prompt_tokens = (
@@ -1711,6 +1721,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                require_reasoning=adapted_request.require_reasoning,
             )
 
             # Update sampling params with reduced max_tokens
@@ -1761,7 +1772,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Mistral models only reason when reasoning_effort is explicitly
             # set to a value other than None/"none" (typically "high").
             return (
-                request.reasoning_effort is not None
-                and request.reasoning_effort != "none"
+                request.reasoning is not None and request.reasoning.effort is not None
             )
         return True  # default

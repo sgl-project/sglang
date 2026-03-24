@@ -1179,6 +1179,7 @@ ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ChatCompletionMessageGenericParam,
 ]
 
 
@@ -1504,11 +1505,6 @@ class ToolCallProcessingResult(NamedTuple):
 class ResponseReasoningTextContent(BaseModel):
     text: str
     type: Literal["reasoning_text"] = "reasoning_text"
-
-
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
-]
 
 
 # ================== Transcription API Protocol Definitions ==================
