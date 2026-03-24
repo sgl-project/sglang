@@ -27,8 +27,6 @@ if is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
     try:
         import aiter  # noqa: F401
 
-        from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
-
         _aiter_available = True
     except ImportError:
         pass
