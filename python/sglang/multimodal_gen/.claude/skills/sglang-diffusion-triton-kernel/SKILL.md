@@ -1,14 +1,14 @@
 ---
-name: add-triton-kernel
-description: Step-by-step guide for adding a new Triton kernel to SGLang Diffusion's jit_kernel module. Use when implementing fused elementwise ops, norm variants, RoPE variants, or any other lightweight GPU kernel for diffusion models using Triton JIT. Covers kernel authoring, autotune, torch.compile compatibility, layer integration, and tests.
+name: sglang-diffusion-triton-kernel
+description: Use when writing or tuning a Triton diffusion kernel in SGLang.
 ---
 
 # Adding a Triton Kernel to SGLang Diffusion
 
-This guide walks through adding a Triton kernel to `python/sglang/jit_kernel/diffusion/triton/`.
+Use this skill when authoring or integrating a Triton kernel in `python/sglang/jit_kernel/diffusion/triton/`.
 We use a fused elementwise operation as the running example: `y = x * (1 + scale) + shift` (AdaLN modulation).
 
-Before compiling, benchmarking, or profiling any Triton kernel from this guide, use `scripts/diffusion_skill_env.py` (or the setup block in `diffusion-benchmark-and-profile.md`) to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and choose an idle GPU.
+Before compiling, benchmarking, or profiling any Triton kernel from this guide, use `../sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py` or the setup block in `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md` to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and choose an idle GPU.
 
 ---
 
@@ -22,7 +22,7 @@ python/sglang/jit_kernel/diffusion/
 │   ├── rmsnorm_onepass.py      # One-pass RMSNorm for small hidden size
 │   └── rotary.py               # RoPE kernel
 └── cutedsl/
-    └── ...                     # CuTe DSL kernels (see use-efficient-diffusion-kernels.md)
+    └── ...                     # CuTe DSL kernels (see existing-fast-paths.md in the benchmark/profile skill)
 ```
 
 New Triton kernels go into `triton/<op_name>.py`.
@@ -375,8 +375,8 @@ After correctness tests, you must use **ncu (Nsight Compute)** to validate hardw
 
 To avoid duplicating ncu CLI details across multiple skills, this skill does not repeat command flags. Follow the canonical docs:
 
-- `diffusion-benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
-- `nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / warp stalls)
+- `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
+- `../sglang-diffusion-benchmark-profile/nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / warp stalls)
 
 ---
 
@@ -510,6 +510,6 @@ python/sglang/multimodal_gen/runtime/layers/layernorm.py    # MODIFIED: integrat
 - `python/sglang/jit_kernel/diffusion/triton/rmsnorm_onepass.py` — `wrap_triton`, tiled one-pass reduction
 - `python/sglang/jit_kernel/diffusion/triton/norm.py` — complex autotune with many `constexpr` flags
 - `python/sglang/jit_kernel/diffusion/triton/rotary.py` — per-head grid, interleaved RoPE
-- `nsight-profiler.md` — full Nsight Compute guide: occupancy analysis, roofline model, warp efficiency, kernel comparison
-- `diffusion-benchmark-and-profile.md` — how to verify the kernel's impact on denoise latency
-- `use-efficient-diffusion-kernels.md` — overview of existing fused kernel entry points
+- `../sglang-diffusion-benchmark-profile/nsight-profiler.md` — full Nsight Compute guide: occupancy analysis, roofline model, warp efficiency, kernel comparison
+- `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md` — how to verify the kernel's impact on denoise latency
+- `../sglang-diffusion-benchmark-profile/existing-fast-paths.md` — overview of existing fused kernel entry points

@@ -306,6 +306,8 @@ dram__throughput.avg.pct_of_peak_sustained_elapsed \
 # - smsp__warp_issue_stalled_*: warp stall breakdown (memory_dependency / math_pipe)
 
 # 6. System-level profiling (per-op breakdown inside sglang generate)
+# Required for gated FLUX repos:
+# export HF_TOKEN=<your_hf_token>
 nsys profile -o denoise_profile \
   sglang generate --model-path=black-forest-labs/FLUX.1-dev \
     --width=1024 --height=1024 --num-inference-steps=50 \
