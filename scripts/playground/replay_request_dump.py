@@ -54,7 +54,8 @@ def normalize_request_data(json_data):
 def read_records(files):
     records = []
     for f in files:
-        tmp = safe_pickle_load(open(f, "rb"))
+        with open(f, "rb") as fh:
+            tmp = safe_pickle_load(fh)
         if isinstance(tmp, dict) and "requests" in tmp:
             records.extend(tmp["requests"])
         else:
