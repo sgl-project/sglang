@@ -496,8 +496,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            # Aiter returns final_state; Triton updates in-place. Copy back when kernel
+            # returns state (aiter, NPU, CPU) so ssm_states is correct for next decode.
+            if (is_npu() or is_cpu() or get_linear_attn_prefill_backend().is_aiter()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
