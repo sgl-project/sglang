@@ -372,7 +372,7 @@ cached by Dynamo — no runtime overhead from the branch.
 `index_select` on it is compilable. The buffer is constant across calls
 (same positions range), so Inductor can optimize the access pattern.
 
-### 4. What Inductor should produce
+### 4. What Inductor produces
 
 For the compiled `forward_native` with KV scatter, Inductor sees:
 
@@ -383,20 +383,12 @@ index_select(cos_sin_cache, 0, positions)
   → index_put_(v_buffer, [cache_loc], value)
 ```
 
-The RoPE portion is a pointwise fusion candidate. The `index_put_` calls
-are scatter ops. Inductor typically emits:
-
-- 1 Triton kernel for RoPE on q (pointwise)
-- 1 Triton kernel for RoPE on k (pointwise)
-- 1 Triton kernel for k_buffer scatter
-- 1 Triton kernel for v_buffer scatter
-
-Or fewer if Inductor manages to fuse pointwise + scatter (e.g., compute
-rotated k and scatter in one pass). Even in the worst case of 2-4
-Triton kernels, this eliminates the JIT compilation overhead and the
-separate `store_kvcache` launch. The real win is that Inductor can
-schedule these optimally and potentially fuse with surrounding ops if the
-compile scope grows.
+**Confirmed result**: Inductor fuses all operations into a **single
+Triton kernel** using `SequentialComboKernelGrid` with 3 sub-kernels
+(RoPE on query, RoPE on key + k scatter, v scatter). This replaces
+both the `fused_rope_kernel` and `store_kvcache` JIT kernels with one
+Inductor-generated kernel. See "Verified fusion" in the Implementation
+Update section for details.
 
 ---
 
@@ -410,10 +402,14 @@ compile scope grows.
 | `srt/models/gpt_oss.py` | Pass `is_compiled=self.rotary_emb.is_torch_compile` to `enable_fused_set_kv_buffer` |
 
 No changes needed in:
-- `cuda_graph_runner.py` (the global `compile_dynamic` is not touched; `_to_torch` already handles `RotaryEmbedding`)
 - `server_args.py` (existing flags suffice)
 - Attention backends (still handle `save_kv_cache=True` for eager SWA)
 - JIT kernels / `forward_cuda` (untouched)
+
+**Note:** `cuda_graph_runner.py` was originally expected to require no
+changes, but it turned out that `DecodeInputBuffers` needed
+`out_cache_loc_swa` support for SWA models — see Fix 4 in the
+Implementation Update below.
 
 ---
 
@@ -471,11 +467,12 @@ launch configs).
 
 ## Open Questions
 
-1. **Does Inductor fuse `index_put_` with preceding pointwise?**
-   Needs empirical check. If not, the compiled path for standard models
-   may be slightly slower than the hand-written fused kernel (which does
-   RoPE + scatter in one pass). For SWA models it's still a win (2 → N
-   where N <= 4, but with better scheduling).
+1. ~~**Does Inductor fuse `index_put_` with preceding pointwise?**~~
+   **Resolved: Yes.** Inductor fuses RoPE pointwise + `index_put_`
+   scatter into a single `SequentialComboKernelGrid` Triton kernel.
+   The key scatter for k is fused with the RoPE rotation of k in the
+   same sub-kernel. This matches or exceeds the hand-written fused
+   kernel for standard models, and replaces 2 kernels → 1 for SWA.
 
 2. **Extend to QK-norm + RoPE + KV?**
    See `todo/compile-qk-norm-rope-kv.md` for the broader plan. This doc
@@ -545,10 +542,10 @@ corrupting the cache.
 
 #### Fix 3: Guard against missing `out_cache_loc_swa` (`utils.py`)
 
-The regular `CudaGraphRunner` does not populate
+The regular `CudaGraphRunner` did not populate
 `forward_batch.out_cache_loc_swa` (only `PiecewiseCudaGraphRunner`
-does). For SWA models during CUDA graph capture, `cache_loc` resolved
-to `None`. Two layers of defense:
+did). For SWA models during CUDA graph capture, `cache_loc` resolved
+to `None`. Two layers of defense were added:
 
 1. `enable_fused_set_kv_buffer` now requires
    `forward_batch.out_cache_loc_swa is not None` when operating on an
@@ -559,6 +556,59 @@ to `None`. Two layers of defense:
 2. `create_fused_set_kv_buffer_arg` returns `None` if `cache_loc`
    resolves to `None` (belt-and-suspenders).
 
+#### Fix 4: `out_cache_loc_swa` in `CudaGraphRunner` (`cuda_graph_runner.py`)
+
+With Fix 3, SWA models using the regular `CudaGraphRunner` fell back
+to the two-kernel eager path because `out_cache_loc_swa` was `None`
+during CUDA graph capture. To fully enable the fused path, the regular
+`CudaGraphRunner` was extended to handle `out_cache_loc_swa`,
+mirroring the pattern already present in `PiecewiseCudaGraphRunner`:
+
+1. **Allocation**: Added `out_cache_loc_swa: Optional[torch.Tensor]`
+   to `DecodeInputBuffers`. `create()` conditionally allocates
+   `torch.zeros((max_num_token,), dtype=torch.int64)` when
+   `is_hybrid_swa=True`.
+
+2. **Capture**: `capture_one_batch_size()` slices
+   `buffers.out_cache_loc_swa[:num_tokens]` and passes it to the
+   `ForwardBatch` constructor.
+
+3. **Replay**: `populate_from_forward_batch()` copies the live
+   `forward_batch.out_cache_loc_swa` into the buffer, and zeros the
+   buffer when `bs != raw_bs` (padding).
+
+This is a small int64 index tensor (`max_num_token` elements × 8
+bytes) — negligible memory overhead. The actual KV cache buffers are
+not duplicated; both pools (`full_kv_pool`, `swa_kv_pool`) only store
+layers assigned to them, and the SWA pool independently recycles old
+tokens via `free_swa()` as sequences grow past the sliding window.
+
+### Verified fusion: Inductor output
+
+With all fixes applied, `torch_compile_debug` artifacts confirm that
+Inductor produces a **single fused Triton kernel** for both full and
+SWA layers. The kernel uses `SequentialComboKernelGrid` with 3
+sub-kernels:
+
+| Sub-kernel | Elements | Operation |
+|---|---|---|
+| `pid < num_xblocks_0` | 4096 (64 heads × 64 dim) | RoPE on **query** |
+| `pid < num_xblocks_1` | 512 (8 heads × 64 dim) | RoPE on **key** + `index_put_` into **k_buffer** |
+| `pid < num_xblocks_2` | 512 | `index_put_` **value** into **v_buffer** |
+
+Dynamo compiles two graph variants:
+
+- **Graph 0** (full attention layers): k/v buffers are static
+  `bf16[2327680, 512]`, `cache_loc` = `out_cache_loc`.
+- **Graph 1** (SWA layers): k/v buffers are dynamic
+  `bf16[s77, 512]` / `bf16[s67, 512]`, `cache_loc` = `out_cache_loc_swa`.
+  Bounds checks use runtime `ks0`/`ks1` kernel arguments.
+
+The two graphs exist because the SWA pool has a different token
+capacity than the full pool (controlled by `swa_full_tokens_ratio`,
+default 0.8). The recompile from graph 0 → graph 1 happens once at
+startup; both are then cached and replayed via CUDA graphs.
+
 ### Files changed (final)
 
 | File | Change |
@@ -568,25 +618,113 @@ to `None`. Two layers of defense:
 | `srt/models/utils.py` | `is_compiled` kwarg + `out_cache_loc_swa` guard in `enable_fused_set_kv_buffer`; `cache_loc is None` guard in `create_fused_set_kv_buffer_arg` |
 | `srt/models/gpt_oss.py` | Pass `is_compiled` kwarg |
 | `srt/layers/utils/multi_platform.py` | MRO-based `_matches_override_layers` for subclass matching |
+| `srt/model_executor/cuda_graph_runner.py` | `out_cache_loc_swa` in `DecodeInputBuffers`: allocate, capture, and replay for SWA models |
 | `test/registered/unit/layers/test_multi_platform.py` | Tests for MRO matching |
 | `test/registered/unit/layers/test_fused_kv_buffer.py` | Unit tests for enable/create helpers + numerics vs CUDA kernel |
 
-### Still needs validation
+### Data flow: how `cache_loc` reaches the compiled kernel
 
-The `out_cache_loc_swa` guard (Fix 3) means that **SWA models using
-the regular `CudaGraphRunner` will not use the fused RoPE+KV path** —
-they fall back to the two-kernel eager path during CUDA graph capture
-because `out_cache_loc_swa` is `None`. The fused path only activates
-for SWA models when:
+#### Non-fused (eager) path — why `out_cache_loc_swa` was never needed
 
-- Using `PiecewiseCudaGraphRunner` (which populates `out_cache_loc_swa`), OR
-- Running outside CUDA graph capture (e.g. prefill)
+In the eager path, the KV cache write is handled by the attention
+backend, which calls `SWAKVPool.set_kv_buffer(layer, loc, k, v)`.
+This method receives `loc = out_cache_loc` (full-pool indices) and
+internally translates to SWA indices for SWA layers:
 
-To fully enable the fused path for SWA models under the regular
-`CudaGraphRunner`, it would need to allocate and populate
-`out_cache_loc_swa` in `DecodeInputBuffers` and
-`capture_one_batch_size`, similar to what `PiecewiseCudaGraphRunner`
-does. This is left for a follow-up.
+```
+SWAKVPool.set_kv_buffer(layer, loc, cache_k, cache_v)
+  └─ is_swa_layer?
+       ├─ yes → loc = self.swa_loc or translate_loc_from_full_to_swa(loc)
+       │        swa_kv_pool.set_kv_buffer(loc, cache_k, cache_v)
+       └─ no  → full_kv_pool.set_kv_buffer(loc, cache_k, cache_v)
+```
+
+The translation is encapsulated inside the pool. The caller (attention
+backend) and the `ForwardBatch`/`DecodeInputBuffers` only ever needed
+`out_cache_loc`. That's why `CudaGraphRunner` never had
+`out_cache_loc_swa`.
+
+#### Fused (compiled) path — why `out_cache_loc_swa` is now required
+
+The compiled `forward_native` writes directly to the pool's buffer:
+
+```python
+k_buffer.index_put_([cache_loc], key.view(-1, k_buffer.shape[-1]))
+v_buffer.index_put_([cache_loc], value.view(-1, v_buffer.shape[-1]))
+```
+
+`k_buffer` is already the correct sub-pool buffer (returned by
+`SWAKVPool.get_key_buffer(layer_id)` which routes via
+`layers_mapping`). But `cache_loc` must be in the matching coordinate
+space — full-pool indices for full layers, SWA-pool indices for SWA
+layers. There is no `SWAKVPool.set_kv_buffer()` call inside the
+compiled graph to do the translation.
+
+#### Decode step data flow (CUDA graph replay)
+
+```
+┌─ Scheduler ─────────────────────────────────────────────────────┐
+│ alloc_for_decode()                                              │
+│   └─ allocator.alloc_decode() → out_cache_loc (full-pool rows)  │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─ ForwardBatch.init_new() ──────────────────────────────────────┐
+│ out_cache_loc = batch.out_cache_loc                            │
+│ out_cache_loc_swa = translate_loc_from_full_to_swa(            │
+│                         out_cache_loc)                          │
+└────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─ CudaGraphRunner.replay() ─────────────────────────────────────┐
+│ populate_from_forward_batch():                                  │
+│   buffers.out_cache_loc[:N].copy_(forward_batch.out_cache_loc)  │
+│   buffers.out_cache_loc_swa[:N].copy_(                          │
+│       forward_batch.out_cache_loc_swa)                          │
+│                                                                 │
+│ torch.cuda.CUDAGraph.replay()                                   │
+│   └─ per layer: compiled forward_native reads from the same     │
+│      GPU addresses that buffers.out_cache_loc[_swa] point to    │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─ Compiled forward_native (Triton kernel) ──────────────────────┐
+│ For full attention layer:                                       │
+│   cache_loc = out_cache_loc        (from FusedSetKVBufferArg)   │
+│   k_buffer  = full_kv_pool.k_buffer[layer_idx]                  │
+│   k_buffer.index_put_([cache_loc], rotated_key)                 │
+│                                                                 │
+│ For SWA layer:                                                  │
+│   cache_loc = out_cache_loc_swa    (from FusedSetKVBufferArg)   │
+│   k_buffer  = swa_kv_pool.k_buffer[swa_layer_idx]              │
+│   k_buffer.index_put_([cache_loc], rotated_key)                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The key property that makes CUDA graph replay work: the
+`DecodeInputBuffers` tensors are allocated once during `__init__` and
+their GPU memory addresses are baked into the captured graph. Each
+replay, `populate_from_forward_batch()` overwrites the *contents*
+(via `.copy_()`) before `graph.replay()`, so the Triton kernel sees
+fresh indices at the same addresses without re-recording.
+
+### SWA memory layout
+
+`SWAKVPool` creates two separate `MHATokenToKVPool` instances:
+
+```
+full_kv_pool:  [full_max_total_num_tokens, head_num, head_dim] × full_layers_num
+swa_kv_pool:   [swa_max_total_num_tokens,  head_num, head_dim] × swa_layers_num
+```
+
+Each layer's KV data lives in exactly one pool — no duplication. The
+`swa_full_tokens_ratio` (default 0.8) controls the token capacity
+split. The SWA pool can be smaller because old tokens beyond the
+sliding window are independently recycled via `free_swa()` (called by
+the scheduler and the radix cache eviction), while full-pool tokens
+persist for the lifetime of the sequence.
+
+### Remaining validation
 
 End-to-end validation with `bench_one_batch` for both standard and SWA
 models (as described in the Validation section above) should be run to
