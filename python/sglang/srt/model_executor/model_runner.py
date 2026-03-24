@@ -673,16 +673,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        from sglang.srt.utils.network import NetworkAddress
+        from sglang.srt.utils import get_local_ip_auto
 
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
             local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
-        self.remote_instance_transfer_engine_session_id = NetworkAddress(
-            local_ip, self.remote_instance_transfer_engine.get_rpc_port()
-        ).to_host_port_str()
+        self.remote_instance_transfer_engine_session_id = (
+            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
+        )
 
     def _register_to_engine_info_bootstrap(self):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
@@ -692,8 +692,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         import requests as http_requests
 
-        bootstrap_na = self._get_bootstrap_network_address()
-        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
+        bootstrap_url = self._get_bootstrap_url()
+        url = f"{bootstrap_url}/register_transfer_engine_info"
 
         payload = {
             "tp_rank": self.tp_rank,
@@ -708,7 +708,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if resp.status_code == 200:
                 logger.info(
                     f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
+                    f"with bootstrap server at {bootstrap_url}"
                 )
             else:
                 logger.error(
@@ -724,8 +724,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Register parallelism config with the EngineInfoBootstrapServer via HTTP PUT."""
         import requests as http_requests
 
-        bootstrap_na = self._get_bootstrap_network_address()
-        url = f"{bootstrap_na.to_url()}/register_parallelism_config"
+        bootstrap_url = self._get_bootstrap_url()
+        url = f"{bootstrap_url}/register_parallelism_config"
 
         payload = {
             "tp_rank": self.tp_rank,
@@ -737,7 +737,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if resp.status_code == 200:
                 logger.info(
                     f"Registered parallelism config for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
+                    f"with bootstrap server at {bootstrap_url}"
                 )
             else:
                 logger.error(
@@ -749,21 +749,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
             )
 
-    def _get_bootstrap_network_address(self):
-        """Get the NetworkAddress for the EngineInfoBootstrapServer."""
-        from sglang.srt.utils.network import NetworkAddress
-
+    def _get_bootstrap_url(self):
+        """Get the base URL for the EngineInfoBootstrapServer."""
         if self.server_args.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
-            bootstrap_host = (
-                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
-            )
+            import socket
+
+            host_part = self.server_args.dist_init_addr.rsplit(":", 1)[0]
+            try:
+                # Resolve hostname to IP if needed
+                bootstrap_host = socket.getaddrinfo(
+                    host_part, None, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG
+                )[0][4][0]
+            except socket.gaierror:
+                bootstrap_host = host_part
         else:
             bootstrap_host = "127.0.0.1"
 
         bootstrap_port = self.server_args.engine_info_bootstrap_port
-        return NetworkAddress(bootstrap_host, bootstrap_port)
+        return f"http://{bootstrap_host}:{bootstrap_port}"
 
     def _publish_modelexpress_metadata(self):
         """Publish TransferEngine metadata to ModelExpress server (seed mode)."""

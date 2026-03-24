@@ -28,7 +28,6 @@ import signal
 import threading
 import time
 from typing import (
-    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -46,9 +45,6 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.entrypoints.engine_info_bootstrap_server import (
-    EngineInfoBootstrapServer,
-)
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -106,16 +102,6 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
-
-
-@dataclasses.dataclass
-class SchedulerInitResult:
-    """Result from launching schedulers."""
-
-    scheduler_infos: List[Dict[str, Any]]
-    wait_for_ready: Callable[[], None] = lambda: None
-    wait_for_completion: Callable[[], None] = lambda: None
-    engine_info_bootstrap_server: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -473,220 +459,6 @@ class Engine(EngineBase):
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
         return ret
-
-    @classmethod
-    def _launch_scheduler_processes(
-        cls,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
-        """Launch scheduler processes using multiprocessing.
-        Override in subclasses for different backends (e.g. Ray).
-        """
-        scheduler_procs = []
-
-        if server_args.dp_size == 1:
-            # Launch tensor parallel scheduler processes
-            memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=server_args.enable_memory_saver
-            )
-            scheduler_pipe_readers = []
-
-            pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-                _calculate_rank_ranges(
-                    server_args.nnodes,
-                    server_args.pp_size,
-                    server_args.tp_size,
-                    server_args.node_rank,
-                )
-            )
-
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
-                    gpu_id = (
-                        server_args.base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-                    )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
-                    )
-
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
-                        )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
-                        ):
-                            proc.start()
-
-                    scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
-        else:
-            # Launch the data parallel controller
-            reader, writer = mp.Pipe(duplex=False)
-            scheduler_pipe_readers = [reader]
-            proc = mp.Process(
-                target=run_data_parallel_controller_process,
-                kwargs=dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    pipe_writer=writer,
-                    run_scheduler_process_func=run_scheduler_process_func,
-                ),
-            )
-            proc.start()
-            scheduler_procs.append(proc)
-
-        scheduler_infos = []
-
-        def wait_for_ready():
-            infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
-            scheduler_infos.extend(infos)
-
-        def wait_for_completion():
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} "
-                    f"terminated with {proc.exitcode}"
-                )
-
-        return SchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_ready=wait_for_ready,
-            wait_for_completion=wait_for_completion,
-        )
-
-    @classmethod
-    def _launch_subprocesses(
-        cls,
-        server_args: ServerArgs,
-        init_tokenizer_manager_func: Callable,
-        run_scheduler_process_func: Callable,
-        run_detokenizer_process_func: Callable,
-        port_args: Optional[PortArgs] = None,
-    ) -> Tuple[TokenizerManager, TemplateManager, PortArgs, SchedulerInitResult]:
-        """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
-
-        Returns:
-            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
-            engine_info_bootstrap_server is stored on scheduler_init_result if started.
-        """
-        # Configure global environment
-        configure_logger(server_args)
-        _set_envs_and_config(server_args)
-        server_args.check_server_args()
-
-        # Allocate ports for inter-process communications
-        if port_args is None:
-            port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-        # Start the engine info bootstrap server if per-rank info is needed.
-        engine_info_bootstrap_server = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
-            bootstrap_port = server_args.engine_info_bootstrap_port
-            engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                host=server_args.host, port=bootstrap_port
-            )
-
-        # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
-        )
-        scheduler_init_result.engine_info_bootstrap_server = (
-            engine_info_bootstrap_server
-        )
-
-        if (
-            getattr(server_args, "enable_elastic_expert_backup", False)
-            and getattr(server_args, "elastic_ep_backend", None) is not None
-        ):
-            from sglang.srt.elastic_ep.expert_backup_manager import (
-                run_expert_backup_manager,
-            )
-
-            run_expert_backup_manager(server_args, port_args)
-
-        if server_args.node_rank >= 1:
-            # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-            # so they can just wait here.
-            scheduler_init_result.wait_for_ready()
-
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-                # When using `Engine` as a Python API, we don't want to block here.
-                return (
-                    None,
-                    None,
-                    port_args,
-                    scheduler_init_result,
-                )
-
-            launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
-            )
-
-            scheduler_init_result.wait_for_completion()
-            return (
-                None,
-                None,
-                port_args,
-                scheduler_init_result,
-            )
-
-        # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
-        )
-        detoken_proc.start()
-
-        # Init tokenizer manager first, as the bootstrap server is initialized here
-        if server_args.tokenizer_worker_num == 1:
-            tokenizer_manager, template_manager = init_tokenizer_manager_func(
-                server_args, port_args
-            )
-        else:
-            # Launch multi-tokenizer router
-            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-            template_manager = None
-
-        # Wait for the model to finish loading
-        scheduler_init_result.wait_for_ready()
-
-        # Get back some info from scheduler to tokenizer_manager
-        tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
-            "max_req_input_len"
-        ]
-
-        return (
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result,
-        )
 
     def shutdown(self):
         """Shutdown the engine"""
@@ -1359,58 +1131,3 @@ def _launch_subprocesses(
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
     return tokenizer_manager, template_manager, scheduler_infos, port_args
-
-
-def _calculate_rank_ranges(
-    nnodes: int, pp_size: int, tp_size: int, node_rank: int
-) -> Tuple[range, range, int, int]:
-    """Calculate pp_rank_range and tp_rank_range for a given node.
-
-    Args:
-        nnodes: Total number of nodes.
-        pp_size: Pipeline parallel size.
-        tp_size: Tensor parallel size.
-        node_rank: The rank of the node to compute ranges for.
-
-    Returns:
-        A tuple of (pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node):
-        - pp_rank_range: range of pipeline-parallel ranks assigned to this node.
-        - tp_rank_range: range of tensor-parallel ranks assigned to this node.
-        - pp_size_per_node: number of PP ranks per node.
-        - tp_size_per_node: number of TP ranks per node.
-    """
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
-    pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
-    )
-
-    nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
-    tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
-    )
-
-    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
-
-
-def _compute_parallelism_ranks(
-    server_args: ServerArgs, tp_rank: int
-) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-
-    # Parallelism hierarchy (outermost to innermost):
-    # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-    # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-    moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
-    moe_ep_rank = (
-        tp_rank
-        % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
-    )
-    return attn_cp_rank, moe_dp_rank, moe_ep_rank
