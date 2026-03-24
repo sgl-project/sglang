@@ -2360,10 +2360,8 @@ class AiterAttnBackend(AttentionBackend):
 
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
-                # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                #    page_table
-                # )
-                page_table = self.forward_metadata.swa_page_table
+                if self.forward_metadata.swa_page_table is not None:
+                    page_table = self.forward_metadata.swa_page_table
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -2496,7 +2494,8 @@ class AiterAttnBackend(AttentionBackend):
                     and layer.sliding_window_size > -1
                 ):
                     window_size = (layer.sliding_window_size - 1, 0)
-                    page_table = self.forward_metadata.swa_page_table
+                    if self.forward_metadata.swa_page_table is not None:
+                        page_table = self.forward_metadata.swa_page_table
 
                 o = torch.empty_like(q)
 

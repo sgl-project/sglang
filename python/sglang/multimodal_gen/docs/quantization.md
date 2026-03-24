@@ -44,7 +44,7 @@ For more installation information, please refer to the [Nunchaku Official Docume
 Nunchaku provides pre-quantized model weights available on Hugging Face:
 
 - [nunchaku-ai/nunchaku-qwen-image](https://huggingface.co/nunchaku-ai/nunchaku-qwen-image)
-- [nunchaku-ai/nunchaku-flux](https://huggingface.co/nunchaku-ai/nunchaku-flux)
+- [Nunchaku FLUX.1 collection](https://huggingface.co/collections/nunchaku-ai/nunchaku-flux1)
 
 Taking Qwen-Image as an example, several quantized models with different configurations are provided:
 
