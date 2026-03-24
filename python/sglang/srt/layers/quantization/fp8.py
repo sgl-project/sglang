@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernel_api_logging import debug_torch_op
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -109,6 +110,8 @@ if _use_aiter or _use_hip_int4:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+_apply_fp8_marlin_linear = debug_torch_op("apply_fp8_marlin_linear")
 
 
 class Fp8Config(QuantizationConfig):
@@ -643,7 +646,7 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            return torch.ops.sglang.apply_fp8_marlin_linear(
+            return _apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -998,23 +1001,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
-                # add this section for MI300
-                # Pre-shuffle weights
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                )
-        elif _use_aiter:
+
+        if _use_aiter:
             # Pre-shuffle weights
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
+            t = shuffle_weight(layer.w13_weight, (16, 16))
+            layer.w13_weight.copy_(t)
+            del t
+            t = shuffle_weight(layer.w2_weight, (16, 16))
+            layer.w2_weight.copy_(t)
+            del t
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available

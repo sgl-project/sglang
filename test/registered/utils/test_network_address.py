@@ -6,7 +6,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 # Mock get_device() so ServerArgs tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -179,23 +179,23 @@ class TestNetworkAddressParseErrors(unittest.TestCase):
             NetworkAddress.parse(":8000")
 
 
-class TestNetworkAddressFromParts(unittest.TestCase):
+class TestNetworkAddressBracketStripping(unittest.TestCase):
     def test_strip_brackets(self):
-        na = NetworkAddress.from_parts("[::1]", 8000)
+        na = NetworkAddress("[::1]", 8000)
         self.assertEqual(na.host, "::1")
         self.assertTrue(na.is_ipv6)
 
     def test_no_brackets(self):
-        na = NetworkAddress.from_parts("::1", 8000)
+        na = NetworkAddress("::1", 8000)
         self.assertEqual(na.host, "::1")
 
     def test_ipv4_passthrough(self):
-        na = NetworkAddress.from_parts("127.0.0.1", 30000)
+        na = NetworkAddress("127.0.0.1", 30000)
         self.assertEqual(na.host, "127.0.0.1")
         self.assertFalse(na.is_ipv6)
 
     def test_hostname_passthrough(self):
-        na = NetworkAddress.from_parts("myhost", 30000)
+        na = NetworkAddress("myhost", 30000)
         self.assertEqual(na.host, "myhost")
 
 

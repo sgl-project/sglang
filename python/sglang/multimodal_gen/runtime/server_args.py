@@ -44,6 +44,7 @@ from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
+    expand_path_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -932,6 +933,7 @@ class ServerArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
+        kwargs = expand_path_kwargs(dict(kwargs))
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 
