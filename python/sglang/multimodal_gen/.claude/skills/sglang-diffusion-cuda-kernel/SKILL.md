@@ -1,28 +1,32 @@
 ---
-name: add-cuda-kernel
-description: Step-by-step guide for adding a new JIT CUDA kernel to SGLang Diffusion. CUDA source files go in jit_kernel/csrc/diffusion/<op>.cuh; Python wrapper at jit_kernel/diffusion/<op>.py. Use when implementing optimized CUDA kernels for diffusion model operators (RMSNorm, RoPE, AdaLN, GEGLU, etc.) on NVIDIA GPUs (H100, A100). Covers kernel authoring with sglang abstractions, JIT compilation, Python wrapper, integration into the denoise stage, and benchmarking. Adapted from https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels.
+name: sglang-diffusion-cuda-kernel
+description: Use when writing or tuning a JIT CUDA diffusion kernel in SGLang.
 ---
 
 # Adding a CUDA Kernel to SGLang Diffusion (JIT Style)
 
+Use this skill when Triton is not enough and you need vectorized loads, warp reductions, or tighter control over memory layout and occupancy.
+
 > **Origin**: This skill is adapted from the [HuggingFace kernels cuda-kernels skill](https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels), rewritten to follow SGLang's JIT compilation system and internal abstractions.
 >
-> **Run environment first**: before compiling, benchmarking, or profiling any kernel from this guide, use `scripts/diffusion_skill_env.py` (or the setup block in `diffusion-benchmark-and-profile.md`) to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and pick an idle GPU.
+> **Run environment first**: before compiling, benchmarking, or profiling any kernel from this guide, use `../sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py` (or the setup block in `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md`) to `cd` to the repo root resolved from `sglang.__file__`, verify write access, export `FLASHINFER_DISABLE_VERSION_CHECK=1`, and pick an idle GPU.
 >
-> **Extended references** (in this directory's `references/` and `scripts/`):
+> **Gated model note**: if you use any FLUX-based `sglang generate` examples from the references below, export `HF_TOKEN` first so the top-level CLI can recognize the gated Hugging Face repo as a diffusion model.
+>
+> **Extended references** (in this directory's `references/` and the sibling benchmark skill):
 > - [references/kernel-templates.md](references/kernel-templates.md) — copy-paste ready templates for element-wise, row-reduction (RMSNorm), fused AdaLN
 > - [references/troubleshooting.md](references/troubleshooting.md) — build errors, perf issues, integration pitfalls
 > - [references/h100-optimization-guide.md](references/h100-optimization-guide.md) — H100 (sm_90) deep dive
 > - [references/a100-optimization-guide.md](references/a100-optimization-guide.md) — A100 (sm_80) deep dive
 > - [references/t4-optimization-guide.md](references/t4-optimization-guide.md) — T4 (sm_75, FP16 only) deep dive
-> - [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark vs PyTorch
-> - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner; compare perf dumps with `compare_perf.py`
+> - [../sglang-diffusion-benchmark-profile/scripts/bench_diffusion_rmsnorm.py](../sglang-diffusion-benchmark-profile/scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark vs PyTorch
+> - [../sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py](../sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner; compare perf dumps with `compare_perf.py`
 
 ## When to Use CUDA vs Triton
 
 | Scenario | Use |
 |----------|-----|
-| Fused elementwise / norm variants / RoPE | **Triton** (`add-triton-kernel.md`) — faster iteration |
+| Fused elementwise / norm variants / RoPE | **Triton** (`sglang-diffusion-triton-kernel`) — faster iteration |
 | Bandwidth-bound reduction (RMSNorm, LayerNorm) requiring max vectorization | **CUDA** — full control over `__nv_bfloat162` / `float4` vectorization |
 | Attention pattern or tile-based ops needing shared memory tuning | **CUDA** — warp-level primitives, shared memory layout |
 | Prototype or NPU/CPU fallback needed | **Triton** — portable across backends |
@@ -441,8 +445,8 @@ After correctness + benchmarking, you must collect **Nsight Compute (ncu)** data
 
 Use the canonical docs in this directory (do not duplicate CLI details across multiple skills):
 
-- `diffusion-benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
-- `nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / stall reasons)
+- `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md` → Step 3.5 (ncu workflow, including CUDA graph profiling)
+- `../sglang-diffusion-benchmark-profile/nsight-profiler.md` (metrics interpretation: bandwidth / occupancy / roofline / stall reasons)
 
 ---
 
@@ -472,7 +476,7 @@ python/sglang/jit_kernel/diffusion/
 python/sglang/jit_kernel/tests/
 └── test_diffusion_rmsnorm.py                    # NEW: correctness tests
 
-python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/
+python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/
 ├── bench_diffusion_rmsnorm.py                   # Validated micro-benchmark used by this skill
 └── bench_diffusion_denoise.py                   # Preset runner for end-to-end perf dumps
 ```
@@ -502,10 +506,10 @@ python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/
 
 ### Other Diffusion Kernel Skills (this directory)
 
-- **Triton alternative**: `add-triton-kernel.md` — prefer Triton unless bandwidth analysis shows CUDA needed
-- **Existing fused kernels**: `use-efficient-diffusion-kernels.md` — check here first before writing new kernels
-- **Profiling**: `diffusion-benchmark-and-profile.md` — workflow to identify bottleneck before implementing
-- **Nsight Compute deep dive**: `nsight-profiler.md` — full guide: occupancy analysis, roofline model, warp efficiency, kernel comparison
+- **Triton alternative**: `../sglang-diffusion-triton-kernel/SKILL.md` — prefer Triton unless bandwidth analysis shows CUDA needed
+- **Existing fused kernels**: `../sglang-diffusion-benchmark-profile/existing-fast-paths.md` — check here first before writing new kernels
+- **Profiling**: `../sglang-diffusion-benchmark-profile/benchmark-and-profile.md` — workflow to identify bottleneck before implementing
+- **Nsight Compute deep dive**: `../sglang-diffusion-benchmark-profile/nsight-profiler.md` — full guide: occupancy analysis, roofline model, warp efficiency, kernel comparison
 
 ### External
 

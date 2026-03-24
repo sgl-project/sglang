@@ -1,11 +1,11 @@
 ---
-name: add-new-diffusion-model
-description: Step-by-step guide for adding a new diffusion model to SGLang. Covers the recommended Hybrid Monolithic pipeline pattern (BeforeDenoisingStage), as well as when to use the Modular Composition Style. Includes pipeline config, model components, registration, and testing.
+name: sglang-diffusion-add-model
+description: Use when adding a new diffusion model or Diffusers pipeline to SGLang.
 ---
 
-# Tutorial: Adding a New Diffusion Model to SGLang
+# Add a Diffusion Model to SGLang
 
-This tutorial walks through adding support for a new diffusion model. SGLang Diffusion supports two pipeline styles; choose the one that best fits your model.
+Use this skill when adding a new diffusion model or pipeline variant to `sglang.multimodal_gen`.
 
 ## Two Pipeline Styles
 
@@ -126,7 +126,7 @@ class MyModelTransformer2DModel(nn.Module):
     """DiT model for MyModel.
 
     Adapt from the Diffusers/reference implementation. Key points:
-    - Use SGLang's fused LayerNorm/RMSNorm ops (see use-efficient-diffusion-kernels skill)
+    - Use SGLang's fused LayerNorm/RMSNorm ops (see `existing-fast-paths.md` under the benchmark/profile skill)
     - Use SGLang's attention backend selector
     - Keep the same parameter naming as Diffusers for weight loading compatibility
     """
@@ -566,7 +566,7 @@ Before submitting, verify:
 - [ ] `_required_config_modules` lists all modules from `model_index.json`
 - [ ] `PipelineConfig` callbacks (`prepare_pos_cond_kwargs`, `get_freqs_cis`, etc.) match DiT's `forward()` signature
 - [ ] Latent scale/shift factors are correctly configured
-- [ ] Use fused kernels where possible (see `use-efficient-diffusion-kernels` skill)
+- [ ] Use fused kernels where possible (see `existing-fast-paths.md` under the benchmark/profile skill)
 - [ ] Weight names match Diffusers for automatic loading
 - [ ] **TP/SP support** considered for DiT model (recommended; reference `wanvideo.py` for TP+SP, `qwen_image.py` for USPAttention)
 - [ ] **Output quality verified** — generated images/videos are not noise; compared against Diffusers reference output
