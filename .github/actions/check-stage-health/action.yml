@@ -21,7 +21,13 @@ runs:
             run_id: context.runId,
             per_page: 100,
           });
-          const failed = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
-          if (failed.length > 0) {
-            core.setFailed(`Fast-fail: skipping — failed job(s): ${failed.map(j => j.name).join(', ')}`);
+          // Find jobs that failed from a real error, not from fast-fail cascade
+          const rootCauseFailures = jobs.filter(j => {
+            if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
+            // If the failing step is "Check stage health", it's a cascade — skip it
+            const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
+            return !failedStep || failedStep.name !== 'Check stage health';
+          });
+          if (rootCauseFailures.length > 0) {
+            core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
           }
