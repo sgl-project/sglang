@@ -586,6 +586,11 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             )
 
             return FlashInferCuteDslMoE
+        quant_name = quant_config.get_name() if quant_config is not None else None
+        raise ValueError(
+            f"flashinfer_cutedsl with moe_a2a_backend='none' requires "
+            f"quantization='modelopt_fp4', got '{quant_name}'."
+        )
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE

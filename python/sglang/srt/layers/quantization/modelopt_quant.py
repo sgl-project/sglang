@@ -1440,9 +1440,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
+        """Access the global enable_flashinfer_cutedsl_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutedsl_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
     def create_weights(
@@ -1802,7 +1802,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # CuteDSL expects MMA layout for weight scales. Convert from swizzled bytes.
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-                sf_vec_size = 16
+                from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                    FlashInferCuteDslMoE,
+                )
+
+                sf_vec_size = FlashInferCuteDslMoE._FP4_SF_VEC_SIZE
                 num_local_experts = layer.w13_weight.shape[0]
                 w13_m = layer.w13_weight.shape[1]
                 w13_k = layer.w13_weight.shape[2] * 2

@@ -1358,6 +1358,8 @@ class FlashInferCuteDslMoE(FusedMoE):
     dispatcher.dispatch() -> quant_method.apply() -> dispatcher.combine().
     """
 
+    _FP4_SF_VEC_SIZE = 16
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._cutedsl_wrapper = None
@@ -1385,7 +1387,18 @@ class FlashInferCuteDslMoE(FusedMoE):
         """
         if self._cutedsl_wrapper is not None:
             return
-        from flashinfer import CuteDslMoEWrapper
+        try:
+            from flashinfer import CuteDslMoEWrapper
+        except ImportError as e:
+            raise ImportError(
+                "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
+                "Install with: pip install flashinfer"
+            ) from e
+
+        assert self.intermediate_size_per_partition > 0, (
+            f"FlashInferCuteDslMoE: intermediate_size_per_partition must be > 0, "
+            f"got {self.intermediate_size_per_partition}. Check EP/TP configuration."
+        )
 
         server_args = get_global_server_args()
         use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
@@ -1449,9 +1462,9 @@ class FlashInferCuteDslMoE(FusedMoE):
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
             self._cutedsl_input_scale,
-            16,
-            False,
-            False,
+            sf_vec_size=self._FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+            is_weight=False,
         )
 
         w1_weight_sf = getattr(self, "w13_blockscale_mma", self.w13_blockscale_swizzled)

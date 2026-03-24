@@ -8,10 +8,6 @@ Two configurations are tested:
   - EP=4, TP=4: each GPU holds 1/4 of experts at full intermediate width,
     partial results combined via all-reduce (no A2A dispatch)
 
-CuteDslMoEWrapper pre-allocates buffers for CUDA graph up to max_num_tokens
-(derived from cuda_graph_max_bs). We use a smaller --cuda-graph-max-bs here
-so the test fits in memory while still exercising the CUDA graph path.
-
 Requires 4 GPUs. Run from repo root with:
   python -m pytest test/registered/backends/test_deepseek_v3_fp4_cutedsl_moe.py -v -s
 Or via the nightly suite:
