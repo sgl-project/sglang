@@ -48,18 +48,15 @@ jobs:
         id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Install dependencies
-        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
-        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         run: |
           cd test/
@@ -81,18 +78,15 @@ jobs:
         id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Install dependencies
-        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run benchmark tests
-        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 45
         run: |
           cd test/
