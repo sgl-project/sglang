@@ -250,33 +250,39 @@ class AutoSpecEngine:
         # EMA acceptance rate tracker per batch size
         self.ema_accept_rate: Dict[int, float] = {bs: 0.5 for bs in self.bs_list}
 
-    def prune_by_graph_capacity(self, step_max_bs: Dict[int, int]):
-        """Remove BS->step mappings where the draft graph can't handle that BS.
+    def sync_with_graph_capacity(self, step_max_bs: Dict[int, int]):
+        """Sync BS->step mappings with actual CUDA graph capacity.
 
-        After CUDA graphs are captured, the draft graph runner for each step has a
-        max_bs limit. If a batch size exceeds that limit, it would fall to eager mode
-        which can cause illegal memory access. This method prunes such mappings.
+        After CUDA graphs are captured, each step's graph runner has a max_bs.
+        This method:
+        1. Expands: allows every BS to use any step whose graph supports it
+        2. Prunes: removes BS->step mappings where the graph can't handle that BS
+
+        This ensures all batch sizes can use all capable steps (maximizing
+        auto-spec flexibility) while preventing eager mode fallback.
 
         Args:
             step_max_bs: Mapping from num_steps -> max batch size supported by graphs.
         """
-        pruned = False
-        for bs in list(self.bs_steps_mapping.keys()):
-            original = self.bs_steps_mapping[bs]
-            filtered = [s for s in original if bs <= step_max_bs.get(s, 0)]
-            if not filtered:
-                # Keep at least the step with the largest max_bs for this entry
-                best_step = max(original, key=lambda s: step_max_bs.get(s, 0))
-                filtered = [best_step]
-            if filtered != original:
-                pruned = True
-                self.bs_steps_mapping[bs] = filtered
+        changed = False
+        all_steps = sorted(step_max_bs.keys())
 
-        if pruned:
+        for bs in list(self.bs_steps_mapping.keys()):
+            # Expand: include all steps whose graph can handle this BS
+            expanded = sorted(s for s in all_steps if bs <= step_max_bs.get(s, 0))
+            if not expanded:
+                # Fallback: keep the step with the largest max_bs
+                best_step = max(all_steps, key=lambda s: step_max_bs.get(s, 0))
+                expanded = [best_step]
+            if expanded != self.bs_steps_mapping[bs]:
+                changed = True
+                self.bs_steps_mapping[bs] = expanded
+
+        if changed:
             self._build_reverse_mapping()
             self._init_current_params()
             logger.info(
-                f"AutoSpecEngine: pruned bs_steps_mapping by graph capacity: "
+                f"AutoSpecEngine: synced bs_steps_mapping with graph capacity: "
                 f"{self.bs_steps_mapping}"
             )
 

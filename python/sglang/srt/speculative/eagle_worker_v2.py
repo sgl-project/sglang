@@ -382,14 +382,15 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner.draft_attn_backend = draft_attn
                 self.draft_attn_backend = draft_attn
 
-                # Capture draft CUDA graph
+                # Capture draft CUDA graph with ALL batch sizes from cuda_graph_bs,
+                # not just the subset from steps_bs_mapping. This ensures every step
+                # has graphs for all batch sizes, eliminating eager mode fallback.
                 if num_steps > 1:
-                    bs_for_step = auto_spec_engine.steps_bs_mapping.get(num_steps)
                     self.cuda_graph_runner_for_steps[num_steps] = (
                         EAGLEDraftCudaGraphRunnerAuto(
                             self,
                             num_steps,
-                            batch_sizes=bs_for_step,
+                            batch_sizes=None,  # Use full cuda_graph_bs
                             draft_attn_backend=draft_attn,
                         )
                     )
@@ -401,7 +402,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.draft_extend_attn_backend = draft_extend_attn
                     self.cuda_graph_runner_for_draft_extend_for_steps[num_steps] = (
                         EAGLEDraftExtendCudaGraphRunnerAuto(
-                            self, num_steps, batch_sizes=bs_for_step
+                            self, num_steps, batch_sizes=None  # Use full cuda_graph_bs
                         )
                     )
                 else:
@@ -426,9 +427,10 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend_for_steps[default_step]
         )
 
-        # Prune bs_steps_mapping: only keep BS->step combinations where
-        # the draft graph runner can handle that BS (avoid eager mode fallback
-        # which can cause illegal memory access with large batches).
+        # Sync bs_steps_mapping with actual CUDA graph capacity.
+        # Since we capture graphs for all batch sizes (batch_sizes=None),
+        # every step should support all BS, enabling full auto-spec flexibility
+        # and eliminating eager mode fallback entirely.
         step_max_bs = {}
         for num_steps, runner in self.cuda_graph_runner_for_steps.items():
             if runner is not None:
@@ -436,7 +438,7 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 # step=1 has no graph runner, allow any BS
                 step_max_bs[num_steps] = max(auto_spec_engine.bs_list)
-        auto_spec_engine.prune_by_graph_capacity(step_max_bs)
+        auto_spec_engine.sync_with_graph_capacity(step_max_bs)
 
         self._auto_spec_initialized = True
         logger.info(
