@@ -2,7 +2,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-import torch_npu
 from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
@@ -324,7 +323,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             beta = beta.view(batch_size, -1, num_value_heads)
             g = g.view(batch_size, -1, num_value_heads)
 
-            core_attn_out = self.fused_recurrent_gated_delta_rule_update_npu_v2(
+            core_attn_out = self.fused_recurrent_gated_delta_rule_update(
                 mixed_qkv,
                 num_heads,
                 num_value_heads,
@@ -392,70 +391,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
 
         return core_attn_out
 
-    def fused_recurrent_gated_delta_rule_update_npu(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        recurrent_state: torch.Tensor,
-        beta: torch.Tensor,
-        g: torch.Tensor,
-        cache_indices: torch.Tensor,
-        intermediate_state: Optional[torch.Tensor] = None,
-    ):
-        _, num_heads, head_k_dim = query.shape  # T, N, D
-        _, num_value_heads, head_v_dim = value.shape
-        beta = beta.view(-1, num_value_heads).to(torch.bfloat16)
-        g = g.view(-1, num_value_heads).to(torch.float32)
-        batch_size = cache_indices.shape[0]
-        seq_len = query.shape[0] // batch_size
-        scale = 1 / (head_k_dim**0.5)
-
-        if intermediate_state is not None:
-            # MTP intermediate_state
-            intermediate_state[cache_indices, 0] = recurrent_state[
-                cache_indices
-            ]  # update indexput slow
-            ssm_state = intermediate_state.view(
-                -1, num_value_heads, head_k_dim, head_v_dim
-            )
-        else:
-            ssm_state = recurrent_state
-
-        if self.graph_mode:
-            num_accepted_tokens = torch.ones(
-                [batch_size], dtype=torch.int32, device=cache_indices.device
-            )
-            actual_seq_lengths = (
-                torch.ones([batch_size], dtype=torch.int32, device=cache_indices.device)
-                * seq_len
-            )
-            ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
-        else:
-            num_accepted_tokens = self.num_accepted_tokens
-            actual_seq_lengths = self.actual_seq_lengths
-            ssm_state_indices = self.ssm_state_indices
-
-        attn_core_out = torch_npu.npu_recurrent_gated_delta_rule(
-            query,
-            key,
-            value,
-            ssm_state,  # for shape: (BlockNum, Nv, Dv, Dk)
-            beta=beta,
-            scale=scale,
-            actual_seq_lengths=actual_seq_lengths,
-            ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            g=g,
-        )
-
-        if intermediate_state is not None:
-            intermediate_state = ssm_state.view(
-                -1, seq_len, num_value_heads, head_k_dim, head_v_dim
-            )
-        return attn_core_out
-
-    def fused_recurrent_gated_delta_rule_update_npu_v2(
+    def fused_recurrent_gated_delta_rule_update(
         self,
         mix_qkv: torch.Tensor,
         num_heads,
