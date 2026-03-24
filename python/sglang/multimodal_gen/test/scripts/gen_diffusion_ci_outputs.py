@@ -17,6 +17,12 @@ from pathlib import Path
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.run_suite import SUITES, collect_test_items, run_pytest
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    ONE_GPU_CASES_A,
+    ONE_GPU_CASES_B,
+    TWO_GPU_CASES_A,
+    TWO_GPU_CASES_B,
+)
 
 logger = init_logger(__name__)
 
@@ -120,6 +126,21 @@ def main():
     if not all_test_items:
         logger.warning(f"No test items found for suite '{args.suite}'.")
         sys.exit(0)
+
+    # Filter out cases marked as incompatible with diffusers backend
+    _all_cases = ONE_GPU_CASES_A + ONE_GPU_CASES_B + TWO_GPU_CASES_A + TWO_GPU_CASES_B
+    skip_ids = {c.id for c in _all_cases if c.skip_diffusers_gt}
+    if skip_ids:
+        before = len(all_test_items)
+        all_test_items = [
+            item for item in all_test_items if not any(sid in item for sid in skip_ids)
+        ]
+        skipped = before - len(all_test_items)
+        if skipped:
+            logger.info(
+                f"Skipped {skipped} case(s) incompatible with diffusers backend: "
+                f"{sorted(skip_ids)}"
+            )
 
     # Partition by test items (same as run_suite.py)
     partition_id = args.partition_id if args.partition_id is not None else 0

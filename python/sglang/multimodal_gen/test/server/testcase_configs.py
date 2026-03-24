@@ -253,6 +253,9 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    skip_diffusers_gt: bool = (
+        False  # Skip this case in GT generation (--backend diffusers)
+    )
 
     def __post_init__(self) -> None:
         has_startup_lora = self.server_args.lora_path is not None
@@ -418,6 +421,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             enable_cache_dit=True,
         ),
         T2I_sampling_params,
+        skip_diffusers_gt=True,  # cache_dit is a native-only feature
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -696,6 +700,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
+        skip_diffusers_gt=True,  # OOM on single GPU with diffusers backend (no offload)
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
@@ -767,6 +772,7 @@ if not current_platform.is_hip():
                 enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
+            skip_diffusers_gt=True,  # Model repo not standard diffusers layout (no model_index.json)
         ),
     )
 # Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.

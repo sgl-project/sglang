@@ -318,6 +318,24 @@ class DiffusersExecutionStage(PipelineStage):
             return "cpu"
         return current_platform.device_type
 
+    def _get_image_mode(self) -> str:
+        """Determine the expected image mode from the diffusers pipeline's VAE.
+
+        Checks the VAE encoder's first conv layer to see how many input
+        channels it actually expects.  If 4, the image must be RGBA;
+        otherwise default to RGB.
+        """
+        vae = getattr(self.diffusers_pipe, "vae", None)
+        if vae is not None:
+            encoder = getattr(vae, "encoder", None)
+            if encoder is not None:
+                conv_in = getattr(encoder, "conv_in", None)
+                if conv_in is not None and hasattr(conv_in, "weight"):
+                    in_channels = conv_in.weight.shape[1]
+                    if in_channels == 4:
+                        return "RGBA"
+        return "RGB"
+
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
         # Check for PIL image in condition_image or pixel_values
@@ -336,12 +354,13 @@ class DiffusersExecutionStage(PipelineStage):
         if isinstance(batch.image_path, list):
             batch.image_path = batch.image_path[0]
 
+        mode = self._get_image_mode()
         try:
             if batch.image_path.startswith(("http://", "https://")):
                 response = requests.get(batch.image_path, timeout=30)
                 response.raise_for_status()
-                return Image.open(BytesIO(response.content)).convert("RGB")
-            return Image.open(batch.image_path).convert("RGB")
+                return Image.open(BytesIO(response.content)).convert(mode)
+            return Image.open(batch.image_path).convert(mode)
         except Exception as e:
             logger.error("Failed to load image from %s: %s", batch.image_path, e)
             return None

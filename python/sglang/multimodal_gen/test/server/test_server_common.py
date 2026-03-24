@@ -118,7 +118,26 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    ctx = manager.start()
+    try:
+        ctx = manager.start()
+    except (RuntimeError, TimeoutError) as exc:
+        # Auto-skip when the installed diffusers version lacks the required
+        # pipeline class, or the model repo doesn't follow the standard
+        # diffusers layout (missing model_index.json / transformer / vae).
+        msg = str(exc)
+        if "not found in diffusers" in msg or "has no attribute" in msg:
+            pytest.skip(
+                f"Skipping {case.id}: required diffusers pipeline class "
+                f"is not available in the installed version. "
+                f"Upgrade diffusers to enable this test."
+            )
+        if "still incomplete after forced re-download" in msg:
+            pytest.skip(
+                f"Skipping {case.id}: model repo does not follow standard "
+                f"diffusers layout (missing model_index.json, transformer/, "
+                f"or vae/). Not compatible with --backend diffusers."
+            )
+        raise
 
     try:
         # Reconstruct output size for OpenAI API
