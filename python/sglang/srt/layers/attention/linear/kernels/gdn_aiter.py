@@ -88,17 +88,28 @@ class AiterGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # Ensure contiguous tensors and int32 indices to avoid ROCm assertion/crash.
+        cu_seqlens = (
+            query_start_loc.to(torch.int32).contiguous()
+            if query_start_loc is not None
+            else None
+        )
+        idx = (
+            cache_indices.to(torch.int32).contiguous()
+            if cache_indices is not None
+            else None
+        )
         return self._decode_fn(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
+            A_log=A_log.contiguous(),
+            dt_bias=dt_bias.contiguous(),
+            q=q.contiguous(),
+            k=k.contiguous(),
+            v=v.contiguous(),
+            a=a.contiguous(),
+            b=b.contiguous(),
+            initial_state_source=ssm_states.contiguous(),
+            initial_state_indices=idx,
+            cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
@@ -125,22 +136,40 @@ class AiterGDNKernel(LinearAttnKernelBase):
         
         # aiter chunk_gated_delta_rule: no head_first, no initial_state_indices.
         # For continuous batching, pass initial_state=ssm_states[cache_indices].
+        # Ensure contiguous tensors and int32 cu_seqlens to avoid ROCm assertion/crash.
         recurrent_state = (
-            ssm_states[cache_indices]
+            ssm_states[cache_indices].contiguous()
             if cache_indices is not None
-            else ssm_states
+            else ssm_states.contiguous()
+        )
+        cu_seqlens = (
+            query_start_loc.to(torch.int32).contiguous()
+            if query_start_loc is not None
+            else None
         )
         o, final_state = self._extend_fn(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
+            q=q.contiguous(),
+            k=k.contiguous(),
+            v=v.contiguous(),
+            g=g.contiguous(),
+            beta=beta.contiguous(),
             initial_state=recurrent_state,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=cu_seqlens,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
+        # aiter may return [N, K, V] but sglang expects [N, H, K, V]. Reshape to match.
+        num_seqs = cache_indices.shape[0] if cache_indices is not None else 1
+        target_shape = (num_seqs,) + tuple(ssm_states.shape[1:])
+        if final_state.shape != target_shape:
+            if len(final_state.shape) == 3:
+                # [N, K, V] -> [N, H, K, V] by broadcasting head dim
+                n, k, v = final_state.shape
+                h = ssm_states.shape[1]
+                final_state = final_state.unsqueeze(1).expand(n, h, k, v)
+            # Slice to match cache_indices if aiter returned more sequences
+            if final_state.shape[0] != num_seqs:
+                final_state = final_state[:num_seqs]
         # gdn_backend expects (core_attn_out, last_recurrent_state, h)
         return o, final_state, final_state
 

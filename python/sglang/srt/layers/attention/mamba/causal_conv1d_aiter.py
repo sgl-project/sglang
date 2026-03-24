@@ -58,6 +58,7 @@ def causal_conv1d_update(
 
     use_silu = activation in ["silu", "swish"]
 
+    ## TODO: use ck or triton 
     aiter.causal_conv1d_update(
         x,
         conv_state,

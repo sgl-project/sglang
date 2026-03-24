@@ -50,12 +50,13 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
-elif _use_aiter and get_bool_env_var("SGLANG_CONV1D_UPDATE_IMPL") == "aiter":
+elif _use_aiter and get_bool_env_var("SGLANG_LINEAR_ATTN_IMPL") == "aiter":
     # Currently, default to disable aiter impl for KDA
     from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
         causal_conv1d_update, 
         causal_conv1d_fn,
     )
+    from aiter.ops.triton._triton_kernels.gate_delta_rule import fused_gdn_gating_sigmoid as fused_gdn_gating
 
 
 class GDNKernelDispatcher:
