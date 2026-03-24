@@ -1,16 +1,24 @@
 ---
 name: write-sglang-test
-description: Guide for writing SGLang CI/UT tests following project conventions. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
+description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
 ---
 
 # Writing SGLang CI / UT Tests
 
+**Before or while applying this skill, read [`test/README.md`](../../../test/README.md)** in the repo root’s `test/` tree. It documents the three-stage CI pipeline, suite naming, how tests are discovered and executed, file layout, and practical tips that complement the sections below.
+
 ## Core Rules
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`
-2. **Place tests in `test/registered/<category>/`** — only use `test/manual/` for debugging / non-CI tests
+2. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`
 3. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
 4. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
+
+JIT kernel exception:
+- If the task is adding or updating code under `python/sglang/jit_kernel/`, prefer the `add-jit-kernel` skill first.
+- JIT kernel correctness tests use `python/sglang/jit_kernel/tests/test_*.py`.
+- JIT kernel benchmarks use `python/sglang/jit_kernel/benchmark/bench_*.py`.
+- Those files are still executed by `test/run_suite.py`, but through dedicated kernel suites rather than `test/registered/`.
 
 ---
 
@@ -18,10 +26,10 @@ description: Guide for writing SGLang CI/UT tests following project conventions.
 
 | Scenario | Model | CI Registration | Suite |
 |----------|-------|-----------------|-------|
-| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-cpu-only` or `stage-b-test-small-1-gpu` |
-| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-small-1-gpu` |
-| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-small-1-gpu` |
-| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-large-1-gpu` |
+| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-test-cpu` or `stage-b-test-1-gpu-small` |
+| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-1-gpu-small` |
+| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-1-gpu-small` |
+| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-1-gpu-large` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
@@ -43,10 +51,10 @@ Defined in `python/sglang/test/test_utils.py`:
 
 | Suite | Runner | Scenario |
 |-------|--------|----------|
-| `stage-a-cpu-only` | CPU | CPU unit tests |
-| `stage-b-test-small-1-gpu` | 1× 5090 (32GB) | Small model tests |
-| `stage-b-test-large-1-gpu` | 1× H100 (80GB) | 8B model tests |
-| `stage-b-test-large-2-gpu` | 2× H100 | TP=2 tests |
+| `stage-a-test-cpu` | CPU | CPU unit tests |
+| `stage-b-test-1-gpu-small` | 1× 5090 (32GB) | Small model tests (1B, 8B) |
+| `stage-b-test-1-gpu-large` | 1× H100 (80GB) | Large model tests or performance related |
+| `stage-b-test-2-gpu-large` | 2× H100 | TP=2 tests |
 | `stage-c-test-4-gpu-h100` | 4× H100 | TP=4 / EP tests |
 | `stage-c-test-8-gpu-h200` | 8× H200 | Large-scale multi-GPU |
 | `nightly-1-gpu` | 1 GPU | Nightly-only |
@@ -70,7 +78,7 @@ from sglang.srt.<module> import TargetClass
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 # Prefer CPU. Only use register_cuda_ci when the test truly needs a GPU.
 
 class TestTargetClass(CustomTestCase):
@@ -110,7 +118,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 
 
 class TestMyFeature(CustomTestCase):
@@ -159,7 +167,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-large")
 
 
 class TestMyFeaturePerf(CustomTestCase):
@@ -222,12 +230,12 @@ Available fixtures in `python/sglang/test/server_fixtures/`:
 
 ## CI Registration
 
-Every test file in `test/registered/` **must** call a registration function at module level:
+Every CI-discovered test file must call a registration function at module level:
 
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 ```
 
 Parameters:
@@ -237,6 +245,12 @@ Parameters:
 - `disabled="reason"`: temporarily disable with explanation
 
 Only add `register_amd_ci` / `register_cpu_ci` when the test exercises backend-specific code paths.
+
+For JIT kernel files:
+- Place correctness tests in `python/sglang/jit_kernel/tests/`
+- Place benchmarks in `python/sglang/jit_kernel/benchmark/`
+- Use `register_cuda_ci` with kernel suites such as `stage-b-kernel-unit-1-gpu-large`, `stage-b-kernel-benchmark-1-gpu-large`, and optionally `nightly-kernel-1-gpu`
+- Keep `est_time` and `suite` as literal values because `test/run_suite.py` collects them by AST parsing
 
 ---
 
@@ -255,12 +269,17 @@ test/
 │   ├── perf/            # performance benchmarks
 │   └── <category>/      # create new category if needed
 ├── manual/              # Non-CI: debugging, one-off, manual verification
-└── run_suite.py         # CI runner (scans registered/ only)
+└── run_suite.py         # CI runner (scans registered/ plus jit_kernel test/benchmark files)
+
+python/sglang/jit_kernel/
+├── tests/               # JIT kernel correctness tests (CI-discovered by test/run_suite.py)
+└── benchmark/           # JIT kernel benchmarks (CI-discovered by test/run_suite.py)
 ```
 
 **Decision rule** (see also `test/registered/README.md`):
 - Component logic, no server → `registered/unit/`
-- Kernel correctness → `registered/kernels/`
+- JIT kernel correctness / benchmarks → `python/sglang/jit_kernel/tests/` or `python/sglang/jit_kernel/benchmark/`
+- Other kernel correctness → `registered/kernels/`
 - Server needed → `registered/<category>/`
 - Local debugging → `manual/`
 
@@ -287,7 +306,8 @@ Before submitting a test:
 
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
-- [ ] Placed in `test/registered/<category>/`
+- [ ] Placed in `test/registered/<category>/`, unless this is a JIT kernel test/benchmark
+- [ ] JIT kernel work: files live in `python/sglang/jit_kernel/tests/` or `python/sglang/jit_kernel/benchmark/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)

@@ -100,13 +100,22 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             self.get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self.get_value_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        if self.use_fia:
+            kv_item_lens = [
+                self.get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self.get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            kv_item_lens = [
+                self.get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self.get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
