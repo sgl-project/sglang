@@ -8,6 +8,7 @@ import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
     DeviceCapability,
     Platform,
     PlatformEnum,
@@ -96,9 +97,17 @@ class XPUPlatform(Platform):
         return free_gpu_memory / (1 << 30)
 
     @classmethod
-    def get_attn_backend_cls_str(cls) -> str:
-        # Use PyTorch's native SDPA which works on XPU
-        return "SDPA"
+    def get_attn_backend_cls_str(
+        cls,
+        selected_backend: AttentionBackendEnum | None,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> str:
+        # Use PyTorch's native SDPA backend on XPU.
+        logger.info("Using Torch SDPA backend for XPU.")
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        )
 
     def get_torch_distributed_backend_str(self) -> str:
         # Intel XPU uses oneCCL (Intel Collective Communications Library).
