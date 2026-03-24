@@ -2278,7 +2278,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--record-power",
         action="store_true",
-        help="Record GPU power usage during benchmark (excluding warmup). Available only on AMD Instinct GPUs at the moment."
+        help="Record GPU power usage during benchmark (excluding warmup). The environment variable `CUDA_VISIBLE_DEVICES` must be set to record the power from the used devices only (e.g. for TP=4 on an 8 devices node)."
         "Samples every 5s and reports P25/mean/median/P75 stats.",
     )
     parser.add_argument(

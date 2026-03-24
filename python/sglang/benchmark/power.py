@@ -1,5 +1,6 @@
 """Power recording utilities for benchmarking."""
 
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import List, Optional
@@ -117,7 +118,45 @@ class PowerRecorderAMD(PowerRecorderMixin):
 
     def init_accelerator(self) -> None:
         self.amdsmi = amdsmi
-        self._accelerator_handles = amdsmi.amdsmi_get_processor_handles()
+        all_handles = amdsmi.amdsmi_get_processor_handles()
+
+        self.all_handles = all_handles
+
+        # CUDA_VISIBLE_DEVICES order is not the same as amdsmi handles order, even when setting `CUDA_DEVICE_ORDER=PCI_BUS_ID`, thus we rely on the bus IDs to monitor the correct devices.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is None:
+            raise ValueError(
+                "The power measurement utility requires the environment variable `CUDA_VISIBLE_DEVICES` to be set "
+                "in the benchmark similarly to the sglang server."
+            )
+        assert torch.cuda.device_count() > 0
+
+        bus_id_to_handle = {}
+        for handle in all_handles:
+            # amdsmi_get_gpu_device_bdf returns e.g. "0000:e5:00.0"; the bus field is hex.
+            bdf = amdsmi.amdsmi_get_gpu_device_bdf(handle)
+            bus_id = int(bdf.split(":")[1], 16)
+            bus_id_to_handle[bus_id] = handle
+
+        # For each visible CUDA device, look up its PCI bus ID via torch, and match it to amdsmi correct handles.
+        self._accelerator_handles = []
+
+        bus_ids = []
+        for idx in range(torch.cuda.device_count()):
+            pci_bus_id = torch.cuda.get_device_properties(idx).pci_bus_id
+            bus_ids.append(pci_bus_id)
+            if pci_bus_id not in bus_id_to_handle:
+                raise ValueError(
+                    f"Could not find amdsmi handle for CUDA device {idx} (PCI bus ID {pci_bus_id}). "
+                    f"Available bus IDs: {list(bus_id_to_handle.keys())}"
+                )
+            self._accelerator_handles.append(bus_id_to_handle[pci_bus_id])
+
+        print(
+            f"Power recorder: monitoring {len(self._accelerator_handles)} GPU(s) "
+            f"(CUDA_VISIBLE_DEVICES={cuda_visible!r}, bus IDs: {bus_ids})"
+        )
+
         # Will be an empty list if amdsmi CPU dependencies are not met.
         self._cpu_handles = amdsmi.amdsmi_get_cpusocket_handles()
 
