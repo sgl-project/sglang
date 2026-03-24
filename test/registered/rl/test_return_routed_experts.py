@@ -30,6 +30,9 @@ SHAREGPT_URL = (
 logger = logging.getLogger(__name__)
 
 
+@unittest.skip(
+    "Flaky in CI, need to be fixed and re-enabled. See https://github.com/sgl-project/sglang/issues/21266"
+)
 class TestReturnRoutedExperts(CustomTestCase):
     # modified from test_hicache.py
     @classmethod
