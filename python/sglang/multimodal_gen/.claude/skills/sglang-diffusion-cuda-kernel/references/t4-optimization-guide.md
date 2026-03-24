@@ -4,6 +4,8 @@ T4 is a Turing architecture GPU (GCP n1+T4, AWS g4dn) commonly used for cloud in
 Its key constraint for diffusion kernels: **no BF16 support** — FP16 only.
 
 > **Adapted from**: [HuggingFace kernels cuda-kernels skill](https://github.com/huggingface/kernels/tree/main/skills/cuda-kernels)
+>
+> If you use the FLUX `sglang generate` example below, export `HF_TOKEN` first. `black-forest-labs/FLUX.*` is a gated Hugging Face repo, and without a token the top-level CLI can fail before model loading.
 
 ---
 
@@ -203,6 +205,9 @@ T4's 16 GB requires careful planning for large diffusion models.
 **sglang generate flags for T4:**
 
 ```bash
+# Required for gated FLUX repos:
+# export HF_TOKEN=<your_hf_token>
+
 # Enable CPU offloading to fit within 16 GB
 sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \

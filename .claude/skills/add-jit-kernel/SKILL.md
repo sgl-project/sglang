@@ -429,6 +429,8 @@ register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
 # register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 ```
 
+Keep `est_time` and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
+
 Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but should be skipped in CI (e.g. multi-GPU only).
 
 **Run like CI** (from repo root):
