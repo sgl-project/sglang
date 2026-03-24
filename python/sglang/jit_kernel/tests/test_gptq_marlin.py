@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
@@ -96,4 +98,4 @@ def test_gptq_marlin_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

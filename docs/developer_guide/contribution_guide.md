@@ -32,7 +32,38 @@ pre-commit run --all-files
 ## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
+SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
+
+### Unit tests (no server required)
+
+Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+
+**When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
+
+```
+srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache.py
+srt/sampling/sampling_params.py →  unit/sampling/test_sampling_params.py
+```
+
+**Run unit tests locally:**
+
+```bash
+pytest test/registered/unit/ -v                # all unit tests
+pytest test/registered/unit/mem_cache/ -v      # one module
+```
+
+**Run with coverage:**
+
+```bash
+pytest test/registered/unit/ --cov --cov-config=.coveragerc -v
+```
+
+For conventions on CI registration, test structure, and examples, see [`test/registered/unit/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit/README.md).
+
+### E2E tests (server required)
+
+For tests that require launching a server, refer to [`test/registered/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/README.md) for guidance on where to place your test.
+
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
 ## Write documentations

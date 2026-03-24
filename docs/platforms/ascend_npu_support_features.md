@@ -124,7 +124,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
 | `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      |      A2, A3      |
 | `--log-requests-target`                            | `None`            | Type: str                      |      A2, A3      |
-| `--uvicorn-access-log-exclude-prefixes`            | `DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES` | Type: str                      |      A2, A3      |
+| `--uvicorn-access-log-exclude-prefixes`            | `[]`              | List[str]                      |      A2, A3      |
 
 ## RequestMetricsExporter configuration
 
@@ -144,7 +144,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
 | `--completion-template` | `None`    | Type: str                      |      A2, A3      |
 | `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
-| `--reasoning-parser`    | `None`    | `deepseek-r1`                  |      A2, A3      |
+| `--reasoning-parser`    | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3`                  |      A2, A3      |
 | `--tool-call-parser`    | `None`    | `deepseekv3`<br/>`deepseekv31`<br/>`glm`<br/>`glm45`<br/>`glm47`<br/>`gpt-oss`<br/>`kimi_k2`<br/>`llama3`<br/>`mistral`<br/>`pythonic`<br/>`qwen`<br/>`qwen25`<br/>`qwen3_coder`<br/>`step3`<br/>`gigachat3`            |      A2, A3      |
 | `--sampling-defaults`   | `model`   | `openai`, `model`              |      A2, A3      |
 
@@ -228,8 +228,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--speculative-ngram-`<br/>`max-match-window-size` | `12`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          |   Experimental   |
-| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental   |
-| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental. `BFS` uses recency-based expansion; `PROB` uses frequency-based expansion. |
+| `--speculative-ngram-`<br/>`max-trie-depth`         | `18`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          |   Experimental   |
 
 ## Expert parallelism

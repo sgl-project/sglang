@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
     is_xpu,
     kill_process_tree,
@@ -167,6 +168,25 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def flush_cache_with_retry(
+    base_url: str, retries: int = 5, interval: float = 2.0
+) -> bool:
+    """Flush device cache with retry.
+
+    The scheduler may still have in-flight HiCache async ops (GPU↔Host↔L3)
+    that prevent is_fully_idle() from returning True, so we retry.
+    """
+    for _ in range(retries):
+        try:
+            response = requests.post(f"{base_url}/flush_cache", timeout=10)
+            if response.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -178,8 +198,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():

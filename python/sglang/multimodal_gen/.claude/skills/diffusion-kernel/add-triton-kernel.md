@@ -292,7 +292,8 @@ def test_fused_scale_shift_output_dtype_preserved():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))
 ```
 
 Run:

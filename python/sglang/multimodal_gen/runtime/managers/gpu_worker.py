@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import logging
 import multiprocessing as mp
 import os
 import time
@@ -57,6 +58,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
@@ -106,7 +108,9 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
+            distributed_init_method=NetworkAddress(
+                "127.0.0.1", self.master_port
+            ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
 
@@ -195,7 +199,7 @@ class GPUWorker:
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
-        logger.info(
+        logger.debug(
             f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
             f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
@@ -246,7 +250,11 @@ class GPUWorker:
                     "after_forward", peak_snapshot
                 )
 
-            if self.rank == 0 and not req.suppress_logs:
+            if (
+                self.rank == 0
+                and not req.suppress_logs
+                and logger.isEnabledFor(logging.DEBUG)
+            ):
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000

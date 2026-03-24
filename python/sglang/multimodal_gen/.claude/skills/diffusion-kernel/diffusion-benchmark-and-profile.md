@@ -6,7 +6,10 @@ description: Denoise-stage benchmark and per-layer kernel profiling guide for SG
 # SGLang Diffusion Benchmark and Profile Guide
 
 **Primary Metric: Denoise Latency**
-The denoising loop latency — total DiT forward pass time across all inference steps — is the dominant cost (>80% of end-to-end) and the **sole optimization target** for kernel work. End-to-end latency is recorded as a secondary check only.
+- Denoise latency is the total DiT forward-pass time across all inference steps.
+- It is the dominant cost for diffusion inference, typically more than 80% of end-to-end time.
+- It is the **sole optimization target** for kernel work.
+- End-to-end latency is a secondary sanity check only.
 
 > **Correctness First**: Faster but incorrect output is not an improvement. Always compare generated images/videos against a reference baseline before and after any change.
 
@@ -42,12 +45,17 @@ check "nsys (Level 2)" which nsys
 check "ncu (Level 3)" which ncu
 check "pandas" python3 -c "import pandas"
 check "plotly" python3 -c "import plotly"
+check "regex" python3 -c "import regex"
 ```
 
-**Minimum for benchmarking**: `sglang`, `torch` with CUDA.
-**Level 1 profiling**: `torch.profiler` (bundled with torch).
-**Level 2 profiling**: `nsys`, `pandas`, `plotly` + `gputrc2graph.py` from the sglang repo.
-All commands below assume you are inside the configured diffusion container shell, already `cd`'d to the repo root derived from `sglang.__file__`, with `FLASHINFER_DISABLE_VERSION_CHECK=1` exported. Re-run `print-idle-gpus` before each perf command if GPU availability may have changed. Keep benchmark commands within 4 GPUs or fewer.
+Environment notes:
+- **Minimum for benchmarking**: `sglang`, `torch` with CUDA.
+- **Level 1 profiling**: `torch.profiler` (bundled with torch).
+- **Level 2 profiling**: `nsys`, `pandas`, `plotly`, `regex`, and `gputrc2graph.py` from the sglang repo.
+- All commands below assume you are inside the configured diffusion container shell and already `cd`'d to the repo root derived from `sglang.__file__`.
+- Export `FLASHINFER_DISABLE_VERSION_CHECK=1` before any benchmark or profiler command.
+- Re-run `print-idle-gpus` before each perf command if GPU availability may have changed.
+- Keep benchmark commands within 4 GPUs or fewer.
 
 Download input images required by some models:
 ```bash
@@ -64,6 +72,8 @@ wget -O "${ASSET_DIR}/mova_single_person.jpg" \
 ## Benchmark Commands
 
 All commands include `--warmup` and `--enable-torch-compile` for real production performance. Add `--perf-dump-path <file>.json` for machine-readable output.
+
+If you want a checked-in preset runner instead of copying commands manually, use `scripts/bench_diffusion_denoise.py --model <preset> --label <name>`. It writes the same perf dump JSONs used by `compare_perf.py`.
 
 ### Perf dump & before/after compare
 
@@ -264,6 +274,11 @@ with torch.profiler.record_function(f"dit_block_{idx}.norm"):
 
 ### Step 3: Deep CUDA Kernel Breakdown (Level 2 — nsys)
 
+Workflow:
+- **Pass A**: collect the `nsys` trace.
+- **Pass B**: measure wall-clock runtime without profiling.
+- Write the non-profiled wall-clock time into `ELAPSED_SEC`.
+
 ```bash
 # Pass A — collect nsys trace (skip warmup with --delay)
 nsys profile -t cuda -o "${PROFILE_DIR}/flux_dev" -f true \
@@ -301,17 +316,24 @@ Create classification JSON at `examples/profiler/nsys_profile_tools/sglang_diffu
 }
 ```
 
+Notes:
+- `gputrc2graph.py` only recognizes `sglang,diffusion,...` after this JSON file exists in `examples/profiler/nsys_profile_tools/`.
+- If you only want a quick structural check, set `ELAPSED_SEC=0`. The report will still generate, but `CPU(non-GPU)` time can be inflated.
+
 Run analysis:
 ```bash
+ELAPSED_SEC=12.34
 cd "$ROOT/examples/profiler/nsys_profile_tools"
 python3 gputrc2graph.py \
-  --in_file "${PROFILE_DIR}/flux_dev.nsys-rep,sglang,diffusion,ELAPSED_SEC" \
+  --in_file "${PROFILE_DIR}/flux_dev.nsys-rep,sglang,diffusion,${ELAPSED_SEC}" \
   --out_dir "${PROFILE_DIR}/analysis" \
   --title "FLUX.1-dev denoise kernel breakdown"
 
 # Read results
 python3 - << 'EOF'
+import os
 import pandas as pd
+
 df = pd.read_csv(f"{os.environ['PROFILE_DIR']}/analysis/result.csv")
 summary = df.groupby("Category")["Elapsed Time (sec)"].sum().sort_values(ascending=False)
 total = summary.sum()
@@ -343,12 +365,14 @@ EOF
 - When a kernel shows up as a top bottleneck in Level 1/2 profiling
 - When comparing your fused kernel vs PyTorch baseline or torch.compile output
 - When tuning Triton autotune configs (block sizes, num_warps)
+- When profiling `sglang generate`, add `--target-processes all` so child worker processes are included
 
 #### Basic ncu workflow
 
 ```bash
 # 1. Profile a specific kernel by name (skip warmup launches, collect 3 invocations)
-ncu --kernel-name "_fused_gated_residual_add_kernel" \
+ncu --target-processes all \
+    --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 10 --launch-count 3 \
     --set full \
     -o "${NCU_DIR}/gated_residual" \
@@ -358,7 +382,8 @@ ncu --kernel-name "_fused_gated_residual_add_kernel" \
       --num-inference-steps=5 --seed=42
 
 # 2. Profile all kernels in a short run (use few steps to limit time)
-ncu --launch-skip 50 --launch-count 200 \
+ncu --target-processes all \
+    --launch-skip 50 --launch-count 200 \
     --set full \
     -o "${NCU_DIR}/all_kernels" \
     sglang generate \
@@ -369,7 +394,8 @@ ncu --launch-skip 50 --launch-count 200 \
 # 3. For CUDA graph mode, keep --graph-profiling=node on the ncu side.
 # Note: `--enable-piecewise-cuda-graph` is a server flag, not a valid
 # `sglang generate` flag, so do not append it here.
-ncu --graph-profiling node \
+ncu --target-processes all \
+    --graph-profiling node \
     --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 5 --launch-count 3 \
     --set full \
@@ -422,12 +448,14 @@ for row in reader:
 
 ```bash
 # Profile baseline kernel
-ncu --kernel-name "vectorized_elementwise_kernel" \
+ncu --target-processes all \
+    --kernel-name "vectorized_elementwise_kernel" \
     --launch-skip 10 --launch-count 3 --set full \
     -o "${NCU_DIR}/baseline" ./program
 
 # Profile optimized kernel
-ncu --kernel-name "_fused_gated_residual_add_kernel" \
+ncu --target-processes all \
+    --kernel-name "_fused_gated_residual_add_kernel" \
     --launch-skip 10 --launch-count 3 --set full \
     -o "${NCU_DIR}/optimized" ./program
 

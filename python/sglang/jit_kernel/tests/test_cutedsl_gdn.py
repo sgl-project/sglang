@@ -1,5 +1,7 @@
 """Tests for CuTe DSL fused sigmoid gating delta rule kernel (GDN)."""
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -302,4 +304,4 @@ def test_cutedsl_gdn_performance(B: int):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
