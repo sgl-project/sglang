@@ -89,7 +89,7 @@ sglang generate \
   --save-output
 ```
 
-For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/api/cli.md).
 
 ## Contributing
 
