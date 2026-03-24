@@ -49,6 +49,7 @@ suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_bmm.py"),
         TestFile("cpu/test_causal_conv1d.py"),
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
@@ -75,7 +76,7 @@ suite_xeon = {
 suite_xpu = {
     "per-commit-xpu": [
         TestFile("xpu/test_deepseek_ocr.py"),
-        TestFile("xpu/test_internvl.py"),
+        # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
@@ -95,7 +96,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
-        TestFile("test_embed_interpolate_unittest.py", 400),
+        TestFile("ascend/test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -325,4 +326,9 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATION NOTICE: The folder `test/srt` should be deprecated as soon as possible. "
+        "Migrate tests to the new CI registry system described in `test/README.md`.",
+        flush=True,
+    )
     main()

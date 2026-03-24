@@ -30,8 +30,6 @@ dependencies = [
   "flashinfer_python==0.6.6", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.6",
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -72,7 +70,8 @@ dependencies = [
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
-  "transformers==4.57.1",
+  "mistral_common>=1.9.0",
+  "transformers==5.3.0",
   "uvicorn",
   "uvloop",
   "watchfiles",
@@ -131,6 +130,7 @@ tracing = [
 
 test = [
   "accelerate",
+  "addict",
   "bitsandbytes",
   "expecttest",
   "jsonlines",
@@ -138,7 +138,7 @@ test = [
   "matplotlib",
   "pandas",
   "parameterized",
-  "peft",
+  "peft>=0.18.0",
   "pytest",
   "pytest-cov",
   "diff-cover",

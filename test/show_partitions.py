@@ -22,7 +22,6 @@ _spec = importlib.util.spec_from_file_location("ci_register", _ci_register_path)
 _ci_register = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ci_register)
 
-CIRegistry = _ci_register.CIRegistry
 HWBackend = _ci_register.HWBackend
 auto_partition = _ci_register.auto_partition
 collect_tests = _ci_register.collect_tests
@@ -37,7 +36,7 @@ HW_MAPPING = {
 # Regex to detect run_suite.py invocations from pr-test.yml.
 # Uses lookaheads so --hw and --suite can appear in any order.
 _RUN_SUITE_RE = re.compile(
-    r"^\s*(?:\w+=\S+\s+)?"  # optional env prefix (e.g. IS_BLACKWELL=1)
+    r"^\s*(?:\w+=\S+\s+)?"  # optional env prefix (e.g. VAR=value)
     r"python3\s+run_suite\.py\b"
     r"(?=.*\s--hw\s+(?P<hw>\S+))"
     r"(?=.*\s--suite\s+(?P<suite>\S+))"
@@ -110,7 +109,7 @@ def main():
 
         total_time = sum(t.est_time for t in enabled)
         out(
-            f"### {suite} (hw={hw_str}, {partition_count} partition(s), "
+            f"### {suite} (hw={hw_str}, {partition_count} partitions, "
             f"{len(enabled)} enabled, {len(disabled)} disabled, est {total_time:.0f}s total)"
         )
         out()

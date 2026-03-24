@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -194,6 +195,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         effective_mamba_size = (
             mamba_size if mamba_size is not None else size
         ) + pre_alloc_size
+        # TODO: Support PP
+        self.start_layer = 0
+        self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
@@ -271,7 +275,9 @@ class DecodePreallocQueue:
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 30  # scheduling cycles
+        self._max_ensure_retries: int = 20  # scheduling cycles
+        self._ensure_last_attempt_time: Dict[str, float] = {}
+        self._ensure_retry_interval: float = 1.0  # seconds
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -509,10 +515,22 @@ class DecodePreallocQueue:
         ready: Dict[str, List[Req]] = {}
         remaining: List[Req] = []
 
+        now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
+            if last_attempt is not None and (
+                now - last_attempt < self._ensure_retry_interval
+            ):
+                remaining.extend(reqs)
+                continue
+
+            self._ensure_last_attempt_time[bootstrap_addr] = now
+
             if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
+                if bootstrap_addr in self._ensure_last_attempt_time:
+                    del self._ensure_last_attempt_time[bootstrap_addr]
                 ready[bootstrap_addr] = reqs
                 continue
 
@@ -530,6 +548,7 @@ class DecodePreallocQueue:
                         self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                     self.scheduler.stream_output([req], req.return_logprob)
                 del self._ensure_retry_count[bootstrap_addr]
+                del self._ensure_last_attempt_time[bootstrap_addr]
             else:
                 remaining.extend(reqs)
 

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
     )
 
 
+@maybe_wrap_jit_kernel_debug
 def timestep_embedding(
     t: torch.Tensor,
     dim: int,
