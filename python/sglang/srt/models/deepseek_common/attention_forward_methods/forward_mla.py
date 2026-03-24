@@ -78,20 +78,6 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
-def _pad_dim_for_mxfp8_bmm(
-    input_tensor: torch.Tensor, dim: int, alignment: int = 128
-) -> tuple[torch.Tensor, int]:
-    expected_dim = input_tensor.shape[dim]
-    aligned_dim = ((expected_dim + alignment - 1) // alignment) * alignment
-    if aligned_dim == expected_dim:
-        return input_tensor, expected_dim
-
-    pad_shape = list(input_tensor.shape)
-    pad_shape[dim] = aligned_dim - expected_dim
-    padding = input_tensor.new_zeros(tuple(pad_shape))
-    return torch.cat([input_tensor, padding], dim=dim), expected_dim
-
-
 class DeepseekMLAForwardMixin:
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
@@ -229,7 +215,6 @@ class DeepseekMLAForwardMixin:
 
         if self.use_mxfp8_bmm:
             q_nope_bmk = q_nope.transpose(0, 1).contiguous()
-            q_nope_bmk, expected_m = _pad_dim_for_mxfp8_bmm(q_nope_bmk, dim=1)
             q_nope_mxfp8, q_nope_mxfp8_scale = (
                 fp8_quant_utils.flashinfer_mxfp8_quantize(
                     q_nope_bmk,
@@ -237,20 +222,14 @@ class DeepseekMLAForwardMixin:
                     alignment=32,
                 )
             )
-            bmm_out_dtype = (
-                q_nope.dtype
-                if q_nope.dtype in (torch.bfloat16, torch.float16)
-                else torch.bfloat16
-            )
             q_nope_out = fp8_quant_utils.flashinfer_bmm_mxfp8(
                 q_nope_mxfp8,
                 self.w_kc,
                 q_nope_mxfp8_scale,
                 self.w_scale_k,
-                bmm_out_dtype,
+                q_nope.dtype,
                 backend="cudnn",
             )
-            q_nope_out = q_nope_out[:, :expected_m, :]
         elif self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -436,7 +415,6 @@ class DeepseekMLAForwardMixin:
 
         if self.use_mxfp8_bmm:
             attn_output_bmk = attn_output.transpose(0, 1).contiguous()
-            attn_output_bmk, expected_m = _pad_dim_for_mxfp8_bmm(attn_output_bmk, dim=1)
             attn_output_mxfp8_bmk, attn_output_mxfp8_scale = (
                 fp8_quant_utils.flashinfer_mxfp8_quantize(
                     attn_output_bmk,
@@ -445,23 +423,16 @@ class DeepseekMLAForwardMixin:
                 )
             )
             attn_output_mxfp8 = attn_output_mxfp8_bmk.transpose(1, 2).contiguous()
-            bmm_out_dtype = (
-                attn_output.dtype
-                if attn_output.dtype in (torch.bfloat16, torch.float16)
-                else torch.bfloat16
-            )
             attn_bmm_output_t = fp8_quant_utils.flashinfer_bmm_mxfp8(
                 self.w_vc,
                 attn_output_mxfp8,
                 self.w_scale_v,
                 attn_output_mxfp8_scale,
-                bmm_out_dtype,
+                attn_output.dtype,
                 backend="cudnn",
             )
             attn_bmm_output = (
-                attn_bmm_output_t.transpose(1, 2)[:, :expected_m, :]
-                .transpose(0, 1)
-                .flatten(1, 2)
+                attn_bmm_output_t.transpose(1, 2).transpose(0, 1).flatten(1, 2)
             )
         elif self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (

@@ -431,8 +431,6 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
-            self_attn.use_deep_gemm_bmm = False
-            self_attn.use_mxfp8_bmm = False
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -468,7 +466,6 @@ class DeepseekV2WeightLoaderMixin:
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
                 )
-                is_mxfp8 = bool(getattr(selected_quant_config, "use_mxfp8", False))
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
                         self_attn.kv_b_proj, "weight_scale"
@@ -487,7 +484,10 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
 
-                    if is_mxfp8 and _is_cuda:
+                    if (
+                        bool(getattr(selected_quant_config, "use_mxfp8", False))
+                        and _is_cuda
+                    ):
                         from flashinfer import block_scale_interleave
 
                         w_kc, w_vc = weight.unflatten(
@@ -529,17 +529,10 @@ class DeepseekV2WeightLoaderMixin:
                         self_attn.use_deep_gemm_bmm = False
                         self_attn.use_mxfp8_bmm = True
                         # MXFP8 absorb path is fully initialized above.
-                        # Do not fall through to the generic re-quantized path.
                         continue
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if is_mxfp8:
-                        weight_scale = (
-                            (weight_scale.to(torch.int32) << 23)
-                            .view(torch.float32)
-                            .contiguous()
-                        )
-                    elif (
+                    if (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=getattr(
                                 self.quant_config, "weight_block_size", None

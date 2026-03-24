@@ -281,15 +281,24 @@ if is_blackwell_supported() and is_flashinfer_available():
         _is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode needs a scale tensor with realistic element count because
-        # callers may reshape it to match cuDNN's block-scale contract.
+        # Fake mode needs rank- and size-faithful outputs for torch.compile.
+        # The real op flattens all prefix dims into M for scale layout.
         k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
         q_input = input.new_empty(
             (*input.shape[:-1], k_aligned), dtype=torch.float8_e4m3fn
         )
-        scale_numel = k_aligned // 32
+
+        m_total = 1
         for dim in input.shape[:-1]:
-            scale_numel *= dim
+            m_total *= dim
+
+        if _is_sf_swizzled_layout:
+            m_padded = ((m_total + 128 - 1) // 128) * 128
+            k_for_scale = ((k_aligned + 128 - 1) // 128) * 128
+            scale_numel = (m_padded * k_for_scale) // 32
+        else:
+            scale_numel = m_total * (k_aligned // 32)
+
         scale = input.new_empty((scale_numel,), dtype=torch.uint8)
         return q_input, scale
 
