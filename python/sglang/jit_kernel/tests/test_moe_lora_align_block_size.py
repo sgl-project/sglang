@@ -1,5 +1,6 @@
 # Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py, will optimize in future refactor
 import random
+import sys
 
 import pytest
 import torch
@@ -10,7 +11,8 @@ import torch
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=28, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def round_up(x, base):
@@ -163,4 +165,4 @@ def test_moe_lora_align_block_size(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
