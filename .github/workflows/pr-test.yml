@@ -95,10 +95,6 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
-      - name: Show test partition assignments
-        continue-on-error: true
-        run: python3 test/show_partitions.py
-
       - name: Determine run mode
         id: run-mode
         run: |
