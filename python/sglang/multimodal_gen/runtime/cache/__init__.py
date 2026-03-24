@@ -5,7 +5,7 @@ Cache acceleration module for SGLang-diffusion
 This module provides various caching strategies to accelerate
 diffusion transformer (DiT) inference:
 
-- TeaCache: Temporal similarity-based caching for diffusion models
+- TeaCache: Timestep Embedding Aware Cache for diffusion models
 - cache-dit integration: Block-level caching with DBCache and TaylorSeer
 
 """

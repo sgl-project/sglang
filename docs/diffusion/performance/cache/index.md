@@ -36,7 +36,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ## TeaCache
 
-TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+TeaCache (Timestep Embedding Aware Cache) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
 
 See [teacache.md](teacache.md) for detailed documentation.
 
@@ -57,4 +57,4 @@ For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled
 ## References
 
 - [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
-- [TeaCache Paper](https://arxiv.org/abs/2411.14324)
+- [TeaCache Paper](https://arxiv.org/abs/2411.19108)

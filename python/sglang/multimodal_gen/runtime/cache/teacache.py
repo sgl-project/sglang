@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-TeaCache: Temporal similarity-based caching for diffusion models.
+TeaCache: Timestep Embedding Aware Cache for diffusion models.
 
 TeaCache accelerates diffusion inference by selectively skipping redundant
 computation when consecutive diffusion steps are similar enough. This is
@@ -13,8 +13,8 @@ Key concepts:
 - CFG support: Separate caches for positive and negative branches
 
 References:
-- TeaCache: Accelerating Diffusion Models with Temporal Similarity
-  https://arxiv.org/abs/2411.14324
+- Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model
+  https://arxiv.org/abs/2411.19108
 """
 
 from dataclasses import dataclass

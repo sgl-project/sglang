@@ -3,7 +3,7 @@
 > **Note**: This is one of two caching strategies available in SGLang.
 > For an overview of all caching options, see [caching](../index.md).
 
-TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+TeaCache (Timestep Embedding Aware Cache) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
 
 ## Overview
 
@@ -81,4 +81,4 @@ TeaCache is built into the following model families:
 
 ## References
 
-- [TeaCache: Accelerating Diffusion Models with Temporal Similarity](https://arxiv.org/abs/2411.14324)
+- [TeaCache: Accelerating Diffusion Models with Temporal Similarity](https://arxiv.org/abs/2411.19108)

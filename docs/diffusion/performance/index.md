@@ -35,7 +35,7 @@ See [Cache-DiT Documentation](cache/cache_dit.md) for detailed configuration.
 
 ### TeaCache
 
-TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+TeaCache (Timestep Embedding Aware Cache) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
 
 **Quick Overview:**
 - Tracks L1 distance between modulated inputs across timesteps
@@ -69,4 +69,4 @@ See [Profiling Guide](profiling.md) for detailed instructions.
 ## References
 
 - [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
-- [TeaCache Paper](https://arxiv.org/abs/2411.14324)
+- [TeaCache Paper](https://arxiv.org/abs/2411.19108)
