@@ -383,7 +383,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(
         os.path.expanduser(
             os.path.join(
-                os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang"),
+                os.getenv("SGLANG_CACHE_DIR") or "~/.cache/sglang",
                 "deep_gemm_cache",
             )
         )
