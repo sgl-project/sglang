@@ -9,7 +9,7 @@ Adapted from: https://github.com/huggingface/kernels/tree/main/skills/cuda-kerne
 
 Usage:
     cd /path/to/sglang
-    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_rmsnorm.py
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_rmsnorm.py
 
 Requirements:
     # Run inside the configured SGLang diffusion container shell.
@@ -34,7 +34,7 @@ import torch
 
 # ---------------------------------------------------------------------------
 # Import the JIT CUDA kernel.
-# When you implement add-cuda-kernel.md, the file will be at:
+# When you implement the sglang-diffusion-cuda-kernel workflow, the file will be at:
 #   python/sglang/jit_kernel/diffusion/rmsnorm.py
 # ---------------------------------------------------------------------------
 try:
@@ -45,7 +45,7 @@ except ImportError:
     JIT_AVAILABLE = False
     print(
         "WARNING: diffusion.rmsnorm JIT kernel not available. "
-        "Run after implementing add-cuda-kernel.md."
+        "Run after implementing the sglang-diffusion-cuda-kernel workflow."
     )
 
 

@@ -1,12 +1,7 @@
----
-name: use-efficient-diffusion-kernels
-description: Guidance for using SGLang Diffusion fused kernels and fast CUDA paths. Use when mapping fusion patterns in diffusion inference, choosing fused ops or attention backends, handling RoPE/QK norm performance pitfalls, or integrating new diffusion models with kernel-aware constraints.
----
+# SGLang Diffusion Fast Paths
 
-# Use Efficient Diffusion Kernels
-
-**Overview**
-This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion patterns and fast CUDA paths. Prefer existing fused ops (Triton, CuTe DSL, sgl-kernel). Make constraints and fallbacks explicit.
+Use this guide when mapping a diffusion bottleneck to an existing fused path in `sglang.multimodal_gen`.
+Prefer reuse before writing a new Triton or CUDA kernel.
 
 **Key Files**
 - `python/sglang/multimodal_gen/runtime/layers/layernorm.py`
@@ -114,4 +109,4 @@ This skill focuses on SGLang Diffusion (`sglang.multimodal_gen`) kernel fusion p
 - Keep CuTe compile cache keys aligned to `(dtype, ndim, D)`.
 - Avoid implicit broadcasts that force hidden `contiguous()` copies.
 - Preserve NPU and ROCm fallback paths.
-- **Always verify with ncu** (`ncu --set full`) and compare against both the unfused baseline and the hardware roofline. Do not rely on a single universal bandwidth/occupancy threshold; the right target depends on whether the kernel is memory-bound, compute-bound, or launch-limited. See `diffusion-benchmark-and-profile.md` Step 3.5 for the ncu workflow.
+- **Always verify with ncu** (`ncu --set full`) and compare against both the unfused baseline and the hardware roofline. Do not rely on a single universal bandwidth/occupancy threshold; the right target depends on whether the kernel is memory-bound, compute-bound, or launch-limited. See `benchmark-and-profile.md` in this directory for the canonical ncu workflow.

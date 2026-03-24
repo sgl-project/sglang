@@ -260,7 +260,7 @@ nsys profile -o profile_report python scripts/bench_diffusion_rmsnorm.py
 # - Stream utilization
 ```
 
-For end-to-end denoise profiling via `sglang generate`, see `diffusion-benchmark-and-profile.md` (Level 2: nsys + gputrc2graph.py).
+For end-to-end denoise profiling via `sglang generate`, see the sibling `sglang-diffusion-benchmark-profile` skill (Level 2: nsys + gputrc2graph.py).
 
 ### NVIDIA Nsight Compute (ncu)
 
