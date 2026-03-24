@@ -24,9 +24,12 @@ runs:
           // Find jobs that failed from a real error, not from fast-fail cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
-            // If the failing step is "Check stage health", it's a cascade — skip it
+            // If the failing step is the health check, it's a cascade — skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
-            return !failedStep || failedStep.name !== 'Check stage health';
+            if (failedStep && (failedStep.name.includes('check-stage-health') || failedStep.name.includes('Check stage health'))) {
+              return false;
+            }
+            return true;
           });
           if (rootCauseFailures.length > 0) {
             core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
