@@ -98,19 +98,60 @@ def create_mm_data_row(
 ):
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
-            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
-            content_items = text_prompt.replace("image 1", "|endoftext10|")
+            prompt_str = processor.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": text_prompt.replace("image 1", "|endoftext10|"),
+                    }
+                ],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt_len = processor(
+                text=[prompt_str],
+                images=images,
+                padding=False,
+                return_tensors="pt",
+            )["input_ids"].numel()
+        elif type(processor).__name__ == "KimiK25Processor":
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": image_base64}
+                        for image_base64 in images_base64
+                    ]
+                    + [{"type": "text", "text": text_prompt}],
+                }
+            ]
+            prompt_str = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt_len = processor(
+                messages=messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )["input_ids"].numel()
         else:
             content_items = [
                 {"type": "image", "image": {"url": image_base64}}
                 for image_base64 in images_base64
             ]
             content_items.append({"type": "text", "text": text_prompt})
-        prompt_str = processor.apply_chat_template(
-            [{"role": "user", "content": content_items}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+            prompt_str = processor.apply_chat_template(
+                [{"role": "user", "content": content_items}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt_len = processor(
+                text=[prompt_str],
+                images=images,
+                padding=False,
+                return_tensors="pt",
+            )["input_ids"].numel()
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
