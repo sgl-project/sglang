@@ -2993,9 +2993,6 @@ class Scheduler(
     ):
         pass
 
-    def get_remote_instance_transfer_engine_info(self):
-        return self.tp_worker.get_remote_instance_transfer_engine_info()
-
 
 class IdleSleeper:
     """

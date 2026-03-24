@@ -679,6 +679,8 @@ class ServerArgs:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    engine_info_bootstrap_port: int = 6789
+    modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -4977,6 +4979,18 @@ class ServerArgs:
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
         )
+        parser.add_argument(
+            "--engine-info-bootstrap-port",
+            type=int,
+            default=ServerArgs.engine_info_bootstrap_port,
+            help="Port for the engine info bootstrap server. Default is 6789.",
+        )
+        parser.add_argument(
+            "--modelexpress-config",
+            type=str,
+            default=ServerArgs.modelexpress_config,
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
+        )
 
         # For PD-Multiplexing
         parser.add_argument(
@@ -5083,11 +5097,49 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+    def url(self, port: Optional[int] = None):
+        scheme = "https" if self.ssl_certfile else "http"
+        # When binding to all interfaces, use loopback for internal requests.
+        host = self.host
+        if not host or host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        effective_port = port if port is not None else self.port
+        if is_valid_ipv6_address(host):
+            return f"{scheme}://[{host}]:{effective_port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"{scheme}://{host}:{effective_port}"
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
+
+    def ssl_verify(self):
+        """Return the value for the requests library's ``verify=`` parameter.
+
+        When SSL is configured:
+          - If a CA certificate file is provided, return its path so requests
+            validates the server certificate against that CA.
+          - Otherwise, return False to disable certificate verification
+            (suitable for self-signed certificates in development/testing).
+            A warning is logged once when this happens.
+        When SSL is not configured, return True to use the system's default
+        CA bundle.
+        """
+        if self.ssl_ca_certs:
+            return self.ssl_ca_certs
+        if self.ssl_certfile:
+            if not getattr(self, "_ssl_verify_warned", False):
+                logger.warning(
+                    "SSL is enabled but --ssl-ca-certs was not provided. "
+                    "Certificate verification is DISABLED for internal "
+                    "health checks. For production deployments, provide "
+                    "--ssl-ca-certs or use CA-signed certificates."
+                )
+                self._ssl_verify_warned = True
+            return False
+        return True
 
     def get_model_config(self):
         # Lazy init to avoid circular import
