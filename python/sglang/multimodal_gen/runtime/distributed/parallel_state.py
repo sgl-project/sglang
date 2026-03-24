@@ -246,13 +246,14 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        # For MPS, MUSA, NPU, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
             if (
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_xpu()
             )
             else dict(device_id=device_id)
         )
