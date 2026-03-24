@@ -428,11 +428,14 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Sync bs_steps_mapping with actual CUDA graph capacity.
-        # Since we capture graphs for all batch sizes (batch_sizes=None),
-        # every step should support all BS, enabling full auto-spec flexibility
-        # and eliminating eager mode fallback entirely.
+        # Only include steps in step_range (not the default step if it's outside
+        # step_range), because verify-side graphs are only captured for step_range.
+        # Including the default step would let auto-spec switch to it, but the
+        # verify graph buffers would have wrong sizes, causing tensor mismatch.
         step_max_bs = {}
         for num_steps, runner in self.cuda_graph_runner_for_steps.items():
+            if num_steps not in step_range:
+                continue
             if runner is not None:
                 step_max_bs[num_steps] = runner.max_bs
             else:
