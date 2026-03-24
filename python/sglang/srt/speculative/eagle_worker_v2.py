@@ -400,7 +400,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 if draft_extend_attn and not _is_npu:
                     self.draft_extend_attn_backend = draft_extend_attn
                     self.cuda_graph_runner_for_draft_extend_for_steps[num_steps] = (
-                        EAGLEDraftExtendCudaGraphRunnerAuto(self, num_steps)
+                        EAGLEDraftExtendCudaGraphRunnerAuto(
+                            self, num_steps, batch_sizes=bs_for_step
+                        )
                     )
                 else:
                     self.cuda_graph_runner_for_draft_extend_for_steps[num_steps] = None
