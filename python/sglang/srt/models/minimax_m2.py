@@ -25,6 +25,7 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -158,6 +159,7 @@ def rmsnorm_apply_kernel_serial(
     tl.store(out2_row + offsets2, out2, mask=mask2)
 
 
+@debug_kernel_api
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
@@ -196,6 +198,7 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return sum_sq
 
 
+@debug_kernel_api
 def rms_apply_serial(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -710,7 +713,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
 
         self.input_layernorm = RMSNorm(
