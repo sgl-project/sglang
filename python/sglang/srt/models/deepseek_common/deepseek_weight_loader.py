@@ -55,11 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
 )
-from sglang.srt.utils import (
-    bind_or_assign,
-    get_bool_env_var,
-    log_info_on_rank0,
-)
+from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
