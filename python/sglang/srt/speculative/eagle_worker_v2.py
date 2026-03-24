@@ -437,6 +437,11 @@ class EagleDraftWorker(BaseDraftWorker):
         if num_steps == self.speculative_num_steps:
             return
 
+        logger.info(
+            f"AutoSpec V2 DraftWorker: switching num_steps "
+            f"{self.speculative_num_steps}->{num_steps}"
+        )
+
         self.speculative_num_steps = num_steps
         self.speculative_num_draft_tokens = num_steps + 1
 
@@ -855,6 +860,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Switch to a different speculative step count."""
         if num_steps == self.speculative_num_steps:
             return
+
+        logger.info(
+            f"AutoSpec V2: switching num_steps "
+            f"{self.speculative_num_steps}->{num_steps}"
+        )
 
         self.speculative_num_steps = num_steps
         self.speculative_num_draft_tokens = num_steps + 1

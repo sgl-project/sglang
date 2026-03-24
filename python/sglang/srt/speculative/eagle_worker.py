@@ -399,6 +399,9 @@ class EAGLEWorker(TpModelWorker):
         if num_steps == self.speculative_num_steps:
             return
 
+        logger.info(
+            f"AutoSpec V1: switching num_steps {self.speculative_num_steps}->{num_steps}"
+        )
         self.speculative_num_steps = num_steps
         self.speculative_num_draft_tokens = num_steps + 1
 

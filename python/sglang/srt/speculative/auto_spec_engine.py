@@ -285,6 +285,7 @@ class AutoSpecEngine:
         inc_threshold = self.increase_thresholds.get(bs, 0.55)
         dec_threshold = self.decrease_thresholds.get(bs, 0.50)
 
+        new_steps = current_steps
         if current_rate >= inc_threshold:
             # Try to increase steps
             higher = [s for s in available_steps if s > current_steps]
@@ -297,6 +298,21 @@ class AutoSpecEngine:
             if lower:
                 new_steps = lower[-1]  # largest step smaller than current
                 self.current_params[bs] = SpecParams(num_steps=new_steps)
+
+        if new_steps != current_steps:
+            logger.info(
+                f"AutoSpecEngine: bs={batch_size}(mapped={bs}) step change "
+                f"{current_steps}->{new_steps}, "
+                f"ema_rate={current_rate:.4f}, "
+                f"thresholds=({inc_threshold:.2f},{dec_threshold:.2f})"
+            )
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"AutoSpecEngine: bs={batch_size}(mapped={bs}) "
+                f"accept_rate={accept_rate:.4f}, ema={current_rate:.4f}, "
+                f"steps={current_steps}, "
+                f"thresholds=({inc_threshold:.2f},{dec_threshold:.2f})"
+            )
 
     def _format_params(self) -> str:
         parts = []
