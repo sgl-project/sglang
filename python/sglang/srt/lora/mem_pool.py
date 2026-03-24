@@ -61,8 +61,8 @@ class LoRAMemoryPool:
         lora_added_tokens_size: int,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
-        tc = get_text_config(base_hf_config)
-        self.num_layer: int = tc.num_hidden_layers
+        text_config = get_text_config(base_hf_config)
+        self.num_layer: int = text_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
@@ -89,7 +89,7 @@ class LoRAMemoryPool:
         self.lm_head_B_buffer: Dict[str, torch.Tensor] = {}
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
 
-        self.embedding_dim: int = tc.hidden_size
+        self.embedding_dim: int = text_config.hidden_size
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}

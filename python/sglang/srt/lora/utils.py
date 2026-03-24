@@ -85,33 +85,33 @@ def get_hidden_dim(
         You can reference this function in llama.py.
         """
         # Resolve VLM configs to text sub-config for hidden_size etc.
-        tc = get_text_config(config)
-        head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
+        text_config = get_text_config(config)
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
 
         # Qwen 3.5 (and similar hybrid models) use attn_output_gate which
         # doubles the Q projection size in attention layers. The gate values
         # are interleaved with the Q outputs in the same projection.
-        attn_output_gate = getattr(tc, "attn_output_gate", False)
+        attn_output_gate = getattr(text_config, "attn_output_gate", False)
         q_heads_multiplier = 2 if attn_output_gate else 1
 
         if module_name == "qkv_proj":
-            return tc.hidden_size, head_dim * (
-                tc.num_attention_heads * q_heads_multiplier
-                + tc.num_key_value_heads * 2
+            return text_config.hidden_size, head_dim * (
+                text_config.num_attention_heads * q_heads_multiplier
+                + text_config.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
             return (
-                head_dim * tc.num_attention_heads,
-                tc.hidden_size,
+                head_dim * text_config.num_attention_heads,
+                text_config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            return tc.hidden_size, tc.intermediate_size * 2
+            return text_config.hidden_size, text_config.intermediate_size * 2
         elif module_name == "down_proj":
-            return tc.intermediate_size, tc.hidden_size
+            return text_config.intermediate_size, text_config.hidden_size
         elif module_name == "embed_tokens":
-            return config.vocab_size + lora_added_vocab_size, tc.hidden_size
+            return config.vocab_size + lora_added_vocab_size, text_config.hidden_size
         elif module_name == "lm_head":
-            return tc.hidden_size, config.vocab_size + lora_added_vocab_size
+            return text_config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
             raise NotImplementedError(
                 "get_hidden_dim not implemented for " + module_name

@@ -65,11 +65,11 @@ class LoRAAdapter(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         self.scaling: float = self.config.lora_alpha / self.config.r
 
-        tc = get_text_config(base_hf_config)
+        text_config = get_text_config(base_hf_config)
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for _ in range(tc.num_hidden_layers)
+                for _ in range(text_config.num_hidden_layers)
             ]
         )
 

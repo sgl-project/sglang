@@ -561,10 +561,10 @@ class LoRAManager:
         return lora_module
 
     def init_lora_modules(self):
-        tc = get_text_config(self.base_hf_config)
+        text_config = get_text_config(self.base_hf_config)
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
-            {} for _ in range(tc.num_hidden_layers)
+            {} for _ in range(text_config.num_hidden_layers)
         ]
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
