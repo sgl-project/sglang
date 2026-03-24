@@ -21,7 +21,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter_conv = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -50,13 +50,11 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
-elif _use_aiter and get_bool_env_var("SGLANG_LINEAR_ATTN_IMPL") == "aiter":
-    # Currently, default to disable aiter impl for KDA
+elif _use_aiter_conv and get_bool_env_var("SGLANG_CONV1D_UPDATE_IMPL") == "aiter":
     from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
-        causal_conv1d_update, 
         causal_conv1d_fn,
+        causal_conv1d_update,
     )
-    from aiter.ops.triton._triton_kernels.gate_delta_rule import fused_gdn_gating_sigmoid as fused_gdn_gating
 
 
 class GDNKernelDispatcher:
@@ -88,17 +86,6 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
-        elif decode_backend.is_aiter():
-            if not is_hip() or not get_bool_env_var("SGLANG_USE_AITER"):
-                raise ValueError(
-                    "Aiter GDN backend requires HIP and SGLANG_USE_AITER=1"
-                )
-            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
-                AiterGDNKernel,
-            )
-
-            aiter_kernel = AiterGDNKernel()
-            self.decode_kernel = aiter_kernel
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -122,32 +109,12 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
-        elif prefill_backend.is_aiter():
-            if not is_hip() or not get_bool_env_var("SGLANG_USE_AITER"):
-                raise ValueError(
-                    "Aiter GDN backend requires HIP and SGLANG_USE_AITER=1"
-                )
-            if decode_backend.is_aiter():
-                self.extend_kernel = self.decode_kernel
-            else:
-                from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
-                    AiterGDNKernel,
-                )
-
-                self.extend_kernel = AiterGDNKernel()
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it;
-        # AiterGDNKernel implements target_verify via Triton fallback
+        # Verify kernel: use FlashInfer if either decode or prefill selected it
         if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
             self.verify_kernel = flashinfer_kernel
-        elif decode_backend.is_aiter() or prefill_backend.is_aiter():
-            self.verify_kernel = (
-                self.decode_kernel
-                if decode_backend.is_aiter()
-                else self.extend_kernel
-            )
         else:
             self.verify_kernel = triton_kernel
 
@@ -497,9 +464,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            # Aiter returns final_state; Triton updates in-place. Copy back when kernel
-            # returns state (aiter, NPU, CPU) so ssm_states is correct for next decode.
-            if (is_npu() or is_cpu() or get_linear_attn_prefill_backend().is_aiter()) and last_recurrent_state is not None:
+            # Triton updates in-place; NPU/CPU return state. Copy back when kernel
+            # returns state so ssm_states is correct for next decode.
+            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

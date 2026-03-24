@@ -14,10 +14,8 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_npu
 from sglang.srt.utils.common import rank0_log
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -29,11 +27,6 @@ elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
     causal_conv1d_update = causal_conv1d_update_cpu
-elif _use_aiter and get_bool_env_var("SGLANG_LINEAR_ATTN_IMPL") == "aiter":
-    # Currently, default to disable aiter impl for KDA
-    from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
-        causal_conv1d_update,
-    )
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner

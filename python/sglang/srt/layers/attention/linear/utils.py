@@ -16,7 +16,6 @@ class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
     CUTEDSL = "cutedsl"
     FLASHINFER = "flashinfer"
-    AITER = "aiter"
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
@@ -26,9 +25,6 @@ class LinearAttnKernelBackend(Enum):
 
     def is_flashinfer(self):
         return self == LinearAttnKernelBackend.FLASHINFER
-
-    def is_aiter(self):
-        return self == LinearAttnKernelBackend.AITER
 
 
 LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
