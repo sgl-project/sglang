@@ -14,7 +14,7 @@ class ScoreResult:
     prompt_tokens: int
 
 
-class TokenizerManagerMultiItemMixin:
+class TokenizerManagerScoreMixin:
     async def score_prompts(
         self,
         prompts: Union[str, List[str], List[List[int]]],
