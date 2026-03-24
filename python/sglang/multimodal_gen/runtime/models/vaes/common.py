@@ -236,6 +236,24 @@ class ParallelTiledVAE(ABC, nn.Module):
                 _start_shape += mul_shape
                 global_idx += 1
 
+    def _get_parallel_tile_batch_size(
+        self,
+        tile_shape: tuple[int, ...],
+        reference_tile_shape: tuple[int, ...],
+    ) -> int:
+        # Full-size tiles keep the previous micro-batch of 2. Smaller edge
+        # tiles can use a slightly larger batch because their decode footprint
+        # is lower, but the result is still capped conservatively instead of
+        # scaling linearly with tile size.
+        reference_tile_numel = prod(reference_tile_shape)
+        tile_numel = prod(tile_shape)
+        if reference_tile_numel <= 0 or tile_numel <= 0:
+            return 1
+
+        max_dynamic_batch_size = 4
+        dynamic_batch_size = max(1, 1 + reference_tile_numel // tile_numel)
+        return min(dynamic_batch_size, max_dynamic_batch_size)
+
     def parallel_tiled_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
@@ -279,7 +297,13 @@ class ParallelTiledVAE(ABC, nn.Module):
         tiles_per_rank = (total_tiles + world_size - 1) // world_size
         start_tile_idx = rank * tiles_per_rank
         end_tile_idx = min((rank + 1) * tiles_per_rank, total_tiles)
-        tile_batch_size = 2
+        reference_tile_shape = (
+            B,
+            C,
+            tile_latent_min_num_frames + 1,
+            tile_latent_min_height,
+            tile_latent_min_width,
+        )
 
         local_results = []
         local_dim_metadata = []
@@ -313,7 +337,10 @@ class ParallelTiledVAE(ABC, nn.Module):
         if tile_work_items:
             decoded_results = [None] * len(tile_work_items)
             decoded_shapes = [None] * len(tile_work_items)
-            for bucket_local_indices in shape_buckets.values():
+            for tile_shape, bucket_local_indices in shape_buckets.items():
+                tile_batch_size = self._get_parallel_tile_batch_size(
+                    tile_shape, reference_tile_shape
+                )
                 for batch_start in range(0, len(bucket_local_indices), tile_batch_size):
                     batch_local_indices = bucket_local_indices[
                         batch_start : batch_start + tile_batch_size
