@@ -180,7 +180,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -227,7 +227,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -270,7 +270,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -309,7 +309,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -350,7 +350,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -389,7 +389,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -428,7 +428,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -468,7 +468,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -508,7 +508,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -548,7 +548,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -676,7 +676,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -805,7 +805,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -851,7 +851,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
@@ -893,7 +893,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Check Host RDMA Environment
         id: rdma_detect

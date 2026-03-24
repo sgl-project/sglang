@@ -1,7 +1,14 @@
 # Adapted from sgl-kernel/tests/test_norm.py
 
+import sys
+
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=125, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=500, suite="nightly-kernel-1-gpu", nightly=True)
 
 # JIT rmsnorm: fp16/bf16 only
 # - Warp norm path (one warp per token):  hidden_size in {64, 128, 256}
@@ -135,4 +142,4 @@ def test_rmsnorm_rejects_unsupported_hidden_size(hidden_size):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

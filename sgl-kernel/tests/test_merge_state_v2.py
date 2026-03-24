@@ -1,3 +1,4 @@
+import sys
 from typing import Optional
 
 import pytest
@@ -397,4 +398,4 @@ def test_merge_attn_states(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

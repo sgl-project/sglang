@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel.kvcacheio import (
@@ -703,4 +705,4 @@ def test_transfer_kv_page_head(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
