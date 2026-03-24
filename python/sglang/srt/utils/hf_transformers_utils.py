@@ -797,11 +797,6 @@ def get_tokenizer(
     # when trust_remote_code=False and the model requires a custom tokenizer.
     # Detect this and auto-retry with trust_remote_code=True.
     if not trust_remote_code and type(tokenizer).__name__ == "TokenizersBackend":
-        logger.info(
-            "Detected generic TokenizersBackend for %s, "
-            "retrying with trust_remote_code=True",
-            tokenizer_name,
-        )
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
