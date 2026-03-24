@@ -31,30 +31,13 @@ def _load_aiter_gdn_kernels():
         return _aiter_fused_sigmoid_gating_delta_rule_update is not None, (
             _aiter_chunk_gated_delta_rule is not None
         )
-
     try:
-        from aiter import fused_sigmoid_gating_delta_rule_update as _aiter_decode
-
-        _aiter_fused_sigmoid_gating_delta_rule_update = _aiter_decode
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+        from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule
+        _aiter_fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update
+        _aiter_chunk_gated_delta_rule = chunk_gated_delta_rule
     except ImportError:
-        try:
-            from aiter.fla import fused_sigmoid_gating_delta_rule_update as _aiter_decode
-
-            _aiter_fused_sigmoid_gating_delta_rule_update = _aiter_decode
-        except ImportError:
-            pass
-
-    try:
-        from aiter import chunk_gated_delta_rule as _aiter_extend
-
-        _aiter_chunk_gated_delta_rule = _aiter_extend
-    except ImportError:
-        try:
-            from aiter.fla import chunk_gated_delta_rule as _aiter_extend
-
-            _aiter_chunk_gated_delta_rule = _aiter_extend
-        except ImportError:
-            pass
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
     _aiter_available = True
     return _aiter_fused_sigmoid_gating_delta_rule_update is not None, (
