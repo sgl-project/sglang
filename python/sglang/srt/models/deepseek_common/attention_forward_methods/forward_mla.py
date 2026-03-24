@@ -213,7 +213,22 @@ class DeepseekMLAForwardMixin:
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_mxfp8_bmm:
+        if self.use_deep_gemm_bmm:
+            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
+                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
+            )
+            q_nope_out = q_nope.new_empty(
+                (self.num_local_heads, aligned_m, self.kv_lora_rank)
+            )
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (q_nope_val, q_nope_scale),
+                (self.w_kc, self.w_scale_k),
+                q_nope_out,
+                masked_m,
+                expected_m,
+            )
+            q_nope_out = q_nope_out[:, :expected_m, :]
+        elif self.use_mxfp8_bmm:
             q_nope_bmk = q_nope.transpose(0, 1).contiguous()
             q_nope_mxfp8, q_nope_mxfp8_scale = (
                 fp8_quant_utils.flashinfer_mxfp8_quantize(
@@ -230,21 +245,6 @@ class DeepseekMLAForwardMixin:
                 q_nope.dtype,
                 backend="cudnn",
             )
-        elif self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
-            )
-            q_nope_out = q_nope_out[:, :expected_m, :]
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
@@ -413,7 +413,26 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.use_mxfp8_bmm:
+        if self.use_deep_gemm_bmm:
+            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
+                per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    attn_output.transpose(0, 1)
+                )
+            )
+            attn_bmm_output = attn_output.new_empty(
+                (self.num_local_heads, aligned_m, self.v_head_dim)
+            )
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (attn_output_val, attn_output_scale),
+                (self.w_vc, self.w_scale_v),
+                attn_bmm_output,
+                masked_m,
+                expected_m,
+            )
+            attn_bmm_output = (
+                attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
+            )
+        elif self.use_mxfp8_bmm:
             attn_output_bmk = attn_output.transpose(0, 1).contiguous()
             attn_output_mxfp8_bmk, attn_output_mxfp8_scale = (
                 fp8_quant_utils.flashinfer_mxfp8_quantize(
@@ -433,25 +452,6 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = (
                 attn_bmm_output_t.transpose(1, 2).transpose(0, 1).flatten(1, 2)
-            )
-        elif self.use_deep_gemm_bmm:
-            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1)
-                )
-            )
-            attn_bmm_output = attn_output.new_empty(
-                (self.num_local_heads, aligned_m, self.v_head_dim)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (attn_output_val, attn_output_scale),
-                (self.w_vc, self.w_scale_v),
-                attn_bmm_output,
-                masked_m,
-                expected_m,
-            )
-            attn_bmm_output = (
-                attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
