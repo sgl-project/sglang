@@ -565,12 +565,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -578,11 +582,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 10
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -591,7 +597,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
 
   stage-a-test-cpu:
     needs: [check-changes, call-gate]
@@ -618,20 +624,27 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Set up Python
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install uv
+        if: steps.stage-health.outputs.healthy == 'true'
         uses: astral-sh/setup-uv@v5
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         env:
           UV_SYSTEM_PYTHON: "1"
@@ -639,6 +652,7 @@ jobs:
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 10
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -672,12 +686,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -685,6 +703,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           source /etc/profile.d/sglang-ci.sh
@@ -694,6 +713,7 @@ jobs:
           pip install -e . --no-build-isolation
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -703,7 +723,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -733,12 +753,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -746,11 +770,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -759,7 +785,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -787,12 +813,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -800,6 +830,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
@@ -808,6 +839,7 @@ jobs:
           pip install -e . --no-build-isolation
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -816,7 +848,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -843,12 +875,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
@@ -856,11 +892,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -869,12 +907,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
       - name: Run FA4 jit_kernel tests (SM100+)
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 10
         run: |
           python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -927,12 +966,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -940,11 +983,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -953,7 +998,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -981,12 +1026,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -994,11 +1043,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Warmup DeepGEMM JIT Compilation
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
@@ -1006,6 +1057,7 @@ jobs:
             deepseek-ai/DeepSeek-V3.2-Exp:8
 
       - name: Warmup Server CUDA Graphs
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_server.py \
@@ -1013,6 +1065,7 @@ jobs:
             inclusionAI/Ring-2.5-1T:8
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -1021,7 +1074,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1051,12 +1104,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -1064,11 +1121,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -1077,7 +1136,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1101,12 +1160,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -1114,23 +1177,27 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Warmup DeepGEMM JIT Compilation
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Warmup Server CUDA Graphs
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_server.py \
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -1139,7 +1206,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
 
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1161,12 +1228,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -1174,11 +1245,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Warmup DeepGEMM JIT Compilation
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
@@ -1186,12 +1259,14 @@ jobs:
             deepseek-ai/DeepSeek-V3.2-Exp:8
 
       - name: Warmup Server CUDA Graphs
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 25
         run: |
           python3 scripts/ci/cuda/warmup_server.py \
             deepseek-ai/DeepSeek-V3-0324:8
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 45
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -1200,7 +1275,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1227,12 +1302,16 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
+        if: steps.stage-health.outputs.healthy == 'true'
         with:
           github-token: ${{ github.token }}
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        if: steps.stage-health.outputs.healthy == 'true' && needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
@@ -1240,11 +1319,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
+        if: steps.stage-health.outputs.healthy == 'true'
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
@@ -1253,7 +1334,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: always() && steps.stage-health.outputs.healthy == 'true'
         with:
           artifact-suffix: ${{ matrix.part }}
 

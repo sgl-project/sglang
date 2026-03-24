@@ -1,0 +1,36 @@
+name: Check Stage Health
+description: Check if any job in the current workflow run has failed. Sets output healthy=true/false. Always succeeds.
+
+inputs:
+  github-token:
+    description: 'GitHub token for API calls'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  healthy:
+    description: '"true" if no job has failed, "false" otherwise'
+    value: ${{ steps.check.outputs.healthy }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check stage health
+      id: check
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+            per_page: 100,
+          });
+          const failed = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
+          if (failed.length > 0) {
+            core.warning(`Fast-fail: skipping — failed job(s): ${failed.map(j => j.name).join(', ')}`);
+            core.setOutput('healthy', 'false');
+          } else {
+            core.setOutput('healthy', 'true');
+          }
